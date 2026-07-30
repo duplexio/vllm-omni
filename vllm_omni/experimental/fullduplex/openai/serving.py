@@ -1156,16 +1156,19 @@ class OmniDuplexSessionHandler(
     ) -> dict[str, object] | None:
         if not self._uses_native_input_append(session):
             return None
-        if not self._config_requests_audio_output(candidate_config):
-            return None
-        if "ref_audio_data" in session.runtime_config:
-            return None
-        return {
-            "type": "error",
-            "session_id": session.session_id,
-            "code": "ref_audio_required",
-            "error": "MiniCPM-o native duplex audio output requires ref_audio",
-        }
+        try:
+            self._serving_runtime_adapter.validate_runtime_config_for_session(
+                candidate_config,
+                session.runtime_config,
+            )
+        except ServingRuntimeConfigError as exc:
+            return {
+                "type": "error",
+                "session_id": session.session_id,
+                "code": exc.code,
+                "error": str(exc),
+            }
+        return None
 
     @staticmethod
     def _uses_native_input_append(session: DuplexSession) -> bool:
@@ -1173,10 +1176,6 @@ class OmniDuplexSessionHandler(
             session.capabilities.implementation_level == "model_native_duplex"
             and session.capabilities.supports_input_append
         )
-
-    @staticmethod
-    def _config_requests_audio_output(config: DuplexSessionConfig) -> bool:
-        return any(str(modality).lower() == "audio" for modality in config.modalities)
 
     @staticmethod
     def _native_stage0_request_id(session: DuplexSession, epoch: int) -> str:

@@ -17,6 +17,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -28,7 +29,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
-from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
+from vllm.v1.worker.ubatch_utils import UBatchSlices, maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
@@ -258,6 +259,55 @@ class OmniGPUModelRunner(GPUModelRunner):
             for_cudagraph_capture=for_cudagraph_capture,
             num_scheduled_tokens_np=num_scheduled_tokens_np,
         )
+
+    def _maybe_update_model_attention_metadata(
+        self,
+        attn_metadata: Any,
+        num_reqs: int,
+    ) -> None:
+        update_attention_metadata = getattr(
+            self.model,
+            "update_attention_metadata",
+            None,
+        )
+        if callable(update_attention_metadata):
+            request_infos = [
+                self.model_intermediate_buffer.get(req_id, {})
+                for req_id in self.input_batch.req_ids[:num_reqs]
+            ]
+            update_attention_metadata(attn_metadata, request_infos)
+
+    def _build_attention_metadata(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        max_query_len: int,
+        num_tokens_padded: int | None = None,
+        num_reqs_padded: int | None = None,
+        ubatch_slices: UBatchSlices | None = None,
+        logits_indices: torch.Tensor | None = None,
+        use_spec_decode: bool = False,
+        for_cudagraph_capture: bool = False,
+        num_scheduled_tokens: dict[str, int] | None = None,
+        cascade_attn_prefix_lens: list[list[int]] | None = None,
+        slot_mappings: dict[int, torch.Tensor] | None = None,
+    ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
+        metadata, spec_decode_metadata = super()._build_attention_metadata(
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            max_query_len=max_query_len,
+            num_tokens_padded=num_tokens_padded,
+            num_reqs_padded=num_reqs_padded,
+            ubatch_slices=ubatch_slices,
+            logits_indices=logits_indices,
+            use_spec_decode=use_spec_decode,
+            for_cudagraph_capture=for_cudagraph_capture,
+            num_scheduled_tokens=num_scheduled_tokens,
+            cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+            slot_mappings=slot_mappings,
+        )
+        self._maybe_update_model_attention_metadata(metadata, num_reqs)
+        return metadata, spec_decode_metadata
 
     def _build_model_sampler_output_token_ids(self) -> list[list[int]]:
         """Build decoded-token history for ``prefer_model_sampler`` models.
@@ -1068,7 +1118,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                     pad_attn=True,
                     for_cudagraph_capture=is_graph_capturing,
                 )
-
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
             num_scheduled_tokens,

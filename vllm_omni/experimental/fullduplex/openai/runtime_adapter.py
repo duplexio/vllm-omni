@@ -57,6 +57,13 @@ class PcmAppendBuffer(Protocol):
         chunk_period_ms: int,
     ) -> PcmAppendReservation: ...
 
+    def prepare_buffered_append(
+        self,
+        *,
+        operation_id: str,
+        chunk_period_ms: int,
+    ) -> PcmAppendReservation | None: ...
+
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None: ...
 
 
@@ -132,6 +139,12 @@ class ServingRuntimeAdapter(Protocol):
         current: Mapping[str, object],
     ) -> dict[str, object]: ...
 
+    def validate_runtime_config_for_session(
+        self,
+        config: object,
+        current: Mapping[str, object],
+    ) -> None: ...
+
     def data_plane_context(
         self,
         *,
@@ -167,6 +180,7 @@ def validate_serving_runtime_adapter(adapter: object) -> ServingRuntimeAdapter:
         "validate_client_extra_body",
         "prepare_runtime_config",
         "runtime_config_for_update",
+        "validate_runtime_config_for_session",
         "data_plane_context",
     )
     missing = [name for name in required_methods if not callable(getattr(adapter, name, None))]

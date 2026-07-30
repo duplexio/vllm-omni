@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
@@ -82,6 +83,23 @@ class MiniCPMO45NativeDuplexServingAdapter:
         stage_sampling["0"] = stage0
         runtime_config["duplex_stage_sampling_params"] = stage_sampling
         return runtime_config
+
+    @classmethod
+    def validate_runtime_config_for_session(
+        cls,
+        config: object,
+        current: Mapping[str, object],
+    ) -> None:
+        if not isinstance(config, DuplexSessionConfig):
+            raise TypeError("MiniCPM-o serving requires DuplexSessionConfig")
+        if not any(str(modality).lower() == "audio" for modality in config.modalities):
+            return
+        if "ref_audio_data" in current:
+            return
+        raise MiniCPMO45ClientRuntimeConfigError(
+            "MiniCPM-o native duplex audio output requires ref_audio",
+            code="ref_audio_required",
+        )
 
     @classmethod
     async def prepare_runtime_config(cls, config: DuplexSessionConfig, *, model_config: Any) -> dict[str, object]:

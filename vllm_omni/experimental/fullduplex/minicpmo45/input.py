@@ -355,6 +355,16 @@ class MiniCPMO45PcmAppendBuffer:
         self._turn_had_speech = False
         return reservation
 
+    def prepare_buffered_append(
+        self,
+        *,
+        operation_id: str,
+        chunk_period_ms: int,
+    ) -> MiniCPMO45PcmAppendReservation | None:
+        """MiniCPM-o already emits exactly one model unit per client append."""
+        del operation_id, chunk_period_ms
+        return None
+
     def append(
         self,
         payload: dict[str, object],

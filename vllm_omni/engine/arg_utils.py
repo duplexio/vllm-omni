@@ -37,6 +37,9 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.duplexio.configuration_duplexio import (
+            DuplexIOConfig,
+        )
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
         )
@@ -68,6 +71,7 @@ def _register_omni_hf_configs() -> None:
         _CONFIG_REGISTRY = None
 
     for model_type, config_cls in [
+        ("duplexio", DuplexIOConfig),
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
         ("indextts2", IndexTTS2Config),

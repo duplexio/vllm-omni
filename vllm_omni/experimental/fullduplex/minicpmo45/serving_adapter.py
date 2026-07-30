@@ -73,6 +73,16 @@ class MiniCPMO45ServingRuntimeAdapter:
         )
 
     @staticmethod
+    def validate_runtime_config_for_session(
+        config: object,
+        current: Mapping[str, object],
+    ) -> None:
+        MiniCPMO45NativeDuplexServingAdapter.validate_runtime_config_for_session(
+            config,
+            current,
+        )
+
+    @staticmethod
     def data_plane_context(
         *,
         epoch: int,

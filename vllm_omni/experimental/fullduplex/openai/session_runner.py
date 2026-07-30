@@ -346,27 +346,50 @@ class DuplexSessionRunnerMixin:
 
             async def _run() -> bool:
                 nonlocal runtime_closed
+                current_payload = payload
+                current_reservation = pcm_reservation
+                current_operation_id = operation_id
+                current_final = final
                 try:
-                    append_ok, emitted_response = await self._append_runtime_input(
-                        session,
-                        payload,
-                        operation_id=(pcm_reservation.operation_id if pcm_reservation is not None else operation_id),
-                        final=final,
-                        send_json=emit_event,
-                        mode="append_audio_chunk",
-                        expected_epoch=append_epoch,
-                    )
-                    if append_ok:
-                        if pcm_reservation is not None:
-                            pcm_reservation.commit()
-                            session.release_input_bytes(pcm_reservation.byte_count)
-                        if (
-                            retained_committed_payload is not None
-                            and native.committed_audio_payload is retained_committed_payload
-                        ):
-                            session.release_input_bytes(native.clear_committed_audio())
-                    elif pcm_reservation is not None:
-                        pcm_reservation.rollback()
+                    emitted_response = False
+                    while True:
+                        append_ok, append_emitted_response = await self._append_runtime_input(
+                            session,
+                            current_payload,
+                            operation_id=(
+                                current_reservation.operation_id
+                                if current_reservation is not None
+                                else current_operation_id
+                            ),
+                            final=current_final,
+                            send_json=emit_event,
+                            mode="append_audio_chunk",
+                            expected_epoch=append_epoch,
+                        )
+                        emitted_response = emitted_response or append_emitted_response
+                        if not append_ok:
+                            if current_reservation is not None:
+                                current_reservation.rollback()
+                            break
+                        if current_reservation is not None:
+                            current_reservation.commit()
+                            session.release_input_bytes(current_reservation.byte_count)
+                        if current_final:
+                            break
+                        current_operation_id = uuid.uuid4().hex
+                        current_reservation = native.audio_buffer.prepare_buffered_append(
+                            operation_id=current_operation_id,
+                            chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
+                        )
+                        if current_reservation is None:
+                            break
+                        current_payload = current_reservation.payload
+                        current_final = False
+                    if append_ok and (
+                        retained_committed_payload is not None
+                        and native.committed_audio_payload is retained_committed_payload
+                    ):
+                        session.release_input_bytes(native.clear_committed_audio())
                     if (
                         not append_ok
                         and precreated_response_id is not None
@@ -400,10 +423,12 @@ class DuplexSessionRunnerMixin:
                             )
                     return append_ok
                 except asyncio.CancelledError:
+                    if current_reservation is not None:
+                        current_reservation.rollback()
                     raise
                 except Exception as exc:
-                    if pcm_reservation is not None:
-                        pcm_reservation.rollback()
+                    if current_reservation is not None:
+                        current_reservation.rollback()
                     logger.exception("Native duplex append task failed: %s", exc)
                     await self._send_runtime_error(emit_event, "runtime_append_task_failed", exc, session=session)
                     if session.state != DuplexSessionState.CLOSED:

@@ -107,6 +107,7 @@ def _valid_runtime_adapter() -> SimpleNamespace:
         validate_client_extra_body=lambda extra_body: None,
         prepare_runtime_config=lambda config, **kwargs: {},
         runtime_config_for_update=lambda config, current: {},
+        validate_runtime_config_for_session=lambda config, current: None,
         data_plane_context=lambda **kwargs: object(),
     )
 

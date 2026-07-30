@@ -6,6 +6,11 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    "DuplexIOForConditionalGeneration": (
+        "duplexio",
+        "modeling_duplexio",
+        "DuplexIOForConditionalGeneration",
+    ),
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
         "qwen2_5_omni",
