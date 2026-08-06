@@ -44,6 +44,10 @@ class MossTTSDelayConfig(PretrainedConfig):
         audio_user_slot_token_id: int = 151654,
         audio_assistant_gen_slot_token_id: int = 151656,
         audio_assistant_delay_slot_token_id: int = 151662,
+        audio_temperature: float = 1.1,
+        audio_top_p: float = 0.9,
+        audio_top_k: int = 50,
+        audio_repetition_penalty: float = 1.1,
         pad_token_id: int = 151643,
         im_start_token_id: int = 151644,
         im_end_token_id: int = 151645,
@@ -69,6 +73,10 @@ class MossTTSDelayConfig(PretrainedConfig):
         self.audio_user_slot_token_id = audio_user_slot_token_id
         self.audio_assistant_gen_slot_token_id = audio_assistant_gen_slot_token_id
         self.audio_assistant_delay_slot_token_id = audio_assistant_delay_slot_token_id
+        self.audio_temperature = audio_temperature
+        self.audio_top_p = audio_top_p
+        self.audio_top_k = audio_top_k
+        self.audio_repetition_penalty = audio_repetition_penalty
         self.pad_token_id = pad_token_id
         self.im_start_token_id = im_start_token_id
         self.im_end_token_id = im_end_token_id

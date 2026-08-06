@@ -130,9 +130,79 @@ def test_moss_tts_delay_prefill_codes_resume_at_cached_token_offset() -> None:
         input_ids=torch.tensor([6, 8], dtype=torch.long),
         input_embeds=None,
         codes={"ref": ref_codes},
+        ids={"prompt": [0, 7, 8, 8, 8]},
         _omni_num_computed_tokens=3,
         _omni_prompt_len=5,
+        _omni_is_prefill=True,
     )
 
     torch.testing.assert_close(embeds[:, 0], torch.tensor([6.0, 8.0]))
     assert update["ref_offset"] == 5
+    assert update["audio_state"]["is_audio"] is True
+    assert update["audio_state"]["audio_lengths"] == 4
+    expected_seen = torch.zeros((2, 10), dtype=torch.bool)
+    expected_seen[0, :6] = True
+    expected_seen[1, :6] = True
+    torch.testing.assert_close(update["audio_codes"]["seen"], expected_seen)
+
+
+def test_moss_tts_delay_tail_counter_advances_on_first_delay_slot() -> None:
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import (
+        MossTTSDelayTalkerForGeneration,
+    )
+
+    model = MossTTSDelayTalkerForGeneration.__new__(MossTTSDelayTalkerForGeneration)
+    nn.Module.__init__(model)
+    model.n_vq = 2
+    model.audio_start_token_id = 10
+    model.audio_end_token_id = 11
+    model.audio_assistant_gen_slot_token_id = 12
+    model.audio_assistant_delay_slot_token_id = 13
+    state = {
+        "audio_lengths": 20,
+        "generated_audio_frames": 0,
+        "delayed_lengths": -1,
+        "is_audio": True,
+        "step": 0,
+    }
+
+    state = model._advance_state(state, model.audio_assistant_delay_slot_token_id)
+    assert state["delayed_lengths"] == 1
+
+    state = model._advance_state(state, model.audio_assistant_delay_slot_token_id)
+    assert state["delayed_lengths"] == 2
+
+    state = model._advance_state(state, model.audio_end_token_id)
+    assert state["delayed_lengths"] == -1
+    assert state["is_audio"] is False
+
+
+def test_moss_tts_audio_sampler_matches_checkpoint_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import (
+        MossTTSDelayTalkerForGeneration,
+    )
+
+    model = MossTTSDelayTalkerForGeneration.__new__(MossTTSDelayTalkerForGeneration)
+    nn.Module.__init__(model)
+    model.audio_temperature = 1.0
+    model.audio_top_k = 3
+    model.audio_top_p = 0.8
+    model.audio_repetition_penalty = 2.0
+    captured: dict[str, torch.Tensor] = {}
+
+    def sample(probs: torch.Tensor, num_samples: int) -> torch.Tensor:
+        assert num_samples == 1
+        captured["probs"] = probs
+        return probs.argmax(dim=-1, keepdim=True)
+
+    monkeypatch.setattr(torch, "multinomial", sample)
+    logits = torch.tensor([[4.0, 3.0, 1.0, 0.0, -1.0]])
+    seen = torch.tensor([[True, False, False, False, False]])
+
+    sampled = model.sample_audio_logits(logits, seen)
+
+    assert sampled.tolist() == [1]
+    torch.testing.assert_close(
+        captured["probs"],
+        torch.tensor([[0.26894143, 0.7310586, 0.0, 0.0, 0.0]]),
+    )

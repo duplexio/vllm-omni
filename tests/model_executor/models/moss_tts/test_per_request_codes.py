@@ -51,7 +51,7 @@ def _make_bare_delay_talker():
     talker._batch_state = None
     talker.n_vq = N_VQ
 
-    def _stub_sample(last_h, state):
+    def _stub_sample(last_h, state, seen):
         row_value = int(last_h.reshape(-1)[0].item())
         return torch.full((N_VQ,), row_value, dtype=torch.long)
 
@@ -68,6 +68,15 @@ def _audio_payload(result):
     return result.multimodal_outputs["codes"]["audio"]
 
 
+def request_info(**audio_codes):
+    return {
+        "audio_codes": {
+            "seen": torch.zeros((N_VQ, 8), dtype=torch.bool),
+            **audio_codes,
+        }
+    }
+
+
 class TestPerRequestRouting:
     def test_mixed_prefill_decode_routes_by_span(self):
         """req 0 prefills 3 rows, req 1 decodes 1 row in the same step.
@@ -77,7 +86,7 @@ class TestPerRequestRouting:
         """
         talker = _make_bare_delay_talker()
         hidden = _row_indexed_hidden(4)
-        info_dicts = [{}, {}]
+        info_dicts = [request_info(), request_info()]
         spans = [(0, 3), (3, 4)]
 
         result = talker.make_omni_output(
@@ -99,7 +108,7 @@ class TestPerRequestRouting:
         talker = _make_bare_delay_talker()
         spans = [(0, 2), (2, 5), (5, 6)]
         hidden = _row_indexed_hidden(6)
-        info_dicts = [{}, {}, {}]
+        info_dicts = [request_info(), request_info(), request_info()]
 
         result = talker.make_omni_output(
             hidden,
@@ -123,7 +132,7 @@ class TestPerRequestRouting:
         # req 1 has an empty span (start == end) and must not displace req 2.
         spans = [(0, 1), (1, 1), (1, 2)]
         hidden = _row_indexed_hidden(2)
-        info_dicts = [{}, {}, {}]
+        info_dicts = [request_info(), request_info(), request_info()]
 
         result = talker.make_omni_output(
             hidden,
@@ -141,7 +150,7 @@ class TestPerRequestRouting:
         talker = _make_bare_delay_talker()
         hidden = _row_indexed_hidden(2)
         prior = torch.full((1, N_VQ), 7, dtype=torch.long)
-        info_dicts = [{"audio_codes": {"accumulated": prior}}, {}]
+        info_dicts = [request_info(accumulated=prior), request_info()]
         spans = [(0, 1), (1, 2)]
 
         result = talker.make_omni_output(
@@ -161,7 +170,7 @@ class TestPerRequestRouting:
         verify that passing them produces a batch-aligned list."""
         talker = _make_bare_delay_talker()
         hidden = _row_indexed_hidden(2)
-        info_dicts = [{}, {}]
+        info_dicts = [request_info(), request_info()]
         spans = [(0, 1), (1, 2)]
 
         result = talker.make_omni_output(

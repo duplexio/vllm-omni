@@ -100,9 +100,9 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
 
     Delay pattern
     ~~~~~~~~~~~~~
-    Audio heads are only active after the model emits the delay-slot token
-    (``audio_assistant_delay_slot_token_id``).  Before the slot fires all
-    audio heads output a pad token (``audio_pad_code``).  After the slot:
+    Audio codebooks activate progressively after ``audio_start``. When the
+    model emits ``audio_assistant_delay_slot_token_id``, they deactivate in
+    the same staggered order so every raw frame has all codebooks:
 
         step  t:     collect audio_codebook_0  for frame t
         step t+1:    collect audio_codebook_0  for frame t+1
@@ -137,6 +137,10 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         self.audio_end_token_id: int = self.config.audio_end_token_id
         self.audio_assistant_gen_slot_token_id: int = self.config.audio_assistant_gen_slot_token_id
         self.audio_assistant_delay_slot_token_id: int = self.config.audio_assistant_delay_slot_token_id
+        self.audio_temperature: float = self.config.audio_temperature
+        self.audio_top_p: float = self.config.audio_top_p
+        self.audio_top_k: int = self.config.audio_top_k
+        self.audio_repetition_penalty: float = self.config.audio_repetition_penalty
         self.pad_token_id: int = getattr(self.config, "pad_token_id", 151643)
         self.im_end_token_id: int = getattr(self.config, "im_end_token_id", 151645)
 
@@ -178,6 +182,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("audio_codes", "current"),  # last step's audio codes
             ("audio_codes", "accumulated"),
+            ("audio_codes", "seen"),
             ("hidden_states", "last"),
         }
 
@@ -387,7 +392,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         if delayed_lengths == -1:
             if sampled_id == self.audio_assistant_delay_slot_token_id:
                 delayed_lengths = 0
-        else:
+        if delayed_lengths != -1:
             delayed_lengths += 1
             if delayed_lengths > self.n_vq:
                 delayed_lengths = -1
@@ -421,15 +426,27 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         span_len = int(input_ids.shape[0])
         audio_state = info_dict.get("audio_state")
         is_first_call = not isinstance(audio_state, dict)
+        is_prefill_raw = info_dict.get("_omni_is_prefill")
+        if isinstance(is_prefill_raw, bool):
+            is_prefill = is_prefill_raw
+        else:
+            is_prefill = span_len > 1 or is_first_call
 
-        if span_len > 1 or is_first_call:
+        if is_first_call:
+            prompt_ids = (info_dict.get("ids", {}) or {}).get("prompt")
+            if prompt_ids is None:
+                prompt_tensor = input_ids
+            else:
+                prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long)
+            audio_state = self._initial_state(prompt_tensor)
+
+        if is_prefill:
             # Prefill (or first call). Initialise the per-request state and
             # build text embeddings. If the request carries reference-audio
             # codes (``codes.ref`` from the upstream MossTTSDelayProcessor's
             # delay-pattern grid, shape ``(L_full, n_vq)``), additively embed
             # them at the matching prefill positions so the talker can attend
             # to the speaker's timbre when generating its response.
-            audio_state = self._initial_state(input_ids)
             embeds = self.model.embed_tokens(input_ids)
 
             ref_codes = (info_dict.get("codes", {}) or {}).get("ref")
@@ -492,9 +509,12 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
                 audio_state["max_new_frames"] = int(max_new_frames_req) if max_new_frames_req is not None else -1
             except (TypeError, ValueError):
                 audio_state["max_new_frames"] = -1
+            audio_codes_update = {"current": current_codes}
+            if is_first_call:
+                audio_codes_update["seen"] = self.initial_audio_seen(ref_codes, device)
             info_update: dict[str, Any] = {
                 "audio_state": audio_state,
-                "audio_codes": {"current": current_codes},
+                "audio_codes": audio_codes_update,
                 "ref_offset": ref_offset + span_len,
             }
             return input_ids, embeds, info_update
@@ -530,21 +550,63 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             return {}
         return {"hidden_states": {"last": hidden_states[-1].detach()}}
 
-    @staticmethod
-    def _sample_with_top_k(
-        logits: torch.Tensor,
-        top_k: int,
-        temperature: float,
+    def initial_audio_seen(
+        self,
+        ref_codes: torch.Tensor | None,
+        device: torch.device,
     ) -> torch.Tensor:
-        """Top-k sampling on a (..., V) logits tensor returning (...,) ids."""
-        if temperature > 0:
-            logits = logits / max(temperature, 1e-6)
-        if top_k and top_k > 0 and top_k < logits.shape[-1]:
-            top_vals, _ = torch.topk(logits, top_k, dim=-1)
-            kth = top_vals[..., -1:].expand_as(logits)
-            logits = torch.where(logits < kth, torch.full_like(logits, float("-inf")), logits)
-        if temperature <= 0:
+        """Return per-codebook token history for the official repetition penalty."""
+        seen = torch.zeros(
+            (self.n_vq, self.audio_vocab_size + 1),
+            dtype=torch.bool,
+            device=device,
+        )
+        if ref_codes is None or ref_codes.numel() == 0:
+            return seen
+        if ref_codes.dim() != 2 or ref_codes.shape[1] != self.n_vq:
+            raise ValueError(
+                "MOSS-TTS reference codes must have shape "
+                f"(frames, {self.n_vq}), got {tuple(ref_codes.shape)}"
+            )
+        history = ref_codes.to(device=device).t().contiguous()
+        seen.scatter_(1, history, True)
+        return seen
+
+    def sample_audio_logits(
+        self,
+        logits: torch.Tensor,
+        seen: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the checkpoint's audio sampler independently to each codebook."""
+        if self.audio_temperature > 0:
+            logits = logits / self.audio_temperature
+
+        penalty = self.audio_repetition_penalty
+        if penalty != 1.0:
+            penalized = torch.where(logits > 0, logits / penalty, logits * penalty)
+            logits = torch.where(seen, penalized, logits)
+
+        if self.audio_temperature <= 0:
             return logits.argmax(dim=-1)
+
+        if 0 < self.audio_top_k < logits.shape[-1]:
+            top_values, top_indices = torch.topk(logits, self.audio_top_k, dim=-1)
+            filtered = torch.full_like(logits, float("-inf"))
+            logits = filtered.scatter(-1, top_indices, top_values)
+
+        if self.audio_top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            remove = cumulative_probs > self.audio_top_p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+            logits = torch.full_like(logits, float("-inf")).scatter(
+                -1,
+                sorted_indices,
+                sorted_logits,
+            )
+
         probs = torch.softmax(logits, dim=-1)
         flat = probs.reshape(-1, probs.shape[-1])
         sampled = torch.multinomial(flat, num_samples=1).reshape(probs.shape[:-1])
@@ -554,6 +616,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         self,
         last_h: torch.Tensor,  # (1, H)
         state: dict[str, Any],
+        seen: torch.Tensor,
     ) -> torch.Tensor:  # (n_vq,)
         """Sample one row of n_vq audio codes given current state.
 
@@ -580,9 +643,6 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         if not bool(sampling_mask.any()):
             return codes
 
-        audio_top_k = 25
-        audio_temp = 1.7
-
         if self._stacked_audio_head_w is not None:
             # Single batched matmul: (n_vq, V+1, H) @ (H,) → (n_vq, V+1).
             # Replaces n_vq serial nn.Linear calls.
@@ -592,17 +652,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
 
             active_idx = sampling_mask.nonzero(as_tuple=True)[0]  # (n_active,)
             active_logits = all_logits[active_idx]  # (n_active, V+1)
-            active_logits = active_logits / max(audio_temp, 1e-6)
-            if audio_top_k > 0 and audio_top_k < active_logits.shape[-1]:
-                top_vals, _ = torch.topk(active_logits, audio_top_k, dim=-1)
-                kth = top_vals[:, -1:].expand_as(active_logits)
-                active_logits = torch.where(
-                    active_logits < kth,
-                    torch.full_like(active_logits, float("-inf")),
-                    active_logits,
-                )
-            probs = torch.softmax(active_logits, dim=-1)
-            codes[active_idx] = torch.multinomial(probs, num_samples=1).squeeze(-1).long()
+            codes[active_idx] = self.sample_audio_logits(active_logits, seen[active_idx]).long()
             return codes
 
         # Fallback: per-head loop (used before load_weights() completes).
@@ -613,7 +663,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             logits = head(last_h).reshape(-1)  # (V,)
             logits[..., -1] = float("-inf")
             logits[..., self.audio_pad_code] = float("-inf")
-            sampled = self._sample_with_top_k(logits, audio_top_k, audio_temp)
+            sampled = self.sample_audio_logits(logits.unsqueeze(0), seen[i : i + 1]).squeeze(0)
             codes[i] = sampled.long()
         return codes
 
@@ -690,9 +740,14 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
                 # Sample new audio codes from the last hidden state of this request.
                 last_h = hidden[row_end - 1].unsqueeze(0)  # (1, H)
                 state = info.get("audio_state", {}) or {}
-                new_codes = self._sample_audio_codes(last_h, state)  # (n_vq,)
+                audio_codes = info.get("audio_codes", {}) or {}
+                seen = audio_codes.get("seen")
+                if not isinstance(seen, torch.Tensor):
+                    raise RuntimeError("MOSS-TTS audio token history was not initialized during prefill")
+                new_codes = self._sample_audio_codes(last_h, state, seen)  # (n_vq,)
+                seen.scatter_(1, new_codes.unsqueeze(1), True)
 
-                acc = (info.get("audio_codes", {}) or {}).get("accumulated")
+                acc = audio_codes.get("accumulated")
                 if isinstance(acc, torch.Tensor) and acc.numel() > 0:
                     updated_acc = torch.cat([acc.to(new_codes.device), new_codes.unsqueeze(0)], dim=0)
                 else:
@@ -701,6 +756,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
                 info["audio_codes"] = {
                     "current": new_codes,
                     "accumulated": updated_acc,
+                    "seen": seen,
                 }
                 per_req_codes.append(updated_acc)
                 have_codes = True

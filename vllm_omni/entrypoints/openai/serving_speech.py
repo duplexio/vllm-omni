@@ -2013,8 +2013,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ]
             batch = processor([conversation], mode="continuation")
             unified = batch["input_ids"][0]
+            text_ids = unified[:, 0].tolist()
             params: dict[str, Any] = {
-                "prompt_token_ids": unified[:, 0].tolist(),
+                "prompt_token_ids": text_ids,
+                "ids": {"prompt": text_ids},
                 "codes": {
                     "ref": unified[:, 1:].contiguous().to(torch.int64),
                     "audio": turn.audio_prefix_codes,
@@ -2160,6 +2162,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         params: dict[str, Any] = {
             "prompt_token_ids": text_ids,
+            "ids": {"prompt": text_ids},
             "codes": {"ref": audio_codes},
         }
         if request.max_new_tokens is not None:
