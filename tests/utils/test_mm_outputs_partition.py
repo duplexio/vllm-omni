@@ -28,6 +28,7 @@ def test_partition_code2wav_client_audio():
     payload = {
         "model_outputs": torch.zeros(1, 2400),
         "sr": torch.tensor(24000, dtype=torch.int32),
+        "audio_codes": torch.zeros(10, 16, dtype=torch.long),
     }
     inter, client = partition_flat_payload(payload)
     assert inter == {}

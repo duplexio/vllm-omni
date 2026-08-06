@@ -14,6 +14,7 @@ from vllm.inputs import TokensPrompt as OmniTokensPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
 
@@ -40,6 +41,22 @@ def _extract_audio_codes(stage_output: Any) -> torch.Tensor | None:
                 return ac
 
     return None
+
+
+def codec_context_from_request(request: Any) -> torch.Tensor | None:
+    """Return the raw codec prefix attached to a continuation request."""
+    info = deserialize_additional_information(getattr(request, "additional_information", None))
+    codes = info.get("codes", {}) or {}
+    context = codes.get("audio")
+    if context is None:
+        return None
+    if not isinstance(context, torch.Tensor):
+        raise TypeError(f"MOSS codec context must be a tensor, got {type(context).__name__}")
+    if context.numel() == 0:
+        return None
+    if context.ndim != 2:
+        raise ValueError(f"MOSS codec context must have shape (frames, codebooks), got {tuple(context.shape)}")
+    return context.detach().to("cpu", torch.long).contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -149,12 +166,10 @@ def talker2codec_delay_async_chunk(
             del state[req_id]
         return None
 
-    # The MOSS audio tokenizer's causal decoder doesn't yet have left-context
-    # plumbing in this port, and a streaming chunk of 25 frames trips an
-    # internal patched-pretransform reshape on the first chunk. Until we wire
-    # left-context properly, accumulate all codes and emit only on finish.
+    # A streaming chunk of 25 frames trips an internal patched-pretransform
+    # reshape on the first chunk. Accumulate all generated codes and decode the
+    # complete continuation, with its causal codec prefix, on finish.
     chunk_frames: int = 1 << 30
-    left_context: int = 0
 
     t_acc = int(acc.shape[0])
     should_emit = is_finished or (t_acc - req_state["total_emitted"] >= chunk_frames)
@@ -163,7 +178,7 @@ def talker2codec_delay_async_chunk(
         return None
 
     # Determine the slice to emit
-    emit_start = max(0, req_state["total_emitted"] - left_context)
+    emit_start = req_state["total_emitted"]
     chunk_codes = acc[emit_start:]  # (T_chunk, NQ)
     req_state["total_emitted"] = t_acc
 
@@ -197,11 +212,22 @@ def talker2codec_delay_async_chunk(
         else:
             de_delayed = de_delayed.new_zeros((0, nq))
 
+    left_context = 0
     if de_delayed.shape[0] == 0:
         # Nothing left after filtering — emit silence sentinel so the codec
         # request still completes cleanly.
         codec_flat: list[int] = []
     else:
+        codec_context = codec_context_from_request(request)
+        if codec_context is not None:
+            if codec_context.shape[1] != nq:
+                raise ValueError(
+                    "MOSS codec context codebook mismatch: "
+                    f"context={codec_context.shape[1]}, generated={nq}"
+                )
+            left_context = int(codec_context.shape[0])
+            de_delayed = torch.cat([codec_context, de_delayed], dim=0)
+
         # Stage 1 (LLM_GENERATION codec) consumes ``codes.audio`` as a flat
         # codebook-major int list — chunk_transfer_adapter assigns it to
         # ``request.prompt_token_ids`` and the codec rebuilds the (NQ, T) grid.

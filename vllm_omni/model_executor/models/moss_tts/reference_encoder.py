@@ -25,17 +25,46 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def _encode_wav_sync(processor: Any, wav_list: list, sr: int, sr_target: int, n_vq: int) -> torch.Tensor:
-    """Blocking resample + CPU codec encode (the expensive bit)."""
+def prepare_reference_wav(wav_list: list, sr: int, sr_target: int) -> torch.Tensor:
+    """Convert resolved audio to a mono waveform at the codec sample rate."""
     wav = torch.tensor(wav_list, dtype=torch.float32)
     if wav.dim() == 1:
         wav = wav.unsqueeze(0)
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
     if sr != sr_target:
         import torchaudio
 
         wav = torchaudio.functional.resample(wav, sr, sr_target)
+    return wav
+
+
+def _encode_wav_sync(processor: Any, wav_list: list, sr: int, sr_target: int, n_vq: int) -> torch.Tensor:
+    """Blocking resample + CPU codec encode (the expensive bit)."""
+    wav = prepare_reference_wav(wav_list, sr, sr_target)
     with torch.no_grad():
         codes_list = processor.encode_audios_from_wav([wav], sampling_rate=sr_target, n_vq=n_vq)
+    return codes_list[0]
+
+
+def encode_concatenated_reference_codes(
+    processor: Any,
+    resolved_references: list[tuple[list, int]],
+    sr_target: int,
+    n_vq: int,
+) -> torch.Tensor:
+    """Codec-encode speaker references after concatenating their waveforms."""
+    wavs = [
+        prepare_reference_wav(wav_list, sr, sr_target)
+        for wav_list, sr in resolved_references
+    ]
+    prompt_wav = torch.cat(wavs, dim=-1)
+    with torch.no_grad():
+        codes_list = processor.encode_audios_from_wav(
+            [prompt_wav],
+            sampling_rate=sr_target,
+            n_vq=n_vq,
+        )
     return codes_list[0]
 
 
@@ -50,6 +79,7 @@ async def encode_reference_codes(
     sr_target: int,
     voice_name: str | None = None,
     voice_created_at: int = 0,
+    resolved_audio: tuple[list, int] | None = None,
 ) -> torch.Tensor:
     """Encode one reference clip into MOSS RVQ codes, reusing the speaker cache.
 
@@ -93,7 +123,10 @@ async def encode_reference_codes(
         logger.debug("Speaker cache HIT for MOSS-TTS reference '%s'", speaker_name)
         return cached["codes"].clone()
 
-    wav_list, sr = await resolve_ref_audio(ref_str)
+    if resolved_audio is None:
+        wav_list, sr = await resolve_ref_audio(ref_str)
+    else:
+        wav_list, sr = resolved_audio
     codes = await asyncio.to_thread(_encode_wav_sync, processor, wav_list, sr, sr_target, n_vq)
     speaker_cache.put(cache_key, {"codes": codes.detach().cpu()})
     logger.debug("Speaker cache STORE for MOSS-TTS reference '%s'", speaker_name)

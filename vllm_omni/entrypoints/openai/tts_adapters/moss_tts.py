@@ -42,7 +42,10 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         else:
             prompt = tokens_input(prompt_token_ids=[1])
         prompt["additional_information"] = tts_params
-        prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
+        cache_salt = tts_params.pop("_cache_salt", None)
+        if cache_salt is None:
+            cache_salt = conditioning_cache_salt(request, tts_params)
+        prompt["cache_salt"] = cache_salt
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type=self.name)
 
 

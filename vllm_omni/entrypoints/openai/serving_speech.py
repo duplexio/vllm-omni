@@ -40,6 +40,8 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
     BatchSpeechResponse,
     CreateAudio,
+    MossTTSDCreateSessionRequest,
+    MossTTSDTurnRequest,
     OpenAICreateSpeechRequest,
     SpeechBatchItem,
     SpeechBatchItemResult,
@@ -474,6 +476,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # differ per HF repo (voice-clone vs dialogue vs ambient-sound vs
         # instruction vs streaming voice-clone).
         self._moss_variant = self._detect_moss_variant() if self._tts_model_type == "moss_tts" else None
+        self._moss_ttsd_sessions = None
+        self._moss_ttsd_pending_turns = {}
+        if self._moss_variant == "ttsd":
+            from vllm_omni.model_executor.models.moss_tts.session import MossTTSDSessionStore
+
+            self._moss_ttsd_sessions = MossTTSDSessionStore(
+                max_sessions=int(os.environ.get("MOSS_TTSD_MAX_SESSIONS", "2048")),
+                ttl_seconds=float(os.environ.get("MOSS_TTSD_SESSION_TTL_SECONDS", "3600")),
+            )
 
         # GLM-TTS lazy-cached resources (populated on first GLM-TTS request)
         self._glm_tts_text_tokenizer: object | None = None
@@ -1809,6 +1820,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_ref_audio_format(request.ref_audio)
 
         if v == "ttsd":
+            if request.moss_session_id is not None:
+                if request.moss_session_role is None:
+                    return "MOSS-TTSD session turns require 'moss_session_role'."
+                if request.stream:
+                    return "MOSS-TTSD session turns do not support streaming."
+                try:
+                    self._require_moss_ttsd_sessions().get(request.moss_session_id)
+                except KeyError as exc:
+                    return str(exc)
+                return None
             if request.ref_audio is None:
                 return "MOSS-TTSD requires 'ref_audio' (speaker 1 reference)."
             fmt_err = self._validate_ref_audio_format(request.ref_audio)
@@ -1856,6 +1877,158 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._moss_processor_cache = proc
         return proc
 
+    def _require_moss_ttsd_sessions(self):
+        if self._moss_variant != "ttsd" or self._moss_ttsd_sessions is None:
+            raise ValueError("Turnwise sessions require a MOSS-TTSD deployment")
+        return self._moss_ttsd_sessions
+
+    async def _encode_moss_reference(
+        self,
+        ref_audio: str,
+        *,
+        variant: str,
+        processor: Any,
+        n_vq: int,
+        sample_rate: int,
+        voice_name: str | None = None,
+        voice_created_at: int = 0,
+        resolved_audio: tuple[list, int] | None = None,
+    ) -> torch.Tensor:
+        from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
+
+        return await encode_reference_codes(
+            ref_audio,
+            processor=processor,
+            resolve_ref_audio=self._resolve_ref_audio,
+            speaker_cache=self._speaker_cache,
+            variant=variant,
+            n_vq=n_vq,
+            sr_target=sample_rate,
+            voice_name=voice_name,
+            voice_created_at=voice_created_at,
+            resolved_audio=resolved_audio,
+        )
+
+    async def create_moss_ttsd_session(self, request: MossTTSDCreateSessionRequest) -> dict[str, Any]:
+        """Encode two references once and create server-owned continuation state."""
+        sessions = self._require_moss_ttsd_sessions()
+        for ref_audio in (request.user.ref_audio, request.assistant.ref_audio):
+            format_error = self._validate_ref_audio_format(ref_audio)
+            if format_error:
+                raise ValueError(format_error)
+
+        processor = self._get_moss_processor()
+        n_vq = int(getattr(processor.model_config, "n_vq", 16))
+        sample_rate = int(getattr(processor.model_config, "sampling_rate", 24000))
+        resolved_references = await asyncio.gather(
+            self._resolve_ref_audio(request.user.ref_audio),
+            self._resolve_ref_audio(request.assistant.ref_audio),
+        )
+        user_codes, assistant_codes = await asyncio.gather(
+            self._encode_moss_reference(
+                request.user.ref_audio,
+                variant="ttsd",
+                processor=processor,
+                n_vq=n_vq,
+                sample_rate=sample_rate,
+                resolved_audio=resolved_references[0],
+            ),
+            self._encode_moss_reference(
+                request.assistant.ref_audio,
+                variant="ttsd",
+                processor=processor,
+                n_vq=n_vq,
+                sample_rate=sample_rate,
+                resolved_audio=resolved_references[1],
+            ),
+        )
+        from vllm_omni.model_executor.models.moss_tts.reference_encoder import (
+            encode_concatenated_reference_codes,
+        )
+
+        prompt_codes = await asyncio.to_thread(
+            encode_concatenated_reference_codes,
+            processor,
+            list(resolved_references),
+            sample_rate,
+            n_vq,
+        )
+        session = sessions.create(
+            request.session_id,
+            (request.user.text, request.assistant.text),
+            (user_codes, assistant_codes),
+            prompt_codes,
+        )
+        return {
+            "session_id": session.session_id,
+            "sample_rate": sample_rate,
+            "reference_code_frames": [int(code.shape[0]) for code in session.reference_codes],
+        }
+
+    async def create_moss_ttsd_turn(
+        self,
+        session_id: str,
+        request: MossTTSDTurnRequest,
+        raw_request: Request | None = None,
+    ):
+        """Synthesize one cached continuation and return a WAV response."""
+        self._require_moss_ttsd_sessions().get(session_id)
+        speech_request = OpenAICreateSpeechRequest(
+            input=request.text,
+            model=self.engine_client.model_config.model,
+            response_format="wav",
+            max_new_tokens=request.max_new_tokens,
+            seed=request.seed,
+            moss_session_id=session_id,
+            moss_session_role=request.role,
+        )
+        response = await self.create_speech(speech_request, raw_request)
+        if isinstance(response, Response) and response.status_code < 400:
+            session = self._require_moss_ttsd_sessions().get(session_id)
+            response.headers["X-MOSS-Session-Revision"] = str(session.revision)
+            response.headers["X-MOSS-Prefix-Code-Frames"] = str(session.audio_prefix_codes.shape[0])
+        return response
+
+    def delete_moss_ttsd_session(self, session_id: str) -> None:
+        self._require_moss_ttsd_sessions().delete(session_id)
+
+    async def _build_moss_ttsd_session_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        sessions = self._require_moss_ttsd_sessions()
+        if request.moss_session_id is None or request.moss_session_role is None:
+            raise ValueError("MOSS-TTSD session turns require a session id and speaker role")
+        turn = sessions.begin_turn(
+            request.moss_session_id,
+            request.moss_session_role,
+            request.input,
+        )
+        self._moss_ttsd_pending_turns[turn.session_id] = turn
+        try:
+            processor = self._get_moss_processor()
+            conversation = [
+                processor.build_user_message(
+                    text=turn.full_text,
+                    reference=list(turn.reference_codes),
+                ),
+                processor.build_assistant_message(audio_codes_list=[turn.audio_prefix_codes]),
+            ]
+            batch = processor([conversation], mode="continuation")
+            unified = batch["input_ids"][0]
+            params: dict[str, Any] = {
+                "prompt_token_ids": unified[:, 0].tolist(),
+                "codes": {
+                    "ref": unified[:, 1:].contiguous().to(torch.int64),
+                    "audio": turn.audio_prefix_codes,
+                },
+                "_cache_salt": turn.cache_salt,
+            }
+            if request.max_new_tokens is not None:
+                params["max_new_frames"] = [request.max_new_tokens]
+            return params
+        except Exception:
+            sessions.abort_turn(turn)
+            self._moss_ttsd_pending_turns.pop(turn.session_id, None)
+            raise
+
     async def _build_moss_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build the talker prompt + ``additional_information`` payload for any
         MOSS-TTS-family request (nano + 5 full variants).
@@ -1875,6 +2048,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         import torch  # local to avoid pulling torch at module import time
 
         v = self._moss_variant
+
+        if v == "ttsd" and request.moss_session_id is not None:
+            return await self._build_moss_ttsd_session_params(request)
 
         # ---- Legacy nano path (unchanged) ----
         if v is None:  # moss_tts_nano
@@ -1933,21 +2109,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Qwen3-TTS which keep reference handling with the model rather than in
         # this shared serving file. Imported lazily so the API-server process
         # only pulls it on the delay-family path (alongside the upstream proc).
-        from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
-
         _voice = getattr(request, "voice", None)
         _voice = _voice.strip() if isinstance(_voice, str) else ""
         _voice_created = self._voice_created_at(_voice.lower()) if _voice else 0
 
         async def _encode_ref(ref_str: str) -> torch.Tensor:
-            return await encode_reference_codes(
+            return await self._encode_moss_reference(
                 ref_str,
                 processor=proc,
-                resolve_ref_audio=self._resolve_ref_audio,
-                speaker_cache=self._speaker_cache,
                 variant=v,
                 n_vq=n_vq,
-                sr_target=sr_target,
+                sample_rate=sr_target,
                 voice_name=_voice or None,
                 voice_created_at=_voice_created,
             )
@@ -2944,6 +3116,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
         return mm, key
 
+    @staticmethod
+    def _extract_moss_codes(multimodal_output: dict[str, Any]) -> torch.Tensor:
+        """Extract the final raw ``(frames, codebooks)`` grid from Stage 1."""
+        candidates: list[torch.Tensor] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, torch.Tensor):
+                if value.ndim == 2 and value.shape[0] > 0:
+                    candidates.append(value)
+                return
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+
+        collect(multimodal_output.get("audio_codes"))
+        if not candidates:
+            raise ValueError("MOSS-TTSD codec stage did not return generated RVQ codes")
+        return candidates[-1].detach().to("cpu", torch.long).contiguous()
+
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build TTS parameters from request.
 
@@ -3748,10 +3939,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # computed SpeechTokenUsage is appended to it. The return stays a
         # 2-tuple so existing callers (and their test mocks) are unaffected;
         # only the batch path, which surfaces per-item usage, opts in.
-        request_id, generator, bytes_tts_params = await self._prepare_speech_generation(request, request_id=request_id)
         artifact_ready = False
+        session_turn = None
+        session_committed = False
 
         try:
+            request_id, generator, bytes_tts_params = await self._prepare_speech_generation(
+                request,
+                request_id=request_id,
+            )
+            if request.moss_session_id is not None:
+                session_turn = self._moss_ttsd_pending_turns.get(request.moss_session_id)
+
             # MOSS-TTS-Nano emits delta chunks per yield (single-stage,
             # async_chunk=false). The engine surfaces each yield as its own
             # RequestOutput, so we need to accumulate across the async-for loop —
@@ -3848,13 +4047,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 base64_encode=base64_encode,
             )
             audio_response: AudioResponse = self.create_audio(audio_obj)
+            if session_turn is not None:
+                generated_codes = self._extract_moss_codes(audio_output)
+                self._require_moss_ttsd_sessions().commit_turn(
+                    session_turn,
+                    generated_codes,
+                )
+                self._moss_ttsd_pending_turns.pop(session_turn.session_id, None)
+                session_committed = True
             self._mark_ref_audio_artifact_ready_for_request(request_id)
             artifact_ready = True
             if usage_out is not None:
                 usage_out.append(self._build_speech_usage(request, bytes_tts_params or {}, usage_acc.total()))
             return audio_response.audio_data, audio_response.media_type
         finally:
-            if not artifact_ready:
+            if session_turn is None and request.moss_session_id is not None:
+                session_turn = self._moss_ttsd_pending_turns.get(request.moss_session_id)
+            if session_turn is not None and not session_committed:
+                self._require_moss_ttsd_sessions().abort_turn(session_turn)
+                self._moss_ttsd_pending_turns.pop(session_turn.session_id, None)
+            if not artifact_ready and request_id is not None:
                 self._discard_ref_audio_artifact_warmup(request_id)
 
     async def _create_diffusion_speech(

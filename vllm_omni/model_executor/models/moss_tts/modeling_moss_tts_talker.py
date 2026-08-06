@@ -268,7 +268,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             delayed_lengths = int(state.get("delayed_lengths", -1))
             is_audio = bool(state.get("is_audio", False))
             step = int(state.get("step", 0))
-            audio_lengths_cur = int(state.get("audio_lengths", 0))
+            generated_audio_frames = int(state.get("generated_audio_frames", 0))
             max_new_frames = int(state.get("max_new_frames", -1))
 
             # ---- max_new_frames cap (force im_end / EOS) ----
@@ -279,7 +279,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             if (
                 max_new_frames > 0
                 and is_audio
-                and audio_lengths_cur >= max_new_frames
+                and generated_audio_frames >= max_new_frames
                 and 0 <= self.im_end_token_id < vocab_size
             ):
                 neg_inf = torch.full_like(row, float("-inf"))
@@ -340,6 +340,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         if prompt_ids.numel() == 0:
             return {
                 "audio_lengths": 0,
+                "generated_audio_frames": 0,
                 "delayed_lengths": -1,
                 "is_audio": False,
                 "step": 0,
@@ -360,6 +361,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         audio_lengths = (seq_len - last_audio_start) if is_audio else 0
         return {
             "audio_lengths": int(audio_lengths),
+            "generated_audio_frames": 0,
             "delayed_lengths": -1,
             "is_audio": bool(is_audio),
             "step": 0,
@@ -368,6 +370,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
     def _advance_state(self, state: dict[str, Any], sampled_id: int) -> dict[str, Any]:
         """Update state given the text token sampled at the previous step."""
         audio_lengths = int(state.get("audio_lengths", 0))
+        generated_audio_frames = int(state.get("generated_audio_frames", 0))
         delayed_lengths = int(state.get("delayed_lengths", -1))
         is_audio = bool(state.get("is_audio", False))
 
@@ -377,6 +380,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             self.audio_assistant_delay_slot_token_id,
         ):
             audio_lengths += 1
+            generated_audio_frames += 1
         if sampled_id == self.audio_end_token_id:
             audio_lengths = 0
 
@@ -395,6 +399,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
 
         state = dict(state)
         state["audio_lengths"] = audio_lengths
+        state["generated_audio_frames"] = generated_audio_frames
         state["delayed_lengths"] = delayed_lengths
         state["is_audio"] = is_audio
         state["step"] = int(state.get("step", 0)) + 1
@@ -429,7 +434,19 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
 
             ref_codes = (info_dict.get("codes", {}) or {}).get("ref")
             last_ref_row = None
-            ref_offset = int(info_dict.get("ref_offset", 0))
+            ref_offset = int(
+                info_dict.get(
+                    "ref_offset",
+                    info_dict.get("_omni_num_computed_tokens", 0),
+                )
+            )
+            if is_first_call:
+                logger.info(
+                    "MOSS-TTS prefill: prompt_tokens=%s cached_tokens=%s scheduled_tokens=%d",
+                    info_dict.get("_omni_prompt_len", span_len),
+                    info_dict.get("_omni_num_computed_tokens", 0),
+                    span_len,
+                )
             if isinstance(ref_codes, torch.Tensor) and ref_codes.numel() > 0:
                 if ref_codes.dim() == 1:
                     if ref_codes.numel() % self.n_vq == 0:
@@ -628,6 +645,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             if isinstance(info, dict) and not isinstance(info.get("audio_state"), dict):
                 info["audio_state"] = {
                     "audio_lengths": 0,
+                    "generated_audio_frames": 0,
                     "delayed_lengths": -1,
                     "is_audio": False,
                     "step": 0,

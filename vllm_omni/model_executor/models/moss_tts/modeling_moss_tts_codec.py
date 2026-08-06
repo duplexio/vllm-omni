@@ -224,9 +224,11 @@ class MossTTSCodecDecoder(nn.Module):
         OmniOutput with:
           multimodal_outputs["model_outputs"] — list of (T_wav,) float32 tensors
           multimodal_outputs["sr"]            — list of scalar int32 tensors
+          multimodal_outputs["audio_codes"]   — list of (T_code, NQ) int64 tensors
         """
         sr_tensor = self._sr_tensor
         empty = self._empty_audio()
+        empty_codes = torch.empty((0, self._n_vq), dtype=torch.long)
         info_list: list[dict[str, Any]] = list(runtime_additional_information or [{}])
         num_req = max(len(info_list), 1)
 
@@ -237,11 +239,13 @@ class MossTTSCodecDecoder(nn.Module):
                 multimodal_outputs={
                     "model_outputs": [empty] * num_req,
                     "sr": [sr_tensor] * num_req,
+                    "audio_codes": [empty_codes] * num_req,
                 },
             )
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs: list[torch.Tensor] = [sr_tensor] * num_req
+        code_outputs: list[torch.Tensor] = [empty_codes] * num_req
         device = next(self._codec.parameters()).device
         streaming_work: list[tuple[int, str, torch.Tensor, bool]] = []
 
@@ -250,7 +254,7 @@ class MossTTSCodecDecoder(nn.Module):
                 audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": audios, "sr": srs},
+                multimodal_outputs={"model_outputs": audios, "sr": srs, "audio_codes": code_outputs},
             )
 
         # ``input_ids`` is concatenated across all requests. vLLM-Omni runners
@@ -277,9 +281,11 @@ class MossTTSCodecDecoder(nn.Module):
         if len(audios) < num_req:
             audios.extend(empty for _ in range(num_req - len(audios)))
             srs.extend(sr_tensor for _ in range(num_req - len(srs)))
+            code_outputs.extend(empty_codes for _ in range(num_req - len(code_outputs)))
         elif len(audios) > num_req:
             audios = audios[:num_req]
             srs = srs[:num_req]
+            code_outputs = code_outputs[:num_req]
 
         offsets = [0]
         for n in token_counts:
@@ -321,6 +327,13 @@ class MossTTSCodecDecoder(nn.Module):
             elif isinstance(left_ctx, torch.Tensor):
                 left_ctx = int(left_ctx.reshape(-1)[0].item()) if left_ctx.numel() else 0
             left_ctx = int(left_ctx)
+            if not 0 <= left_ctx <= t_chunk:
+                raise ValueError(
+                    f"MOSS codec left context must be within [0, {t_chunk}], got {left_ctx}"
+                )
+            code_outputs[i] = (
+                codes_nq_t[:, left_ctx:].transpose(0, 1).detach().to("cpu", torch.long).contiguous()
+            )
 
             req_key = self._runtime_request_key(info, meta, i)
 
@@ -363,7 +376,7 @@ class MossTTSCodecDecoder(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs},
+            multimodal_outputs={"model_outputs": audios, "sr": srs, "audio_codes": code_outputs},
         )
 
     def _finish_empty_streaming_requests(self, info_list: list[dict[str, Any]]) -> dict[int, torch.Tensor]:
@@ -725,18 +738,17 @@ class MossTTSCodecDecoder(nn.Module):
         return {f"_codec.{name}" for name, _ in codec.named_parameters()}
 
     def _build_codec(self, codec_path: str) -> tuple[Any, nn.Module]:
-        try:
+        config_dict, _ = MossAudioTokenizerV2Config.get_config_dict(codec_path)
+        number_channels = config_dict.get("number_channels") or 1
+        if number_channels >= 2:
             codec_cfg = MossAudioTokenizerV2Config.from_pretrained(codec_path)
             codec = MossAudioTokenizerV2Model(codec_cfg)
             logger.info("Using vendored MOSS Audio Tokenizer v2 classes from %s", codec_path)
             return codec_cfg, codec
-        except Exception:
-            logger.exception(
-                "Failed to instantiate vendored MOSS Audio Tokenizer v2; falling back to legacy vendored codec."
-            )
 
         codec_cfg = MossAudioTokenizerConfig.from_pretrained(codec_path)
         codec = MossAudioTokenizerModel(codec_cfg)
+        logger.info("Using vendored MOSS Audio Tokenizer v1 classes from %s", codec_path)
         return codec_cfg, codec
 
     def _maybe_enable_decoder_cudagraph(self, device: torch.device) -> None:
