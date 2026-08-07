@@ -15,12 +15,13 @@ class AudioInputAdapter(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int) -> None:
         super().__init__()
         self.gate_up_proj = nn.Linear(input_dim, 2 * hidden_dim, bias=False)
+        self.norm = nn.RMSNorm(hidden_dim, elementwise_affine=False)
         self.output_proj = nn.Linear(hidden_dim, output_dim, bias=False)
 
     def forward(self, audio_features: Tensor) -> tuple[Tensor, Tensor]:
         gate, value = self.gate_up_proj(audio_features).chunk(2, dim=-1)
         skip = F.silu(gate) * value
-        return self.output_proj(skip), skip
+        return self.output_proj(self.norm(skip)), skip
 
 
 class AgentAudioInputAdapter(nn.Module):
@@ -64,6 +65,7 @@ class AgentAudioOutputAdapter(nn.Module):
         skip_dim: int,
         speaker_dim: int,
         hidden_dim: int,
+        skip_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         gate_up_dim = 2 * hidden_dim
@@ -73,6 +75,7 @@ class AgentAudioOutputAdapter(nn.Module):
             bias=False,
         )
         self.skip_gate_up_proj = nn.Linear(skip_dim, gate_up_dim, bias=False)
+        self.skip_dropout = nn.Dropout1d(skip_dropout)
         self.speaker_gate_up_proj = nn.Linear(
             speaker_dim,
             gate_up_dim,
@@ -90,9 +93,11 @@ class AgentAudioOutputAdapter(nn.Module):
         speaker_gate_up = self.speaker_gate_up_proj(
             speaker_embeddings
         ).index_select(0, request_indices)
+        skip_gate_up = self.skip_gate_up_proj(audio_skip)
+        skip_gate_up = self.skip_dropout(skip_gate_up.unsqueeze(0)).squeeze(0)
         gate_up = (
             self.backbone_gate_up_proj(backbone_hidden)
-            + self.skip_gate_up_proj(audio_skip)
+            + skip_gate_up
             + speaker_gate_up
         )
         gate, value = gate_up.chunk(2, dim=-1)

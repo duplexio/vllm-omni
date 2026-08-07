@@ -9,6 +9,9 @@ import torch
 from vllm_omni.model_executor.models.duplexio.audio_representation import (
     DelayedMimiState,
 )
+from vllm_omni.model_executor.models.duplexio.fastconformer import (
+    FastConformerStreamingState,
+)
 from vllm_omni.model_executor.models.duplexio.mimi import (
     MimiStreamingState,
     MimiTransformerState,
@@ -53,6 +56,12 @@ def test_sustained_request_counters_do_not_grow_request_tensor_state() -> None:
             encoder_transformer=MimiTransformerState.empty(2),
             decoder_transformer=MimiTransformerState.empty(2),
         ),
+        user_asr=FastConformerStreamingState(
+            sample_buffer=torch.zeros(480),
+            feature_buffer=torch.zeros(80, 16),
+            attention_caches=(torch.zeros(70, 512),) * 17,
+            convolution_caches=(torch.zeros(512, 8),) * 17,
+        ),
         speaker_embedding=torch.zeros(512),
         system_token_ids=(1, 2, 3),
         sampling_generator=generator,
@@ -73,3 +82,6 @@ def test_sustained_request_counters_do_not_grow_request_tensor_state() -> None:
     assert fork.mimi is not state.mimi
     assert fork.mimi.encoder_transformer is not state.mimi.encoder_transformer
     assert fork.mimi.decoder_transformer is not state.mimi.decoder_transformer
+    assert fork.user_asr.sample_buffer.shape == (480,)
+    assert all(cache.shape == (70, 512) for cache in fork.user_asr.attention_caches)
+    assert all(cache.shape == (512, 8) for cache in fork.user_asr.convolution_caches)

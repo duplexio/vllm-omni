@@ -161,9 +161,16 @@ class DuplexIOServingRuntimeAdapter:
             system_prompt,
             add_special_tokens=False,
         )
+        initial_user_prefix_ids = tokenizer.encode(
+            hf_config.initial_user_prefix,
+            add_special_tokens=False,
+        )
         return {
             "instructions": config.instructions,
-            "duplexio_system_token_ids": [int(token) for token in system_token_ids],
+            "duplexio_system_token_ids": [
+                int(token)
+                for token in (*system_token_ids, *initial_user_prefix_ids)
+            ],
             "duplexio_voice": voice,
             "duplexio_voice_ids": list(voice_ids),
             "duplexio_voice_embedding_index": 0,

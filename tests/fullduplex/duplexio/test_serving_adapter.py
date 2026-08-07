@@ -34,6 +34,8 @@ async def test_serving_config_selects_exported_default_voice(
         model=str(tmp_path),
         hf_config=SimpleNamespace(
             default_voice="voice-b",
+            default_system_prompt="system",
+            initial_user_prefix="<|im_start|>user\n",
             pad_token_id=11,
             depth_transformer_config={
                 "sampling_temperature": 0.9,
@@ -41,7 +43,13 @@ async def test_serving_config_selects_exported_default_voice(
             },
         ),
     )
-    tokenizer = SimpleNamespace(encode=lambda text, add_special_tokens: [3, 4])
+    encoded = {
+        "system": [3, 4],
+        "<|im_start|>user\n": [5, 6],
+    }
+    tokenizer = SimpleNamespace(
+        encode=lambda text, add_special_tokens: encoded[text]
+    )
     monkeypatch.setattr(
         "vllm_omni.experimental.fullduplex.duplexio.serving_adapter."
         "cached_tokenizer_from_config",
@@ -60,7 +68,7 @@ async def test_serving_config_selects_exported_default_voice(
     assert runtime["duplexio_voice_ids"] == ["voice-a", "voice-b"]
     assert runtime["duplexio_scheduler_token_id"] == 11
     assert isinstance(runtime["duplexio_sampling_seed"], int)
-    assert runtime["duplexio_system_token_ids"] == [3, 4]
+    assert runtime["duplexio_system_token_ids"] == [3, 4, 5, 6]
     assert runtime["duplexio_depth_sampling"] == {
         "temperature": 0.9,
         "top_k": 32,

@@ -9,6 +9,8 @@ from typing import Any
 
 from transformers import AutoConfig, PretrainedConfig
 
+INITIAL_USER_PREFIX = "<|im_start|>user\n"
+
 
 class DuplexIOConfig(PretrainedConfig):
     """Serving-only configuration exported by the DuplexIO training package."""
@@ -22,7 +24,7 @@ class DuplexIOConfig(PretrainedConfig):
         *,
         text_config: dict[str, Any] | PretrainedConfig | None = None,
         audio_codec_config: dict[str, Any] | None = None,
-        duplexio_export_version: int = 1,
+        duplexio_export_version: int = 2,
         stream_names: list[str] | None = None,
         audio_cell_names: list[str] | None = None,
         num_cells: int = 6,
@@ -32,9 +34,11 @@ class DuplexIOConfig(PretrainedConfig):
         audio_attention_window_frames: int = 4_096,
         silence_token_id: int | None = None,
         default_system_prompt: str = "",
+        initial_user_prefix: str = INITIAL_USER_PREFIX,
         speaker_embed_dim: int = 2_048,
         default_voice: str | None = None,
         audio_adapter_config: dict[str, Any] | None = None,
+        user_asr_encoder_config: dict[str, Any] | None = None,
         quantized_audio_config: dict[str, Any] | None = None,
         depth_transformer_config: dict[str, Any] | None = None,
         tied_weight_aliases: dict[str, str] | None = None,
@@ -53,11 +57,13 @@ class DuplexIOConfig(PretrainedConfig):
         self.audio_attention_window_frames = audio_attention_window_frames
         self.silence_token_id = silence_token_id
         self.default_system_prompt = default_system_prompt
+        self.initial_user_prefix = initial_user_prefix
         self.speaker_embed_dim = speaker_embed_dim
         self.default_voice = default_voice
         self.audio_adapter_config = dict(
             audio_adapter_config or {"architecture": "mlp"}
         )
+        self.user_asr_encoder_config = dict(user_asr_encoder_config or {})
         self.quantized_audio_config = dict(
             quantized_audio_config or {"num_codebooks": 8}
         )
@@ -74,7 +80,7 @@ class DuplexIOConfig(PretrainedConfig):
         return self.text_config
 
     def _validate_duplexio_contract(self) -> None:
-        if self.duplexio_export_version != 1:
+        if self.duplexio_export_version != 2:
             raise ValueError(
                 "Unsupported DuplexIO export version: "
                 f"{self.duplexio_export_version}"
@@ -87,6 +93,10 @@ class DuplexIOConfig(PretrainedConfig):
             )
         if self.num_cells != 6:
             raise ValueError(f"DuplexIO requires six cells per frame, got {self.num_cells}")
+        if self.initial_user_prefix != INITIAL_USER_PREFIX:
+            raise ValueError(
+                "Native DuplexIO requires its fixed initial user-stream prefix"
+            )
         if not math.isclose(
             self.frame_size * self.frame_rate,
             self.sample_rate,
@@ -102,6 +112,14 @@ class DuplexIOConfig(PretrainedConfig):
             not isinstance(adapter_hidden_size, int) or adapter_hidden_size < 1
         ):
             raise ValueError("DuplexIO adapter hidden_size must be positive")
+        skip_dropout = self.audio_adapter_config.get(
+            "agent_audio_skip_dropout",
+            0.0,
+        )
+        if not isinstance(skip_dropout, (int, float)) or not 0 <= skip_dropout < 1:
+            raise ValueError(
+                "DuplexIO agent_audio_skip_dropout must be in [0, 1)"
+            )
         if self.audio_codec_config.get("model_type") != "mimi":
             raise ValueError("Native DuplexIO requires the original Mimi codec")
         if (
@@ -128,14 +146,42 @@ class DuplexIOConfig(PretrainedConfig):
             raise ValueError("DuplexIO audio embedding_dim must be positive")
         if self.quantized_audio_config.get("acoustic_delay_frames") != 1:
             raise ValueError("Native DuplexIO requires one acoustic delay frame")
-        if (
-            self.depth_transformer_config.get("implementation")
-            != "moshi_original_depformer"
-            or self.depth_transformer_config.get("original_moshi_compatible")
-            is not True
+        if self.user_asr_encoder_config.get("implementation") != (
+            "nvidia_fastconformer_streaming_multi"
         ):
             raise ValueError(
-                "Native DuplexIO requires the original Moshi depformer checkpoint"
+                "Native DuplexIO requires the frozen streaming FastConformer augment"
+            )
+        required_asr_values = {
+            "source_sample_rate": self.sample_rate,
+            "sample_rate": 16_000,
+            "frame_size": self.frame_size,
+            "features": 80,
+            "n_fft": 512,
+            "window_size": 400,
+            "window_stride": 160,
+            "subsampling_factor": 8,
+            "subsampling_conv_channels": 256,
+            "num_layers": 17,
+            "dim": 512,
+            "feedforward_dim": 2_048,
+            "num_heads": 8,
+            "attention_left_context": 70,
+            "attention_right_context": 0,
+            "convolution_kernel_size": 9,
+        }
+        for field, expected in required_asr_values.items():
+            if self.user_asr_encoder_config.get(field) != expected:
+                raise ValueError(
+                    f"Unsupported DuplexIO FastConformer {field}: "
+                    f"{self.user_asr_encoder_config.get(field)!r} != {expected!r}"
+                )
+        if (
+            self.depth_transformer_config.get("implementation")
+            != "duplexio_speaker_adaptive_depth_v1"
+        ):
+            raise ValueError(
+                "Native DuplexIO requires the speaker-conditioned depth checkpoint"
             )
         depth_dim = self.depth_transformer_config.get("dim")
         depth_layers = self.depth_transformer_config.get("num_layers")
@@ -149,18 +195,48 @@ class DuplexIOConfig(PretrainedConfig):
                 depth_layers,
                 depth_heads,
                 depth_mlp_dim,
-                low_rank,
             )
         ):
             raise ValueError("DuplexIO depformer dimensions must be positive integers")
+        if low_rank is not None and (
+            not isinstance(low_rank, int) or low_rank < 1
+        ):
+            raise ValueError(
+                "DuplexIO low_rank_embeddings must be positive or null"
+            )
         if depth_dim % depth_heads != 0:
             raise ValueError("DuplexIO depformer dim must be divisible by num_heads")
         temperature = self.depth_transformer_config.get("sampling_temperature")
         top_k = self.depth_transformer_config.get("sampling_top_k")
-        if not isinstance(temperature, (int, float)) or temperature < 0:
-            raise ValueError("DuplexIO depformer sampling_temperature must be non-negative")
+        if not isinstance(temperature, (int, float)) or temperature <= 0:
+            raise ValueError("DuplexIO depth sampling_temperature must be positive")
         if not isinstance(top_k, int) or not 1 <= top_k <= representation_size:
-            raise ValueError("DuplexIO depformer sampling_top_k is outside the codebook")
+            raise ValueError("DuplexIO depth sampling_top_k is outside the codebook")
+        semantic_top_k = self.depth_transformer_config.get(
+            "semantic_sampling_top_k"
+        )
+        if semantic_top_k is not None and (
+            not isinstance(semantic_top_k, int)
+            or not 1 <= semantic_top_k <= representation_size
+        ):
+            raise ValueError(
+                "DuplexIO semantic_sampling_top_k is outside the codebook"
+            )
+        codebook_loss_weights = self.depth_transformer_config.get(
+            "codebook_loss_weights"
+        )
+        if (
+            not isinstance(codebook_loss_weights, list)
+            or len(codebook_loss_weights) != num_codebooks
+            or any(
+                not isinstance(weight, (int, float)) or weight <= 0
+                for weight in codebook_loss_weights
+            )
+        ):
+            raise ValueError(
+                "DuplexIO depth checkpoint requires one positive loss weight "
+                "per codebook"
+            )
         if self.audio_attention_window_frames < 1:
             raise ValueError("DuplexIO audio attention window must be positive")
         if self.speaker_embed_dim < 1:

@@ -44,13 +44,18 @@ from vllm_omni.model_executor.models.duplexio.checkpoint import (
 from vllm_omni.model_executor.models.duplexio.configuration_duplexio import (
     DuplexIOConfig,
 )
+from vllm_omni.model_executor.models.duplexio.depth_sampler import (
+    DepthAutoregressiveSampler,
+    DepthSamplerConfig,
+)
+from vllm_omni.model_executor.models.duplexio.fastconformer import (
+    FastConformerConfig,
+    FastConformerStreamingState,
+    FastConformerUserEncoder,
+)
 from vllm_omni.model_executor.models.duplexio.mimi import (
     MimiModel,
     MimiStreamingState,
-)
-from vllm_omni.model_executor.models.duplexio.moshi_depth import (
-    MoshiDepthConfig,
-    MoshiDepthTransformer,
 )
 from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
     DuplexIOQwenModel,
@@ -79,6 +84,7 @@ class DuplexIORequestState:
     user_delay: DelayedMimiState
     agent_delay: DelayedMimiState
     mimi: MimiStreamingState
+    user_asr: FastConformerStreamingState
     speaker_embedding: Tensor
     system_token_ids: tuple[int, ...]
     sampling_generator: torch.Generator
@@ -101,6 +107,7 @@ class DuplexIORequestState:
                 pending_semantic_code=self.agent_delay.pending_semantic_code,
             ),
             mimi=self.mimi.fork(),
+            user_asr=self.user_asr,
             speaker_embedding=self.speaker_embedding,
             system_token_ids=self.system_token_ids,
             sampling_generator=_fork_generator(self.sampling_generator),
@@ -230,11 +237,28 @@ class DuplexIOForConditionalGeneration(
             adapter_hidden_size,
             config.speaker_embed_dim,
             adapter_hidden_size,
+            adapter_config.get("agent_audio_skip_dropout", 0.0),
+        )
+        asr_config = FastConformerConfig(
+            **{
+                key: value
+                for key, value in config.user_asr_encoder_config.items()
+                if key != "implementation"
+                and key != "attention_right_context"
+                and key != "model_id"
+            }
+        )
+        self.user_asr_encoder = FastConformerUserEncoder(asr_config).float()
+        self.user_asr_proj = nn.Linear(
+            asr_config.dim,
+            representation_dim,
+            bias=False,
         )
         depth_config = config.depth_transformer_config
-        self.audio_sampler = MoshiDepthTransformer(
-            MoshiDepthConfig(
+        self.audio_sampler = DepthAutoregressiveSampler(
+            DepthSamplerConfig(
                 conditioning_dim=hidden_size,
+                speaker_embedding_dim=config.speaker_embed_dim,
                 text_vocab_size=self.text_config.vocab_size,
                 codebook_size=codebook_size,
                 num_codebooks=num_codebooks,
@@ -247,8 +271,17 @@ class DuplexIOForConditionalGeneration(
                     "sampling_temperature", 0.8
                 ),
                 sampling_top_k=depth_config.get("sampling_top_k", 250),
+                semantic_sampling_top_k=depth_config.get(
+                    "semantic_sampling_top_k"
+                ),
             )
         ).float()
+        self.emit_heads = nn.ModuleDict(
+            {
+                name: nn.Linear(hidden_size, 1)
+                for name in TARGET_STREAM_NAMES
+            }
+        )
         self.logits_processor = LogitsProcessor(self.text_config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.llm.base_model.model.make_empty_intermediate_tensors
@@ -339,7 +372,14 @@ class DuplexIOForConditionalGeneration(
             raw_user_codes,
             state.user_delay,
         )
+        asr_features, state.user_asr = self.user_asr_encoder.step(
+            waveform,
+            state.user_asr,
+        )
         user_features = self.user_audio_embedding(user_codes)
+        user_features = user_features + self.user_asr_proj(
+            asr_features.to(user_features.dtype)
+        )
         agent_features = self.agent_audio_embedding(state.agent_audio_codes)
         speaker = state.speaker_embedding.unsqueeze(0)
         request_index = torch.zeros(1, dtype=torch.long, device=input_ids.device)
@@ -522,6 +562,7 @@ class DuplexIOForConditionalGeneration(
             predicted_audio = self.audio_sampler.sample(
                 audio_condition.float(),
                 predicted_text[1:2],
+                state.speaker_embedding.unsqueeze(0).float(),
                 temperature=depth_sampling[0],
                 top_k=depth_sampling[1],
                 generator=state.sampling_generator,
@@ -596,15 +637,20 @@ class DuplexIOForConditionalGeneration(
             ]
         )
         logits = self.logits_processor(self.llm.base_model.lm_head, projected)
+        emit_logits = torch.stack(
+            [
+                self.emit_heads[name](projected[index]).squeeze(-1)
+                for index, name in enumerate(TARGET_STREAM_NAMES)
+            ]
+        )
         temperature = _text_temperature(info)
-        if temperature == 0:
-            return logits.argmax(dim=-1)
-        probabilities = (logits / temperature).softmax(dim=-1)
-        return torch.multinomial(
-            probabilities,
-            num_samples=1,
+        return _sample_factorized_text_ids(
+            logits,
+            emit_logits,
+            silence_token_id=self.silence_token_id,
+            temperature=temperature,
             generator=generator,
-        ).squeeze(-1)
+        )
 
     def compute_logits(
         self,
@@ -685,6 +731,7 @@ class DuplexIOForConditionalGeneration(
             user_delay=self.audio_representation.new_state(device=device),
             agent_delay=self.audio_representation.new_state(device=device),
             mimi=self.audio_codec.new_streaming_state(),
+            user_asr=self.user_asr_encoder.new_state(device=device),
             speaker_embedding=pool[embedding_index].to(
                 device=device,
                 dtype=self.llm.channel_emb.dtype,
@@ -805,6 +852,40 @@ def _text_temperature(info: Mapping[str, object]) -> float:
     if not isinstance(value, (int, float)) or value < 0:
         raise ValueError("duplexio_text_temperature must be non-negative")
     return float(value)
+
+
+def _sample_factorized_text_ids(
+    logits: Tensor,
+    emit_logits: Tensor,
+    *,
+    silence_token_id: int,
+    temperature: float,
+    generator: torch.Generator,
+) -> Tensor:
+    """Sample emit/silence independently from the conditional content ID."""
+    if temperature == 0:
+        emit = emit_logits >= 0
+    else:
+        emit = torch.bernoulli(
+            torch.sigmoid(emit_logits.float() / temperature),
+            generator=generator,
+        ).bool()
+
+    content_logits = logits.clone()
+    content_logits[:, silence_token_id] = -torch.inf
+    if temperature == 0:
+        content_ids = content_logits.argmax(dim=-1)
+    else:
+        content_ids = torch.multinomial(
+            (content_logits / temperature).softmax(dim=-1),
+            num_samples=1,
+            generator=generator,
+        ).squeeze(-1)
+    return torch.where(
+        emit,
+        content_ids,
+        torch.full_like(content_ids, silence_token_id),
+    )
 
 
 def _depth_sampling(info: Mapping[str, object]) -> tuple[float, int]:

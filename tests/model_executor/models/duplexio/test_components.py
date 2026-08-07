@@ -16,9 +16,16 @@ from vllm_omni.model_executor.models.duplexio.audio_representation import (
 from vllm_omni.model_executor.models.duplexio.configuration_duplexio import (
     DuplexIOConfig,
 )
-from vllm_omni.model_executor.models.duplexio.moshi_depth import (
-    MoshiDepthConfig,
-    MoshiDepthTransformer,
+from vllm_omni.model_executor.models.duplexio.depth_sampler import (
+    DepthAutoregressiveSampler,
+    DepthSamplerConfig,
+)
+from vllm_omni.model_executor.models.duplexio.fastconformer import (
+    FastConformerConfig,
+    FastConformerUserEncoder,
+)
+from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
+    _sample_factorized_text_ids,
 )
 from vllm_omni.model_executor.models.duplexio.pipeline import DUPLEXIO_PIPELINE
 
@@ -45,7 +52,30 @@ def _config() -> DuplexIOConfig:
             "sampling_rate": 24_000,
             "frame_rate": 12.5,
         },
-        audio_adapter_config={"architecture": "mlp", "hidden_size": 16},
+        audio_adapter_config={
+            "architecture": "mlp",
+            "hidden_size": 16,
+            "agent_audio_skip_dropout": 0.2,
+        },
+        user_asr_encoder_config={
+            "implementation": "nvidia_fastconformer_streaming_multi",
+            "source_sample_rate": 24_000,
+            "sample_rate": 16_000,
+            "frame_size": 1_920,
+            "features": 80,
+            "n_fft": 512,
+            "window_size": 400,
+            "window_stride": 160,
+            "subsampling_factor": 8,
+            "subsampling_conv_channels": 256,
+            "num_layers": 17,
+            "dim": 512,
+            "feedforward_dim": 2_048,
+            "num_heads": 8,
+            "attention_left_context": 70,
+            "attention_right_context": 0,
+            "convolution_kernel_size": 9,
+        },
         quantized_audio_config={
             "num_codebooks": 8,
             "codebook_size": 2_048,
@@ -53,8 +83,7 @@ def _config() -> DuplexIOConfig:
             "acoustic_delay_frames": 1,
         },
         depth_transformer_config={
-            "implementation": "moshi_original_depformer",
-            "original_moshi_compatible": True,
+            "implementation": "duplexio_speaker_adaptive_depth_v1",
             "low_rank_embeddings": 8,
             "dim": 32,
             "num_layers": 2,
@@ -62,6 +91,8 @@ def _config() -> DuplexIOConfig:
             "mlp_dim": 64,
             "sampling_temperature": 0.8,
             "sampling_top_k": 32,
+            "semantic_sampling_top_k": 1,
+            "codebook_loss_weights": [3, 3, 3, 2, 2, 2, 1, 1],
         },
         pad_token_id=1,
         silence_token_id=2,
@@ -76,8 +107,11 @@ def test_duplexio_config_round_trips_nested_text_config() -> None:
     assert restored.get_text_config().hidden_size == 32
     assert restored.quantized_audio_config["num_codebooks"] == 8
     assert restored.depth_transformer_config["implementation"] == (
-        "moshi_original_depformer"
+        "duplexio_speaker_adaptive_depth_v1"
     )
+    assert restored.user_asr_encoder_config["attention_left_context"] == 70
+    assert restored.audio_adapter_config["agent_audio_skip_dropout"] == 0.2
+    assert restored.initial_user_prefix == "<|im_start|>user\n"
 
 
 def test_duplexio_config_rejects_non_row_quantum() -> None:
@@ -100,15 +134,23 @@ def test_duplexio_config_rejects_non_row_quantum() -> None:
         )
 
 
-def test_duplexio_config_rejects_non_original_depth_checkpoint() -> None:
+def test_duplexio_config_rejects_old_depth_checkpoint() -> None:
     config = _config().to_dict()
     config["depth_transformer_config"] = {
-        "implementation": "duplexio_speaker_adaptive_depth_v1",
-        "original_moshi_compatible": False,
+        "implementation": "moshi_original_depformer",
     }
 
-    with pytest.raises(ValueError, match="original Moshi"):
+    with pytest.raises(ValueError, match="speaker-conditioned"):
         DuplexIOConfig.from_dict(config)
+
+
+def test_duplexio_config_accepts_full_width_depth_embeddings() -> None:
+    config = _config().to_dict()
+    config["depth_transformer_config"]["low_rank_embeddings"] = None
+
+    assert DuplexIOConfig.from_dict(config).depth_transformer_config[
+        "low_rank_embeddings"
+    ] is None
 
 
 def test_duplexio_config_rejects_non_native_acoustic_delay() -> None:
@@ -201,11 +243,12 @@ def test_mimi_embedding_keeps_checkpoint_module_layout() -> None:
     assert embedding(torch.tensor([[1, 2, 3]])).shape == (1, 5)
 
 
-def test_moshi_depth_teacher_logits_match_sequential_argmax() -> None:
+def test_speaker_depth_sampling_is_deterministic_at_top_k_one() -> None:
     torch.manual_seed(1)
-    model = MoshiDepthTransformer(
-        MoshiDepthConfig(
+    model = DepthAutoregressiveSampler(
+        DepthSamplerConfig(
             conditioning_dim=5,
+            speaker_embedding_dim=6,
             text_vocab_size=11,
             codebook_size=7,
             num_codebooks=3,
@@ -214,50 +257,73 @@ def test_moshi_depth_teacher_logits_match_sequential_argmax() -> None:
             num_layers=2,
             num_heads=2,
             feedforward_dim=12,
-            sampling_top_k=3,
+            sampling_top_k=1,
         )
     ).eval()
     conditioning = torch.randn(2, 5)
     text_tokens = torch.tensor([2, 4])
+    speakers = torch.randn(2, 6)
 
-    sampled = model.sample(conditioning, text_tokens, temperature=0, top_k=3)
-    teacher_logits = model(conditioning, text_tokens, sampled)
+    first = model.sample(conditioning, text_tokens, speakers)
+    second = model.sample(conditioning, text_tokens, speakers)
 
-    torch.testing.assert_close(teacher_logits.argmax(dim=-1), sampled)
+    torch.testing.assert_close(first, second)
 
 
-def test_moshi_depth_is_causal_across_codebooks() -> None:
+def test_factorized_text_argmax_excludes_silence_from_content() -> None:
+    logits = torch.tensor(
+        [
+            [0.0, 1.0, 100.0, 3.0],
+            [4.0, 2.0, 100.0, 1.0],
+            [1.0, 5.0, 100.0, 2.0],
+        ]
+    )
+    emit_logits = torch.tensor([-1.0, 0.0, 1.0])
+
+    sampled = _sample_factorized_text_ids(
+        logits,
+        emit_logits,
+        silence_token_id=2,
+        temperature=0.0,
+        generator=torch.Generator().manual_seed(1),
+    )
+
+    assert torch.equal(sampled, torch.tensor([2, 0, 1]))
+
+
+def test_speaker_depth_conditioning_changes_adaptive_normalization() -> None:
     torch.manual_seed(2)
-    model = MoshiDepthTransformer(
-        MoshiDepthConfig(
+    model = DepthAutoregressiveSampler(
+        DepthSamplerConfig(
             conditioning_dim=5,
+            speaker_embedding_dim=6,
             text_vocab_size=11,
             codebook_size=7,
             num_codebooks=3,
             low_rank_embeddings=2,
             dim=8,
-            num_layers=1,
+            num_layers=2,
             num_heads=2,
             feedforward_dim=12,
+            sampling_top_k=1,
         )
     ).eval()
-    conditioning = torch.randn(2, 5)
-    text_tokens = torch.tensor([2, 4])
-    target = torch.tensor([[1, 2, 3], [3, 2, 1]])
-    changed = target.clone()
-    changed[:, 1] = (changed[:, 1] + 1) % 7
+    hidden = torch.randn(2, 1, 8)
+    speakers = torch.randn(2, 6)
+    speaker_states = model.speaker_projection(speakers)
+    norm = model.transformer.layers[0].attention_norm
 
-    logits = model(conditioning, text_tokens, target)
-    changed_logits = model(conditioning, text_tokens, changed)
+    first = norm(hidden, speaker_states)
+    second = norm(hidden, speaker_states.flip(0))
 
-    torch.testing.assert_close(logits[:, :2], changed_logits[:, :2])
-    assert not torch.equal(logits[:, 2], changed_logits[:, 2])
+    assert not torch.allclose(first, second)
 
 
-def test_moshi_depth_uses_original_checkpoint_module_names() -> None:
-    model = MoshiDepthTransformer(
-        MoshiDepthConfig(
+def test_depth_sampler_uses_current_checkpoint_module_names() -> None:
+    model = DepthAutoregressiveSampler(
+        DepthSamplerConfig(
             conditioning_dim=5,
+            speaker_embedding_dim=6,
             text_vocab_size=11,
             codebook_size=7,
             num_codebooks=3,
@@ -270,11 +336,63 @@ def test_moshi_depth_uses_original_checkpoint_module_names() -> None:
     )
     keys = set(model.state_dict())
 
-    assert "depformer_in.0.weight" in keys
-    assert "depformer_emb.0.low_rank.weight" in keys
-    assert "depformer_text_emb.low_rank.weight" in keys
-    assert "depformer.layers.0.self_attn.in_projs.0.weight" in keys
-    assert "depformer.layers.0.gating.0.linear_in.weight" in keys
-    assert "depformer.layers.0.norm1.alpha" in keys
-    assert "linears.0.weight" in keys
-    assert not any("speaker" in key for key in keys)
+    assert "conditioning_projections.0.weight" in keys
+    assert "speaker_projection.weight" in keys
+    assert "previous_codebook_embeddings.0.output_projection.weight" in keys
+    assert "text_embedding.output_projection.weight" in keys
+    assert "transformer.layers.0.attention.input_projections.0.weight" in keys
+    assert "transformer.layers.0.feedforward.layers.0.input.weight" in keys
+    assert "transformer.layers.0.attention_norm.modulation.1.weight" in keys
+    assert "heads.0.weight" in keys
+
+
+def test_fastconformer_streaming_state_stays_bounded() -> None:
+    config = FastConformerConfig(
+        source_sample_rate=64,
+        sample_rate=64,
+        frame_size=64,
+        features=8,
+        n_fft=32,
+        window_size=24,
+        window_stride=8,
+        subsampling_conv_channels=4,
+        num_layers=2,
+        dim=8,
+        feedforward_dim=16,
+        num_heads=2,
+        attention_left_context=3,
+        convolution_kernel_size=3,
+    )
+    model = FastConformerUserEncoder(config).eval()
+    model.preprocessor.featurizer.window.copy_(torch.hann_window(24))
+    model.preprocessor.featurizer.fb.fill_(1 / 17)
+    state = model.new_state(device=torch.device("cpu"))
+    frames = torch.randn(20, 1, 1, 64)
+    streaming_preencoded = []
+    handle = model.encoder.pre_encode.register_forward_hook(
+        lambda _module, _args, output: streaming_preencoded.append(output[0])
+    )
+
+    with torch.inference_mode():
+        for frame in frames:
+            feature, state = model.step(frame, state)
+    handle.remove()
+
+    offline_features = model.preprocessor(frames.flatten())
+    offline_hidden = model.encoder.pre_encode.conv(
+        offline_features.T.unsqueeze(0).unsqueeze(0)
+    )
+    offline_hidden = offline_hidden.transpose(1, 2).flatten(2)
+    offline_preencoded = model.encoder.pre_encode.out(offline_hidden)[0, :20]
+
+    assert feature.shape == (8,)
+    torch.testing.assert_close(
+        torch.stack(streaming_preencoded),
+        offline_preencoded,
+        rtol=1e-4,
+        atol=2e-5,
+    )
+    assert all(cache.shape == (3, 8) for cache in state.attention_caches)
+    assert all(cache.shape == (8, 2) for cache in state.convolution_caches)
+    assert state.sample_buffer.shape == (24,)
+    assert state.feature_buffer.shape == (8, 16)

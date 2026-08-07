@@ -20,7 +20,7 @@ def _write_checkpoint(tmp_path) -> None:
         json.dumps(
             {
                 "format": "duplexio_vllm",
-                "version": 1,
+                "version": 2,
                 "weight_files": ["model.safetensors"],
                 "voice_ids": ["alice"],
             }
@@ -90,8 +90,8 @@ def test_checkpoint_resolves_hugging_face_repository(
 
     root = resolve_checkpoint_directory(
         "owner/duplexio",
-        revision="export-v1",
+        revision="export-v2",
     )
 
     assert root == tmp_path
-    assert calls == [("owner/duplexio", "export-v1")]
+    assert calls == [("owner/duplexio", "export-v2")]
