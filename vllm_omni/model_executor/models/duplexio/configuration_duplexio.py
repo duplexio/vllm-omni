@@ -9,6 +9,7 @@ from typing import Any
 
 from transformers import AutoConfig, PretrainedConfig
 
+INITIAL_AGENT_PREFIX = "<|im_start|>assistant\n"
 INITIAL_USER_PREFIX = "<|im_start|>user\n"
 
 
@@ -34,6 +35,7 @@ class DuplexIOConfig(PretrainedConfig):
         audio_attention_window_frames: int = 4_096,
         silence_token_id: int | None = None,
         default_system_prompt: str = "",
+        initial_agent_prefix: str = INITIAL_AGENT_PREFIX,
         initial_user_prefix: str = INITIAL_USER_PREFIX,
         speaker_embed_dim: int = 2_048,
         default_voice: str | None = None,
@@ -57,6 +59,7 @@ class DuplexIOConfig(PretrainedConfig):
         self.audio_attention_window_frames = audio_attention_window_frames
         self.silence_token_id = silence_token_id
         self.default_system_prompt = default_system_prompt
+        self.initial_agent_prefix = initial_agent_prefix
         self.initial_user_prefix = initial_user_prefix
         self.speaker_embed_dim = speaker_embed_dim
         self.default_voice = default_voice
@@ -93,6 +96,10 @@ class DuplexIOConfig(PretrainedConfig):
             )
         if self.num_cells != 6:
             raise ValueError(f"DuplexIO requires six cells per frame, got {self.num_cells}")
+        if self.initial_agent_prefix != INITIAL_AGENT_PREFIX:
+            raise ValueError(
+                "Native DuplexIO requires its fixed initial agent-stream prefix"
+            )
         if self.initial_user_prefix != INITIAL_USER_PREFIX:
             raise ValueError(
                 "Native DuplexIO requires its fixed initial user-stream prefix"

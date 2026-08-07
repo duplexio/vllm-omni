@@ -47,6 +47,7 @@ class DuplexIOServingRuntimeAdapter:
         {
             "duplexio_scheduler_token_id",
             "duplexio_sampling_seed",
+            "duplexio_start_role",
             "duplexio_voice_ids",
             "duplexio_voice_embedding_index",
             "duplexio_depth_sampling",
@@ -130,6 +131,7 @@ class DuplexIOServingRuntimeAdapter:
             raise TypeError("DuplexIO serving requires DuplexSessionConfig")
         cls.validate_client_extra_body(config.extra_body)
         _validate_full_duplex_mode(config)
+        start_role = _start_role(config.extra_body)
         hf_config = getattr(model_config, "hf_config", model_config)
         voice_ids, manifest_default = _load_voice_manifest(model_config)
         configured_default = getattr(hf_config, "default_voice", None)
@@ -161,16 +163,22 @@ class DuplexIOServingRuntimeAdapter:
             system_prompt,
             add_special_tokens=False,
         )
-        initial_user_prefix_ids = tokenizer.encode(
-            hf_config.initial_user_prefix,
+        initial_prefix = (
+            hf_config.initial_agent_prefix
+            if start_role == "agent"
+            else hf_config.initial_user_prefix
+        )
+        initial_prefix_ids = tokenizer.encode(
+            initial_prefix,
             add_special_tokens=False,
         )
         return {
             "instructions": config.instructions,
             "duplexio_system_token_ids": [
                 int(token)
-                for token in (*system_token_ids, *initial_user_prefix_ids)
+                for token in (*system_token_ids, *initial_prefix_ids)
             ],
+            "duplexio_start_role": start_role,
             "duplexio_voice": voice,
             "duplexio_voice_ids": list(voice_ids),
             "duplexio_voice_embedding_index": 0,
@@ -214,6 +222,13 @@ class DuplexIOServingRuntimeAdapter:
                 "DuplexIO cannot change instructions after a session is created",
                 code="instructions_update_unsupported",
             )
+        if "start_role" in config.extra_body:
+            start_role = _start_role(config.extra_body)
+            if start_role != current.get("duplexio_start_role"):
+                raise DuplexIOClientRuntimeConfigError(
+                    "DuplexIO cannot change start_role after a session is created",
+                    code="start_role_update_unsupported",
+                )
         if (
             config.voice is not None
             and config.voice != current.get("duplexio_voice")
@@ -290,6 +305,16 @@ def _validate_full_duplex_mode(config: DuplexSessionConfig) -> None:
         "DuplexIO requires full-duplex auto-response mode",
         code="full_duplex_required",
     )
+
+
+def _start_role(extra_body: Mapping[str, object]) -> str:
+    role = extra_body.get("start_role", "user")
+    if not isinstance(role, str) or role not in {"user", "agent"}:
+        raise DuplexIOClientRuntimeConfigError(
+            "DuplexIO start_role must be 'user' or 'agent'",
+            code="start_role_invalid",
+        )
+    return role
 
 
 __all__ = ["DuplexIOServingRuntimeAdapter"]

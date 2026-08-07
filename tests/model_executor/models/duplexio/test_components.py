@@ -111,6 +111,7 @@ def test_duplexio_config_round_trips_nested_text_config() -> None:
     )
     assert restored.user_asr_encoder_config["attention_left_context"] == 70
     assert restored.audio_adapter_config["agent_audio_skip_dropout"] == 0.2
+    assert restored.initial_agent_prefix == "<|im_start|>assistant\n"
     assert restored.initial_user_prefix == "<|im_start|>user\n"
 
 

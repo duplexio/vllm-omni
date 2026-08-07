@@ -18,9 +18,19 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_role", "expected_prefix_ids"),
+    [
+        (None, [5, 6]),
+        ("user", [5, 6]),
+        ("agent", [7, 8]),
+    ],
+)
 async def test_serving_config_selects_exported_default_voice(
     tmp_path,
     monkeypatch,
+    start_role: str | None,
+    expected_prefix_ids: list[int],
 ) -> None:
     (tmp_path / "voices.json").write_text(
         json.dumps(
@@ -35,6 +45,7 @@ async def test_serving_config_selects_exported_default_voice(
         hf_config=SimpleNamespace(
             default_voice="voice-b",
             default_system_prompt="system",
+            initial_agent_prefix="<|im_start|>assistant\n",
             initial_user_prefix="<|im_start|>user\n",
             pad_token_id=11,
             depth_transformer_config={
@@ -46,6 +57,7 @@ async def test_serving_config_selects_exported_default_voice(
     encoded = {
         "system": [3, 4],
         "<|im_start|>user\n": [5, 6],
+        "<|im_start|>assistant\n": [7, 8],
     }
     tokenizer = SimpleNamespace(
         encode=lambda text, add_special_tokens: encoded[text]
@@ -56,10 +68,13 @@ async def test_serving_config_selects_exported_default_voice(
         lambda config: tokenizer,
     )
 
+    extra_body: dict[str, object] = {"full_duplex": True}
+    if start_role is not None:
+        extra_body["start_role"] = start_role
     runtime = await DuplexIOServingRuntimeAdapter.prepare_runtime_config(
         DuplexSessionConfig(
             modalities=["text", "audio"],
-            extra_body={"full_duplex": True},
+            extra_body=extra_body,
         ),
         model_config=model_config,
     )
@@ -68,7 +83,12 @@ async def test_serving_config_selects_exported_default_voice(
     assert runtime["duplexio_voice_ids"] == ["voice-a", "voice-b"]
     assert runtime["duplexio_scheduler_token_id"] == 11
     assert isinstance(runtime["duplexio_sampling_seed"], int)
-    assert runtime["duplexio_system_token_ids"] == [3, 4, 5, 6]
+    assert runtime["duplexio_system_token_ids"] == [
+        3,
+        4,
+        *expected_prefix_ids,
+    ]
+    assert runtime["duplexio_start_role"] == (start_role or "user")
     assert runtime["duplexio_depth_sampling"] == {
         "temperature": 0.9,
         "top_k": 32,
@@ -168,6 +188,41 @@ def test_duplexio_rejects_stateful_conditioning_updates(
         )
 
     assert exc_info.value.code == code
+
+
+def test_duplexio_rejects_start_role_update() -> None:
+    config = DuplexSessionConfig(
+        modalities=["text", "audio"],
+        extra_body={"full_duplex": True, "start_role": "agent"},
+    )
+    current = {
+        "instructions": None,
+        "duplexio_start_role": "user",
+        "duplexio_voice": "voice-a",
+        "duplexio_voice_ids": ["voice-a"],
+    }
+
+    with pytest.raises(DuplexIOClientRuntimeConfigError) as exc_info:
+        DuplexIOServingRuntimeAdapter.validate_runtime_config_for_session(
+            config,
+            current,
+        )
+
+    assert exc_info.value.code == "start_role_update_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_duplexio_rejects_invalid_start_role() -> None:
+    with pytest.raises(DuplexIOClientRuntimeConfigError) as exc_info:
+        await DuplexIOServingRuntimeAdapter.prepare_runtime_config(
+            DuplexSessionConfig(
+                modalities=["text", "audio"],
+                extra_body={"full_duplex": True, "start_role": "assistant"},
+            ),
+            model_config=SimpleNamespace(),
+        )
+
+    assert exc_info.value.code == "start_role_invalid"
 
 
 @pytest.mark.asyncio
