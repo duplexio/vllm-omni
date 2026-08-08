@@ -1263,6 +1263,25 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 ec_connector_output,
             ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
 
+            update_graph_inputs = getattr(self.model, "update_graph_inputs", None)
+            if callable(update_graph_inputs):
+                request_infos = [
+                    self.model_intermediate_buffer.get(req_id, {})
+                    for req_id in req_ids[:num_reqs]
+                ]
+                update_graph_inputs(request_infos)
+                supports_cudagraph_replay = getattr(
+                    self.model,
+                    "supports_cudagraph_replay",
+                    None,
+                )
+                if (
+                    callable(supports_cudagraph_replay)
+                    and not supports_cudagraph_replay(request_infos)
+                ):
+                    cudagraph_mode = CUDAGraphMode.NONE
+                    runner_assisted_full_attn = False
+
         # Let the model adjust inputs before forward (e.g. restore input_ids
         # for multimodal position detection, fix decode position offsets).
         prepare_runner_inputs = getattr(self.model, "prepare_runner_inputs", None)

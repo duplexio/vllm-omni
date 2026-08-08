@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
+import json
 from collections.abc import Mapping
 
 import numpy as np
@@ -784,6 +785,14 @@ class NativeRuntimeBridgeMixin:
         )
         if isinstance(data_plane_request_id, str) and not active_request_matches:
             return close_reason, emitted_response
+        if native_result.get("initial_data_plane_complete") is True:
+            await send_json(
+                {
+                    "type": "session.initial_data_plane_complete",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                }
+            )
         if isinstance(native_result.get("error_code"), str):
             response_id = session.active_response_id
             await send_json(
@@ -820,6 +829,17 @@ class NativeRuntimeBridgeMixin:
             # protocol response only when Stage1 emits text/audio so empty
             # model turns cannot create empty responses or steal later audio.
             return close_reason, False
+        input_text_delta = native_result.get("input_text_delta")
+        if isinstance(input_text_delta, str) and input_text_delta:
+            await send_json(
+                {
+                    "type": "input.transcript.delta",
+                    "session_id": session.session_id,
+                    "item_id": f"item_input_{session.session_id}",
+                    "epoch": session.epoch,
+                    "delta": input_text_delta,
+                }
+            )
         is_listen = native_result.get("is_listen")
         model_turn_id = coerce_int(native_result.get("model_turn_id"))
         if native_result.get("is_buffering") is True or native_result.get("prefill_success") is False:
@@ -918,7 +938,9 @@ class NativeRuntimeBridgeMixin:
         end_of_turn = bool(native_result.get("end_of_turn", False))
         has_text = isinstance(text, str) and bool(text)
         has_audio = isinstance(audio, str) and bool(audio)
-        if not has_text and not has_audio and not end_of_turn:
+        tool_call = native_result.get("tool_call")
+        has_tool_call = isinstance(tool_call, Mapping)
+        if not has_text and not has_audio and not has_tool_call and not end_of_turn:
             tts_segment_ended = (
                 native_result.get("stage_role") == "tts" and native_result.get("abort_data_plane_request") is True
             )
@@ -934,7 +956,13 @@ class NativeRuntimeBridgeMixin:
                     expected_model_turn_id=model_turn_id,
                 )
             return close_reason, emitted_response
-        if end_of_turn and not has_text and not has_audio and session.active_response_id is None:
+        if (
+            end_of_turn
+            and not has_text
+            and not has_audio
+            and not has_tool_call
+            and session.active_response_id is None
+        ):
             if isinstance(data_plane_request_id, str):
                 if not self._session_auto_responds(session) and data_plane_request_id == session.active_request_id:
                     session.clear_request()
@@ -988,7 +1016,44 @@ class NativeRuntimeBridgeMixin:
         response_stage_metrics = session.accumulate_response_stage_metrics(
             native_result.get("stage_metrics") if isinstance(native_result.get("stage_metrics"), Mapping) else None
         )
-        if response_created:
+        if has_tool_call:
+            assert isinstance(tool_call, Mapping)
+            name = tool_call.get("name")
+            arguments = tool_call.get("arguments")
+            if (
+                not isinstance(name, str)
+                or not name
+                or not isinstance(arguments, dict)
+            ):
+                raise RuntimeError(
+                    f"DuplexIO data plane returned an invalid tool call: {tool_call!r}"
+                )
+            call = session.register_tool_call(
+                name=name,
+                arguments=arguments,
+                content=(
+                    "".join(session.assistant_text_buffer)
+                    + (text if isinstance(text, str) else "")
+                ),
+            )
+            await send_json(
+                {
+                    "type": "response.tool_call.done",
+                    "session_id": session.session_id,
+                    "response_id": response_id,
+                    "epoch": session.epoch,
+                    "item": {
+                        "id": call.item_id,
+                        "object": "realtime.item",
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": call.call_id,
+                        "name": name,
+                        "arguments": json.dumps(arguments, ensure_ascii=False),
+                    },
+                }
+            )
+        if response_created and (has_text or has_audio):
             speak_payload = {
                 "type": "response.speak",
                 "session_id": session.session_id,
@@ -1004,6 +1069,27 @@ class NativeRuntimeBridgeMixin:
                 stage_metrics=response_stage_metrics,
             )
             await send_json(speak_payload)
+        if has_tool_call and not has_text and not has_audio:
+            session.end_response(
+                commit_text=False,
+                preserve_request=self._session_auto_responds(session),
+            )
+            await send_json(
+                {
+                    "type": "response.done",
+                    "session_id": session.session_id,
+                    "response_id": response_id,
+                    "epoch": session.epoch,
+                    "committed": False,
+                    "status": "completed",
+                    "status_details": {
+                        "type": "completed",
+                        "reason": "tool_call",
+                    },
+                    "playback": session.playback.as_dict(),
+                }
+            )
+            return close_reason, emitted_response
         previous_sent_ms = session.playback.sent_ms
         text_chars_before_append = len("".join(session.assistant_text_buffer))
         if isinstance(text, str):
@@ -1072,6 +1158,27 @@ class NativeRuntimeBridgeMixin:
             stage_metrics=response_stage_metrics,
         )
         await send_json(payload)
+        if has_tool_call:
+            session.end_response(
+                commit_text=False,
+                preserve_request=self._session_auto_responds(session),
+            )
+            await send_json(
+                {
+                    "type": "response.done",
+                    "session_id": session.session_id,
+                    "response_id": response_id,
+                    "epoch": session.epoch,
+                    "committed": False,
+                    "status": "completed",
+                    "status_details": {
+                        "type": "completed",
+                        "reason": "tool_call",
+                    },
+                    "playback": session.playback.as_dict(),
+                }
+            )
+            return close_reason, emitted_response
         if (
             not end_of_turn
             and native_result.get("stage_role") == "tts"
@@ -1233,6 +1340,22 @@ class NativeRuntimeBridgeMixin:
         model_turn_id = coerce_int(native_result.get("model_turn_id"))
         if model_turn_id is not None:
             metadata["model_turn_id"] = model_turn_id
+        token_ids = {
+            name: token_id
+            for name in (
+                "user_token_id",
+                "agent_token_id",
+                "tool_call_token_id",
+            )
+            if (token_id := coerce_int(native_result.get(name))) is not None
+        }
+        if token_ids:
+            metadata["token_ids"] = token_ids
+        audio_token_ids = native_result.get("agent_audio_token_ids")
+        if isinstance(audio_token_ids, list) and all(
+            isinstance(token_id, int) for token_id in audio_token_ids
+        ):
+            metadata["agent_audio_token_ids"] = audio_token_ids
         for name in (
             "uses_model_runner_scheduler",
             "runner_kv_backed",

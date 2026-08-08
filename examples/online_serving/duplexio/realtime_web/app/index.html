@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>duplexio</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font: 16px/1.5 system-ui, sans-serif;
+        background: #101114;
+        color: #f4f4f5;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+      }
+      main {
+        width: min(92vw, 720px);
+        padding: 32px;
+        border: 1px solid #2b2d33;
+        border-radius: 18px;
+        background: #17181c;
+        box-shadow: 0 20px 60px #0006;
+      }
+      .header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      h1 {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin: 0;
+      }
+      h1 img { display: block; }
+      .mark {
+        display: block;
+        flex: 0 0 auto;
+        width: 42px;
+        height: 42px;
+        object-fit: cover;
+      }
+      .wordmark {
+        width: auto;
+        height: 38px;
+        filter: brightness(0) invert(1);
+      }
+      p { color: #a1a1aa; }
+      .status { display: flex; align-items: center; gap: 8px; margin: 20px 0; }
+      .dot { width: 10px; height: 10px; border-radius: 50%; background: #71717a; }
+      .online .dot { background: #34d399; }
+      .error .dot { background: #fb7185; }
+      .actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 10px;
+        margin-left: auto;
+      }
+      .voice-picker {
+        display: grid;
+        gap: 5px;
+        margin: 16px 0;
+        color: #a1a1aa;
+        font-size: 13px;
+      }
+      select,
+      input[type="number"] {
+        box-sizing: border-box;
+        width: 100%;
+        border: 1px solid #3f3f46;
+        border-radius: 10px;
+        padding: 10px 12px;
+        color: #f4f4f5;
+        background: #27272a;
+        font: inherit;
+      }
+      select:disabled,
+      input:disabled { opacity: .55; }
+      .sampling-panel { margin: 16px 0; }
+      .sampling-panel fieldset {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        gap: 10px;
+        margin: 0;
+        border: 0;
+        padding: 4px 12px 12px;
+      }
+      .sampling-panel label {
+        display: grid;
+        gap: 5px;
+        color: #a1a1aa;
+        font-size: 12px;
+      }
+      .sampling-panel small {
+        grid-column: 1 / -1;
+        color: #71717a;
+      }
+      .tool-picker {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+        gap: 8px;
+        margin: 16px 0;
+        padding: 12px;
+        border: 1px solid #2b2d33;
+        border-radius: 12px;
+      }
+      .tool-picker legend {
+        padding: 0 6px;
+        color: #a1a1aa;
+        font-size: 13px;
+      }
+      .tool-option {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        min-width: 0;
+        padding: 8px;
+        border-radius: 8px;
+        background: #202126;
+        cursor: pointer;
+      }
+      .tool-option input { margin-top: 4px; }
+      .tool-option-name { display: block; font-size: 13px; font-weight: 650; }
+      .tool-option-description { display: block; color: #71717a; font-size: 11px; }
+      .tool-picker:disabled .tool-option { cursor: not-allowed; opacity: .55; }
+      button {
+        border: 0;
+        border-radius: 10px;
+        padding: 11px 18px;
+        font: inherit;
+        color: #fff;
+        background: #3f3f46;
+        cursor: pointer;
+      }
+      button.primary { background: #2563eb; }
+      button.active { background: #b91c1c; }
+      button.armed { background: #7f1d1d; }
+      button.recording { background: #b91c1c; }
+      button:disabled { cursor: not-allowed; opacity: .45; }
+      #detail { min-height: 24px; margin: 20px 0 8px; font-size: 14px; }
+      #meter { height: 5px; margin-bottom: 20px; border-radius: 5px; background: #27272a; overflow: hidden; }
+      #meter-fill { width: 0; height: 100%; background: #60a5fa; transition: width 80ms linear; }
+      .conversation {
+        height: min(42vh, 360px);
+        min-height: 220px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding: 16px;
+        border: 1px solid #2b2d33;
+        border-radius: 12px;
+        background: #101114;
+      }
+      .empty-message { margin: auto; color: #71717a; }
+      .message { max-width: 82%; }
+      .message-user { align-self: flex-end; }
+      .message-assistant { align-self: flex-start; }
+      .message-tool { align-self: stretch; max-width: 100%; }
+      .message-role {
+        margin: 0 8px 4px;
+        color: #71717a;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+      }
+      .message-user .message-role { text-align: right; }
+      .message-text {
+        min-height: 24px;
+        padding: 10px 13px;
+        border-radius: 14px;
+        background: #27272a;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .message-user .message-text { background: #1d4ed8; }
+      .tool-call {
+        display: grid;
+        gap: 9px;
+        padding: 12px;
+        border: 1px solid #3f3f46;
+        border-radius: 14px;
+        background: #202126;
+      }
+      .tool-arguments {
+        min-height: 0;
+        max-height: 120px;
+        padding: 9px;
+        border-radius: 8px;
+        background: #101114;
+      }
+      .tool-status { color: #a1a1aa; font-size: 12px; }
+      .tool-result {
+        box-sizing: border-box;
+        width: 100%;
+        resize: vertical;
+        border: 1px solid #3f3f46;
+        border-radius: 8px;
+        padding: 9px;
+        color: #f4f4f5;
+        background: #101114;
+        font: 13px/1.4 ui-monospace, monospace;
+      }
+      details {
+        margin-top: 12px;
+        border: 1px solid #2b2d33;
+        border-radius: 10px;
+        background: #101114;
+      }
+      summary {
+        padding: 9px 12px;
+        color: #a1a1aa;
+        font-size: 13px;
+        cursor: pointer;
+        user-select: none;
+      }
+      pre {
+        min-height: 100px;
+        max-height: 180px;
+        margin: 0;
+        overflow: auto;
+        padding: 12px;
+        border-radius: 10px;
+        background: #0b0c0f;
+        color: #a1a1aa;
+        font: 12px/1.5 ui-monospace, monospace;
+        white-space: pre-wrap;
+      }
+      @media (max-width: 640px) {
+        .header { align-items: flex-start; flex-direction: column; }
+        .actions { justify-content: flex-start; margin-left: 0; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header class="header">
+        <h1>
+          <img class="mark" src="/static/logo.png" alt="" aria-hidden="true">
+          <img class="wordmark" src="/static/logo-wordmark.svg" alt="duplexio">
+        </h1>
+        <div class="actions">
+          <button id="start" class="primary" type="button">Start session</button>
+          <button id="mute" type="button" disabled>Mute</button>
+          <button id="record" type="button" aria-pressed="false">Record session</button>
+        </div>
+      </header>
+      <div id="status" class="status">
+        <span class="dot"></span>
+        <span id="status-label">Offline</span>
+      </div>
+      <label class="voice-picker" for="model-voice">
+        Model voice
+        <select id="model-voice">
+          <option value="">Loading voices…</option>
+        </select>
+      </label>
+      <details class="sampling-panel" open>
+        <summary>Sampling parameters</summary>
+        <fieldset id="sampling-picker">
+          <label>
+            Text strategy
+            <select id="text-sampling-mode">
+              <option value="">Checkpoint default</option>
+              <option value="argmax">Argmax</option>
+              <option value="top_k">Top K</option>
+              <option value="top_p">Top P</option>
+            </select>
+          </label>
+          <label>
+            Text temperature
+            <input id="text-temperature" type="number" min="0.01" step="0.01" placeholder="Checkpoint default">
+          </label>
+          <label>
+            Text top K
+            <input id="text-top-k" type="number" min="1" step="1" placeholder="Checkpoint default">
+          </label>
+          <label>
+            Text top P
+            <input id="text-top-p" type="number" min="0.01" max="1" step="0.01" placeholder="Checkpoint default">
+          </label>
+          <label>
+            Audio temperature
+            <input id="audio-temperature" type="number" min="0.01" step="0.01" placeholder="Checkpoint default">
+          </label>
+          <label>
+            Audio top K
+            <input id="audio-top-k" type="number" min="1" step="1" placeholder="Checkpoint default">
+          </label>
+          <label>
+            User emit temperature
+            <input id="user-emit-temperature" type="number" min="0" step="0.01" placeholder="Checkpoint default">
+          </label>
+          <label>
+            Agent emit temperature
+            <input id="agent-emit-temperature" type="number" min="0" step="0.01" placeholder="Checkpoint default">
+          </label>
+          <label>
+            Tool-call emit temperature
+            <input id="tool-call-emit-temperature" type="number" min="0" step="0.01" placeholder="Checkpoint default">
+          </label>
+          <label>
+            Seed
+            <input id="sampling-seed" type="number" min="0" max="9007199254740991" step="1" placeholder="Random per session">
+          </label>
+          <small>Text settings choose words; audio settings choose Mimi codes; emit temperatures control each stream's speak-versus-silence gate. Zero is deterministic.</small>
+        </fieldset>
+      </details>
+      <fieldset id="tool-picker" class="tool-picker">
+        <legend>Enabled tools · choose before starting</legend>
+      </fieldset>
+      <div id="detail">No active connection</div>
+      <div id="meter" aria-label="Microphone level"><div id="meter-fill"></div></div>
+      <section id="conversation" class="conversation" aria-label="Live token transcript" aria-live="polite">
+        <p id="empty-message" class="empty-message">Transcribed model tokens will appear here.</p>
+      </section>
+      <details class="logs-panel">
+        <summary>Logs</summary>
+        <pre id="log" aria-live="polite"></pre>
+      </details>
+    </main>
+    <script>window.DUPLEXIO_CONFIG = __DUPLEXIO_CONFIG__;</script>
+    <script src="static/app.js?v=__DUPLEXIO_APP_VERSION__"></script>
+  </body>
+</html>

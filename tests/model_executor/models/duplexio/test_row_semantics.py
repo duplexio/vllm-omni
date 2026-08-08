@@ -9,6 +9,7 @@ from vllm_omni.model_executor.models.duplexio.row_semantics import (
     duplexio_attention_visible,
     duplexio_cell_ids,
     duplexio_frame_positions,
+    duplexio_logical_positions,
     expand_stream_conv_weight,
     mask_inactive_gdn_gates,
 )
@@ -104,4 +105,14 @@ def test_cell_and_frame_positions_share_one_rope_position_per_row() -> None:
     assert torch.equal(
         duplexio_cell_ids(positions),
         torch.arange(DUPLEXIO_NUM_CELLS).repeat(3),
+    )
+
+
+def test_text_mrope_positions_collapse_to_one_logical_position() -> None:
+    positions = torch.arange(18)
+    mrope_positions = positions.repeat(3, 1)
+
+    torch.testing.assert_close(
+        duplexio_logical_positions(mrope_positions),
+        positions,
     )

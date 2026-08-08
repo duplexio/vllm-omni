@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -414,6 +415,14 @@ class ConversationHistory:
     last_assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
 
 
+@dataclass(frozen=True, slots=True)
+class DuplexPendingToolCall:
+    call_id: str
+    item_id: str
+    name: str
+    arguments: dict[str, object]
+
+
 @dataclass
 class DuplexSession:
     session_id: str
@@ -429,6 +438,10 @@ class DuplexSession:
     _playback: PlaybackLedger = field(default_factory=PlaybackLedger, repr=False)
     _conversation: ConversationHistory = field(default_factory=ConversationHistory, repr=False)
     _runtime_config: dict[str, object] = field(default_factory=dict, repr=False)
+    _pending_tool_calls: dict[str, DuplexPendingToolCall] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
     @property
     def response_config(self) -> DuplexSessionConfig:
@@ -554,6 +567,62 @@ class DuplexSession:
 
     def append_history_message(self, message: dict[str, object]) -> None:
         self._conversation.messages.append(message)
+
+    def register_tool_call(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, object],
+        content: str = "",
+    ) -> DuplexPendingToolCall:
+        call_id = f"call_{uuid4().hex}"
+        item_id = f"item_{uuid4().hex}"
+        call = DuplexPendingToolCall(
+            call_id=call_id,
+            item_id=item_id,
+            name=name,
+            arguments=dict(arguments),
+        )
+        self._pending_tool_calls[call_id] = call
+        message = {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(arguments, ensure_ascii=False),
+                    },
+                }
+            ],
+        }
+        self._conversation.messages.append(message)
+        self._conversation.item_ids[item_id] = message
+        return call
+
+    def pending_tool_call(self, call_id: str) -> DuplexPendingToolCall | None:
+        return self._pending_tool_calls.get(call_id)
+
+    def complete_tool_call(
+        self,
+        *,
+        call_id: str,
+        item_id: str,
+        output: str,
+    ) -> dict[str, object]:
+        call = self._pending_tool_calls.pop(call_id, None)
+        if call is None:
+            raise RuntimeError(f"Duplex session has no pending tool call {call_id!r}")
+        message: dict[str, object] = {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": output,
+        }
+        self._conversation.messages.append(message)
+        self._conversation.item_ids[item_id] = message
+        return message
 
     def stage_pending_history_item(self, item_id: str, message: dict[str, object]) -> None:
         self._conversation.pending_item_ids[item_id] = dict(message)

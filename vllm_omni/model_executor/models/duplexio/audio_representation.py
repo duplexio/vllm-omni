@@ -95,6 +95,29 @@ class DelayedMimiRepresentation:
         state.previous_acoustic_codes = raw_codes[1:]
         return delayed
 
+    def encode_sequence(
+        self,
+        raw_codes: Tensor,
+        state: DelayedMimiState,
+    ) -> Tensor:
+        """Delay a complete ``(frames, codebooks)`` Mimi sequence."""
+        if raw_codes.ndim != 2 or raw_codes.shape[1] != self.num_codebooks:
+            raise ValueError(
+                "Expected Mimi sequence with shape (frames, "
+                f"{self.num_codebooks}), got {tuple(raw_codes.shape)}"
+            )
+        if raw_codes.shape[0] == 0:
+            return raw_codes
+        acoustic_codes = torch.cat(
+            (
+                state.previous_acoustic_codes.unsqueeze(0),
+                raw_codes[:-1, 1:],
+            ),
+            dim=0,
+        )
+        state.previous_acoustic_codes = raw_codes[-1, 1:]
+        return torch.cat((raw_codes[:, :1], acoustic_codes), dim=1)
+
     def decode_column(
         self,
         delayed_codes: Tensor,

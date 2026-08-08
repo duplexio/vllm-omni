@@ -142,6 +142,9 @@ class DuplexSessionRunnerMixin:
                 session.mark_closing()
 
         event_emit_lock = asyncio.Lock()
+        initial_data_plane_complete = asyncio.Event()
+        initial_session_announced = asyncio.Event()
+        initial_outbound_events: list[dict[str, object]] = []
 
         async def send_outbound(payload: dict[str, object]) -> None:
             if not attachment_ready or session is None:
@@ -160,6 +163,17 @@ class DuplexSessionRunnerMixin:
                 )
 
         async def emit_event(payload: dict[str, object]) -> None:
+            if payload.get("type") == "session.initial_data_plane_complete":
+                initial_data_plane_complete.set()
+                return
+            if (
+                session is not None
+                and not initial_session_announced.is_set()
+                and payload.get("type")
+                not in {"error", "session.created", "session.closed"}
+            ):
+                initial_outbound_events.append(dict(payload))
+                return
             deferred_precreate_response = False
             async with event_emit_lock:
                 accepted, deferred_overlap_payload = await self._apply_outbound_session_event(
@@ -718,7 +732,39 @@ class DuplexSessionRunnerMixin:
                     )
                 if isinstance(open_result, dict):
                     created_payload["runtime_control"] = self._redact_runtime_control_result(open_result)
+                initial_payloads = tuple(
+                    self._serving_runtime_adapter.initial_data_plane_payloads(
+                        session
+                    )
+                )
+                for payload in initial_payloads:
+                    append_task = await start_native_append(
+                        payload,
+                        final=False,
+                    )
+                    if append_task is None or not await append_task:
+                        return
+                if initial_payloads:
+                    try:
+                        await asyncio.wait_for(
+                            initial_data_plane_complete.wait(),
+                            timeout=self._runtime_control_timeout_s(session),
+                        )
+                    except TimeoutError:
+                        await emit_event(
+                            {
+                                "type": "error",
+                                "code": "initial_data_plane_timeout",
+                                "error": "Timed out waiting for initial model prefill",
+                            }
+                        )
+                        return
                 await emit_event(created_payload)
+                initial_session_announced.set()
+                pending_initial_events = tuple(initial_outbound_events)
+                initial_outbound_events.clear()
+                for payload in pending_initial_events:
+                    await emit_event(payload)
                 resume_credential_delivered = session.capabilities.supports_session_resume
                 reader_task = asyncio.create_task(read_event_loop(), name="duplex-session-reader")
 
@@ -1121,6 +1167,79 @@ class DuplexSessionRunnerMixin:
                         if turn_event == "conversation.item.create":
                             payload = event.get("payload")
                             item = payload.get("item") if isinstance(payload, dict) else None
+                            if isinstance(item, dict) and item.get("type") == "function_call_output":
+                                call_id = item.get("call_id")
+                                output = item.get("output")
+                                item_id = item.get("id")
+                                if (
+                                    not isinstance(call_id, str)
+                                    or not call_id
+                                    or not isinstance(output, str)
+                                    or not isinstance(item_id, str)
+                                    or not item_id
+                                ):
+                                    await emit_event(
+                                        {
+                                            "type": "error",
+                                            "code": "invalid_function_call_output",
+                                            "error": (
+                                                "function_call_output requires call_id, "
+                                                "output, and item id"
+                                            ),
+                                        }
+                                    )
+                                    continue
+                                if session.pending_tool_call(call_id) is None:
+                                    await emit_event(
+                                        {
+                                            "type": "error",
+                                            "code": "unknown_tool_call",
+                                            "error": f"No pending tool call {call_id!r}",
+                                        }
+                                    )
+                                    continue
+                                if not await wait_for_native_append_tail():
+                                    continue
+                                result_payloads = tuple(
+                                    self._serving_runtime_adapter.tool_result_data_plane_payloads(
+                                        session,
+                                        output,
+                                    )
+                                )
+                                if not result_payloads:
+                                    await emit_event(
+                                        {
+                                            "type": "error",
+                                            "code": "tool_results_unsupported",
+                                            "error": "The active duplex model cannot accept tool results",
+                                        }
+                                    )
+                                    continue
+                                appended = True
+                                for result_payload in result_payloads:
+                                    append_task = await start_native_append(
+                                        result_payload,
+                                        final=False,
+                                    )
+                                    if append_task is None or not await append_task:
+                                        appended = False
+                                        break
+                                if not appended:
+                                    continue
+                                session.complete_tool_call(
+                                    call_id=call_id,
+                                    item_id=item_id,
+                                    output=output,
+                                )
+                                await emit_event(
+                                    {
+                                        "type": "conversation.item.created",
+                                        "session_id": session.session_id,
+                                        "item": item,
+                                        "created": True,
+                                    }
+                                )
+                                continue
                             message = self._realtime_item_to_history_message(item)
                             item_id = item.get("id") if isinstance(item, dict) else None
                             if message is not None:

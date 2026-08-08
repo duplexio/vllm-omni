@@ -78,6 +78,7 @@ class _RealtimeResponseState:
     conversation_item_done: bool = False
     speak_emitted: bool = False
     done_emitted: bool = False
+    tool_call_items: list[dict[str, object]] = field(default_factory=list)
 
     @property
     def transcript(self) -> str:

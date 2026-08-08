@@ -108,6 +108,8 @@ def _valid_runtime_adapter() -> SimpleNamespace:
         prepare_runtime_config=lambda config, **kwargs: {},
         runtime_config_for_update=lambda config, current: {},
         validate_runtime_config_for_session=lambda config, current: None,
+        initial_data_plane_payloads=lambda session: (),
+        tool_result_data_plane_payloads=lambda session, output: (),
         data_plane_context=lambda **kwargs: object(),
     )
 
@@ -137,4 +139,20 @@ def test_runtime_adapter_validator_rejects_incomplete_data_plane() -> None:
     adapter.data_plane.close_session = None
 
     with pytest.raises(TypeError, match="data_plane.*close_session"):
+        validate_serving_runtime_adapter(adapter)
+
+
+def test_runtime_adapter_validator_requires_initial_data_plane_payloads() -> None:
+    adapter = _valid_runtime_adapter()
+    adapter.initial_data_plane_payloads = None
+
+    with pytest.raises(TypeError, match="initial_data_plane_payloads"):
+        validate_serving_runtime_adapter(adapter)
+
+
+def test_runtime_adapter_validator_requires_tool_result_data_plane_payloads() -> None:
+    adapter = _valid_runtime_adapter()
+    adapter.tool_result_data_plane_payloads = None
+
+    with pytest.raises(TypeError, match="tool_result_data_plane_payloads"):
         validate_serving_runtime_adapter(adapter)

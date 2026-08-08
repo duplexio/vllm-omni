@@ -43,6 +43,7 @@ class DuplexIOConfig(PretrainedConfig):
         user_asr_encoder_config: dict[str, Any] | None = None,
         quantized_audio_config: dict[str, Any] | None = None,
         depth_transformer_config: dict[str, Any] | None = None,
+        rollout_sampling_config: dict[str, Any] | None = None,
         tied_weight_aliases: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -71,6 +72,15 @@ class DuplexIOConfig(PretrainedConfig):
             quantized_audio_config or {"num_codebooks": 8}
         )
         self.depth_transformer_config = dict(depth_transformer_config or {})
+        self.rollout_sampling_config = dict(
+            rollout_sampling_config
+            or {
+                "mode": "argmax",
+                "temperature": 1.0,
+                "top_k": 50,
+                "top_p": 0.95,
+            }
+        )
         self.tied_weight_aliases = dict(tied_weight_aliases or {})
         self._validate_duplexio_contract()
 
@@ -190,6 +200,24 @@ class DuplexIOConfig(PretrainedConfig):
             raise ValueError(
                 "Native DuplexIO requires the speaker-conditioned depth checkpoint"
             )
+        rollout_mode = self.rollout_sampling_config.get("mode")
+        if rollout_mode not in {"argmax", "max", "top_k", "top_p"}:
+            raise ValueError(
+                f"Unsupported DuplexIO rollout sampling mode: {rollout_mode!r}"
+            )
+        rollout_temperature = self.rollout_sampling_config.get("temperature")
+        rollout_top_k = self.rollout_sampling_config.get("top_k")
+        rollout_top_p = self.rollout_sampling_config.get("top_p")
+        if not isinstance(rollout_temperature, (int, float)) or (
+            rollout_temperature <= 0
+        ):
+            raise ValueError("DuplexIO rollout sampling temperature must be positive")
+        if not isinstance(rollout_top_k, int) or rollout_top_k < 1:
+            raise ValueError("DuplexIO rollout sampling top_k must be positive")
+        if not isinstance(rollout_top_p, (int, float)) or not (
+            0 < rollout_top_p <= 1
+        ):
+            raise ValueError("DuplexIO rollout sampling top_p must be in (0, 1]")
         depth_dim = self.depth_transformer_config.get("dim")
         depth_layers = self.depth_transformer_config.get("num_layers")
         depth_heads = self.depth_transformer_config.get("num_heads")
@@ -275,9 +303,23 @@ def _text_config(
     value: dict[str, Any] | PretrainedConfig | None,
 ) -> PretrainedConfig:
     if isinstance(value, PretrainedConfig):
-        return value
-    config = dict(value or {"model_type": "qwen3_5_text"})
-    model_type = config.pop("model_type", None)
-    if not isinstance(model_type, str):
-        raise ValueError("DuplexIO text_config must contain a model_type")
-    return AutoConfig.for_model(model_type, **config)
+        config = value
+    else:
+        config_data = dict(value or {"model_type": "qwen3_5_text"})
+        model_type = config_data.pop("model_type", None)
+        if not isinstance(model_type, str):
+            raise ValueError("DuplexIO text_config must contain a model_type")
+        config = AutoConfig.for_model(model_type, **config_data)
+
+    # DuplexIO flattens all streams into text-like rows and trains with 1-D
+    # RoPE. Qwen's generic text config carries the multimodal M-RoPE marker,
+    # which would make vLLM's runner require vision-token metadata.
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict) and "mrope_section" in rope_parameters:
+        config.rope_parameters = {
+            key: value
+            for key, value in rope_parameters.items()
+            if key not in {"mrope_interleaved", "mrope_section"}
+        }
+
+    return config

@@ -2759,6 +2759,83 @@ async def test_native_append_propagates_current_turn_fence_to_engine():
 
 
 @pytest.mark.asyncio
+async def test_native_duplex_projects_user_token_text_as_realtime_transcription_delta():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-user-transcript",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    ws = TimedWebSocket()
+
+    await handler._send_one_native_duplex_event(
+        ws.send_json,
+        {
+            "stage_role": "duplexio",
+            "is_listen": True,
+            "model_listen": True,
+            "data_plane_request_id": "duplex-sid-user-transcript-e0-stage0",
+            "input_text_delta": "hello",
+            "end_of_turn": False,
+        },
+        session=session,
+    )
+
+    assert ws.sent[0] == {
+        "type": "input.transcript.delta",
+        "session_id": "sid-user-transcript",
+        "item_id": "item_input_sid-user-transcript",
+        "epoch": 0,
+        "delta": "hello",
+    }
+    protocol = NativeRealtimeSessionProtocol({})
+    assert protocol._from_duplex_event(ws.sent[0]) == [
+        {
+            "type": "conversation.item.input_audio_transcription.delta",
+            "item_id": "item_input_sid-user-transcript",
+            "content_index": 0,
+            "delta": "hello",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_duplex_emits_structured_tool_call_and_waits_for_result():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-tool-call",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    ws = TimedWebSocket()
+
+    await handler._send_one_native_duplex_event(
+        ws.send_json,
+        {
+            "stage_role": "duplexio",
+            "is_listen": False,
+            "data_plane_request_id": "duplex-sid-tool-call-e0-stage0",
+            "model_turn_id": 0,
+            "tool_call": {
+                "name": "get_current_time",
+                "arguments": {"time_zone": "Europe/Copenhagen"},
+            },
+        },
+        session=session,
+    )
+
+    tool_event = next(
+        event for event in ws.sent if event["type"] == "response.tool_call.done"
+    )
+    call_id = tool_event["item"]["call_id"]
+    assert tool_event["item"]["name"] == "get_current_time"
+    assert tool_event["item"]["arguments"] == (
+        '{"time_zone": "Europe/Copenhagen"}'
+    )
+    assert session.pending_tool_call(call_id) is not None
+    done = next(event for event in ws.sent if event["type"] == "response.done")
+    assert done["status_details"]["reason"] == "tool_call"
+
+
+@pytest.mark.asyncio
 async def test_minicpmo_auto_response_tts_segment_boundary_appends_silence_unit():
     request_id = "duplex-sid-segment-boundary-e0-stage0"
     engine = FakeEngineClient()
@@ -3999,6 +4076,111 @@ async def test_duplex_handler_explicit_close_closes_runtime_once_with_client_rea
 
     assert ws.sent_types() == ["session.created", "session.closed"]
     assert engine.closed == [("sid-close", "session_close")]
+
+
+@pytest.mark.asyncio
+async def test_native_session_is_not_announced_before_initial_prefill_completes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class BlockingPrefillEngine(FakeEngineClient):
+        def __init__(self) -> None:
+            request_id = duplex_resource_request_id(
+                DuplexFence("sid-prefill-readiness"),
+                "stage0",
+            )
+            super().__init__(
+                append_result={
+                    "stage_results": [
+                        {
+                            "stage_id": 0,
+                            "replica_id": 0,
+                            "result": {
+                                "supported": True,
+                                "data_plane_append": True,
+                                "request_id": request_id,
+                                "response_stage_id": 0,
+                            },
+                        }
+                    ]
+                }
+            )
+            self.prefill_started = asyncio.Event()
+            self.release_prefill = asyncio.Event()
+            self.wait_forever = asyncio.Event()
+            self.collect_count = 0
+
+        async def collect_duplex_data_plane_outputs_async(
+            self,
+            request_id: str,
+            **kwargs,
+        ):
+            del request_id, kwargs
+            self.collect_count += 1
+            if self.collect_count > 1:
+                await self.wait_forever.wait()
+            self.prefill_started.set()
+            await self.release_prefill.wait()
+            return [SimpleNamespace(finished=False)]
+
+    engine = BlockingPrefillEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    monkeypatch.setattr(
+        handler._serving_runtime_adapter,
+        "initial_data_plane_payloads",
+        lambda session: (_native_audio_payload(is_speech=False),),
+    )
+    request_id = duplex_resource_request_id(
+        DuplexFence("sid-prefill-readiness"),
+        "stage0",
+    )
+    monkeypatch.setattr(
+        handler._serving_runtime_adapter.data_plane,
+        "project",
+        lambda result, context: (
+            iter(
+                [
+                    {
+                        "initial_data_plane_complete": True,
+                        "data_plane_request_id": request_id,
+                        "is_listen": True,
+                        "model_listen": True,
+                    }
+                ]
+            )
+            if isinstance(result, dict) and result.get("data_plane_outputs")
+            else iter(())
+        ),
+    )
+    ws = TimedWebSocket(receive_timeout_s=2)
+    ws.put(_native_realtime_session_update("sid-prefill-readiness"))
+    handler_task = asyncio.create_task(handler.handle_realtime_session(ws))
+
+    try:
+        await asyncio.wait_for(engine.prefill_started.wait(), timeout=1)
+        assert "session.created" not in ws.sent_types()
+        assert "session.updated" not in ws.sent_types()
+
+        engine.release_prefill.set()
+        for _ in range(100):
+            if "session.updated" in ws.sent_types():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("session readiness was not emitted after prefill")
+
+        assert ws.sent_types()[:3] == [
+            "session.created",
+            "session.updated",
+            "response.listen",
+        ]
+    finally:
+        engine.release_prefill.set()
+        ws.put({"type": "session.close"})
+        await asyncio.wait_for(handler_task, timeout=2)
 
 
 @pytest.mark.asyncio
