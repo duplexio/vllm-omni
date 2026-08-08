@@ -1102,7 +1102,8 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     f"got {self.activation!r}"
                 )
             conv_state[state_indices] = conv_input[:, :, -state_length:]
-            return F.silu(conv_output.squeeze(0).transpose(0, 1))
+            conv_output = conv_output.squeeze(0).transpose(0, 1).contiguous()
+            return F.silu(conv_output)
 
         output = torch.empty_like(mixed_qkv)
 

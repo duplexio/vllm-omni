@@ -212,6 +212,7 @@ def test_duplexio_single_request_convolution_updates_state_without_scalar_reads(
         output[:, 0],
         torch.nn.functional.silu(torch.tensor([2.0, 3.0])),
     )
+    assert output.is_contiguous()
     torch.testing.assert_close(
         conv_state,
         torch.tensor([[[5.0, 6.0]], [[7.0, 8.0]]]),
