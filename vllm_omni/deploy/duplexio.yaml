@@ -24,11 +24,12 @@ stages:
     enforce_eager: false
     async_scheduling: false
     compilation_config:
-      mode: 0
+      mode: 3
       cudagraph_mode: FULL
       # With max_num_seqs=1, every live append is one uniform six-cell frame.
       # Larger system/tool prefills run eagerly outside this graph.
       cudagraph_capture_sizes: [6]
+      compile_sizes: ["cudagraph_capture_sizes"]
       cudagraph_copy_inputs: true
     engine_extras:
       attention_config:
