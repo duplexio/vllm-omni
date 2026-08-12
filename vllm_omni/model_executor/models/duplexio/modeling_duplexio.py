@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import base64
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -15,6 +15,7 @@ import torch
 import xgrammar as xgr
 from torch import Tensor, nn
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config.compilation import CompilationMode
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
@@ -28,6 +29,7 @@ from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLMBase
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
@@ -50,6 +52,7 @@ from vllm_omni.model_executor.models.duplexio.configuration_duplexio import (
 from vllm_omni.model_executor.models.duplexio.depth_sampler import (
     DepthAutoregressiveSampler,
     DepthSamplerConfig,
+    DepthSpeakerConditioning,
 )
 from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FastConformerConfig,
@@ -98,6 +101,7 @@ class DuplexIORequestState:
     user_asr: FastConformerStreamingState
     user_asr_prefill_features: Tensor
     speaker_embedding: Tensor
+    depth_speaker_conditioning: DepthSpeakerConditioning
     system_token_ids: tuple[int, ...]
     sampling_generator: torch.Generator
     tool_call_constraint: ToolCallConstraintState | None = None
@@ -130,6 +134,7 @@ class DuplexIORequestState:
             user_asr=self.user_asr,
             user_asr_prefill_features=self.user_asr_prefill_features,
             speaker_embedding=self.speaker_embedding,
+            depth_speaker_conditioning=self.depth_speaker_conditioning,
             system_token_ids=self.system_token_ids,
             sampling_generator=_fork_generator(self.sampling_generator),
             tool_call_constraint=(
@@ -327,7 +332,21 @@ class DuplexIOForConditionalGeneration(
         self.user_asr_encoder = FastConformerUserEncoder(
             asr_config,
             compute_dtype=vllm_config.model_config.dtype,
-        ).float()
+        )
+        compilation = vllm_config.compilation_config
+        self.compiled_user_asr_step: Callable[..., tuple[Tensor, ...]] | None = (
+            torch.compile(
+                self.user_asr_encoder.steady_step,
+                fullgraph=True,
+            )
+            if (
+                graph_device.type == "cuda"
+                and not vllm_config.model_config.enforce_eager
+                and compilation.backend == "inductor"
+                and compilation.mode != CompilationMode.NONE
+            )
+            else None
+        )
         self.user_asr_proj = nn.Linear(
             asr_config.dim,
             representation_dim,
@@ -354,7 +373,7 @@ class DuplexIOForConditionalGeneration(
                     "semantic_sampling_top_k"
                 ),
             )
-        ).float()
+        )
         self.emit_heads = nn.ModuleDict(
             {
                 name: nn.Linear(hidden_size, 1)
@@ -388,12 +407,18 @@ class DuplexIOForConditionalGeneration(
         attn_metadata: object,
         request_infos: list[dict[str, Any]],
     ) -> None:
-        """Expose accepted active-text counts to the compact Flex metadata."""
+        """Expose accepted audio and active-text counts to Flex metadata."""
         active_text_tokens = []
+        live_audio_frames = []
         for info in request_infos:
             state = info.get("duplexio_model_state")
-            accepted = (
+            accepted_text_tokens = (
                 state.active_text_tokens
+                if isinstance(state, DuplexIORequestState)
+                else 0
+            )
+            accepted_frames = (
+                state.frames_seen
                 if isinstance(state, DuplexIORequestState)
                 else 0
             )
@@ -405,12 +430,14 @@ class DuplexIOForConditionalGeneration(
             )
             assert isinstance(frame_count, int) and frame_count > 0
             active_text_tokens.append(
-                accepted
+                accepted_text_tokens
                 + (frame_count - 1) * len(TEXT_STREAM_NAMES)
             )
+            live_audio_frames.append(accepted_frames + frame_count)
         update_duplexio_attention_metadata(
             attn_metadata,
             active_text_tokens,
+            live_audio_frames,
         )
 
     def update_graph_inputs(
@@ -588,7 +615,7 @@ class DuplexIOForConditionalGeneration(
                     system_token_start:system_token_end
                 ]
             else:
-                asr_features, state.user_asr = self.user_asr_encoder.step_sequence(
+                asr_features, state.user_asr = self.step_user_asr(
                     waveform,
                     state.user_asr,
                 )
@@ -952,7 +979,7 @@ class DuplexIOForConditionalGeneration(
                     predicted_audio = self.audio_sampler.sample(
                         audio_condition,
                         predicted_text[1:2],
-                        state.speaker_embedding.unsqueeze(0),
+                        state.depth_speaker_conditioning,
                         temperature=depth_sampling[0],
                         top_k=depth_sampling[1],
                         generator=state.sampling_generator,
@@ -1202,6 +1229,10 @@ class DuplexIOForConditionalGeneration(
                 device=device,
             )
         )
+        speaker_embedding = pool[embedding_index].to(
+            device=device,
+            dtype=self.llm.channel_emb.dtype,
+        )
         return DuplexIORequestState(
             text_input_ids=torch.full(
                 (len(TEXT_STREAM_NAMES),),
@@ -1222,9 +1253,9 @@ class DuplexIOForConditionalGeneration(
             output_mimi=self.audio_codec.new_streaming_state(),
             user_asr=user_asr,
             user_asr_prefill_features=user_asr_prefill_features,
-            speaker_embedding=pool[embedding_index].to(
-                device=device,
-                dtype=self.llm.channel_emb.dtype,
+            speaker_embedding=speaker_embedding,
+            depth_speaker_conditioning=self.audio_sampler.prepare_speaker(
+                speaker_embedding.unsqueeze(0)
             ),
             system_token_ids=cast(tuple[int, ...], tuple(system_tokens)),
             sampling_generator=sampling_generator,
@@ -1274,11 +1305,74 @@ class DuplexIOForConditionalGeneration(
         )[0].T
         return self.audio_representation.encode_sequence(raw_codes, delay)
 
+    def step_user_asr(
+        self,
+        waveform: Tensor,
+        state: FastConformerStreamingState,
+    ) -> tuple[Tensor, FastConformerStreamingState]:
+        """Use the compiled fixed-shape path after the ASR window is full."""
+        compiled_step = self.compiled_user_asr_step
+        if compiled_step is None:
+            return self.user_asr_encoder.step_sequence(waveform, state)
+
+        config = self.user_asr_encoder.config
+        if (
+            waveform.shape[-1] != config.frame_size
+            or state.frames_seen < config.attention_left_context
+        ):
+            return self.user_asr_encoder.step_sequence(waveform, state)
+
+        outputs = compiled_step(
+            waveform,
+            state.sample_buffer,
+            state.feature_buffer,
+            *state.attention_caches,
+            *state.convolution_caches,
+        )
+        layer_count = config.num_layers
+        return outputs[0], FastConformerStreamingState(
+            sample_buffer=outputs[1],
+            feature_buffer=outputs[2],
+            attention_caches=tuple(outputs[3 : 3 + layer_count]),
+            convolution_caches=tuple(outputs[3 + layer_count :]),
+            frames_seen=state.frames_seen + 1,
+        )
+
+    @torch.inference_mode()
+    def warmup_compiled_user_asr_step(self) -> None:
+        """Compile the steady one-frame ASR path before accepting sessions."""
+        compiled_step = self.compiled_user_asr_step
+        if compiled_step is None:
+            return
+        config = self.user_asr_encoder.config
+        device = next(self.user_asr_encoder.parameters()).device
+        waveform = torch.zeros(
+            1,
+            1,
+            config.frame_size,
+            device=device,
+            dtype=next(self.audio_codec.parameters()).dtype,
+        )
+        state = self.user_asr_encoder.new_state(device=device)
+        for _ in range(config.attention_left_context):
+            _, state = self.user_asr_encoder.step(waveform, state)
+        with set_default_torch_dtype(torch.float32):
+            outputs = compiled_step(
+                waveform,
+                state.sample_buffer,
+                state.feature_buffer,
+                *state.attention_caches,
+                *state.convolution_caches,
+            )
+        assert outputs[0].shape == (1, config.dim)
+
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(
+        loaded = AutoWeightsLoader(self).load_weights(
             weights,
             mapper=self.hf_to_vllm_mapper,
         )
+        self.warmup_compiled_user_asr_step()
+        return loaded
 
     @classmethod
     def get_mamba_state_dtype_from_config(

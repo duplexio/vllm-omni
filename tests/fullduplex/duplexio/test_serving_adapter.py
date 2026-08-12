@@ -110,7 +110,7 @@ async def test_serving_config_selects_exported_default_voice(
     ]
     assert runtime["duplexio_start_role"] == (start_role or "user")
     assert runtime["duplexio_depth_sampling"] == {
-        "temperature": 0.9,
+        "temperature": 0.7,
         "top_k": 32,
     }
     assert runtime["duplexio_text_sampling"] == {
@@ -121,7 +121,7 @@ async def test_serving_config_selects_exported_default_voice(
     }
     assert runtime["duplexio_emit_temperatures"] == {
         "user": 0.0,
-        "agent": 0.0,
+        "agent": 1.0,
         "tool_call": 1.0,
     }
     assert runtime["duplexio_suppressed_token_ids"] == [11, 12]

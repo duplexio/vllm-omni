@@ -9,6 +9,9 @@ import torch
 from vllm_omni.model_executor.models.duplexio.audio_representation import (
     DelayedMimiState,
 )
+from vllm_omni.model_executor.models.duplexio.depth_sampler import (
+    DepthSpeakerConditioning,
+)
 from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FastConformerStreamingState,
 )
@@ -74,6 +77,10 @@ def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
         ),
         user_asr_prefill_features=torch.zeros(12, 512),
         speaker_embedding=torch.zeros(512),
+        depth_speaker_conditioning=DepthSpeakerConditioning(
+            attention=(),
+            feedforward=(),
+        ),
         system_token_ids=(1, 2, 3),
         sampling_generator=generator,
         frames_seen=100_000,

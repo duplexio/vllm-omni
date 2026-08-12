@@ -4,7 +4,7 @@
   const config = window.DUPLEXIO_CONFIG || {};
   const inputRate = Number(config.inputSampleRate || 24000);
   const outputRate = 24000;
-  const playbackBufferMs = 80;
+  const playbackBufferMs = 160;
   const sendIntervalMs = 80;
   const tools = Array.isArray(config.tools) ? config.tools : [];
 
@@ -181,7 +181,9 @@
     audioTemperature.value = audio.temperature ?? '';
     audioTopK.value = audio.top_k ?? '';
     userEmitTemperature.value = emit.user ?? '';
-    agentEmitTemperature.value = emit.agent ?? '';
+    agentEmitTemperature.value = Number.isInteger(emit.agent)
+      ? emit.agent.toFixed(1)
+      : emit.agent ?? '';
     toolCallEmitTemperature.value = Number.isInteger(emit.tool_call)
       ? emit.tool_call.toFixed(1)
       : emit.tool_call ?? '';

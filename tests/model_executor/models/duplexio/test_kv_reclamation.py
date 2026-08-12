@@ -105,6 +105,14 @@ def test_compact_attention_matches_logical_rows_across_audio_eviction() -> None:
         all_positions = torch.arange(all_keys.shape[0])
         live_slots = layout.live_compact_slots(active_text_tokens)
         compact_positions = torch.arange(live_slots)
+        live_pages = layout.live_compact_pages(
+            live_audio_frames=frame + 1,
+            active_text_tokens=active_text_tokens,
+        )
+        gathered_slots = torch.zeros(live_slots, dtype=torch.bool)
+        for page in live_pages:
+            page_start = page * layout.block_size
+            gathered_slots[page_start : page_start + layout.block_size] = True
 
         queries = torch.randn(DUPLEXIO_NUM_CELLS, dim)
         for query, query_position in zip(queries, positions, strict=True):
@@ -130,6 +138,7 @@ def test_compact_attention_matches_logical_rows_across_audio_eviction() -> None:
                 cached_active[:live_slots],
                 layout,
             )
+            assert not torch.any(compact_visible & ~gathered_slots)
             compact_scores = query @ cached_keys[:live_slots][compact_visible].T
             compact_output = (
                 compact_scores.softmax(dim=-1)
@@ -154,6 +163,19 @@ def test_audio_ring_usage_stays_constant_for_sustained_session() -> None:
     assert layout.live_compact_slots(0) == (
         layout.persistent_text_base + DUPLEXIO_NUM_TEXT_CELLS
     )
+
+
+def test_live_compact_pages_skip_unfilled_audio_ring() -> None:
+    layout = DuplexIOKVLayout(
+        block_size=16,
+        audio_window_frames=64,
+        max_model_len=600,
+    )
+
+    assert layout.live_compact_pages(
+        live_audio_frames=10,
+        active_text_tokens=5,
+    ) == (0, 1, 9, 10)
 
 
 def test_bulk_prefill_keeps_only_final_transient_text_writes() -> None:
@@ -394,6 +416,7 @@ def test_runtime_metadata_scans_only_live_compact_pages() -> None:
     update_duplexio_attention_metadata(
         {"first": metadata, "shared": metadata},
         [5, 19],
+        [10, 20],
     )
 
     expected_lengths = torch.tensor(
@@ -417,9 +440,9 @@ def test_runtime_metadata_scans_only_live_compact_pages() -> None:
     assert metadata.physical_to_logical[0, first_unused_block] == -1
 
 
-def test_graph_block_mask_updates_stable_physical_candidates() -> None:
+def test_graph_block_mask_updates_stable_sparse_physical_candidates() -> None:
     metadata = cast(Any, object.__new__(FlexAttentionMetadata))
-    metadata.block_table = torch.tensor([[3, 4]], dtype=torch.int32)
+    metadata.block_table = torch.tensor([[3, 4, 7]], dtype=torch.int32)
     metadata.block_size = 16
     metadata.kv_block_size = 8
     metadata.duplexio_graph_block_offsets = torch.arange(3, dtype=torch.int32)
@@ -439,11 +462,11 @@ def test_graph_block_mask_updates_stable_physical_candidates() -> None:
     metadata.duplexio_graph_block_mask = block_mask
     indices_pointer = block_mask.kv_indices.data_ptr()
 
-    update_duplexio_graph_block_mask(metadata, 2)
+    update_duplexio_graph_block_mask(metadata, (0, 2))
 
     assert block_mask.kv_indices.data_ptr() == indices_pointer
     assert block_mask.kv_num_blocks.item() == 4
     assert torch.equal(
         block_mask.kv_indices[0, 0, 0],
-        torch.tensor([6, 7, 8, 9, -1, -1, -1], dtype=torch.int32),
+        torch.tensor([6, 7, 14, 15, -1, -1, -1], dtype=torch.int32),
     )

@@ -336,7 +336,10 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
         )
         setattr(metadata, "duplexio_graph_block_offsets", self.graph_block_offsets)
         setattr(metadata, "duplexio_graph_block_mask", block_mask)
-        update_duplexio_graph_block_mask(metadata, self.layout.max_blocks)
+        update_duplexio_graph_block_mask(
+            metadata,
+            tuple(range(self.layout.max_blocks)),
+        )
         return block_mask
 
     def build(
@@ -373,14 +376,18 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
 
 def update_duplexio_graph_block_mask(
     metadata: FlexAttentionMetadata,
-    num_live_pages: int,
+    compact_page_indices: tuple[int, ...],
 ) -> None:
-    """Update the stable six-cell graph's conservative physical block list."""
+    """Update the stable six-cell graph's live physical block list."""
     block_mask = getattr(metadata, "duplexio_graph_block_mask", None)
     if not isinstance(block_mask, BlockMask):
         return
     block_offsets = getattr(metadata, "duplexio_graph_block_offsets")
-    physical_pages = metadata.block_table[0, :num_live_pages].to(torch.int32)
+    page_indices = metadata.block_table.new_tensor(compact_page_indices)
+    physical_pages = metadata.block_table[0].index_select(
+        0,
+        page_indices,
+    ).to(torch.int32)
     page_starts = physical_pages * metadata.block_size
     first_flex_blocks = page_starts // metadata.kv_block_size
     candidate_blocks = first_flex_blocks[:, None] + block_offsets[None, :]
@@ -403,8 +410,9 @@ def update_duplexio_graph_block_mask(
 def update_duplexio_attention_metadata(
     attn_metadata: object,
     active_text_tokens: list[int],
+    live_audio_frames: list[int],
 ) -> None:
-    """Limit Flex's gathered pages to the retained prefix plus frame headroom."""
+    """Expose each request's live compact address space to FlexAttention."""
     pending = [attn_metadata]
     seen: set[int] = set()
     while pending:
@@ -427,6 +435,10 @@ def update_duplexio_attention_metadata(
         num_reqs = metadata.seq_lens.shape[0]
         retained_tokens = active_text_tokens[:num_reqs]
         retained_tokens.extend([0] * (num_reqs - len(retained_tokens)))
+        retained_audio_frames = live_audio_frames[:num_reqs]
+        retained_audio_frames.extend(
+            [0] * (num_reqs - len(retained_audio_frames))
+        )
         compact_lengths = [
             layout.live_compact_slots(retained)
             for retained in retained_tokens
@@ -447,15 +459,20 @@ def update_duplexio_attention_metadata(
             metadata.physical_to_logical.shape[1],
         )
         metadata.physical_to_logical.copy_(inverse)
-        num_live_pages = (
-            compact_lengths[0] + metadata.block_size - 1
-        ) // metadata.block_size
-        update_duplexio_graph_block_mask(metadata, num_live_pages)
-        metadata.block_mask = getattr(
-            metadata,
-            "duplexio_graph_block_mask",
-            None,
-        )
+        graph_block_mask = getattr(metadata, "duplexio_graph_block_mask", None)
+        if isinstance(graph_block_mask, BlockMask):
+            assert metadata.num_reqs == 1
+            compact_pages = layout.live_compact_pages(
+                live_audio_frames=retained_audio_frames[0],
+                active_text_tokens=retained_tokens[0],
+            )
+            update_duplexio_graph_block_mask(metadata, compact_pages)
+            metadata.block_mask = graph_block_mask
+        else:
+            # The normal multi-request path rebuilds a request-aware block mask
+            # in DuplexIOFlexAttentionImpl.forward. A single-request graph mask
+            # must never be reused for a batched metadata object.
+            metadata.block_mask = None
 
 
 class DuplexIOFlexAttentionImpl(FlexAttentionImpl):
@@ -1078,7 +1095,8 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
         state_length = conv_weights.size(-1) - 1
-        if self.full_cudagraph_enabled and query_start_loc.shape[0] == 2:
+        request_count = query_start_loc.shape[0] - 1
+        if self.full_cudagraph_enabled and request_count == 1:
             state_indices = state_indices[:1]
             history = conv_state.index_select(0, state_indices)
             if has_initial_state is not None:
@@ -1104,6 +1122,49 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             conv_state[state_indices] = conv_input[:, :, -state_length:]
             conv_output = conv_output.squeeze(0).transpose(0, 1).contiguous()
             return F.silu(conv_output)
+
+        if request_count > 1:
+            query_lengths = query_start_loc[1:] - query_start_loc[:-1]
+            if bool(torch.all(query_lengths == query_lengths[0])):
+                query_length = mixed_qkv.shape[0] // request_count
+                assert mixed_qkv.shape[0] == request_count * query_length
+                history = conv_state.index_select(
+                    0,
+                    state_indices[:request_count],
+                )
+                if has_initial_state is not None:
+                    history = history.masked_fill(
+                        ~has_initial_state[:request_count, None, None],
+                        0,
+                    )
+                conv_input = torch.cat(
+                    (
+                        history,
+                        mixed_qkv.view(
+                            request_count,
+                            query_length,
+                            -1,
+                        ).transpose(1, 2),
+                    ),
+                    dim=-1,
+                )
+                conv_output = F.conv1d(
+                    conv_input,
+                    conv_weights.unsqueeze(1),
+                    bias=self.conv1d.bias,
+                    groups=conv_weights.size(0),
+                )
+                if self.activation != "silu":
+                    raise ValueError(
+                        "DuplexIO's native convolution path requires silu, "
+                        f"got {self.activation!r}"
+                    )
+                conv_state[state_indices[:request_count]] = conv_input[
+                    :, :, -state_length:
+                ]
+                return F.silu(
+                    conv_output.transpose(1, 2).contiguous().view_as(mixed_qkv)
+                )
 
         output = torch.empty_like(mixed_qkv)
 

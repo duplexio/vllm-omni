@@ -13,6 +13,13 @@ STATIC_ROOT = APP_ROOT / "static"
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_login_shows_logo_and_wordmark() -> None:
+    login = (APP_ROOT / "login.html").read_text(encoding="utf-8")
+
+    assert 'class="mark" src="/static/logo.png"' in login
+    assert 'class="wordmark" src="/static/logo-wordmark.svg"' in login
+
+
 def test_frontend_shows_role_grouped_transcript_and_collapsed_logs() -> None:
     index = (APP_ROOT / "index.html").read_text(encoding="utf-8")
     app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
@@ -51,6 +58,7 @@ def test_microphone_upload_waits_for_session_readiness() -> None:
 
     assert "if (message.type === 'session.updated' && !ready)" in app
     assert "const sendIntervalMs = 80;" in app
+    assert "const playbackBufferMs = 160;" in app
     readiness = app.index("await openSocket();")
     running = app.index("running = true;", readiness)
     send_timer = app.index("window.setInterval(flushCapture", running)

@@ -9,9 +9,9 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "$script_dir/../../.." && pwd)"
 
-checkpoint="${1:-/home/anders/repos/duplexio/checkpoints/duplexio-475001-checkpoint-7-vllm}"
+checkpoint="${1:-/home/anders/repos/duplexio/checkpoints/duplexio-475001-checkpoint-7-vllm-serving-bf16}"
 voice="${2:-69f67cf0ae15b9e491cd6b21}"
-deploy_config="$repo_dir/vllm_omni/deploy/duplexio.yaml"
+deploy_config="$repo_dir/vllm_omni/deploy/duplexio-multistream.yaml"
 python="$repo_dir/.venv/bin/python"
 vllm_omni="$repo_dir/.venv/bin/vllm-omni"
 web_server="$script_dir/realtime_web/server.py"

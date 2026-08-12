@@ -282,14 +282,9 @@ class DuplexIOServingRuntimeAdapter:
             )
         if config.temperature is not None:
             text_sampling["temperature"] = config.temperature
-        emit_temperature = (
-            0.0
-            if text_sampling.get("mode") in {"argmax", "max"}
-            else text_sampling["temperature"]
-        )
         emit_temperatures = {
             "user": 0.0,
-            "agent": emit_temperature,
+            "agent": 1.0,
             "tool_call": 1.0,
         }
         if client_sampling.emit is not None:
@@ -297,7 +292,7 @@ class DuplexIOServingRuntimeAdapter:
                 client_sampling.emit.model_dump(exclude_none=True)
             )
         depth_sampling = {
-            "temperature": depth.get("sampling_temperature", 0.8),
+            "temperature": 0.7,
             "top_k": depth.get("sampling_top_k", 250),
         }
         if client_sampling.audio is not None:

@@ -14,6 +14,9 @@ from vllm_omni.model_executor.models.duplexio.audio_representation import (
     DelayedMimiRepresentation,
     MimiEmbedding,
 )
+from vllm_omni.model_executor.models.duplexio.depth_sampler import (
+    DepthSpeakerConditioning,
+)
 from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FastConformerStreamingState,
 )
@@ -127,6 +130,7 @@ def model_fixture() -> SimpleNamespace:
         ),
         user_asr_proj=nn.Linear(4, representation_dim, bias=False),
         user_asr_encoder=FakeUserASREncoder(),
+        compiled_user_asr_step=None,
         user_audio_input_adapter=AudioInputAdapter(
             representation_dim,
             7,
@@ -149,6 +153,10 @@ def model_fixture() -> SimpleNamespace:
     )
     model.encode_silent_agent_frames = MethodType(
         DuplexIOForConditionalGeneration.encode_silent_agent_frames,
+        model,
+    )
+    model.step_user_asr = MethodType(
+        DuplexIOForConditionalGeneration.step_user_asr,
         model,
     )
     return model
@@ -182,6 +190,10 @@ def request_state(model: SimpleNamespace) -> DuplexIORequestState:
         ),
         user_asr_prefill_features=torch.randn(3, 4),
         speaker_embedding=torch.randn(3),
+        depth_speaker_conditioning=DepthSpeakerConditioning(
+            attention=(),
+            feedforward=(),
+        ),
         system_token_ids=(3, 4, 5),
         sampling_generator=torch.Generator().manual_seed(9),
         cache_epoch=7,

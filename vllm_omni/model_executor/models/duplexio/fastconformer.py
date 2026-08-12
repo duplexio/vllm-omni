@@ -78,10 +78,18 @@ class FilterbankFeatures(nn.Module):
 
     def __init__(self, config: FastConformerConfig) -> None:
         super().__init__()
-        self.register_buffer("window", torch.empty(config.window_size))
+        self.register_buffer(
+            "window",
+            torch.empty(config.window_size, dtype=torch.float32),
+        )
         self.register_buffer(
             "fb",
-            torch.empty(1, config.features, config.n_fft // 2 + 1),
+            torch.empty(
+                1,
+                config.features,
+                config.n_fft // 2 + 1,
+                dtype=torch.float32,
+            ),
         )
 
 
@@ -821,6 +829,32 @@ class FastConformerUserEncoder(nn.Module):
         assert waveform.shape == (1, 1, self.config.frame_size)
         features, state = self.step_sequence(waveform, state)
         return features[0], state
+
+    def steady_step(
+        self,
+        waveform: Tensor,
+        sample_buffer: Tensor,
+        feature_buffer: Tensor,
+        *caches: Tensor,
+    ) -> tuple[Tensor, ...]:
+        """Advance one frame once every bounded encoder cache is populated."""
+        layer_count = self.config.num_layers
+        assert len(caches) == 2 * layer_count
+        state = FastConformerStreamingState(
+            sample_buffer=sample_buffer,
+            feature_buffer=feature_buffer,
+            attention_caches=tuple(caches[:layer_count]),
+            convolution_caches=tuple(caches[layer_count:]),
+            frames_seen=self.config.attention_left_context,
+        )
+        features, next_state = self.step_sequence(waveform, state)
+        return (
+            features,
+            next_state.sample_buffer,
+            next_state.feature_buffer,
+            *next_state.attention_caches,
+            *next_state.convolution_caches,
+        )
 
     def step_sequence(
         self,

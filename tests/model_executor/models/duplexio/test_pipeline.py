@@ -24,13 +24,28 @@ def test_default_deploy_uses_flexattention_compatible_tiles() -> None:
     assert deploy.enable_chunked_prefill
     assert not stage.enforce_eager
     assert stage.compilation_config == {
-        "mode": 0,
+        "mode": 3,
         "cudagraph_mode": "FULL",
         "cudagraph_capture_sizes": [6],
+        "compile_sizes": ["cudagraph_capture_sizes"],
         "cudagraph_copy_inputs": True,
     }
     assert stage.engine_extras["attention_config"] == {
         "flex_attn_block_m": 16,
         "flex_attn_block_n": 16,
         "flex_attn_kv_block_size": 64,
+    }
+
+
+def test_multistream_deploy_uses_batched_flexattention_path() -> None:
+    deploy = load_deploy_config(DEPLOY_DIR / "duplexio-multistream.yaml")
+    stage = deploy.stages[0]
+
+    assert deploy.active_stream_window == 2
+    assert deploy.duplex_session.max_sessions == 2
+    assert stage.max_num_seqs == 2
+    assert not stage.enforce_eager
+    assert stage.compilation_config == {
+        "mode": 3,
+        "cudagraph_mode": "NONE",
     }

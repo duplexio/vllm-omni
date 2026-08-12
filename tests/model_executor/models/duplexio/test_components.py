@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import nn
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
 
@@ -216,6 +217,35 @@ def test_duplexio_single_request_convolution_updates_state_without_scalar_reads(
     torch.testing.assert_close(
         conv_state,
         torch.tensor([[[5.0, 6.0]], [[7.0, 8.0]]]),
+    )
+
+
+def test_duplexio_batched_convolution_keeps_request_histories_separate() -> None:
+    attention = DuplexIOQwenGatedDeltaNetAttention.__new__(
+        DuplexIOQwenGatedDeltaNetAttention
+    )
+    nn.Module.__init__(attention)
+    attention.full_cudagraph_enabled = True
+    attention.conv1d = nn.Conv1d(1, 1, 3, groups=1, bias=False)
+    attention.conv1d.weight.data.copy_(torch.tensor([[[1.0, 0.0, 0.0]]]))
+    attention.activation = "silu"
+    conv_state = torch.tensor([[[2.0, 3.0]], [[7.0, 8.0]]])
+
+    output = attention.apply_stream_causal_conv(
+        mixed_qkv=torch.tensor([[5.0], [6.0], [9.0], [10.0]]),
+        conv_state=conv_state,
+        state_indices=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2, 4]),
+        has_initial_state=torch.tensor([True, False]),
+    )
+
+    torch.testing.assert_close(
+        output[:, 0],
+        torch.nn.functional.silu(torch.tensor([2.0, 3.0, 0.0, 0.0])),
+    )
+    torch.testing.assert_close(
+        conv_state,
+        torch.tensor([[[5.0, 6.0]], [[9.0, 10.0]]]),
     )
 
 
@@ -563,10 +593,48 @@ def test_speaker_depth_sampling_is_deterministic_at_top_k_one() -> None:
     text_tokens = torch.tensor([2, 4])
     speakers = torch.randn(2, 6)
 
-    first = model.sample(conditioning, text_tokens, speakers)
-    second = model.sample(conditioning, text_tokens, speakers)
+    speaker_conditioning = model.prepare_speaker(speakers)
+    first = model.sample(conditioning, text_tokens, speaker_conditioning)
+    second = model.sample(conditioning, text_tokens, speaker_conditioning)
 
     torch.testing.assert_close(first, second)
+
+
+def test_depth_sampler_runs_with_native_bfloat16_parameters() -> None:
+    torch.manual_seed(1)
+    model = DepthAutoregressiveSampler(
+        DepthSamplerConfig(
+            conditioning_dim=5,
+            speaker_embedding_dim=6,
+            text_vocab_size=11,
+            codebook_size=7,
+            num_codebooks=3,
+            low_rank_embeddings=2,
+            dim=8,
+            num_layers=2,
+            num_heads=2,
+            feedforward_dim=12,
+            sampling_top_k=1,
+        )
+    ).eval().bfloat16()
+    conditioning = torch.randn(2, 5, dtype=torch.bfloat16)
+    text_tokens = torch.tensor([2, 4])
+    speakers = torch.randn(2, 6, dtype=torch.bfloat16)
+
+    speaker_conditioning = model.prepare_speaker(speakers)
+    sampled = model.sample(
+        conditioning,
+        text_tokens,
+        speaker_conditioning,
+    )
+
+    assert sampled.shape == (2, 3)
+    assert all(
+        layer.shift.dtype == torch.bfloat16
+        and layer.scale.dtype == torch.bfloat16
+        for layer in speaker_conditioning.attention
+        + speaker_conditioning.feedforward
+    )
 
 
 def test_factorized_text_argmax_excludes_silence_from_content() -> None:
@@ -638,9 +706,11 @@ def test_speaker_depth_conditioning_changes_adaptive_normalization() -> None:
     speakers = torch.randn(2, 6)
     speaker_states = model.speaker_projection(speakers)
     norm = model.transformer.layers[0].attention_norm
+    first_conditioning = norm.prepare(speaker_states)
+    second_conditioning = norm.prepare(speaker_states.flip(0))
 
-    first = norm(hidden, speaker_states)
-    second = norm(hidden, speaker_states.flip(0))
+    first = norm(hidden, first_conditioning)
+    second = norm(hidden, second_conditioning)
 
     assert not torch.allclose(first, second)
 
@@ -670,6 +740,40 @@ def test_depth_sampler_uses_current_checkpoint_module_names() -> None:
     assert "transformer.layers.0.feedforward.layers.0.input.weight" in keys
     assert "transformer.layers.0.attention_norm.modulation.1.weight" in keys
     assert "heads.0.weight" in keys
+
+
+def test_fastconformer_keeps_only_preprocessing_buffers_in_float32() -> None:
+    config = FastConformerConfig(
+        source_sample_rate=96,
+        sample_rate=64,
+        frame_size=96,
+        features=8,
+        n_fft=32,
+        window_size=24,
+        window_stride=8,
+        subsampling_conv_channels=4,
+        num_layers=2,
+        dim=8,
+        feedforward_dim=16,
+        num_heads=2,
+        attention_left_context=3,
+        convolution_kernel_size=3,
+    )
+    with set_default_torch_dtype(torch.bfloat16):
+        model = FastConformerUserEncoder(
+            config,
+            compute_dtype=torch.bfloat16,
+        )
+
+    assert {parameter.dtype for parameter in model.parameters()} == {
+        torch.bfloat16
+    }
+    assert {
+        name: buffer.dtype for name, buffer in model.named_buffers()
+    } == {
+        "preprocessor.featurizer.window": torch.float32,
+        "preprocessor.featurizer.fb": torch.float32,
+    }
 
 
 def test_fastconformer_streaming_matches_full_prefix_and_stays_bounded() -> None:
@@ -775,6 +879,42 @@ def test_fastconformer_step_sequence_matches_serial_steps(
     with torch.inference_mode():
         for frame in frames[:prefix_frames]:
             _, prefix_state = model.step(frame, prefix_state)
+
+    if prefix_frames == config.attention_left_context:
+        with torch.inference_mode():
+            expected_feature, expected_state = model.step(
+                frames[prefix_frames],
+                prefix_state,
+            )
+            steady_outputs = model.steady_step(
+                frames[prefix_frames],
+                prefix_state.sample_buffer,
+                prefix_state.feature_buffer,
+                *prefix_state.attention_caches,
+                *prefix_state.convolution_caches,
+            )
+        layer_count = config.num_layers
+        torch.testing.assert_close(steady_outputs[0][0], expected_feature)
+        torch.testing.assert_close(
+            steady_outputs[1],
+            expected_state.sample_buffer,
+        )
+        torch.testing.assert_close(
+            steady_outputs[2],
+            expected_state.feature_buffer,
+        )
+        for actual, expected in zip(
+            steady_outputs[3 : 3 + layer_count],
+            expected_state.attention_caches,
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected)
+        for actual, expected in zip(
+            steady_outputs[3 + layer_count :],
+            expected_state.convolution_caches,
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected)
 
     serial_state = prefix_state
     serial_features = []

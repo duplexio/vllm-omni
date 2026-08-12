@@ -169,6 +169,46 @@ def test_pcm_reservations_commit_in_wire_order() -> None:
     assert not buffer.has_reserved()
 
 
+def test_buffered_drain_waits_for_earlier_wire_reservation() -> None:
+    buffer = DuplexIOPcmAppendBuffer()
+    samples = np.arange(3 * DUPLEXIO_FRAME_SIZE, dtype=np.float32)
+    first = buffer.prepare_append(
+        _payload(samples[: 2 * DUPLEXIO_FRAME_SIZE]),
+        operation_id="first",
+        chunk_period_ms=80,
+        allow_emit=True,
+    )
+    second = buffer.prepare_append(
+        _payload(samples[2 * DUPLEXIO_FRAME_SIZE :]),
+        operation_id="second",
+        chunk_period_ms=80,
+        allow_emit=True,
+    )
+    assert first is not None and second is not None
+
+    first.commit()
+
+    assert (
+        buffer.prepare_buffered_append(
+            operation_id="third",
+            chunk_period_ms=80,
+        )
+        is None
+    )
+    second.commit()
+    third = buffer.prepare_buffered_append(
+        operation_id="third",
+        chunk_period_ms=80,
+    )
+    assert third is not None and third.payload is not None
+    np.testing.assert_array_equal(
+        _decoded(third.payload),
+        samples[2 * DUPLEXIO_FRAME_SIZE :],
+    )
+    third.commit()
+    assert not buffer.has_reserved()
+
+
 @pytest.mark.parametrize(
     "payload, message",
     [
