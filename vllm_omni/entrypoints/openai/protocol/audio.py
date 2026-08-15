@@ -107,12 +107,12 @@ class OpenAICreateSpeechRequest(BaseModel):
     moss_session_id: str | None = Field(
         default=None,
         exclude=True,
-        description="Internal MOSS-TTSD continuation session identifier.",
+        description="Internal MOSS turnwise continuation session identifier.",
     )
     moss_session_role: Literal["user", "assistant"] | None = Field(
         default=None,
         exclude=True,
-        description="Internal speaker role for a MOSS-TTSD continuation turn.",
+        description="Internal speaker role for a MOSS turnwise continuation turn.",
     )
     ambient_sound: str | None = Field(
         default=None,
@@ -412,6 +412,33 @@ class MossTTSDTurnRequest(BaseModel):
     role: Literal["user", "assistant"]
     text: str = Field(min_length=1)
     max_new_tokens: int = Field(default=640, gt=0, le=4096)
+    seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
+
+
+class MossTTSRealtimeVoicePrompt(BaseModel):
+    """One reference voice for a Realtime session.
+
+    Realtime conditions on the reference audio codes only; unlike MOSS-TTSD,
+    it does not consume a reference transcript during prompt construction.
+    """
+
+    ref_audio: str = Field(validation_alias=AliasChoices("ref_audio", "audio_path"))
+
+
+class MossTTSRealtimeCreateSessionRequest(BaseModel):
+    """Two reference voices used to initialize a Realtime turn session."""
+
+    session_id: str = Field(min_length=1)
+    user: MossTTSRealtimeVoicePrompt
+    assistant: MossTTSRealtimeVoicePrompt
+
+
+class MossTTSRealtimeTurnRequest(BaseModel):
+    """One text turn synthesized with the preceding turn as context."""
+
+    role: Literal["user", "assistant"]
+    text: str = Field(min_length=1)
+    max_new_tokens: int = Field(default=512, gt=0, le=4096)
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
 
 

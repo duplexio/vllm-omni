@@ -555,7 +555,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         ref_codes: torch.Tensor | None,
         device: torch.device,
     ) -> torch.Tensor:
-        """Return per-codebook token history for the official repetition penalty."""
+        """Return the checkpoint's channel-0 and shared residual token history."""
         seen = torch.zeros(
             (self.n_vq, self.audio_vocab_size + 1),
             dtype=torch.bool,
@@ -568,9 +568,21 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
                 "MOSS-TTS reference codes must have shape "
                 f"(frames, {self.n_vq}), got {tuple(ref_codes.shape)}"
             )
-        history = ref_codes.to(device=device).t().contiguous()
-        seen.scatter_(1, history, True)
+        history = ref_codes.to(device=device)
+        seen[0].scatter_(0, history[:, 0], True)
+        residual_history = history[:, 1:].reshape(1, -1).expand(self.n_vq - 1, -1)
+        seen[1:].scatter_(1, residual_history, True)
         return seen
+
+    def update_audio_seen(
+        self,
+        seen: torch.Tensor,
+        new_codes: torch.Tensor,
+    ) -> None:
+        """Update repetition history exactly as the checkpoint sampler does."""
+        seen[0, new_codes[0]] = True
+        residual_codes = new_codes[1:].reshape(1, -1).expand(self.n_vq - 1, -1)
+        seen[1:].scatter_(1, residual_codes, True)
 
     def sample_audio_logits(
         self,
@@ -745,7 +757,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
                 if not isinstance(seen, torch.Tensor):
                     raise RuntimeError("MOSS-TTS audio token history was not initialized during prefill")
                 new_codes = self._sample_audio_codes(last_h, state, seen)  # (n_vq,)
-                seen.scatter_(1, new_codes.unsqueeze(1), True)
+                self.update_audio_seen(seen, new_codes)
 
                 acc = audio_codes.get("accumulated")
                 if isinstance(acc, torch.Tensor) and acc.numel() > 0:
@@ -1071,12 +1083,16 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
             remaining = (info_dict.get("ids", {}) or {}).get("all")
             if not isinstance(remaining, list):
                 remaining = []
+            max_new_frames = info_dict.get("max_new_frames", -1)
+            if isinstance(max_new_frames, (list, tuple)):
+                max_new_frames = max_new_frames[0] if max_new_frames else -1
             info_update: dict[str, Any] = {
                 "audio_state": {
                     "is_stopping": False,
                     "step": 0,
                     "text_cursor": 0,
                     "remaining_text": list(remaining),
+                    "max_new_frames": int(max_new_frames) if max_new_frames is not None else -1,
                 },
                 "audio_codes": {"current": current_codes},
                 "ref_offset": ref_offset + span_len,
@@ -1213,6 +1229,9 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
 
                 info["audio_codes"] = {"current": new_codes, "accumulated": updated_acc}
                 state["step"] = int(state.get("step", 0)) + 1
+                max_new_frames = int(state.get("max_new_frames", -1))
+                if max_new_frames > 0 and updated_acc.shape[0] >= max_new_frames:
+                    state["is_stopping"] = True
                 per_req_codes[i] = new_codes.unsqueeze(0)
                 have_codes = True
 

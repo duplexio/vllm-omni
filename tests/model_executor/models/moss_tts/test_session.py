@@ -99,7 +99,7 @@ def test_session_rejects_overlapping_turns() -> None:
         raise AssertionError("overlapping turn was accepted")
 
 
-def test_adjacent_same_speaker_turns_extend_one_transcript_segment() -> None:
+def test_adjacent_same_speaker_turns_preserve_each_turn_boundary() -> None:
     store = MossTTSDSessionStore()
     session = store.create(
         "conversation",
@@ -112,25 +112,23 @@ def test_adjacent_same_speaker_turns_extend_one_transcript_segment() -> None:
     store.commit_turn(first, generated_codes=torch.full((5, 4), 3))
     second = store.begin_turn("conversation", "assistant", "Great news, it passed.")
 
-    assert not first.continues_previous
-    assert second.continues_previous
     assert second.full_text == (
         "[S1] User reference. [S2] Assistant reference. "
-        "[S2] Running that test now. Great news, it passed."
+        "[S2] Running that test now. [S2] Great news, it passed."
     )
     assert second.audio_prefix_codes.shape == (11, 4)
 
     store.commit_turn(second, generated_codes=torch.full((7, 4), 4))
 
     assert [segment.render() for segment in session.completed_segments] == [
-        "[S2] Running that test now. Great news, it passed."
+        "[S2] Running that test now.",
+        "[S2] Great news, it passed.",
     ]
     assert session.audio_prefix_codes.shape == (18, 4)
 
     user = store.begin_turn("conversation", "user", "What changed?")
 
-    assert not user.continues_previous
     assert user.full_text == (
         "[S1] User reference. [S2] Assistant reference. "
-        "[S2] Running that test now. Great news, it passed. [S1] What changed?"
+        "[S2] Running that test now. [S2] Great news, it passed. [S1] What changed?"
     )

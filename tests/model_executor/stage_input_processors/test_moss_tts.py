@@ -68,3 +68,17 @@ def test_delay_processor_without_context_decodes_only_generated_codes() -> None:
     assert payload.meta.left_context_size == 0
     assert payload.codes is not None
     assert payload.codes.audio == [10, 11, 20, 21]
+
+
+def test_delay_processor_rejects_incomplete_audio_frame() -> None:
+    generated = torch.tensor([[10, 20], [11, 21]], dtype=torch.long)
+    delayed = delayed_codes(generated)
+    delayed[1, 1] = AUDIO_PAD_CODE
+
+    with pytest.raises(RuntimeError, match="delay tail did not finish cleanly"):
+        talker2codec_delay_async_chunk(
+            SimpleNamespace(),
+            {"codes": {"audio": delayed}},
+            request_with_codec_context(None),
+            is_finished=True,
+        )

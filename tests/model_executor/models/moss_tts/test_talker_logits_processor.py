@@ -206,3 +206,34 @@ def test_moss_tts_audio_sampler_matches_checkpoint_filters(monkeypatch: pytest.M
         captured["probs"],
         torch.tensor([[0.26894143, 0.7310586, 0.0, 0.0, 0.0]]),
     )
+
+
+def test_moss_tts_residual_codebooks_share_checkpoint_repetition_history() -> None:
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import (
+        MossTTSDelayTalkerForGeneration,
+    )
+
+    model = MossTTSDelayTalkerForGeneration.__new__(MossTTSDelayTalkerForGeneration)
+    nn.Module.__init__(model)
+    model.n_vq = 4
+    model.audio_vocab_size = 9
+    ref_codes = torch.tensor(
+        [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+        ],
+        dtype=torch.long,
+    )
+
+    seen = model.initial_audio_seen(ref_codes, torch.device("cpu"))
+
+    expected = torch.zeros((4, 10), dtype=torch.bool)
+    expected[0, [1, 5]] = True
+    expected[1:, [2, 3, 4, 6, 7, 8]] = True
+    torch.testing.assert_close(seen, expected)
+
+    model.update_audio_seen(seen, torch.tensor([9, 1, 5, 0]))
+
+    expected[0, 9] = True
+    expected[1:, [0, 1, 5]] = True
+    torch.testing.assert_close(seen, expected)

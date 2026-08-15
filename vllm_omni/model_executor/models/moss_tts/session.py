@@ -1,7 +1,7 @@
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
-"""Server-owned state for turnwise MOSS-TTSD continuation."""
+"""Server-owned state for turnwise MOSS-TTS continuation."""
 
 from __future__ import annotations
 
@@ -39,7 +39,6 @@ class MossTTSDTurn:
     full_text: str
     role: SpeakerRole
     text: str
-    continues_previous: bool
     reference_codes: tuple[torch.Tensor, torch.Tensor]
     audio_prefix_codes: torch.Tensor
     cache_salt: str
@@ -141,21 +140,10 @@ class MossTTSDSessionStore:
         if not normalized_text:
             raise ValueError("MOSS-TTSD turn text cannot be empty")
 
-        continues_previous = bool(
-            session.completed_segments
-            and session.completed_segments[-1].role == role
-        )
         prompt_segments = list(session.completed_segments)
-        if continues_previous:
-            previous = prompt_segments[-1]
-            prompt_segments[-1] = MossTTSDTranscriptSegment(
-                role=role,
-                text=f"{previous.text} {normalized_text}",
-            )
-        else:
-            prompt_segments.append(
-                MossTTSDTranscriptSegment(role=role, text=normalized_text)
-            )
+        prompt_segments.append(
+            MossTTSDTranscriptSegment(role=role, text=normalized_text)
+        )
         full_text = " ".join(
             [
                 *session.reference_text,
@@ -170,7 +158,6 @@ class MossTTSDSessionStore:
             full_text=full_text,
             role=role,
             text=normalized_text,
-            continues_previous=continues_previous,
             reference_codes=session.reference_codes,
             audio_prefix_codes=session.audio_prefix_codes,
             cache_salt=session.cache_salt,
@@ -190,25 +177,13 @@ class MossTTSDSessionStore:
                 "generated_codes must have shape (frames, codebooks), "
                 f"got {tuple(generated.shape)}"
             )
-        if turn.continues_previous:
-            assert (
-                session.completed_segments
-                and session.completed_segments[-1].role == turn.role
-            )
         session.audio_prefix_codes = torch.cat(
             [session.audio_prefix_codes, generated],
             dim=0,
         )
-        if turn.continues_previous:
-            previous = session.completed_segments[-1]
-            session.completed_segments[-1] = MossTTSDTranscriptSegment(
-                role=turn.role,
-                text=f"{previous.text} {turn.text}",
-            )
-        else:
-            session.completed_segments.append(
-                MossTTSDTranscriptSegment(role=turn.role, text=turn.text)
-            )
+        session.completed_segments.append(
+            MossTTSDTranscriptSegment(role=turn.role, text=turn.text)
+        )
         session.revision += 1
         session.in_flight = False
         session.updated_at = time.monotonic()
@@ -253,6 +228,183 @@ class MossTTSDSessionStore:
         if not session.in_flight or session.revision != turn.revision:
             raise RuntimeError(
                 "Stale MOSS-TTSD turn commit: "
+                f"session={turn.session_id} expected_revision={session.revision} "
+                f"turn_revision={turn.revision}"
+            )
+
+
+@dataclass(frozen=True)
+class MossTTSRealtimeTurn:
+    """Immutable prompt view reserved for one Realtime turn."""
+
+    session_id: str
+    revision: int
+    role: SpeakerRole
+    text: str
+    reference_codes: tuple[torch.Tensor, torch.Tensor]
+    previous_text: str | None
+    previous_codes: torch.Tensor | None
+    cache_salt: str
+
+
+@dataclass
+class MossTTSRealtimeSession:
+    """Bounded state for a turnwise MOSS-TTS-Realtime conversation.
+
+    Realtime's public processor has one explicit user-context slot.  Keeping
+    only the most recent completed turn is therefore both the model's native
+    contract and a useful invariant for predictable prompt lengths.
+    """
+
+    session_id: str
+    reference_codes: tuple[torch.Tensor, torch.Tensor]
+    cache_salt: str
+    previous_text: str | None = None
+    previous_codes: torch.Tensor | None = None
+    revision: int = 0
+    in_flight: bool = False
+    updated_at: float = field(default_factory=time.monotonic)
+
+
+class MossTTSRealtimeSessionStore:
+    """Bounded in-memory state for batched Realtime turn requests."""
+
+    def __init__(self, max_sessions: int = 2048, ttl_seconds: float = 3600.0) -> None:
+        if max_sessions <= 0:
+            raise ValueError(f"max_sessions must be positive, got {max_sessions}")
+        if ttl_seconds <= 0:
+            raise ValueError(f"ttl_seconds must be positive, got {ttl_seconds}")
+        self.max_sessions = max_sessions
+        self.ttl_seconds = ttl_seconds
+        self.sessions: dict[str, MossTTSRealtimeSession] = {}
+
+    def create(
+        self,
+        session_id: str,
+        reference_codes: tuple[torch.Tensor, torch.Tensor],
+    ) -> MossTTSRealtimeSession:
+        """Create a session with two already-encoded reference voices."""
+        self.prune()
+        normalized_id = session_id.strip()
+        if not normalized_id:
+            raise ValueError("session_id cannot be empty")
+        if normalized_id in self.sessions:
+            raise ValueError(f"MOSS-TTS-Realtime session already exists: {normalized_id}")
+        if len(self.sessions) >= self.max_sessions:
+            idle = [session for session in self.sessions.values() if not session.in_flight]
+            if not idle:
+                raise RuntimeError("MOSS-TTS-Realtime session capacity is exhausted")
+            oldest = min(idle, key=lambda session: session.updated_at)
+            del self.sessions[oldest.session_id]
+
+        if len(reference_codes) != 2:
+            raise ValueError(f"MOSS-TTS-Realtime requires two reference tensors, got {len(reference_codes)}")
+        refs = tuple(code.detach().to("cpu", torch.long).contiguous() for code in reference_codes)
+        for index, code in enumerate(refs):
+            if code.ndim != 2 or code.shape[0] == 0:
+                raise ValueError(
+                    f"reference_codes[{index}] must have shape (frames, codebooks), got {tuple(code.shape)}"
+                )
+        if refs[0].shape[1] != refs[1].shape[1]:
+            raise ValueError(
+                "MOSS-TTS-Realtime reference codebooks differ: "
+                f"{refs[0].shape[1]} != {refs[1].shape[1]}"
+            )
+
+        session = MossTTSRealtimeSession(
+            session_id=normalized_id,
+            reference_codes=(refs[0], refs[1]),
+            cache_salt=f"moss-realtime:{secrets.token_hex(16)}",
+        )
+        self.sessions[normalized_id] = session
+        return session
+
+    def begin_turn(self, session_id: str, role: SpeakerRole, text: str) -> MossTTSRealtimeTurn:
+        """Reserve a turn and snapshot the immediately preceding context."""
+        self.prune()
+        session = self.get(session_id)
+        if session.in_flight:
+            raise RuntimeError(f"MOSS-TTS-Realtime session already has an in-flight turn: {session_id}")
+        normalized_text = text.strip()
+        if not normalized_text:
+            raise ValueError("MOSS-TTS-Realtime turn text cannot be empty")
+        session.in_flight = True
+        session.updated_at = time.monotonic()
+        previous_codes = session.previous_codes
+        if previous_codes is not None:
+            previous_codes = previous_codes.clone()
+        return MossTTSRealtimeTurn(
+            session_id=session.session_id,
+            revision=session.revision,
+            role=role,
+            text=normalized_text,
+            reference_codes=session.reference_codes,
+            previous_text=session.previous_text,
+            previous_codes=previous_codes,
+            cache_salt=session.cache_salt,
+        )
+
+    def commit_turn(self, turn: MossTTSRealtimeTurn, generated_codes: torch.Tensor) -> int:
+        """Store the generated frames as context for the next turn."""
+        session = self.get(turn.session_id)
+        self.check_pending_turn(session, turn)
+        generated = generated_codes.detach().to("cpu", torch.long).contiguous().clone()
+        if generated.ndim != 2 or generated.shape[0] == 0:
+            raise ValueError(
+                "generated_codes must have shape (frames, codebooks), "
+                f"got {tuple(generated.shape)}"
+            )
+        if generated.shape[1] != session.reference_codes[0].shape[1]:
+            raise ValueError(
+                "generated and reference codebooks differ: "
+                f"{generated.shape[1]} != {session.reference_codes[0].shape[1]}"
+            )
+        session.previous_text = turn.text
+        session.previous_codes = generated
+        session.revision += 1
+        session.in_flight = False
+        session.updated_at = time.monotonic()
+        return session.revision
+
+    def abort_turn(self, turn: MossTTSRealtimeTurn) -> None:
+        """Release an in-flight reservation without changing the context."""
+        session = self.sessions.get(turn.session_id)
+        if session is None or session.revision != turn.revision:
+            return
+        session.in_flight = False
+        session.updated_at = time.monotonic()
+
+    def delete(self, session_id: str) -> bool:
+        session = self.sessions.get(session_id)
+        if session is None:
+            return False
+        if session.in_flight:
+            raise RuntimeError(f"Cannot delete an in-flight MOSS-TTS-Realtime session: {session_id}")
+        del self.sessions[session_id]
+        return True
+
+    def get(self, session_id: str) -> MossTTSRealtimeSession:
+        try:
+            return self.sessions[session_id]
+        except KeyError as exc:
+            raise KeyError(f"Unknown or expired MOSS-TTS-Realtime session: {session_id}") from exc
+
+    def prune(self) -> int:
+        expires_before = time.monotonic() - self.ttl_seconds
+        expired = [
+            session_id
+            for session_id, session in self.sessions.items()
+            if not session.in_flight and session.updated_at < expires_before
+        ]
+        for session_id in expired:
+            del self.sessions[session_id]
+        return len(expired)
+
+    @staticmethod
+    def check_pending_turn(session: MossTTSRealtimeSession, turn: MossTTSRealtimeTurn) -> None:
+        if not session.in_flight or session.revision != turn.revision:
+            raise RuntimeError(
+                "Stale MOSS-TTS-Realtime turn commit: "
                 f"session={turn.session_id} expected_revision={session.revision} "
                 f"turn_revision={turn.revision}"
             )

@@ -42,6 +42,8 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     CreateAudio,
     MossTTSDCreateSessionRequest,
     MossTTSDTurnRequest,
+    MossTTSRealtimeCreateSessionRequest,
+    MossTTSRealtimeTurnRequest,
     OpenAICreateSpeechRequest,
     SpeechBatchItem,
     SpeechBatchItemResult,
@@ -478,12 +480,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._moss_variant = self._detect_moss_variant() if self._tts_model_type == "moss_tts" else None
         self._moss_ttsd_sessions = None
         self._moss_ttsd_pending_turns = {}
+        self._moss_realtime_sessions = None
+        self._moss_realtime_pending_turns = {}
         if self._moss_variant == "ttsd":
             from vllm_omni.model_executor.models.moss_tts.session import MossTTSDSessionStore
 
             self._moss_ttsd_sessions = MossTTSDSessionStore(
                 max_sessions=int(os.environ.get("MOSS_TTSD_MAX_SESSIONS", "2048")),
                 ttl_seconds=float(os.environ.get("MOSS_TTSD_SESSION_TTL_SECONDS", "3600")),
+            )
+        elif self._moss_variant == "realtime":
+            from vllm_omni.model_executor.models.moss_tts.session import MossTTSRealtimeSessionStore
+
+            self._moss_realtime_sessions = MossTTSRealtimeSessionStore(
+                max_sessions=int(os.environ.get("MOSS_REALTIME_MAX_SESSIONS", "2048")),
+                ttl_seconds=float(os.environ.get("MOSS_REALTIME_SESSION_TTL_SECONDS", "3600")),
             )
 
         # GLM-TTS lazy-cached resources (populated on first GLM-TTS request)
@@ -1791,7 +1802,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Validate any MOSS-TTS-family request (nano + 5 full variants).
 
         Dispatches by ``self._moss_variant``:
-          - ``tts``/``realtime``: require ``ref_audio`` (voice cloning).
+          - ``tts``/``realtime``: require ``ref_audio`` for one-shot requests;
+            Realtime session turns use the encoded session references.
           - ``ttsd``: require ``ref_audio`` (speaker 1); ``ref_audio_2``
             optional (defaults to the same ref for both speakers).
           - ``sound_effect``: require ``ambient_sound`` (no ref_audio).
@@ -1805,6 +1817,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return "Input text cannot be empty"
 
         v = self._moss_variant
+        if v == "realtime" and request.moss_session_id is not None:
+            if request.moss_session_role is None:
+                return "MOSS-TTS-Realtime session turns require 'moss_session_role'."
+            if request.stream:
+                return "MOSS-TTS-Realtime session turns do not support streaming."
+            try:
+                self._require_moss_realtime_sessions().get(request.moss_session_id)
+            except KeyError as exc:
+                return str(exc)
+            return None
+
         if v in (None, "tts", "realtime", "local"):
             if request.ref_audio is None:
                 label = (
@@ -1877,10 +1900,101 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._moss_processor_cache = proc
         return proc
 
+    def _get_moss_realtime_processor(self):
+        """Load the Realtime processor shipped in the model snapshot.
+
+        The Realtime repository declares an ``AutoProcessor`` mapping but does
+        not ship ``processor_config.json``.  Transformers therefore cannot
+        discover it through ``AutoProcessor.from_pretrained``; loading the
+        declared module directly is the same path used by the upstream
+        offline example and avoids a second prompt implementation.
+        """
+        cached = getattr(self, "_moss_realtime_processor_cache", None)
+        if cached is not None:
+            return cached
+        import importlib.util
+        import sys
+
+        from transformers import AutoTokenizer
+
+        model_id = self.engine_client.model_config.model
+        snapshot_dir = Path(model_id)
+        if not (snapshot_dir / "processing_mossttsrealtime.py").exists():
+            from huggingface_hub import snapshot_download
+
+            snapshot_dir = Path(snapshot_download(repo_id=model_id))
+        module_path = snapshot_dir / "processing_mossttsrealtime.py"
+        if not module_path.exists():
+            raise FileNotFoundError(f"MOSS-TTS-Realtime processor module missing at {module_path}")
+        module_name = "_vllm_omni_moss_tts_realtime_processor_" + hashlib.sha1(
+            str(snapshot_dir).encode("utf-8")
+        ).hexdigest()[:12]
+        module = sys.modules.get(module_name)
+        if module is None:
+            spec = importlib.util.spec_from_file_location(module_name, module_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Could not load MOSS-TTS-Realtime processor from {module_path}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        processor = module.MossTTSRealtimeProcessor(tokenizer=tokenizer)
+        self._moss_realtime_processor_cache = processor
+        return processor
+
+    def _get_moss_realtime_codec(self):
+        """Load the standalone 16-codebook reference encoder on CPU once."""
+        cached = getattr(self, "_moss_realtime_codec_cache", None)
+        if cached is not None:
+            return cached
+        from transformers import AutoModel
+
+        codec = AutoModel.from_pretrained(
+            "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+            trust_remote_code=True,
+        ).to("cpu").eval()
+        self._moss_realtime_codec_cache = codec
+        return codec
+
+    async def _encode_moss_realtime_reference(
+        self,
+        ref_audio: str,
+        *,
+        resolved_audio: tuple[list[float], int] | None = None,
+    ) -> torch.Tensor:
+        """Resolve/cache/encode one Realtime reference clip."""
+        from vllm_omni.model_executor.models.moss_tts.realtime_prompt import (
+            encode_realtime_reference,
+        )
+
+        source_key = hashlib.sha1(ref_audio.encode("utf-8")).hexdigest()
+        cache_key = self._speaker_cache.make_cache_key(
+            f"realtime-ref:{source_key}",
+            model_type="moss_tts_realtime_nq16",
+        )
+        cached = self._speaker_cache.get(cache_key)
+        if cached is not None:
+            return cached["codes"].clone()
+        if resolved_audio is None:
+            resolved_audio = await self._resolve_ref_audio(ref_audio)
+        codes = await asyncio.to_thread(
+            encode_realtime_reference,
+            self._get_moss_realtime_codec(),
+            resolved_audio[0],
+            resolved_audio[1],
+        )
+        self._speaker_cache.put(cache_key, {"codes": codes.detach().cpu()})
+        return codes
+
     def _require_moss_ttsd_sessions(self):
         if self._moss_variant != "ttsd" or self._moss_ttsd_sessions is None:
             raise ValueError("Turnwise sessions require a MOSS-TTSD deployment")
         return self._moss_ttsd_sessions
+
+    def _require_moss_realtime_sessions(self):
+        if self._moss_variant != "realtime" or self._moss_realtime_sessions is None:
+            raise ValueError("Turnwise sessions require a MOSS-TTS-Realtime deployment")
+        return self._moss_realtime_sessions
 
     async def _encode_moss_reference(
         self,
@@ -1992,6 +2106,64 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def delete_moss_ttsd_session(self, session_id: str) -> None:
         self._require_moss_ttsd_sessions().delete(session_id)
 
+    async def create_moss_realtime_session(
+        self,
+        request: MossTTSRealtimeCreateSessionRequest,
+    ) -> dict[str, Any]:
+        """Encode two voices once and create a bounded Realtime session."""
+        sessions = self._require_moss_realtime_sessions()
+        for ref_audio in (request.user.ref_audio, request.assistant.ref_audio):
+            format_error = self._validate_ref_audio_format(ref_audio)
+            if format_error:
+                raise ValueError(format_error)
+        resolved = await asyncio.gather(
+            self._resolve_ref_audio(request.user.ref_audio),
+            self._resolve_ref_audio(request.assistant.ref_audio),
+        )
+        user_codes, assistant_codes = await asyncio.gather(
+            self._encode_moss_realtime_reference(
+                request.user.ref_audio,
+                resolved_audio=resolved[0],
+            ),
+            self._encode_moss_realtime_reference(
+                request.assistant.ref_audio,
+                resolved_audio=resolved[1],
+            ),
+        )
+        session = sessions.create(request.session_id, (user_codes, assistant_codes))
+        return {
+            "session_id": session.session_id,
+            "sample_rate": 24_000,
+            "reference_code_frames": [int(code.shape[0]) for code in session.reference_codes],
+            "reference_codebooks": int(session.reference_codes[0].shape[1]),
+        }
+
+    async def create_moss_realtime_turn(
+        self,
+        session_id: str,
+        request: MossTTSRealtimeTurnRequest,
+        raw_request: Request | None = None,
+    ):
+        """Synthesize one Realtime turn and return a WAV response."""
+        self._require_moss_realtime_sessions().get(session_id)
+        speech_request = OpenAICreateSpeechRequest(
+            input=request.text,
+            model=self.engine_client.model_config.model,
+            response_format="wav",
+            max_new_tokens=request.max_new_tokens,
+            seed=request.seed,
+            moss_session_id=session_id,
+            moss_session_role=request.role,
+        )
+        response = await self.create_speech(speech_request, raw_request)
+        if isinstance(response, Response) and response.status_code < 400:
+            session = self._require_moss_realtime_sessions().get(session_id)
+            response.headers["X-MOSS-Session-Revision"] = str(session.revision)
+        return response
+
+    def delete_moss_realtime_session(self, session_id: str) -> None:
+        self._require_moss_realtime_sessions().delete(session_id)
+
     async def _build_moss_ttsd_session_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         sessions = self._require_moss_ttsd_sessions()
         if request.moss_session_id is None or request.moss_session_role is None:
@@ -2031,6 +2203,49 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             self._moss_ttsd_pending_turns.pop(turn.session_id, None)
             raise
 
+    async def _build_moss_realtime_session_params(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> dict[str, Any]:
+        """Build a turnwise Realtime grid with one-turn audio context."""
+        from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
+
+        sessions = self._require_moss_realtime_sessions()
+        if request.moss_session_id is None or request.moss_session_role is None:
+            raise ValueError("MOSS-TTS-Realtime session turns require a session id and speaker role")
+        turn = sessions.begin_turn(
+            request.moss_session_id,
+            request.moss_session_role,
+            request.input,
+        )
+        self._moss_realtime_pending_turns[turn.session_id] = turn
+        try:
+            processor = self._get_moss_realtime_processor()
+            reference_codes = turn.reference_codes[0 if turn.role == "user" else 1]
+            prompt = build_realtime_prompt(
+                processor,
+                text=turn.text,
+                reference_codes=reference_codes,
+                previous_text=turn.previous_text,
+                previous_codes=turn.previous_codes,
+            )
+            params: dict[str, Any] = {
+                "prompt_token_ids": prompt.text_ids,
+                "ids": {
+                    "prompt": prompt.text_ids,
+                    "all": prompt.remaining_text_ids,
+                },
+                "codes": {"ref": prompt.audio_codes},
+                "_cache_salt": turn.cache_salt,
+            }
+            if request.max_new_tokens is not None:
+                params["max_new_frames"] = [request.max_new_tokens]
+            return params
+        except Exception:
+            sessions.abort_turn(turn)
+            self._moss_realtime_pending_turns.pop(turn.session_id, None)
+            raise
+
     async def _build_moss_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build the talker prompt + ``additional_information`` payload for any
         MOSS-TTS-family request (nano + 5 full variants).
@@ -2043,6 +2258,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         we **call the upstream processor server-side** to produce the unified
         ``(text_ids, audio_codes)`` shape the talker actually consumes — same
         flow as ``examples/.../moss_tts/end2end.py:_build_unified_codes``.
+        Realtime session turns additionally include the previous turn's
+        text/audio context.
         Returns ``{prompt_token_ids: list[int], codes.ref: torch.LongTensor,
         max_new_frames, ...}``. The caller treats ``prompt_token_ids`` as the
         prompt and forwards the rest as ``additional_information``.
@@ -2053,6 +2270,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         if v == "ttsd" and request.moss_session_id is not None:
             return await self._build_moss_ttsd_session_params(request)
+
+        if v == "realtime" and request.moss_session_id is not None:
+            return await self._build_moss_realtime_session_params(request)
 
         # ---- Legacy nano path (unchanged) ----
         if v is None:  # moss_tts_nano
@@ -2066,23 +2286,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["prompt_audio_array"] = [[wav_list, sr]]
             return params
 
-        # ---- MOSS-TTS-Realtime: keep the old prompt_audio_array path ----
-        # ``AutoProcessor.from_pretrained`` doesn't auto-discover
-        # ``MossTTSRealtimeProcessor`` (no ``processor_config.json`` in the
-        # snapshot), and Realtime's prompt format diverges from MossTTSDelay
-        # (16-channel grid, separate per-step text feed). The
-        # ``prompt_audio_array`` shape lines up well enough with what the
-        # talker reads for short prompts; full Realtime support needs a
-        # separate processor.from_module path which we don't wire here.
+        # ---- MOSS-TTS-Realtime one-shot path ----
         if v == "realtime":
-            params: dict[str, Any] = {
-                "text": [request.input or ""],
-                "mode": ["voice_clone"],
+            from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
+
+            processor = self._get_moss_realtime_processor()
+            reference_codes = await self._encode_moss_realtime_reference(request.ref_audio)
+            prompt = build_realtime_prompt(
+                processor,
+                text=request.input or "",
+                reference_codes=reference_codes,
+            )
+            params = {
+                "prompt_token_ids": prompt.text_ids,
+                "ids": {
+                    "prompt": prompt.text_ids,
+                    "all": prompt.remaining_text_ids,
+                },
+                "codes": {"ref": prompt.audio_codes},
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-            params["prompt_audio_array"] = [[wav_list, sr]]
             return params
 
         # ---- MossTTSDelay family (tts/ttsd/sound_effect/voice_generator)
@@ -3135,7 +3359,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         collect(multimodal_output.get("audio_codes"))
         if not candidates:
-            raise ValueError("MOSS-TTSD codec stage did not return generated RVQ codes")
+            raise ValueError("MOSS codec stage did not return generated RVQ codes")
         return candidates[-1].detach().to("cpu", torch.long).contiguous()
 
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
@@ -3952,7 +4176,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request_id=request_id,
             )
             if request.moss_session_id is not None:
-                session_turn = self._moss_ttsd_pending_turns.get(request.moss_session_id)
+                if self._moss_variant == "realtime":
+                    session_turn = self._moss_realtime_pending_turns.get(request.moss_session_id)
+                else:
+                    session_turn = self._moss_ttsd_pending_turns.get(request.moss_session_id)
 
             # MOSS-TTS-Nano emits delta chunks per yield (single-stage,
             # async_chunk=false). The engine surfaces each yield as its own
@@ -4052,11 +4279,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             audio_response: AudioResponse = self.create_audio(audio_obj)
             if session_turn is not None:
                 generated_codes = self._extract_moss_codes(audio_output)
-                self._require_moss_ttsd_sessions().commit_turn(
-                    session_turn,
-                    generated_codes,
-                )
-                self._moss_ttsd_pending_turns.pop(session_turn.session_id, None)
+                if self._moss_variant == "realtime":
+                    self._require_moss_realtime_sessions().commit_turn(session_turn, generated_codes)
+                    self._moss_realtime_pending_turns.pop(session_turn.session_id, None)
+                else:
+                    self._require_moss_ttsd_sessions().commit_turn(session_turn, generated_codes)
+                    self._moss_ttsd_pending_turns.pop(session_turn.session_id, None)
                 session_committed = True
             self._mark_ref_audio_artifact_ready_for_request(request_id)
             artifact_ready = True
@@ -4065,10 +4293,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return audio_response.audio_data, audio_response.media_type
         finally:
             if session_turn is None and request.moss_session_id is not None:
-                session_turn = self._moss_ttsd_pending_turns.get(request.moss_session_id)
+                if self._moss_variant == "realtime":
+                    session_turn = self._moss_realtime_pending_turns.get(request.moss_session_id)
+                else:
+                    session_turn = self._moss_ttsd_pending_turns.get(request.moss_session_id)
             if session_turn is not None and not session_committed:
-                self._require_moss_ttsd_sessions().abort_turn(session_turn)
-                self._moss_ttsd_pending_turns.pop(session_turn.session_id, None)
+                if self._moss_variant == "realtime":
+                    self._require_moss_realtime_sessions().abort_turn(session_turn)
+                    self._moss_realtime_pending_turns.pop(session_turn.session_id, None)
+                else:
+                    self._require_moss_ttsd_sessions().abort_turn(session_turn)
+                    self._moss_ttsd_pending_turns.pop(session_turn.session_id, None)
             if not artifact_ready and request_id is not None:
                 self._discard_ref_audio_artifact_warmup(request_id)
 

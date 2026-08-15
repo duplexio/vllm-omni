@@ -31,14 +31,43 @@ def _extract_audio_codes(stage_output: Any) -> torch.Tensor | None:
     if stage_output is None:
         return None
 
-    # OmniOutput
-    mm = getattr(stage_output, "multimodal_outputs", None)
-    if mm is not None:
+    if isinstance(stage_output, Mapping):
+        flat_audio = stage_output.get("codes.audio")
+        if isinstance(flat_audio, torch.Tensor):
+            return flat_audio
+        codes_dict = stage_output.get("codes")
+        if isinstance(codes_dict, Mapping):
+            audio = codes_dict.get("audio")
+            if isinstance(audio, torch.Tensor):
+                return audio
+
+    # OmniRequestOutput exposes the stage payload through the singular
+    # ``multimodal_output`` property.  The property also unwraps the
+    # underlying completion output, so the bridge does not need to know which
+    # output container the orchestrator used.
+    mm = getattr(stage_output, "multimodal_output", None)
+    if isinstance(mm, Mapping):
+        flat_audio = mm.get("codes.audio")
+        if isinstance(flat_audio, torch.Tensor):
+            return flat_audio
         codes_dict = mm.get("codes", {})
-        if isinstance(codes_dict, dict):
+        if isinstance(codes_dict, Mapping):
             ac = codes_dict.get("audio")
             if isinstance(ac, torch.Tensor):
                 return ac
+
+    # The raw EngineCore path can hand the bridge a RequestOutput instead of
+    # the OmniRequestOutput wrapper.  Its multimodal payload lives on the
+    # completion item, so inspect that container explicitly.
+    request_output = getattr(stage_output, "request_output", None)
+    if request_output is not None:
+        extracted = _extract_audio_codes(request_output)
+        if extracted is not None:
+            return extracted
+    for completion in getattr(stage_output, "outputs", ()) or ():
+        extracted = _extract_audio_codes(completion)
+        if extracted is not None:
+            return extracted
 
     return None
 
@@ -65,30 +94,26 @@ def codec_context_from_request(request: Any) -> torch.Tensor | None:
 
 
 def talker2codec(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompt: Any = None,
     requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
 ) -> list[Any]:
-    """Convert all talker codes to a single Stage-1 token sequence.
+    """Convert resolved Stage-0 outputs to Stage-1 codec prompts.
 
-    Stage 0 output contains ``codes["audio"]`` shaped ``(T, NQ)`` where T is
-    the number of generated audio frames and NQ is n_vq.  We flatten to
-    ``[NQ * T]`` as the Stage-1 ``input_ids`` so the codec can reshape back
-    to ``(NQ, T)`` for decoding.
+    ``StageEngineCoreClient.process_engine_inputs`` passes the outputs from
+    the upstream stage directly.  Stage 0 emits ``codes["audio"]`` shaped
+    ``(T, NQ)``; Stage 1 consumes the codebook-major flattening
+    ``[NQ * T]`` and reconstructs the grid for decoding.
     """
+    del prompt, requires_multimodal_data, streaming_context
     results: list[Any] = []
 
-    for src_idx in engine_input_source:
-        if src_idx >= len(stage_list):
-            results.append(OmniTokensPrompt(prompt_token_ids=[]))
-            continue
-
-        stage_out = stage_list[src_idx]
+    for stage_out in source_outputs:
         audio_codes = _extract_audio_codes(stage_out)
 
         if audio_codes is None or audio_codes.numel() == 0:
-            logger.warning("talker2codec: no audio codes in stage output %d; emitting silence.", src_idx)
+            logger.warning("talker2codec: no audio codes in Stage-0 output; emitting silence.")
             results.append(OmniTokensPrompt(prompt_token_ids=[]))
             continue
 
@@ -195,8 +220,6 @@ def talker2codec_delay_async_chunk(
     chunk_codes_long = chunk_codes.to(torch.long).cpu().contiguous()  # (T_chunk, NQ)
     nq = int(chunk_codes_long.shape[1])
     t_chunk = int(chunk_codes_long.shape[0])
-    audio_pad_code = 1024  # MOSS-TTS audio_pad_code; same value across variants.
-
     if t_chunk > nq:
         de_delayed = chunk_codes_long.new_zeros((t_chunk - nq + 1, nq))
         for i in range(nq):
@@ -205,12 +228,18 @@ def talker2codec_delay_async_chunk(
         de_delayed = chunk_codes_long.new_zeros((0, nq))
 
     if de_delayed.shape[0] > 0:
-        is_pad = (de_delayed == audio_pad_code).all(dim=1)
+        is_pad = (de_delayed == _MOSS_AUDIO_PAD_CODE).all(dim=1)
         non_pad = ~is_pad
         if bool(non_pad.any()):
             de_delayed = de_delayed[non_pad]
         else:
             de_delayed = de_delayed.new_zeros((0, nq))
+
+    if bool(((de_delayed < 0) | (de_delayed >= _MOSS_AUDIO_PAD_CODE)).any()):
+        raise RuntimeError(
+            "MOSS-TTS de-delay produced an incomplete raw audio frame; "
+            "the generated delay tail did not finish cleanly"
+        )
 
     left_context = 0
     if de_delayed.shape[0] == 0:

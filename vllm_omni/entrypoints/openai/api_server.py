@@ -105,6 +105,8 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
     MossTTSDCreateSessionRequest,
     MossTTSDTurnRequest,
+    MossTTSRealtimeCreateSessionRequest,
+    MossTTSRealtimeTurnRequest,
     OpenAICreateAudioGenerateRequest,
     OpenAICreateSpeechRequest,
 )
@@ -1283,7 +1285,7 @@ async def create_moss_ttsd_session(request: MossTTSDCreateSessionRequest, raw_re
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="The model does not support Speech API")
     try:
         return await handler.create_moss_ttsd_session(request)
-    except (KeyError, ValueError) as exc:
+    except (KeyError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
 
 
@@ -1323,6 +1325,67 @@ async def delete_moss_ttsd_session(session_id: str, raw_request: Request):
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="The model does not support Speech API")
     try:
         handler.delete_moss_ttsd_session(session_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=HTTPStatus.CONFLICT.value, detail=str(exc)) from exc
+    return Response(status_code=HTTPStatus.NO_CONTENT.value)
+
+
+@router.post(
+    "/v1/audio/speech/realtime/sessions",
+    dependencies=[Depends(validate_json_request)],
+    status_code=HTTPStatus.CREATED.value,
+)
+@with_cancellation
+@load_aware_call
+async def create_moss_realtime_session(
+    request: MossTTSRealtimeCreateSessionRequest,
+    raw_request: Request,
+):
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="The model does not support Speech API")
+    try:
+        return await handler.create_moss_realtime_session(request)
+    except (KeyError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+
+
+@router.post(
+    "/v1/audio/speech/realtime/sessions/{session_id}/turn",
+    dependencies=[Depends(validate_json_request)],
+    responses={HTTPStatus.OK.value: {"content": {"audio/wav": {}}}},
+)
+@with_cancellation
+@load_aware_call
+async def create_moss_realtime_turn(
+    session_id: str,
+    request: MossTTSRealtimeTurnRequest,
+    raw_request: Request,
+):
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="The model does not support Speech API")
+    try:
+        result = await handler.create_moss_realtime_turn(session_id, request, raw_request)
+        if isinstance(result, ErrorResponse):
+            return _error_response_to_json_response(result)
+        return result
+    except KeyError as exc:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail=str(exc)) from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=HTTPStatus.CONFLICT.value, detail=str(exc)) from exc
+
+
+@router.delete(
+    "/v1/audio/speech/realtime/sessions/{session_id}",
+    status_code=HTTPStatus.NO_CONTENT.value,
+)
+async def delete_moss_realtime_session(session_id: str, raw_request: Request):
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="The model does not support Speech API")
+    try:
+        handler.delete_moss_realtime_session(session_id)
     except RuntimeError as exc:
         raise HTTPException(status_code=HTTPStatus.CONFLICT.value, detail=str(exc)) from exc
     return Response(status_code=HTTPStatus.NO_CONTENT.value)

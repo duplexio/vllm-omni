@@ -1,0 +1,54 @@
+# MOSS-TTS-Realtime turnwise sessions.
+#
+# Each HTTP turn is a complete vLLM request.  Prefix caching reuses the stable
+# system/voice-clone prefix while the server-owned session supplies the
+# immediately preceding turn's text and RVQ codes.  This is deliberately
+# separate from moss_tts_realtime.yaml, whose async connector settings target
+# low-latency live streaming rather than batched dataset synthesis.
+async_chunk: false
+trust_remote_code: true
+
+connectors:
+  shm:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: false
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.60
+    enable_prefix_caching: true
+    async_scheduling: true
+    max_num_batched_tokens: 8192
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_1: shm
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 4096
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.12
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 196608
+    max_model_len: 196608
+    devices: "0"
+    input_connectors:
+      from_stage_0: shm
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      repetition_penalty: 1.0
