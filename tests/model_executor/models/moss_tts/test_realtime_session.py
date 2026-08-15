@@ -34,7 +34,12 @@ def test_realtime_session_exposes_previous_turn_and_commits_new_audio() -> None:
 
     store.commit_turn(second, torch.full((6, 16), 4, dtype=torch.long))
     assert session.previous_text == "Hi there."
+    assert session.previous_role == "assistant"
     assert session.revision == 2
+
+    third = store.begin_turn("conversation", "user", "Thanks.")
+    assert third.previous_text is None
+    assert third.previous_codes is None
 
 
 def test_realtime_session_rejects_wrong_codebook_count() -> None:

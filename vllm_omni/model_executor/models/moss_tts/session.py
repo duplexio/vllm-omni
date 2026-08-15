@@ -261,6 +261,7 @@ class MossTTSRealtimeSession:
     cache_salt: str
     previous_text: str | None = None
     previous_codes: torch.Tensor | None = None
+    previous_role: SpeakerRole | None = None
     revision: int = 0
     in_flight: bool = False
     updated_at: float = field(default_factory=time.monotonic)
@@ -330,7 +331,12 @@ class MossTTSRealtimeSessionStore:
             raise ValueError("MOSS-TTS-Realtime turn text cannot be empty")
         session.in_flight = True
         session.updated_at = time.monotonic()
-        previous_codes = session.previous_codes
+        # The Realtime checkpoint has one explicit user-context slot.  It is
+        # consumed only while synthesizing the following assistant turn;
+        # feeding an assistant turn back as a user prompt changes the role
+        # layout and causes autoregressive drift on the next user turn.
+        previous_text = session.previous_text if role == "assistant" and session.previous_role == "user" else None
+        previous_codes = session.previous_codes if previous_text is not None else None
         if previous_codes is not None:
             previous_codes = previous_codes.clone()
         return MossTTSRealtimeTurn(
@@ -339,7 +345,7 @@ class MossTTSRealtimeSessionStore:
             role=role,
             text=normalized_text,
             reference_codes=session.reference_codes,
-            previous_text=session.previous_text,
+            previous_text=previous_text,
             previous_codes=previous_codes,
             cache_salt=session.cache_salt,
         )
@@ -361,6 +367,7 @@ class MossTTSRealtimeSessionStore:
             )
         session.previous_text = turn.text
         session.previous_codes = generated
+        session.previous_role = turn.role
         session.revision += 1
         session.in_flight = False
         session.updated_at = time.monotonic()

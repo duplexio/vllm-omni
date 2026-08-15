@@ -1986,6 +1986,38 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._speaker_cache.put(cache_key, {"codes": codes.detach().cpu()})
         return codes
 
+    async def _roundtrip_moss_realtime_context_codes(self, codes: torch.Tensor) -> torch.Tensor:
+        """Re-encode generated audio before using it as the next user context.
+
+        Realtime's reference implementation decodes each completed user turn
+        and encodes that waveform again before putting it in the assistant
+        prompt.  The generated RVQ rows are not a stable substitute: the
+        decoder's boundary handling and quantizer state are part of the
+        conditioning contract.
+        """
+        if codes.ndim != 2 or codes.shape[0] == 0:
+            raise ValueError(f"MOSS Realtime context codes must be 2-D and non-empty, got {tuple(codes.shape)}")
+        codec = self._get_moss_realtime_codec()
+        codebooks = int(codes.shape[1])
+
+        def decode_and_encode() -> torch.Tensor:
+            with torch.inference_mode():
+                decoded = codec.batch_decode(
+                    codes_list=[codes.transpose(0, 1).contiguous()],
+                    num_quantizers=codebooks,
+                )
+                if decoded.audio is None or decoded.audio_lengths is None:
+                    raise RuntimeError("MOSS Audio Tokenizer returned no waveform for Realtime context")
+                waveform = decoded.audio[0]
+                waveform = waveform[..., : int(decoded.audio_lengths[0].item())]
+                encoded = codec.batch_encode([waveform], num_quantizers=codebooks)
+                if encoded.audio_codes is None or encoded.audio_codes_lengths is None:
+                    raise RuntimeError("MOSS Audio Tokenizer returned no codes for Realtime context")
+                frame_count = int(encoded.audio_codes_lengths[0].item())
+                return encoded.audio_codes[:codebooks, 0, :frame_count].transpose(0, 1).contiguous().cpu()
+
+        return await asyncio.to_thread(decode_and_encode)
+
     def _require_moss_ttsd_sessions(self):
         if self._moss_variant != "ttsd" or self._moss_ttsd_sessions is None:
             raise ValueError("Turnwise sessions require a MOSS-TTSD deployment")
@@ -4280,6 +4312,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if session_turn is not None:
                 generated_codes = self._extract_moss_codes(audio_output)
                 if self._moss_variant == "realtime":
+                    if session_turn.role == "user":
+                        generated_codes = await self._roundtrip_moss_realtime_context_codes(generated_codes)
                     self._require_moss_realtime_sessions().commit_turn(session_turn, generated_codes)
                     self._moss_realtime_pending_turns.pop(session_turn.session_id, None)
                 else:
