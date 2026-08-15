@@ -234,6 +234,15 @@ class MossTTSDSessionStore:
 
 
 @dataclass(frozen=True)
+class MossTTSRealtimeSegment:
+    """Completed turn data needed to replay the upstream KV-cache input."""
+
+    role: SpeakerRole
+    text: str
+    codes: torch.Tensor
+
+
+@dataclass(frozen=True)
 class MossTTSRealtimeTurn:
     """Immutable prompt view reserved for one Realtime turn."""
 
@@ -242,33 +251,25 @@ class MossTTSRealtimeTurn:
     role: SpeakerRole
     text: str
     reference_codes: tuple[torch.Tensor, torch.Tensor]
-    previous_text: str | None
-    previous_codes: torch.Tensor | None
+    history_segments: tuple[MossTTSRealtimeSegment, ...]
     cache_salt: str
 
 
 @dataclass
 class MossTTSRealtimeSession:
-    """Bounded state for a turnwise MOSS-TTS-Realtime conversation.
-
-    Realtime's public processor has one explicit user-context slot.  Keeping
-    only the most recent completed turn is therefore both the model's native
-    contract and a useful invariant for predictable prompt lengths.
-    """
+    """Bounded state for a turnwise MOSS-TTS-Realtime conversation."""
 
     session_id: str
     reference_codes: tuple[torch.Tensor, torch.Tensor]
     cache_salt: str
-    previous_text: str | None = None
-    previous_codes: torch.Tensor | None = None
-    previous_role: SpeakerRole | None = None
+    completed_segments: list[MossTTSRealtimeSegment] = field(default_factory=list)
     revision: int = 0
     in_flight: bool = False
     updated_at: float = field(default_factory=time.monotonic)
 
 
 class MossTTSRealtimeSessionStore:
-    """Bounded in-memory state for batched Realtime turn requests."""
+    """In-memory state for batched Realtime turn requests."""
 
     def __init__(self, max_sessions: int = 2048, ttl_seconds: float = 3600.0) -> None:
         if max_sessions <= 0:
@@ -321,7 +322,7 @@ class MossTTSRealtimeSessionStore:
         return session
 
     def begin_turn(self, session_id: str, role: SpeakerRole, text: str) -> MossTTSRealtimeTurn:
-        """Reserve a turn and snapshot the immediately preceding context."""
+        """Reserve a turn and snapshot the completed conversation history."""
         self.prune()
         session = self.get(session_id)
         if session.in_flight:
@@ -331,27 +332,18 @@ class MossTTSRealtimeSessionStore:
             raise ValueError("MOSS-TTS-Realtime turn text cannot be empty")
         session.in_flight = True
         session.updated_at = time.monotonic()
-        # The Realtime checkpoint has one explicit user-context slot.  It is
-        # consumed only while synthesizing the following assistant turn;
-        # feeding an assistant turn back as a user prompt changes the role
-        # layout and causes autoregressive drift on the next user turn.
-        previous_text = session.previous_text if role == "assistant" and session.previous_role == "user" else None
-        previous_codes = session.previous_codes if previous_text is not None else None
-        if previous_codes is not None:
-            previous_codes = previous_codes.clone()
         return MossTTSRealtimeTurn(
             session_id=session.session_id,
             revision=session.revision,
             role=role,
             text=normalized_text,
             reference_codes=session.reference_codes,
-            previous_text=previous_text,
-            previous_codes=previous_codes,
+            history_segments=tuple(session.completed_segments),
             cache_salt=session.cache_salt,
         )
 
     def commit_turn(self, turn: MossTTSRealtimeTurn, generated_codes: torch.Tensor) -> int:
-        """Store the generated frames as context for the next turn."""
+        """Store generated frames and text for the next assistant prompt."""
         session = self.get(turn.session_id)
         self.check_pending_turn(session, turn)
         generated = generated_codes.detach().to("cpu", torch.long).contiguous().clone()
@@ -365,9 +357,13 @@ class MossTTSRealtimeSessionStore:
                 "generated and reference codebooks differ: "
                 f"{generated.shape[1]} != {session.reference_codes[0].shape[1]}"
             )
-        session.previous_text = turn.text
-        session.previous_codes = generated
-        session.previous_role = turn.role
+        session.completed_segments.append(
+            MossTTSRealtimeSegment(
+                role=turn.role,
+                text=turn.text,
+                codes=generated,
+            )
+        )
         session.revision += 1
         session.in_flight = False
         session.updated_at = time.monotonic()

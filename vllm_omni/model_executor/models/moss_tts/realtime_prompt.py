@@ -11,11 +11,14 @@ details and gives us a small, CPU-testable contract for turnwise requests.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
+
+from vllm_omni.model_executor.models.moss_tts.session import MossTTSRealtimeSegment
 
 
 @dataclass(frozen=True)
@@ -56,23 +59,99 @@ def _as_audio_tokens(codes: torch.Tensor | None, channels: int) -> np.ndarray | 
     return codes.detach().to("cpu", torch.long).numpy()
 
 
+def _assistant_prefix_grid(processor: Any, *, after_user: bool) -> np.ndarray:
+    prefix_text = (
+        "<|im_end|>\n<|im_start|>assistant\n"
+        if after_user
+        else "<|im_start|>assistant\n"
+    )
+    prefix_ids = _encode_without_special_tokens(processor.tokenizer, prefix_text)
+    prefix = _audio_grid(processor, len(prefix_ids))
+    prefix[:, 0] = prefix_ids
+    return prefix
+
+
+def _assistant_history_grid(
+    processor: Any,
+    *,
+    text: str,
+    audio_codes: torch.Tensor,
+) -> np.ndarray:
+    """Reconstruct the input rows cached by upstream after one assistant turn.
+
+    The Realtime reference keeps the assistant model cache between turns. Its
+    generated audio is not itself an input row until the next model step, so
+    each emitted frame is paired with the next text token (or ``text_pad``)
+    here. The EOS frame is intentionally absent from ``audio_codes``.
+    """
+    text_ids = _encode_without_special_tokens(processor.tokenizer, text)
+    prefix_len = min(len(text_ids), int(processor.delay_tokens_len))
+    prefix = _audio_grid(processor, prefix_len)
+    prefix[:, 0] = text_ids[:prefix_len]
+    if prefix_len:
+        prefix[-1, 1] = int(processor.audio_bos_token)
+
+    codes = _as_audio_tokens(audio_codes, int(processor.channels))
+    assert codes is not None
+    continuation = _audio_grid(processor, codes.shape[0])
+    text_pad_id = getattr(processor, "text_pad_token_id", None)
+    if text_pad_id is None:
+        text_pad_id = processor.tokenizer.convert_tokens_to_ids("<|text_pad|>")
+    text_pad_id = int(text_pad_id)
+    remaining = text_ids[prefix_len:]
+    continuation[:, 0] = [
+        remaining[index] if index < len(remaining) else text_pad_id
+        for index in range(codes.shape[0])
+    ]
+    continuation[:, 1:] = codes
+    return np.concatenate([prefix, continuation], axis=0)
+
+
+def _history_grid(
+    processor: Any,
+    segments: Sequence[MossTTSRealtimeSegment],
+) -> np.ndarray:
+    grids: list[np.ndarray] = []
+    for index, segment in enumerate(segments):
+        if segment.role == "user":
+            user_codes = _as_audio_tokens(segment.codes, int(processor.channels))
+            assert user_codes is not None
+            grids.append(
+                np.asarray(
+                    processor.make_user_prompt(segment.text, user_codes),
+                    dtype=np.int64,
+                )
+            )
+        elif segment.role == "assistant":
+            if index == 0 or segments[index - 1].role == "assistant":
+                grids.append(_assistant_prefix_grid(processor, after_user=index > 0))
+            grids.append(
+                _assistant_history_grid(
+                    processor,
+                    text=segment.text,
+                    audio_codes=segment.codes,
+                )
+            )
+        else:
+            raise ValueError(f"Unknown MOSS Realtime history role: {segment.role!r}")
+    if not grids:
+        return np.empty((0, int(processor.channels) + 1), dtype=np.int64)
+    return np.concatenate(grids, axis=0)
+
+
 def build_realtime_prompt(
     processor: Any,
     *,
     text: str,
     reference_codes: torch.Tensor,
-    previous_text: str | None = None,
-    previous_codes: torch.Tensor | None = None,
+    history_segments: Sequence[MossTTSRealtimeSegment] = (),
     prefill_text_tokens: int = 12,
 ) -> MossTTSRealtimePrompt:
     """Build the exact mixed text/audio grid expected by Realtime.
 
-    ``previous_text`` and ``previous_codes`` describe at most the immediately
-    preceding turn.  Realtime's reference implementation uses
-    ``make_user_prompt`` for this context; retaining only one turn keeps the
-    prompt bounded and matches the live turnwise recipe.  The current turn is
-    always synthesized as an assistant section, with ``reference_codes``
-    selecting the voice for that turn.
+    ``history_segments`` contains completed turns from the assistant session.
+    The upstream realtime implementation keeps those rows in its KV cache; a
+    stateless vLLM request must present the same rows explicitly.
     """
     channels = int(processor.channels)
     reference_tokens = _as_audio_tokens(reference_codes, channels)
@@ -81,25 +160,16 @@ def build_realtime_prompt(
     system_grid = processor.make_ensemble(prompt_audio_tokens=reference_tokens)
     grids = [np.asarray(system_grid, dtype=np.int64)]
 
-    if (previous_text is None) != (previous_codes is None):
-        raise ValueError("previous_text and previous_codes must be provided together")
-    if previous_text is not None and previous_codes is not None:
-        previous_tokens = _as_audio_tokens(previous_codes, channels)
-        assert previous_tokens is not None
+    history = _history_grid(processor, history_segments)
+    if history.shape[0]:
+        grids.append(history)
+    if not history_segments or history_segments[-1].role != "user":
         grids.append(
-            np.asarray(
-                processor.make_user_prompt(previous_text, previous_tokens),
-                dtype=np.int64,
+            _assistant_prefix_grid(
+                processor,
+                after_user=bool(history_segments),
             )
         )
-    else:
-        assistant_ids = _encode_without_special_tokens(
-            processor.tokenizer,
-            "<|im_start|>assistant\n",
-        )
-        assistant_grid = _audio_grid(processor, len(assistant_ids))
-        assistant_grid[:, 0] = assistant_ids
-        grids.append(assistant_grid)
 
     current_ids = _encode_without_special_tokens(processor.tokenizer, text)
     if prefill_text_tokens <= 0:

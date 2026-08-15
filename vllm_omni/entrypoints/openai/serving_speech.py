@@ -2239,7 +2239,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self,
         request: OpenAICreateSpeechRequest,
     ) -> dict[str, Any]:
-        """Build a turnwise Realtime grid with one-turn audio context."""
+        """Build a turnwise Realtime grid with replayed assistant context."""
         from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
 
         sessions = self._require_moss_realtime_sessions()
@@ -2258,8 +2258,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 processor,
                 text=turn.text,
                 reference_codes=reference_codes,
-                previous_text=turn.previous_text,
-                previous_codes=turn.previous_codes,
+                history_segments=(
+                    turn.history_segments
+                    if turn.role == "assistant"
+                    else ()
+                ),
             )
             params: dict[str, Any] = {
                 "prompt_token_ids": prompt.text_ids,
