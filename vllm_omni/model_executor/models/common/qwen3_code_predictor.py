@@ -1,4 +1,4 @@
-"""Qwen3 Code Predictor -- optimized re-prefill, no KV cache.
+"""Qwen3 Code Predictor -- optimized short-sequence decoding.
 
 Shared by Qwen3-Omni and Qwen3-TTS talker models.
 
@@ -9,6 +9,11 @@ Shared by Qwen3-Omni and Qwen3-TTS talker models.
 * torch.compile (epilogue_fusion=False) on inner transformer by default
 * Optional manual CUDA graph capture per batch-size bucket
 * Inline sampling (top-k + top-p) -- no custom op overhead
+
+The regular ``forward`` path remains the re-prefill implementation used by
+Qwen3-TTS and Qwen3-Omni.  ``forward_incremental`` is an optional one-token
+path for models that need to decode a short codebook sequence while retaining
+the exact same attention numerics.
 """
 
 from __future__ import annotations
@@ -111,8 +116,10 @@ class CodePredictorAttention(nn.Module):
     """Multi-head self-attention for code predictor.
 
     Uses ``F.scaled_dot_product_attention`` with HF-compatible RoPE and RMSNorm.
-    No KV cache -- the code predictor always re-prefills the full (short)
-    sequence each AR step.
+    The default path re-prefills the full (short) sequence each AR step.  The
+    optional ``past_key_value`` arguments provide an incremental path for
+    realtime decoders; callers that do not pass them retain the original
+    behavior.
 
     Input : [B, seq_len, hidden_size]
     Output: [B, seq_len, hidden_size]
@@ -214,7 +221,10 @@ class CodePredictorAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
+        *,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         bsz, seq_len, _ = hidden_states.shape
         hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
         hidden_shape_kv = (bsz, seq_len, self.num_kv_heads, self.head_dim)
@@ -230,20 +240,31 @@ class CodePredictorAttention(nn.Module):
         q = (q * cos) + (_rotate_half(q) * sin)
         k = (k * cos) + (_rotate_half(k) * sin)
 
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = torch.cat((past_k, k), dim=2)
+            v = torch.cat((past_v, v), dim=2)
+
         if not current_omni_platform.is_npu():
             attn_out = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
                 scale=self.scaling,
-                is_causal=True,
+                # With a cache, K/V contain only positions <= the current
+                # query, so an explicit causal mask is unnecessary.  The
+                # no-cache path keeps SDPA's native causal kernel.
+                is_causal=past_key_value is None,
                 enable_gqa=self.is_gqa,
             )
         else:
-            attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
+            attn_out = self._forward_npu_attention(q, k, v, bsz, k.shape[2])
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
-        return self.o_proj(attn_out)
+        output = self.o_proj(attn_out)
+        if use_cache:
+            return output, (k, v)
+        return output
 
 
 # ===================================================================
@@ -283,16 +304,30 @@ class CodePredictorDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
+        *,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings)
+        attention_output = self.self_attn(
+            hidden_states,
+            position_embeddings,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+        )
+        if use_cache:
+            hidden_states, present_key_value = attention_output
+        else:
+            hidden_states = attention_output
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        if use_cache:
+            return hidden_states, present_key_value
         return hidden_states
 
 
@@ -344,7 +379,16 @@ class CodePredictorBaseModel(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
+        past_key_values: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
+        if past_key_values is not None:
+            hidden_states, _ = self.forward_incremental(
+                inputs_embeds,
+                position_ids,
+                past_key_values=past_key_values,
+            )
+            return hidden_states
+
         # Run the transformer body in float32 when the model is in fp16.
         # fp16 lacks the dynamic range for stable attention scores and
         # SiLU-gated MLP intermediates, producing NaN on GPUs without
@@ -364,6 +408,48 @@ class CodePredictorBaseModel(nn.Module):
                 hidden_states = layer(hidden_states, position_embeddings)
             hidden_states = self.norm(hidden_states)
         return hidden_states.to(input_dtype)
+
+    def forward_incremental(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        *,
+        past_key_values: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ) -> tuple[torch.Tensor, tuple[tuple[torch.Tensor, torch.Tensor], ...]]:
+        """Run one causal token while retaining each layer's K/V tensors.
+
+        ``inputs_embeds`` is normally ``(B, 1, H)`` and ``position_ids`` is
+        ``(B, 1)``.  The returned cache is local to one generated frame; a
+        caller must discard it before starting the next frame.
+        """
+        if past_key_values is not None and len(past_key_values) != len(self.layers):
+            raise ValueError(
+                "past_key_values must contain one entry per decoder layer: "
+                f"got {len(past_key_values)} for {len(self.layers)} layers"
+            )
+
+        input_dtype = inputs_embeds.dtype
+        use_fp32 = input_dtype == torch.float16 and inputs_embeds.device.type != "cpu"
+        if use_fp32:
+            inputs_embeds = inputs_embeds.float()
+
+        hidden_states = inputs_embeds
+        past = past_key_values
+        presents: list[tuple[torch.Tensor, torch.Tensor]] = []
+        with torch.amp.autocast(inputs_embeds.device.type, enabled=use_fp32, dtype=torch.float32):
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+            for index, layer in enumerate(self.layers):
+                layer_past = None if past is None else past[index]
+                layer_output = layer(
+                    hidden_states,
+                    position_embeddings,
+                    past_key_value=layer_past,
+                    use_cache=True,
+                )
+                hidden_states, present = layer_output
+                presents.append(present)
+            hidden_states = self.norm(hidden_states)
+        return hidden_states.to(input_dtype), tuple(presents)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters(remove_duplicate=False))

@@ -949,7 +949,6 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
 
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("audio_codes", "current"),
-            ("audio_codes", "accumulated"),
             ("hidden_states", "last"),
         }
 
@@ -1090,9 +1089,11 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                 "audio_state": {
                     "is_stopping": False,
                     "step": 0,
+                    "generated_audio_frames": 0,
                     "text_cursor": 0,
                     "remaining_text": list(remaining),
                     "max_new_frames": int(max_new_frames) if max_new_frames is not None else -1,
+                    "history_per_codebook": [[] for _ in range(self.n_vq)],
                 },
                 "audio_codes": {"current": current_codes},
                 "ref_offset": ref_offset + span_len,
@@ -1145,12 +1146,15 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         # See delay talker: real per-request row spans from the runner are
         # required because mixed prefill+decode steps have unequal row counts.
         spans = kwargs.get("request_token_spans")
-        # Per-request accumulated codes in batch order, pre-filled with empty
+        # Per-request current-frame codes in batch order, pre-filled with empty
         # placeholders so every skip path (stopped / eos / bos / pad) keeps
         # indices aligned for to_payload_element's per-request routing. A
         # shorter list would silently fall back to request 0's codes.
         per_req_codes: list[torch.Tensor] = [hidden.new_empty((0, self.n_vq), dtype=torch.long) for _ in info_dicts]
         have_codes = False
+        active_indices: list[int] = []
+        active_last_hidden: list[torch.Tensor] = []
+        active_histories: list[list[list[int]]] = []
         if hidden.numel() > 0 and info_dicts:
             num_rows = hidden.shape[0]
             if spans is None or len(spans) != len(info_dicts):
@@ -1170,28 +1174,32 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                 if state.get("is_stopping"):
                     continue  # already stopped — no more audio frames
 
-                last_h = hidden[row_end - 1].unsqueeze(0)  # (1, H)
                 # Sampling parameters mirror upstream ``MossTTSRealtimeInference.generate``:
                 # 0.8 / 0.6 / 30 + 1.1 repetition penalty over a 50-frame window.
-                rep_window = 50
-                hist_per_cb: list[list[int]] = []
-                acc_for_hist = (info.get("audio_codes", {}) or {}).get("accumulated")
-                if isinstance(acc_for_hist, torch.Tensor) and acc_for_hist.numel() > 0:
-                    tail = acc_for_hist[-rep_window:].long().cpu().tolist()
-                    for cb in range(self.n_vq):
-                        hist_per_cb.append([row[cb] for row in tail])
-                else:
-                    hist_per_cb = [[] for _ in range(self.n_vq)]
-                new_codes = self.local_transformer.generate_frame(
-                    last_h,
+                history = state.get("history_per_codebook")
+                if not isinstance(history, list) or len(history) != self.n_vq:
+                    raise RuntimeError("MOSS-TTS realtime repetition history was not initialized during prefill")
+                hist_per_cb = [list(tokens[-50:]) for tokens in history]
+                active_indices.append(i)
+                active_last_hidden.append(hidden[row_end - 1])
+                active_histories.append(hist_per_cb)
+
+            if active_indices:
+                new_codes_batch = self.local_transformer.generate_frame(
+                    torch.stack(active_last_hidden, dim=0),
                     self.local_lm_heads,
                     temperature=0.8,
                     top_p=0.6,
                     top_k=30,
                     do_sample=True,
                     repetition_penalty=1.1,
-                    history_per_codebook=hist_per_cb,
-                ).squeeze(0)  # (n_vq,)
+                    history_per_codebook=active_histories,
+                )
+
+            for active_index, i in enumerate(active_indices):
+                info = info_dicts[i]
+                state = info["audio_state"]
+                new_codes = new_codes_batch[active_index]
                 if int(state.get("step", 0)) < 5 or int(state.get("step", 0)) % 50 == 0:
                     logger.debug(
                         "[MossTTSRealtime make_omni] step=%d ch0=%d cursor=%d/%d",
@@ -1206,31 +1214,26 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                 if ch0 == self.AUDIO_EOS:
                     state["is_stopping"] = True
                     state["step"] = int(state.get("step", 0)) + 1
-                    info["audio_codes"] = {
-                        "current": new_codes,
-                        "accumulated": (info.get("audio_codes", {}) or {}).get("accumulated"),
-                    }
-                    continue  # don't append the eos frame to accumulated
+                    info["audio_codes"] = {"current": new_codes}
+                    continue  # don't add the EOS frame to the repetition history
 
                 if ch0 in (self.AUDIO_BOS, self.audio_pad_token):
                     # Skip the bos / pad frames — they don't decode to real audio.
                     state["step"] = int(state.get("step", 0)) + 1
-                    info["audio_codes"] = {
-                        "current": new_codes,
-                        "accumulated": (info.get("audio_codes", {}) or {}).get("accumulated"),
-                    }
+                    info["audio_codes"] = {"current": new_codes}
                     continue
 
-                acc = (info.get("audio_codes", {}) or {}).get("accumulated")
-                if isinstance(acc, torch.Tensor) and acc.numel() > 0:
-                    updated_acc = torch.cat([acc.to(new_codes.device), new_codes.unsqueeze(0)], dim=0)
-                else:
-                    updated_acc = new_codes.unsqueeze(0)
+                history = state["history_per_codebook"]
+                new_codes_cpu = new_codes.tolist()
+                for codebook, token in enumerate(new_codes_cpu):
+                    history[codebook].append(int(token))
+                    del history[codebook][:-50]
 
-                info["audio_codes"] = {"current": new_codes, "accumulated": updated_acc}
+                info["audio_codes"] = {"current": new_codes}
                 state["step"] = int(state.get("step", 0)) + 1
                 max_new_frames = int(state.get("max_new_frames", -1))
-                if max_new_frames > 0 and updated_acc.shape[0] >= max_new_frames:
+                state["generated_audio_frames"] = int(state.get("generated_audio_frames", 0)) + 1
+                if max_new_frames > 0 and state["generated_audio_frames"] >= max_new_frames:
                     state["is_stopping"] = True
                 per_req_codes[i] = new_codes.unsqueeze(0)
                 have_codes = True

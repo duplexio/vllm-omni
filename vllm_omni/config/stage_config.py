@@ -20,7 +20,10 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
-from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.core.sched.omni_generation_scheduler import (
+    OmniGenerationAsyncScheduler,
+    OmniGenerationScheduler,
+)
 
 logger = init_logger(__name__)
 
@@ -183,16 +186,19 @@ def _resolve_scheduler(
 ) -> type[VLLMScheduler] | None:
     """Return the scheduler class for the given execution_type.
 
-    NOTE: For AutoRegressive stages, we have two schedulers for sync / async
-    respectively, and decide which to used based on the value of async_scheduling.
-    For other execution types, async_scheduling is not used.
+    AutoRegressive and generation stages each have synchronous and asynchronous
+    schedulers. The asynchronous generation scheduler is important for
+    ``async_chunk`` pipelines: it lets newly arrived chunks join the next
+    scheduling step without imposing a lockstep batch barrier.
     """
     if execution_type == StageExecutionType.LLM_AR:
         if not async_scheduling:
             return OmniARScheduler
         return OmniARAsyncScheduler
     if execution_type == StageExecutionType.LLM_GENERATION:
-        return OmniGenerationScheduler
+        if not async_scheduling:
+            return OmniGenerationScheduler
+        return OmniGenerationAsyncScheduler
     # Diffusion currently returns None here.
     return None
 

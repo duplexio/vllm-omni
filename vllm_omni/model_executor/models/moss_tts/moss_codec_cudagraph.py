@@ -9,6 +9,8 @@ eager execution transparently.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from torch.cuda import CUDAGraph
@@ -26,21 +28,25 @@ logger = init_logger(__name__)
 class MossTTSCUDAGraphCodecWrapper:
     """CUDA Graph wrapper for MossAudioTokenizerModel._decode.
 
-    Graphs are keyed by padded_T (int).  On each call the actual T is
-    bucket-matched to the smallest pre-captured size >= T.  The static code
-    buffer [NQ, 1, padded_T] is filled left-aligned (right-zero-padded) and
-    the graph is replayed.  The output audio is sliced to the correct length
-    by scaling from the captured audio shape (actual_T / padded_T * captured_len),
-    avoiding any assumption about downsample_rate vs effective decoder upsample.
-    The slice is cloned before returning so the static buffer can be reused.
+    Graphs are keyed by ``(batch_size, padded_T)``.  On each call the actual
+    request count and frame count are bucket-matched to the smallest
+    pre-captured sizes.  The static code buffer ``[NQ, B, padded_T]`` is filled
+    left-aligned (right-zero-padded) and the graph is replayed.  The output
+    audio is sliced to each request's correct length by scaling from the
+    captured audio shape (``actual_T / padded_T * captured_len``), avoiding
+    any assumption about downsample_rate vs effective decoder upsample.  Each
+    slice is cloned before returning so the static buffer can be reused.
 
     Usage::
 
         wrapper = MossTTSCUDAGraphCodecWrapper(codec_model, capture_sizes, nq)
         wrapper.warmup(device)
 
-        # per-request decode:
-        out = wrapper.decode(codes_nq_t)   # codes_nq_t: [NQ, T]
+        # batched decode:
+        outputs = wrapper.decode_batch(codes_list)  # each code tensor: [NQ, T]
+
+        # single-request compatibility:
+        out = wrapper.decode(codes_nq_t)
     """
 
     def __init__(
@@ -48,20 +54,30 @@ class MossTTSCUDAGraphCodecWrapper:
         model: MossAudioTokenizerModel,
         capture_sizes: list[int],
         num_quantizers: int,
+        capture_batch_sizes: list[int] | None = None,
         enabled: bool = True,
     ) -> None:
         self.model = model
         self.capture_sizes: list[int] = sorted(capture_sizes)
         self.num_quantizers = num_quantizers
+        self.capture_batch_sizes: list[int] = sorted(set(capture_batch_sizes or [1]))
         self.enabled = enabled
 
-        # All dicts keyed by padded_T.
-        self.graphs: dict[int, CUDAGraph] = {}
-        self.static_codes: dict[int, torch.Tensor] = {}  # [NQ, 1, padded_T]
+        # All dictionaries are keyed by (batch_size, padded_T).
+        self.graphs: dict[tuple[int, int], CUDAGraph] = {}
+        self.static_codes: dict[tuple[int, int], torch.Tensor] = {}
         # static_lengths is kept alive here — the captured graph holds a
         # reference to the underlying storage and must not be GC'd.
-        self.static_lengths: dict[int, torch.Tensor] = {}  # [1]
-        self.static_audio: dict[int, torch.Tensor] = {}  # [1, 1, padded_T * effective_upsample]
+        self.static_lengths: dict[tuple[int, int], torch.Tensor] = {}
+        self.static_audio: dict[tuple[int, int], torch.Tensor] = {}
+
+        # v1 calls this method _decode while v2 calls it _decode_frame.  The
+        # tensor-only signatures are identical, so resolve the variant once at
+        # construction instead of branching in every replay.
+        decode = getattr(model, "_decode", None)
+        if decode is None:
+            decode = model._decode_frame
+        self._decode_tensor: Callable[[torch.Tensor, torch.Tensor], Any] = decode
 
         self._warmed_up = False
 
@@ -76,6 +92,13 @@ class MossTTSCUDAGraphCodecWrapper:
                 return s
         return None
 
+    def _get_padded_batch_size(self, actual_batch: int) -> int | None:
+        """Return the smallest captured batch size that fits ``actual_batch``."""
+        for size in self.capture_batch_sizes:
+            if actual_batch <= size:
+                return size
+        return None
+
     # ------------------------------------------------------------------
     # Warmup / capture
     # ------------------------------------------------------------------
@@ -87,65 +110,73 @@ class MossTTSCUDAGraphCodecWrapper:
 
         nq = self.num_quantizers
         logger.info(
-            "MOSS-TTS codec CUDA Graph warmup: nq=%d capture_sizes=%s",
+            "MOSS-TTS codec CUDA Graph warmup: nq=%d capture_batch_sizes=%s capture_sizes=%s",
             nq,
+            self.capture_batch_sizes,
             self.capture_sizes,
         )
         t0 = time.perf_counter()
 
         # One eager run per size to let cuDNN / CUDA allocate memory before
         # the capture window (graph capture forbids new CUDA allocs during it).
-        for size in self.capture_sizes:
-            dummy_codes = torch.zeros(nq, 1, size, dtype=torch.long, device=device)
-            dummy_lengths = torch.tensor([size], dtype=torch.long, device=device)
-            with torch.no_grad():
-                _ = self.model._decode(dummy_codes, dummy_lengths)
+        for batch_size in self.capture_batch_sizes:
+            for size in self.capture_sizes:
+                dummy_codes = torch.zeros(nq, batch_size, size, dtype=torch.long, device=device)
+                dummy_lengths = torch.full((batch_size,), size, dtype=torch.long, device=device)
+                with torch.no_grad():
+                    _ = self._decode_tensor(dummy_codes, dummy_lengths)
 
         torch.accelerator.synchronize(device)
 
-        for size in self.capture_sizes:
-            try:
-                self._capture(size, device)
-                logger.info("  Captured CUDA Graph for size=%d", size)
-            except Exception:
-                logger.warning(
-                    "  Failed to capture CUDA Graph for size=%d; this size will fall back to eager decode",
-                    size,
-                    exc_info=True,
-                )
+        for batch_size in self.capture_batch_sizes:
+            for size in self.capture_sizes:
+                try:
+                    self._capture(batch_size, size, device)
+                    logger.info("  Captured CUDA Graph for batch_size=%d size=%d", batch_size, size)
+                except Exception:
+                    logger.warning(
+                        "  Failed to capture CUDA Graph for batch_size=%d size=%d; "
+                        "this pair will fall back to eager decode",
+                        batch_size,
+                        size,
+                        exc_info=True,
+                    )
 
         self._warmed_up = True
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         logger.info(
             "MOSS-TTS codec CUDA Graph warmup complete: %d/%d captured in %.1f ms",
             len(self.graphs),
-            len(self.capture_sizes),
+            len(self.capture_sizes) * len(self.capture_batch_sizes),
             elapsed_ms,
         )
 
-    def _capture(self, size: int, device: torch.device) -> None:
+    def _capture(self, batch_size: int, size: int, device: torch.device) -> None:
         nq = self.num_quantizers
-        static_codes = torch.zeros(nq, 1, size, dtype=torch.long, device=device)
+        static_codes = torch.zeros(nq, batch_size, size, dtype=torch.long, device=device)
         # lengths holds the number of valid code frames; set to full size at
-        # capture time so the decoder emits a full-size audio buffer.
-        static_lengths = torch.tensor([size], dtype=torch.long, device=device)
+        # capture time so the decoder emits a full-size audio buffer for every
+        # graph lane.  Runtime requests are padded to this frame count and
+        # trimmed after replay; inactive lanes are ignored by the caller.
+        static_lengths = torch.full((batch_size,), size, dtype=torch.long, device=device)
 
         # Extra eager warmup inside capture to ensure all kernels are compiled.
         with torch.no_grad():
-            _ = self.model._decode(static_codes, static_lengths)
+            _ = self._decode_tensor(static_codes, static_lengths)
         torch.accelerator.synchronize(device)
 
         graph = CUDAGraph()
         with torch.no_grad():
             with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-                static_out = self.model._decode(static_codes, static_lengths)
+                static_out = self._decode_tensor(static_codes, static_lengths)
 
-        self.graphs[size] = graph
-        self.static_codes[size] = static_codes
-        self.static_lengths[size] = static_lengths
+        key = (batch_size, size)
+        self.graphs[key] = graph
+        self.static_codes[key] = static_codes
+        self.static_lengths[key] = static_lengths
         # static_out.audio is a static buffer reused every replay; hold a
         # reference so it is not garbage-collected.
-        self.static_audio[size] = static_out.audio  # [1, 1, size * effective_upsample]
+        self.static_audio[key] = static_out.audio  # [B, C, size * effective_upsample]
 
     # ------------------------------------------------------------------
     # Inference
@@ -160,48 +191,107 @@ class MossTTSCUDAGraphCodecWrapper:
           - an outer CUDA stream capture is active (e.g. vLLM FULL graph mode)
           - actual T exceeds all pre-captured sizes
         """
-        if not self.enabled or not self._warmed_up:
-            return self.model.batch_decode(codes_list=[codes_nq_t], num_quantizers=self.num_quantizers)
+        return self.decode_batch([codes_nq_t])[0]
 
-        # Replaying a graph inside an active stream capture would corrupt the
-        # outer graph.  Fall back to eager so the caller can complete its capture.
-        if torch.cuda.is_current_stream_capturing():
-            return self.model.batch_decode(codes_list=[codes_nq_t], num_quantizers=self.num_quantizers)
+    def _eager_decode_batch(
+        self,
+        codes_list: list[torch.Tensor],
+    ) -> list[MossAudioTokenizerDecoderOutput]:
+        """Decode a variable-length batch eagerly and split it per request."""
+        result = self.model.batch_decode(codes_list=codes_list, num_quantizers=self.num_quantizers)
+        if result.audio is None:
+            return [MossAudioTokenizerDecoderOutput(audio=None, audio_lengths=None) for _ in codes_list]
 
-        actual_t = int(codes_nq_t.shape[-1])
-        padded_size = self._get_padded_size(actual_t)
+        outputs: list[MossAudioTokenizerDecoderOutput] = []
+        for index, _ in enumerate(codes_list):
+            audio = result.audio[index : index + 1]
+            if result.audio_lengths is None:
+                length = audio.shape[-1]
+                lengths = None
+            else:
+                length = int(result.audio_lengths[index].item())
+                audio = audio[..., :length]
+                lengths = torch.tensor([length], dtype=torch.long, device=audio.device)
+            outputs.append(MossAudioTokenizerDecoderOutput(audio=audio, audio_lengths=lengths))
+        return outputs
 
-        if padded_size is None or padded_size not in self.graphs:
-            return self.model.batch_decode(codes_list=[codes_nq_t], num_quantizers=self.num_quantizers)
+    @torch.no_grad()
+    def decode_batch(
+        self,
+        codes_list: list[torch.Tensor],
+    ) -> list[MossAudioTokenizerDecoderOutput]:
+        """Decode variable-length requests using bucketed batched graph replay.
 
-        # --- Fill static buffers then replay ---
+        The scheduler remains free to submit and complete requests
+        independently.  Only requests present in this call are grouped into
+        a padded frame bucket and a captured batch-size bucket.  The graph
+        computes all lanes together; host-side request splitting happens after
+        replay.
+        """
+        if not codes_list:
+            return []
+        if not self.enabled or not self._warmed_up or torch.cuda.is_current_stream_capturing():
+            return self._eager_decode_batch(codes_list)
 
-        static_codes = self.static_codes[padded_size]  # [NQ, 1, padded_size]
+        outputs: list[MossAudioTokenizerDecoderOutput | None] = [None] * len(codes_list)
+        bucketed: dict[int, list[tuple[int, torch.Tensor]]] = {}
+        eager_indices: list[int] = []
 
-        if actual_t == padded_size:
-            # Exact fit: copy the whole buffer at once.
-            # codes_nq_t is [NQ, T]; unsqueeze(1) → [NQ, 1, T] matching static_codes.
-            static_codes.copy_(codes_nq_t.unsqueeze(1))
-        else:
-            # Smaller input: zero the buffer first (right-zero-pad), then fill
-            # left-aligned.  static_codes[:, 0, :actual_t] is [NQ, actual_t]
-            # and codes_nq_t is [NQ, actual_t].
-            static_codes.zero_()
-            static_codes[:, 0, :actual_t].copy_(codes_nq_t)
+        for index, codes in enumerate(codes_list):
+            padded_size = self._get_padded_size(int(codes.shape[-1]))
+            if padded_size is None:
+                eager_indices.append(index)
+            else:
+                bucketed.setdefault(padded_size, []).append((index, codes))
 
-        self.graphs[padded_size].replay()
+        for padded_size, items in bucketed.items():
+            # If the ready set is larger than the largest captured graph, use
+            # one eager tensor batch instead of serialising it into smaller
+            # graph replays.  This is the normal high-throughput path when the
+            # safe graph configuration captures only batch size 1.
+            if len(items) > self.capture_batch_sizes[-1]:
+                eager_indices.extend(index for index, _ in items)
+                continue
 
-        # static_audio[padded_size] is the live output buffer of the graph.
-        # Slice to the real audio length and clone before returning; without
-        # the clone the next replay would overwrite the caller's tensor.
-        # Derive the slice length from the captured audio shape rather than
-        # downsample_rate: the decoder's effective upsample (product of all
-        # PatchedPretransform patch sizes) can differ from the config attribute.
-        captured_len = self.static_audio[padded_size].shape[-1]
-        actual_wav_len = captured_len * actual_t // padded_size
-        audio = self.static_audio[padded_size][..., :actual_wav_len].clone()
-        audio_lengths = torch.tensor([actual_wav_len], dtype=torch.long, device=audio.device)
-        return MossAudioTokenizerDecoderOutput(audio=audio, audio_lengths=audio_lengths)
+            start = 0
+            while start < len(items):
+                batch_size = self._get_padded_batch_size(len(items) - start)
+                if batch_size is None:
+                    eager_indices.extend(index for index, _ in items[start:])
+                    break
+
+                chunk = items[start : start + batch_size]
+                key = (batch_size, padded_size)
+                if key not in self.graphs:
+                    eager_indices.extend(index for index, _ in chunk)
+                    start += len(chunk)
+                    continue
+
+                static_codes = self.static_codes[key]
+                static_codes.zero_()
+                for lane, (_, codes) in enumerate(chunk):
+                    static_codes[:, lane, : codes.shape[-1]].copy_(codes)
+                self.graphs[key].replay()
+
+                static_audio = self.static_audio[key]
+                captured_len = static_audio.shape[-1]
+                for lane, (index, codes) in enumerate(chunk):
+                    actual_t = int(codes.shape[-1])
+                    actual_wav_len = captured_len * actual_t // padded_size
+                    audio = static_audio[lane : lane + 1, ..., :actual_wav_len].clone()
+                    lengths = torch.tensor([actual_wav_len], dtype=torch.long, device=audio.device)
+                    outputs[index] = MossAudioTokenizerDecoderOutput(audio=audio, audio_lengths=lengths)
+                start += len(chunk)
+
+        if eager_indices:
+            eager_codes = [codes_list[index] for index in eager_indices]
+            eager_outputs = self._eager_decode_batch(eager_codes)
+            for index, output in zip(eager_indices, eager_outputs, strict=True):
+                outputs[index] = output
+
+        if any(output is None for output in outputs):
+            raise RuntimeError("MOSS codec batch decode did not produce an output for every request.")
+        return [output for output in outputs if output is not None]
 
 
 __all__ = ["MossTTSCUDAGraphCodecWrapper"]

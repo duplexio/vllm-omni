@@ -63,7 +63,14 @@ MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_raw_async_chunk"),
-            sampling_constraints={"detokenize": False},
+            sampling_constraints={
+                "detokenize": False,
+                # The realtime talker forces this text token after its local
+                # audio transformer emits AUDIO_EOS.  Without declaring it
+                # here, vLLM keeps decoding through the frame budget instead
+                # of terminating the request.
+                "stop_token_ids": [151645],
+            },
         ),
         StagePipelineConfig(
             stage_id=1,

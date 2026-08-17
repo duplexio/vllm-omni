@@ -1,10 +1,11 @@
 # MOSS-TTS-Realtime turnwise sessions.
 #
-# Each HTTP turn is a complete vLLM request.  Prefix caching reuses the stable
-# system/voice-clone prefix while the server-owned session supplies the
-# immediately preceding turn's text and RVQ codes.  This is deliberately
-# separate from moss_tts_realtime.yaml, whose async connector settings target
-# low-latency live streaming rather than batched dataset synthesis.
+# Each HTTP turn is a complete vLLM request.  The server-owned session supplies
+# the immediately preceding turn's text and RVQ codes.  Prefix caching stays
+# disabled here because the RVQ conditioning lives outside the token-id prompt
+# and therefore cannot safely participate in a shared KV-prefix hash.  This is
+# deliberately separate from moss_tts_realtime.yaml, whose async connector
+# settings target low-latency live streaming rather than batched synthesis.
 async_chunk: false
 trust_remote_code: true
 
@@ -13,17 +14,28 @@ connectors:
     name: SharedMemoryConnector
     extra:
       codec_streaming: false
+      # Keep graph pools bounded on the shared stage-0/stage-1 GPU.  The codec
+      # still batches ready requests per frame bucket eagerly; this controls
+      # only optional per-batch CUDA graph capture.
+      decode_cudagraph_capture_batch_sizes: [1]
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
 
 stages:
   - stage_id: 0
+    # Sixteen active sequences is the measured saturation point on one H100 in
+    # the 2,048-token bulk probe; additional requests remain queued without
+    # increasing aggregate tokens/s.
     max_num_seqs: 16
     gpu_memory_utilization: 0.60
     attention_backend: FLASHINFER
-    enable_prefix_caching: true
+    # Realtime's RVQ prompt lives in ``additional_information`` and is not
+    # part of vLLM's token-id prefix hash. Reusing a cached KV block would
+    # therefore reuse the previous speaker's audio conditioning.
+    enable_prefix_caching: false
     async_scheduling: true
+    enable_chunked_prefill: true
     max_num_batched_tokens: 8192
     max_model_len: 4096
     devices: "0"
@@ -35,13 +47,21 @@ stages:
       top_k: 50
       max_tokens: 4096
       repetition_penalty: 1.1
+      stop_token_ids: [151645]  # <|im_end|> emitted after audio EOS
 
   - stage_id: 1
     max_num_seqs: 16
     gpu_memory_utilization: 0.12
-    enforce_eager: true
+    # The codec is a non-autoregressive generation stage, so it has no KV
+    # cache or useful prefill phase.  Its forward returns CPU audio tensors,
+    # which is not compatible with vLLM's generic full CUDA-graph capture.
+    # The model-level decoder wrapper below captures the actual codec instead.
+    enforce_eager: false
+    attention_backend: FLASHINFER
     enable_prefix_caching: false
     async_scheduling: true
+    compilation_config:
+      cudagraph_mode: NONE
     max_num_batched_tokens: 196608
     max_model_len: 196608
     devices: "0"

@@ -2225,7 +2225,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "ref": unified[:, 1:].contiguous().to(torch.int64),
                     "audio": turn.audio_prefix_codes,
                 },
-                "_cache_salt": turn.cache_salt,
+                # ``codes.ref`` is carried outside the token-id prompt. Keep
+                # each revision isolated if a deployment enables prefix
+                # caching: reusing the session-wide salt would replay stale
+                # audio-conditioned KV blocks on the next turn.
+                "_cache_salt": f"{turn.cache_salt}:turn-{turn.revision}",
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
@@ -2271,7 +2275,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "all": prompt.remaining_text_ids,
                 },
                 "codes": {"ref": prompt.audio_codes},
-                "_cache_salt": turn.cache_salt,
+                # The RVQ grid is additional information rather than token
+                # ids, so a session-wide cache salt is unsafe across turns.
+                "_cache_salt": f"{turn.cache_salt}:turn-{turn.revision}",
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
@@ -4216,12 +4222,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 else:
                     session_turn = self._moss_ttsd_pending_turns.get(request.moss_session_id)
 
-            # MOSS-TTS-Nano emits delta chunks per yield (single-stage,
-            # async_chunk=false). The engine surfaces each yield as its own
-            # RequestOutput, so we need to accumulate across the async-for loop —
-            # final_output alone only carries the last (often empty) sentinel.
-            is_moss = self._tts_model_type == "moss_tts_nano"
+            # MOSS codecs can emit one payload per async chunk. Keep the
+            # family-wide handling here: the final request output may contain
+            # an empty terminal code sentinel even when audio was produced.
+            is_moss = self._tts_model_type in {"moss_tts_nano", "moss_tts"}
+            moss_async_chunk = is_moss and bool(getattr(self.engine_client.model_config, "async_chunk", False))
             moss_chunks: list[Any] = []
+            moss_code_chunks: list[torch.Tensor] = []
             moss_sample_rate: int | None = None
 
             final_output: OmniRequestOutput | None = None
@@ -4244,6 +4251,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 for cand in candidates:
                     if hasattr(cand, "numel") and cand.numel() > 0:
                         moss_chunks.append(cand)
+                code_value = step_audio.get("audio_codes")
+                code_candidates = code_value if isinstance(code_value, list) else [code_value]
+                for code in code_candidates:
+                    if isinstance(code, torch.Tensor) and code.ndim == 2 and code.numel() > 0:
+                        moss_code_chunks.append(code.detach().to("cpu", torch.long).contiguous())
                 sr_step = step_audio.get("sr")
                 if sr_step is not None:
                     sr_val_step = sr_step[-1] if isinstance(sr_step, list) and sr_step else sr_step
@@ -4262,11 +4274,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
             if is_moss:
-                # Prefer the engine's own consolidated audio when present. After the
-                # vllm 0.20 rebase non-stream requests resolve to FINAL_ONLY, so
-                # final_output already carries the full concatenated waveform; the
-                # delta-accumulator below is kept as a fallback for DELTA-style
-                # engines that surface chunks one yield at a time.
+                # Prefer the engine's consolidated audio for ordinary
+                # full-payload requests. Async-chunk requests may expose only
+                # per-chunk payloads, so concatenate those explicitly.
                 if isinstance(audio_tensor, list):
                     non_empty_final = [c for c in audio_tensor if hasattr(c, "numel") and c.numel() > 0]
                     final_audio = torch.cat(non_empty_final, dim=-1) if non_empty_final else None
@@ -4275,7 +4285,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 else:
                     final_audio = None
 
-                if final_audio is not None:
+                if moss_async_chunk and moss_chunks:
+                    audio_tensor = torch.cat(moss_chunks, dim=-1)
+                elif final_audio is not None:
                     audio_tensor = final_audio
                 elif moss_chunks:
                     audio_tensor = torch.cat(moss_chunks, dim=-1)
@@ -4313,7 +4325,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
             audio_response: AudioResponse = self.create_audio(audio_obj)
             if session_turn is not None:
-                generated_codes = self._extract_moss_codes(audio_output)
+                if moss_async_chunk and moss_code_chunks:
+                    generated_codes = torch.cat(moss_code_chunks, dim=0)
+                else:
+                    generated_codes = self._extract_moss_codes(audio_output)
                 if self._moss_variant == "realtime":
                     if session_turn.role == "user":
                         generated_codes = await self._roundtrip_moss_realtime_context_codes(generated_codes)

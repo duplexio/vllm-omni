@@ -8,8 +8,8 @@ codes for one audio frame, autoregressively over codebooks. It runs inside the
 talker's per-step ``make_omni_output``, independent from vLLM's main scheduler.
 
 The transformer body is shared with Qwen3-TTS and Qwen3-Omni via
-``common.qwen3_code_predictor.CodePredictorBaseModel`` (re-prefill, no KV cache,
-HF-compatible numerics). MossTTSRealtime differs in two ways:
+``common.qwen3_code_predictor.CodePredictorBaseModel`` (HF-compatible
+numerics). MossTTSRealtime differs in two ways:
 
   * codebook 0 is generated here from ``backbone_last_hidden`` (the other models
     receive it from the talker's main LM head), so we run one extra step and own
@@ -17,8 +17,10 @@ HF-compatible numerics). MossTTSRealtime differs in two ways:
   * sampling adds top-p and a windowed repetition penalty on top of
     temperature + top-k, matching upstream ``MossTTSRealtimeInference.generate``.
 
-Re-prefilling the (<=rvq) frame each step is numerically identical to the
-previous KV-cache loop -- causal attention, only the last position is read.
+The regular body still supports re-prefill for the other model families.  This
+decoder uses its incremental path: the K/V cache is created for one frame and
+discarded before the next frame, so each codebook step computes only the new
+position while preserving the causal attention result.
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
 from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
     MossTTSLocalTransformerConfig,
 )
+
+HistoryPerCodebook = list[list[int]] | list[list[list[int]]]
 
 
 class MossTTSRealtimeLocalTransformer(nn.Module):
@@ -72,15 +76,17 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         top_p: float = 0.95,
         do_sample: bool = True,
         repetition_penalty: float = 1.0,
-        history_per_codebook: list[list[int]] | None = None,
+        history_per_codebook: HistoryPerCodebook | None = None,
     ) -> torch.Tensor:
         """Generate one audio frame (rvq codebook tokens) for batch B.
 
         Returns a ``(B, rvq)`` LongTensor.
 
-        ``history_per_codebook[i]`` is a list of recently-emitted token ids for
-        codebook ``i``; when ``repetition_penalty != 1.0`` those tokens get
-        their logits scaled down (mirrors upstream's rep-penalty behaviour).
+        For a single request, ``history_per_codebook[i]`` is a list of
+        recently-emitted token ids for codebook ``i``. For a batch, use
+        ``history_per_codebook[batch][codebook]``. When
+        ``repetition_penalty != 1.0`` those tokens get their logits scaled
+        down (mirrors upstream's rep-penalty behaviour).
         """
         device = backbone_last_hidden.device
         B = backbone_last_hidden.shape[0]
@@ -89,35 +95,87 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
 
         codec_embeds = self.model.codec_embedding
 
-        # Re-prefill buffer: position 0 = backbone hidden, position s = embed of
-        # code_{s-1}. At step s we forward positions [0..s] and read the last.
-        embeds = backbone_last_hidden.new_zeros((B, rvq, hidden_size))
-        embeds[:, 0, :] = backbone_last_hidden.to(embeds.dtype)
-
-        pos_ids_full = torch.arange(rvq, device=device, dtype=torch.long).unsqueeze(0).expand(B, -1)
-
         codes = backbone_last_hidden.new_zeros((B, rvq), dtype=torch.long)
 
-        for step in range(rvq):
-            seq_len = step + 1
-            hidden = self.model(embeds[:, :seq_len, :], pos_ids_full[:, :seq_len])
-            logits = lm_heads[step](hidden[:, step, :]).float()
+        histories: list[list[list[int]]] | None
+        if history_per_codebook is None:
+            histories = None
+        elif B == 1 and (
+            not history_per_codebook
+            or not history_per_codebook[0]
+            or not isinstance(history_per_codebook[0][0], list)
+        ):
+            # Preserve the original single-request calling convention.
+            histories = [history_per_codebook]  # type: ignore[list-item]
+        else:
+            histories = history_per_codebook  # type: ignore[assignment]
 
-            if repetition_penalty != 1.0 and history_per_codebook is not None and step < len(history_per_codebook):
-                hist = history_per_codebook[step]
-                if hist:
-                    hist_t = torch.tensor(hist, dtype=torch.long, device=logits.device)
-                    sel = logits.index_select(-1, hist_t)
-                    pos = sel > 0
-                    sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
-                    logits.index_copy_(-1, hist_t, sel)
+        # The cache is scoped to this frame.  Position zero is the talker
+        # hidden state; every later position is the embedding of the previous
+        # codebook token.
+        frame_embed = backbone_last_hidden.to(dtype=next(self.model.parameters()).dtype).unsqueeze(1)
+        past_key_values = None
+        for step in range(rvq):
+            pos_ids = torch.full((B, 1), step, dtype=torch.long, device=device)
+            hidden, past_key_values = self.model.forward_incremental(
+                frame_embed,
+                pos_ids,
+                past_key_values=past_key_values,
+            )
+            logits = lm_heads[step](hidden[:, -1, :]).float()
+
+            if repetition_penalty != 1.0 and histories is not None:
+                apply_repetition_penalty(logits, histories, step, repetition_penalty)
 
             codes[:, step] = _sample_token(logits, temperature, top_k, top_p, do_sample)
 
             if step + 1 < rvq:
-                embeds[:, step + 1, :] = codec_embeds[step](codes[:, step].view(B, 1)).view(B, hidden_size)
+                frame_embed = codec_embeds[step](codes[:, step].view(B, 1)).view(B, 1, hidden_size)
 
         return codes
+
+
+def apply_repetition_penalty(
+    logits: torch.Tensor,
+    histories: list[list[list[int]]],
+    codebook: int,
+    repetition_penalty: float,
+) -> None:
+    """Apply one history penalty mask across a batched codebook decode."""
+    batch_size, vocab_size = logits.shape
+    token_lists = [
+        histories[index][codebook] if codebook < len(histories[index]) else []
+        for index in range(batch_size)
+    ]
+    max_history = max((len(tokens) for tokens in token_lists), default=0)
+    if max_history == 0:
+        return
+
+    # Use vocab_size as a sentinel so padded history entries cannot collide
+    # with a real token id, including token 0.
+    history_ids = torch.full(
+        (batch_size, max_history),
+        vocab_size,
+        dtype=torch.long,
+        device=logits.device,
+    )
+    for index, tokens in enumerate(token_lists):
+        if tokens:
+            history_ids[index, : len(tokens)] = torch.as_tensor(
+                tokens,
+                dtype=torch.long,
+                device=logits.device,
+            )
+
+    seen = torch.zeros(
+        (batch_size, vocab_size + 1),
+        dtype=torch.bool,
+        device=logits.device,
+    )
+    seen.scatter_(1, history_ids, True)
+    seen = seen[:, :vocab_size]
+    penalized = torch.where(logits > 0, logits / repetition_penalty, logits * repetition_penalty)
+    logits.copy_(torch.where(seen, penalized, logits))
 
 
 def _sample_token(

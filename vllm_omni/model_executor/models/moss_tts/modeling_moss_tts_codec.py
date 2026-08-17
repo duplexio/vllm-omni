@@ -35,7 +35,7 @@ logger = init_logger(__name__)
 
 
 class _MossCodecStreamSession:
-    """Persistent streaming decode session for vendored MOSS-Audio-Tokenizer-v2."""
+    """Persistent streaming decode session for the vendored MOSS tokenizers."""
 
     def __init__(
         self,
@@ -52,8 +52,13 @@ class _MossCodecStreamSession:
         self._free_stream_slots = list(range(self._stream_slots))
         self._exit_stack = contextlib.ExitStack()
         self._closed = False
-        with torch.no_grad():
-            self._exit_stack.enter_context(codec.streaming(self._batch_size))
+        self._native_streaming = callable(getattr(codec, "streaming", None)) and callable(
+            getattr(codec, "_decode_frame", None)
+        )
+        self._history: dict[int, torch.Tensor] = {}
+        if self._native_streaming:
+            with torch.no_grad():
+                self._exit_stack.enter_context(codec.streaming(self._batch_size))
 
     def acquire(self) -> int | None:
         if not self._free_stream_slots:
@@ -63,11 +68,13 @@ class _MossCodecStreamSession:
     def release(self, slot: int) -> None:
         if self._closed:
             return
-        self.reset_slots([slot])
+        if self._native_streaming:
+            self.reset_slots([slot])
+        self._history.pop(slot, None)
         self._free_stream_slots.append(slot)
 
     def reset_slots(self, slots: list[int]) -> None:
-        if not slots:
+        if not slots or not self._native_streaming:
             return
         reset_mask = torch.zeros(self._batch_size, dtype=torch.bool, device=self._device)
         reset_mask[slots] = True
@@ -83,8 +90,10 @@ class _MossCodecStreamSession:
     def close(self) -> None:
         if self._closed:
             return
-        with torch.no_grad():
-            self._exit_stack.close()
+        if self._native_streaming:
+            with torch.no_grad():
+                self._exit_stack.close()
+        self._history.clear()
         self._closed = True
 
     @torch.no_grad()
@@ -94,6 +103,9 @@ class _MossCodecStreamSession:
         step_lengths = {int(codes.shape[1]) for codes in slot_codes.values()}
         if len(step_lengths) != 1:
             raise ValueError(f"MOSS codec streaming step needs uniform T, got {sorted(step_lengths)}")
+        if not self._native_streaming:
+            return self._step_v1(slot_codes)
+
         (step_t,) = step_lengths
         codes_step = torch.zeros(
             self._n_vq,
@@ -121,6 +133,50 @@ class _MossCodecStreamSession:
             if lengths is not None:
                 wav = wav[..., : int(lengths[slot].item())]
             out[slot] = wav.contiguous()
+        return out
+
+    @torch.no_grad()
+    def _step_v1(self, slot_codes: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
+        """Decode v1 requests from accumulated causal histories.
+
+        The v1 tokenizer exposes only stateless ``batch_decode``.  Decoding a
+        chunk in isolation would reset the causal receptive field at every
+        boundary and produces audible seams.  Keeping the code history and
+        trimming the already-emitted waveform preserves the same causal
+        prefix for every request while still presenting all ready requests as
+        one ragged batch to the GPU.
+        """
+        histories: list[torch.Tensor] = []
+        previous_lengths: list[int] = []
+        slots: list[int] = []
+        for slot, codes in slot_codes.items():
+            history = self._history.get(slot)
+            previous_length = 0 if history is None else int(history.shape[1])
+            if history is None:
+                history = codes.detach().to(self._device, torch.long).contiguous()
+            else:
+                history = torch.cat(
+                    [history, codes.detach().to(self._device, torch.long)],
+                    dim=1,
+                ).contiguous()
+            self._history[slot] = history
+            slots.append(slot)
+            histories.append(history)
+            previous_lengths.append(previous_length)
+
+        result = self._codec.batch_decode(codes_list=histories, num_quantizers=self._n_vq)
+        if result.audio is None:
+            return {}
+
+        audio = result.audio.detach().to("cpu", torch.float32)
+        lengths = result.audio_lengths.detach().to("cpu") if result.audio_lengths is not None else None
+        out: dict[int, torch.Tensor] = {}
+        for index, slot in enumerate(slots):
+            wav = audio[index]
+            if lengths is not None:
+                wav = wav[..., : int(lengths[index].item())]
+            trim = min(previous_lengths[index] * self._codec.downsample_rate, wav.shape[-1])
+            out[slot] = wav[..., trim:].contiguous()
         return out
 
 
@@ -177,6 +233,7 @@ class MossTTSCodecDecoder(nn.Module):
         self._stream_max_step_frames: int = self._connector_int("codec_max_step_frames", default=100)
         self._stream_req_slots: dict[str, int] = {}
         self._stream_pending_codes: dict[str, list[torch.Tensor]] = {}
+        self._stream_code_history: dict[str, torch.Tensor] = {}
         self._stream_starved_reqs: set[str] = set()
 
     # ------------------------------------------------------------------
@@ -291,6 +348,7 @@ class MossTTSCodecDecoder(nn.Module):
         for n in token_counts:
             offsets.append(offsets[-1] + int(n))
 
+        offline_work: list[tuple[int, torch.Tensor, int]] = []
         for i, info in enumerate(info_list):
             if i + 1 >= len(offsets):
                 break
@@ -302,8 +360,16 @@ class MossTTSCodecDecoder(nn.Module):
             streaming_enabled = bool(meta.get("codec_streaming", False))
             code_flat_numel = meta.get("code_flat_numel")
             if streaming_enabled and finished and code_flat_numel is not None and int(code_flat_numel) == 0:
+                req_key = self._runtime_request_key(info, meta, i)
+                # The terminal control packet carries no new audio frames. Keep
+                # the complete RVQ grid in its multimodal output so a
+                # FINAL_ONLY consumer can commit the session context even when
+                # intermediate codec chunks were not exposed to the client.
+                completed_codes = self._stream_code_history.get(req_key)
                 for _, wav in self._finish_empty_streaming_requests([info]).items():
                     audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
+                if completed_codes is not None:
+                    code_outputs[i] = completed_codes
                 continue
             if seg.numel() % self._n_vq != 0:
                 logger.warning(
@@ -338,37 +404,71 @@ class MossTTSCodecDecoder(nn.Module):
             req_key = self._runtime_request_key(info, meta, i)
 
             if streaming_enabled:
+                code_chunk = code_outputs[i]
+                previous_codes = self._stream_code_history.get(req_key)
+                full_codes = (
+                    code_chunk
+                    if previous_codes is None
+                    else torch.cat([previous_codes, code_chunk], dim=0).contiguous()
+                )
+                if finished:
+                    # A normal (non-streaming) speech request sees only the
+                    # terminal payload. Preserve the complete generated grid
+                    # there so session context does not depend on output
+                    # accumulation of intermediate chunks.
+                    code_outputs[i] = full_codes
+                    self._stream_code_history.pop(req_key, None)
+                else:
+                    self._stream_code_history[req_key] = full_codes
                 streaming_work.append((i, req_key, codes_nq_t, finished))
                 continue
+            offline_work.append((i, codes_nq_t, left_ctx))
 
+        if offline_work:
+            codes_list = [codes for _, codes, _ in offline_work]
             if self._cuda_graph_wrapper is not None:
-                out = self._cuda_graph_wrapper.decode(codes_nq_t)
+                decoded = self._cuda_graph_wrapper.decode_batch(codes_list)
             else:
-                out = self._codec.batch_decode(codes_list=[codes_nq_t], num_quantizers=self._n_vq)
+                decoded_batch = self._codec.batch_decode(codes_list=codes_list, num_quantizers=self._n_vq)
+                if decoded_batch.audio is None:
+                    decoded = [None] * len(offline_work)
+                else:
+                    decoded = [
+                        type(decoded_batch)(
+                            audio=decoded_batch.audio[index : index + 1],
+                            audio_lengths=(
+                                decoded_batch.audio_lengths[index : index + 1]
+                                if decoded_batch.audio_lengths is not None
+                                else None
+                            ),
+                        )
+                        for index in range(len(offline_work))
+                    ]
 
-            if out.audio is None:
-                continue
+            for (output_index, codes_nq_t, left_ctx), out in zip(offline_work, decoded, strict=True):
+                if out is None or out.audio is None:
+                    continue
 
-            # ``out.audio`` is ``(1, C, T)``; keep the channel axis for
-            # stereo codecs (Local-v1.5) and flatten to ``(T,)`` for mono
-            # ones (Delay/Realtime) to preserve their existing output shape.
-            wav = out.audio[0].to(dtype=torch.float32).cpu()
-            if out.audio_lengths is not None:
-                wav = wav[..., : int(out.audio_lengths[0].item())]
+                # ``out.audio`` is ``(1, C, T)``; keep the channel axis for
+                # stereo codecs (Local-v1.5) and flatten to ``(T,)`` for mono
+                # ones (Delay/Realtime) to preserve their existing output shape.
+                wav = out.audio[0].to(dtype=torch.float32).cpu()
+                if out.audio_lengths is not None:
+                    wav = wav[..., : int(out.audio_lengths[0].item())]
 
-            # Trim left-context samples (per-channel sample axis, so the
-            # trim amount is identical for mono and interleaved-stereo).
-            if left_ctx > 0:
-                trim = min(left_ctx * self._codec.downsample_rate, wav.shape[-1])
-                if trim < left_ctx * self._codec.downsample_rate:
-                    logger.warning(
-                        "left_ctx trim (%d samples) exceeds wav length (%d); returning empty audio.",
-                        left_ctx * self._codec.downsample_rate,
-                        wav.shape[-1],
-                    )
-                wav = wav[..., trim:]
+                # Trim left-context samples (per-channel sample axis, so the
+                # trim amount is identical for mono and interleaved-stereo).
+                if left_ctx > 0:
+                    trim = min(left_ctx * self._codec.downsample_rate, wav.shape[-1])
+                    if trim < left_ctx * self._codec.downsample_rate:
+                        logger.warning(
+                            "left_ctx trim (%d samples) exceeds wav length (%d); returning empty audio.",
+                            left_ctx * self._codec.downsample_rate,
+                            wav.shape[-1],
+                        )
+                    wav = wav[..., trim:]
 
-            audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
+                audios[output_index] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
 
         if streaming_work:
             for i, wav in self._decode_streaming_batch(streaming_work).items():
@@ -411,6 +511,7 @@ class MossTTSCodecDecoder(nn.Module):
                         req_key,
                     )
                 self._finish_stream_request(req_key, session, slot)
+            self._stream_code_history.pop(req_key, None)
         return outputs
 
     @staticmethod
@@ -572,6 +673,7 @@ class MossTTSCodecDecoder(nn.Module):
             session.release(slot)
         self._stream_req_slots.pop(request_id, None)
         self._stream_pending_codes.pop(request_id, None)
+        self._stream_code_history.pop(request_id, None)
         self._stream_starved_reqs.discard(request_id)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
@@ -597,6 +699,7 @@ class MossTTSCodecDecoder(nn.Module):
             else:
                 self._stream_req_slots.pop(request_id, None)
                 self._stream_pending_codes.pop(request_id, None)
+                self._stream_code_history.pop(request_id, None)
                 self._stream_starved_reqs.discard(request_id)
 
     def _connector_int(self, name: str, default: int = 0) -> int:
@@ -762,6 +865,13 @@ class MossTTSCodecDecoder(nn.Module):
         # as Qwen3-TTS), falling back to a sensible default covering common
         # codec_chunk_frames values used in moss_tts.yaml.
         capture_sizes: list[int] = [4, 8, 16, 25, 32, 50, 64, 100, 128, 200, 256]
+        scheduler_cfg = getattr(self.vllm_config, "scheduler_config", None)
+        max_batch_size = int(getattr(scheduler_cfg, "max_num_seqs", 1) or 1)
+        # Capturing every batch-size/frame-size pair consumes a separate CUDA
+        # graph memory pool.  Stage 0 and stage 1 share one GPU, so the safe
+        # default is one-request graphs plus eager batched decode for larger
+        # ready sets.  Larger graph buckets remain an explicit opt-in.
+        capture_batch_sizes: list[int] = [1]
         model_cfg = getattr(self.vllm_config, "model_config", None)
         connector_cfg = getattr(model_cfg, "stage_connector_config", None)
         if isinstance(connector_cfg, dict):
@@ -779,11 +889,23 @@ class MossTTSCodecDecoder(nn.Module):
                     parsed = [int(raw)]
                 if parsed:
                     capture_sizes = parsed
+            raw_batch = extra_cfg.get("decode_cudagraph_capture_batch_sizes")
+            if raw_batch is not None:
+                if isinstance(raw_batch, (list, tuple)):
+                    parsed_batch = sorted({int(v) for v in raw_batch if 0 < int(v) <= max_batch_size})
+                elif isinstance(raw_batch, str):
+                    parsed_batch = sorted({int(v.strip()) for v in raw_batch.split(",") if v.strip()})
+                    parsed_batch = [value for value in parsed_batch if value <= max_batch_size and value > 0]
+                else:
+                    parsed_batch = [int(raw_batch)] if 0 < int(raw_batch) <= max_batch_size else []
+                if parsed_batch:
+                    capture_batch_sizes = parsed_batch
 
         self._cuda_graph_wrapper = MossTTSCUDAGraphCodecWrapper(
             model=self._codec,
             capture_sizes=capture_sizes,
             num_quantizers=self._n_vq,
+            capture_batch_sizes=capture_batch_sizes,
             enabled=True,
         )
         self._cuda_graph_wrapper.warmup(device)

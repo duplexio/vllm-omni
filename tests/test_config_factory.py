@@ -17,6 +17,10 @@ from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline
+from vllm_omni.core.sched.omni_generation_scheduler import (
+    OmniGenerationAsyncScheduler,
+    OmniGenerationScheduler,
+)
 from vllm_omni.config.stage_config import (
     DeployConfig,
     PipelineConfig,
@@ -685,7 +689,19 @@ class TestResolveScheduler:
     def test_generation(self):
         cls = _resolve_scheduler(StageExecutionType.LLM_GENERATION)
         assert cls is not None
-        assert "Generation" in cls.__name__
+        assert cls is OmniGenerationAsyncScheduler
+
+    def test_generation_sync_when_false(self):
+        assert (
+            _resolve_scheduler(StageExecutionType.LLM_GENERATION, async_scheduling=False)
+            is OmniGenerationScheduler
+        )
+
+    def test_generation_async_when_true(self):
+        assert (
+            _resolve_scheduler(StageExecutionType.LLM_GENERATION, async_scheduling=True)
+            is OmniGenerationAsyncScheduler
+        )
 
     def test_diffusion_returns_none(self):
         assert _resolve_scheduler(StageExecutionType.DIFFUSION) is None

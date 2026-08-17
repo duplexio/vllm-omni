@@ -9,6 +9,7 @@ from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
@@ -716,3 +717,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+
+class OmniGenerationAsyncScheduler(OmniGenerationScheduler, AsyncVLLMScheduler):
+    """Asynchronous generation scheduler with Omni chunk-transfer handling."""
