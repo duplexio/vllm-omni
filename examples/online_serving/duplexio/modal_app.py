@@ -15,7 +15,7 @@ import modal
 
 APP_NAME = "duplexio-vllm-omni"
 MODEL_VOLUME_NAME = "duplexio-vllm-models"
-MODEL_NAME = "duplexio-487557-checkpoint-4-vllm-v3"
+MODEL_NAME = "duplexio-489780-checkpoint-1-vllm-v3"
 MODEL_PATH = Path("/models") / MODEL_NAME
 # Default voice for prewarm + demo; must exist in the checkpoint voice
 # pool (v3 ships the VoxCeleb id100xx set; id10014 is the eval voice).
