@@ -17,7 +17,9 @@ APP_NAME = "duplexio-vllm-omni"
 MODEL_VOLUME_NAME = "duplexio-vllm-models"
 MODEL_NAME = "duplexio-487557-checkpoint-4-vllm-v3"
 MODEL_PATH = Path("/models") / MODEL_NAME
-VOICE = "69f67cf0ae15b9e491cd6b21"
+# Default voice for prewarm + demo; must exist in the checkpoint voice
+# pool (v3 ships the VoxCeleb id100xx set; id10014 is the eval voice).
+VOICE = "id10014"
 APP_ROOT = Path("/app/vllm-omni")
 FRONTEND_ROOT = Path("/app/realtime_web")
 DEPLOY_CONFIG_NAME = "duplexio.yaml"
