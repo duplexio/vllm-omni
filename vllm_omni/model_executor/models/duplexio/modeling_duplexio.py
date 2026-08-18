@@ -546,17 +546,19 @@ class DuplexIOForConditionalGeneration(
                 info,
                 state.sampling_generator,
             )
+            # Session-side payloads cross the IPC hop as CPU tensors.
+            speaker_embedding = state.speaker_embedding.to(row_hidden.device)
             audio_condition = self.agent_audio_output_adapter(
                 row_hidden[AGENT_AUDIO_CELL : AGENT_AUDIO_CELL + 1],
-                info["duplexio_agent_audio_skip"].unsqueeze(0),
-                state.speaker_embedding.unsqueeze(0),
+                info["duplexio_agent_audio_skip"].to(row_hidden.device).unsqueeze(0),
+                speaker_embedding.unsqueeze(0),
                 torch.zeros(1, dtype=torch.long, device=row_hidden.device),
             )
             depth_sampling = _depth_sampling(info)
             predicted_audio = self.audio_sampler.sample(
                 audio_condition.float(),
                 predicted_text[1:2],
-                state.speaker_embedding.unsqueeze(0).float(),
+                speaker_embedding.unsqueeze(0).float(),
                 temperature=depth_sampling[0],
                 top_k=depth_sampling[1],
                 generator=state.sampling_generator,
