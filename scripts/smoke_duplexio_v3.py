@@ -153,8 +153,11 @@ def audio_samples(value: object) -> np.ndarray:
     if isinstance(value, (list, tuple)):
         return audio_samples(value[-1]) if value else np.zeros(0, dtype=np.float32)
     if hasattr(value, "detach"):
-        # No cast: the float32 dtype assertion runs on the returned array.
-        return value.detach().cpu().numpy().reshape(-1)
+        tensor = value.detach().cpu()
+        if tensor.numel() and not tensor.is_floating_point():
+            raise ValueError(f"audio tensor has non-float dtype {tensor.dtype}")
+        # bfloat16 has no numpy dtype; widen for the finite/shape checks.
+        return tensor.float().numpy().reshape(-1)
     return np.asarray(value).reshape(-1)
 
 
@@ -342,8 +345,6 @@ async def drive_session(
                         f"frame {frame_index} {name} token {token_id!r} "
                         f"outside vocab of {vocab_size}"
                     )
-            if waveform.dtype != np.float32:
-                fail(f"frame {frame_index} audio dtype {waveform.dtype} != float32")
             if len(waveform) not in (0, FRAME_SIZE):
                 fail(
                     f"frame {frame_index} audio has {len(waveform)} samples, "
