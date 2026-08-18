@@ -231,7 +231,9 @@ async def run_session(args: argparse.Namespace, speech: np.ndarray) -> None:
                 tokenizer=tokenizer,
                 silence_token_id=silence_token_id,
                 vocab_size=vocab_size,
-                adapter=DuplexIOServingRuntimeAdapter,
+                adapter=DuplexIOServingRuntimeAdapter(
+                    encode_audio=lambda *_args: None,
+                ),
                 fence_cls=DuplexFence,
                 session_config_cls=DuplexSessionConfig,
                 buffer_cls=DuplexIOPcmAppendBuffer,
