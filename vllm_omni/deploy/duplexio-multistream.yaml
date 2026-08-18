@@ -32,4 +32,3 @@ stages:
       attention_config:
         flex_attn_block_m: 16
         flex_attn_block_n: 16
-        flex_attn_kv_block_size: 64
