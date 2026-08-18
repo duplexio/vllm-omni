@@ -792,7 +792,8 @@ def _gather_key_active(
     if all(isinstance(value, Tensor) for value in values):
         key_active = torch.cat(cast(list[Tensor], values))
         if key_active.shape[0] == inputs_embeds.shape[0]:
-            return key_active
+            # Session-side appends build these on CPU; the engine runs on GPU.
+            return key_active.to(inputs_embeds.device)
     raise RuntimeError(
         "DuplexIO key-activity rows do not match the scheduled embeddings"
     )
@@ -815,7 +816,8 @@ def _gather_frame_metadata(
     if all(isinstance(value, Tensor) for value in values):
         metadata = torch.cat(cast(list[Tensor], values))
         if metadata.shape == (inputs_embeds.shape[0],):
-            return metadata
+            # Session-side appends build these on CPU; the engine runs on GPU.
+            return metadata.to(inputs_embeds.device)
     raise RuntimeError(
         f"DuplexIO {name} rows do not match the scheduled embeddings"
     )
