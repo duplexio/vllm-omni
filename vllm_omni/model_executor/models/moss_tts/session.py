@@ -269,15 +269,31 @@ class MossTTSRealtimeSession:
 
 
 class MossTTSRealtimeSessionStore:
-    """In-memory state for batched Realtime turn requests."""
+    """In-memory state for batched Realtime turn requests.
 
-    def __init__(self, max_sessions: int = 2048, ttl_seconds: float = 3600.0) -> None:
+    ``history_turns`` bounds the audio/text replayed into each assistant
+    request.  The upstream realtime implementation keeps an unbounded KV
+    conversation, but stateless HTTP turns cannot reuse that KV safely because
+    the RVQ grid is request-specific.  A bounded window keeps prefill and
+    memory costs predictable while retaining the immediately preceding turn.
+    ``None`` preserves the complete-history behavior for callers that need it.
+    """
+
+    def __init__(
+        self,
+        max_sessions: int = 2048,
+        ttl_seconds: float = 3600.0,
+        history_turns: int | None = None,
+    ) -> None:
         if max_sessions <= 0:
             raise ValueError(f"max_sessions must be positive, got {max_sessions}")
         if ttl_seconds <= 0:
             raise ValueError(f"ttl_seconds must be positive, got {ttl_seconds}")
+        if history_turns is not None and history_turns < 0:
+            raise ValueError(f"history_turns must be nonnegative or None, got {history_turns}")
         self.max_sessions = max_sessions
         self.ttl_seconds = ttl_seconds
+        self.history_turns = history_turns
         self.sessions: dict[str, MossTTSRealtimeSession] = {}
 
     def create(
@@ -332,13 +348,19 @@ class MossTTSRealtimeSessionStore:
             raise ValueError("MOSS-TTS-Realtime turn text cannot be empty")
         session.in_flight = True
         session.updated_at = time.monotonic()
+        if self.history_turns is None:
+            history_segments = tuple(session.completed_segments)
+        elif self.history_turns == 0:
+            history_segments = ()
+        else:
+            history_segments = tuple(session.completed_segments[-self.history_turns :])
         return MossTTSRealtimeTurn(
             session_id=session.session_id,
             revision=session.revision,
             role=role,
             text=normalized_text,
             reference_codes=session.reference_codes,
-            history_segments=tuple(session.completed_segments),
+            history_segments=history_segments,
             cache_salt=session.cache_salt,
         )
 

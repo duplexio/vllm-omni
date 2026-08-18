@@ -492,9 +492,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         elif self._moss_variant == "realtime":
             from vllm_omni.model_executor.models.moss_tts.session import MossTTSRealtimeSessionStore
 
+            history_turns_env = os.environ.get("MOSS_REALTIME_CONTEXT_TURNS")
             self._moss_realtime_sessions = MossTTSRealtimeSessionStore(
                 max_sessions=int(os.environ.get("MOSS_REALTIME_MAX_SESSIONS", "2048")),
                 ttl_seconds=float(os.environ.get("MOSS_REALTIME_SESSION_TTL_SECONDS", "3600")),
+                history_turns=(int(history_turns_env) if history_turns_env is not None else None),
             )
 
         # GLM-TTS lazy-cached resources (populated on first GLM-TTS request)

@@ -52,3 +52,23 @@ def test_realtime_session_rejects_wrong_codebook_count() -> None:
     assert session.in_flight
     store.abort_turn(turn)
     assert not session.in_flight
+
+
+def test_realtime_session_can_bound_replayed_history() -> None:
+    store = MossTTSRealtimeSessionStore(history_turns=1)
+    store.create("conversation", refs())
+
+    first = store.begin_turn("conversation", "user", "First.")
+    store.commit_turn(first, torch.full((2, 16), 3, dtype=torch.long))
+    second = store.begin_turn("conversation", "assistant", "Second.")
+    store.commit_turn(second, torch.full((2, 16), 4, dtype=torch.long))
+
+    third = store.begin_turn("conversation", "user", "Third.")
+    assert [(segment.role, segment.text) for segment in third.history_segments] == [
+        ("assistant", "Second."),
+    ]
+
+
+def test_realtime_session_rejects_negative_history_window() -> None:
+    with pytest.raises(ValueError, match="history_turns"):
+        MossTTSRealtimeSessionStore(history_turns=-1)

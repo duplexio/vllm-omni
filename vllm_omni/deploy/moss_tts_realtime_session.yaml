@@ -1,19 +1,18 @@
 # MOSS-TTS-Realtime turnwise sessions.
 #
 # Each HTTP turn is a complete vLLM request.  The server-owned session supplies
-# the immediately preceding turn's text and RVQ codes.  Prefix caching stays
-# disabled here because the RVQ conditioning lives outside the token-id prompt
-# and therefore cannot safely participate in a shared KV-prefix hash.  This is
-# deliberately separate from moss_tts_realtime.yaml, whose async connector
-# settings target low-latency live streaming rather than batched synthesis.
-async_chunk: false
+# a bounded preceding-turn window; the stage-0 AR loop and stage-1 codec run
+# concurrently so codec work is overlapped with audio-code generation.
+async_chunk: true
 trust_remote_code: true
 
 connectors:
   shm:
     name: SharedMemoryConnector
     extra:
-      codec_streaming: false
+      codec_streaming: true
+      codec_chunk_frames: 15
+      codec_stream_slots: 16
       # Keep graph pools bounded on the shared stage-0/stage-1 GPU.  The codec
       # still batches ready requests per frame bucket eagerly; this controls
       # only optional per-batch CUDA graph capture.
@@ -28,7 +27,12 @@ stages:
     # the 2,048-token bulk probe; additional requests remain queued without
     # increasing aggregate tokens/s.
     max_num_seqs: 16
-    gpu_memory_utilization: 0.60
+    # 0.60 left ~0 GiB free once stage 1 exceeded its nominal budget and the
+    # Convogen client parked its forced aligner on GPU 0: per-request
+    # activation temporaries then OOMed the fullest replica.  0.55 keeps
+    # several GiB of headroom while the KV pool stays far larger than
+    # 16 seqs x 4096 tokens needs.
+    gpu_memory_utilization: 0.55
     attention_backend: FLASHINFER
     # Realtime's RVQ prompt lives in ``additional_information`` and is not
     # part of vLLM's token-id prefix hash. Reusing a cached KV block would
@@ -52,10 +56,10 @@ stages:
   - stage_id: 1
     max_num_seqs: 16
     gpu_memory_utilization: 0.12
-    # The codec is a non-autoregressive generation stage, so it has no KV
-    # cache or useful prefill phase.  Its forward returns CPU audio tensors,
-    # which is not compatible with vLLM's generic full CUDA-graph capture.
-    # The model-level decoder wrapper below captures the actual codec instead.
+# Stage 1 decodes streamed codec chunks while stage 0 continues emitting
+# frames.  Generic vLLM CUDA graphs remain disabled for the wrapper because
+# its forward returns CPU audio/Python structures; the model-level decoder
+# wrapper captures the actual codec path instead.
     enforce_eager: false
     attention_backend: FLASHINFER
     enable_prefix_caching: false
