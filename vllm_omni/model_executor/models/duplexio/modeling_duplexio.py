@@ -307,6 +307,10 @@ class DuplexIOForConditionalGeneration(
         **info: Any,
     ) -> tuple[Tensor, Tensor, dict[str, object]]:
         del input_embeds
+        # Appends arrive with CPU token ids; bind the whole request state
+        # (masks, speaker embedding, sampling generator) to the engine device
+        # so nothing downstream mixes devices.
+        input_ids = input_ids.to(self.llm.channel_emb.device)
         duplex = info.get("duplex")
         if not isinstance(duplex, Mapping):
             raise ValueError("Native DuplexIO accepts only framed duplex appends")
