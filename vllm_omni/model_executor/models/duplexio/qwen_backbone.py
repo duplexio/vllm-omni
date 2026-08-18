@@ -206,6 +206,24 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
 
     _cudagraph_support = AttentionCGSupport.NEVER
 
+    @staticmethod
+    def _get_block_sizes(
+        attn_cfg,
+        supports_small_blocks: bool,
+        cache_block_size: int,
+    ) -> tuple[int, int]:
+        # Hybrid GDN/attention page alignment yields non-power-of-2 token
+        # pages (e.g. 336 with the 20-byte cache metadata); FlexAttention
+        # requires power-of-2 blocks. Default the kv block to the largest
+        # power of 2 dividing the page so flex blocks tile pages exactly.
+        if attn_cfg.flex_attn_kv_block_size is None and supports_small_blocks:
+            cache_block_size = cache_block_size & (-cache_block_size)
+        return FlexAttentionMetadataBuilder._get_block_sizes(
+            attn_cfg,
+            supports_small_blocks,
+            cache_block_size,
+        )
+
     def __init__(
         self,
         kv_cache_spec: DuplexIOKVCacheSpec,
