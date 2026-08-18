@@ -16,6 +16,12 @@ from vllm_omni.model_executor.models.duplexio.row_semantics import (
 
 def test_duplexio_attention_visibility_matches_row_contract() -> None:
     positions = torch.arange(30)
+    # Frame 3 is a token-only burst: audio time freezes, so the window is
+    # measured over audio positions [1, 2, 3, 3, 4], not frame indices.
+    frame_audio_positions = torch.tensor([1, 1, 1, 0, 1]).cumsum(0)
+    audio_positions = frame_audio_positions.repeat_interleave(
+        DUPLEXIO_NUM_CELLS
+    )
     query = positions[:, None]
     key = positions[None, :]
     key_active = torch.ones_like(key, dtype=torch.bool)
@@ -24,6 +30,8 @@ def test_duplexio_attention_visibility_matches_row_contract() -> None:
     visible = duplexio_attention_visible(
         query,
         key,
+        audio_positions[:, None],
+        audio_positions[None, :],
         key_active,
         audio_attention_window_frames=2,
     )
@@ -34,16 +42,24 @@ def test_duplexio_attention_visibility_matches_row_contract() -> None:
             query_frame, _ = divmod(query_position, DUPLEXIO_NUM_CELLS)
             key_frame, key_cell = divmod(key_position, DUPLEXIO_NUM_CELLS)
             active = key_position != 1
+            audio_distance = int(
+                frame_audio_positions[query_frame]
+                - frame_audio_positions[key_frame]
+            )
             expected[query_position, key_position] = (
                 query_position == key_position
                 or (
                     key_frame < query_frame
                     and active
-                    and (key_cell < 4 or query_frame - key_frame <= 2)
+                    and (key_cell < 4 or audio_distance <= 2)
                 )
             )
 
     torch.testing.assert_close(visible, expected)
+    # Frame 4 sits 3 audio steps from frame 0 (out of the window of 2) but
+    # frame 3 sits 4 frames later than frame 0 at audio distance 2 (inside).
+    assert not bool(visible[4 * DUPLEXIO_NUM_CELLS + 4, 4])
+    assert bool(visible[3 * DUPLEXIO_NUM_CELLS + 4, 4])
 
 
 def test_expanded_gdn_kernel_matches_independent_cell_convolutions() -> None:

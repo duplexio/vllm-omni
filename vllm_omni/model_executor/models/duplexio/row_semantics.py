@@ -7,6 +7,10 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from vllm_omni.model_executor.models.duplexio.attention_semantics import (
+    key_visible,
+)
+
 DUPLEXIO_NUM_TEXT_CELLS = 4
 DUPLEXIO_NUM_CELLS = 6
 
@@ -14,6 +18,8 @@ DUPLEXIO_NUM_CELLS = 6
 def duplexio_attention_visible(
     query_positions: Tensor,
     key_positions: Tensor,
+    query_audio_positions: Tensor,
+    key_audio_positions: Tensor,
     key_active: Tensor,
     *,
     audio_attention_window_frames: int,
@@ -22,7 +28,8 @@ def duplexio_attention_visible(
 
     Positions are logical vLLM token positions, with six consecutive cells per
     frame. A query sees itself and active keys from prior frames. Audio keys
-    additionally expire after ``audio_attention_window_frames``.
+    additionally expire once the AUDIO-TIME distance (not the frame distance)
+    exceeds ``audio_attention_window_frames``.
     """
     query_frames = torch.div(
         query_positions,
@@ -35,13 +42,16 @@ def duplexio_attention_visible(
         rounding_mode="floor",
     )
     key_cells = torch.remainder(key_positions, DUPLEXIO_NUM_CELLS)
-    prior_frame = query_frames > key_frames
-    key_is_audio = key_cells >= DUPLEXIO_NUM_TEXT_CELLS
-    audio_in_window = (
-        query_frames - key_frames
-    ) <= audio_attention_window_frames
-    key_visible = key_active & (~key_is_audio | audio_in_window)
-    return (prior_frame & key_visible) | (query_positions == key_positions)
+    return key_visible(
+        query_frames,
+        key_frames,
+        query_audio_positions,
+        key_audio_positions,
+        key_cells,
+        key_active,
+        audio_attention_window_frames,
+        False,
+    ) | (query_positions == key_positions)
 
 
 def expand_stream_conv_weight(weight: Tensor, *, num_cells: int) -> Tensor:

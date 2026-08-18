@@ -45,12 +45,25 @@ def test_compact_attention_matches_logical_rows_across_audio_eviction() -> None:
     cached_epochs = torch.zeros(layout.max_compact_slots, dtype=torch.long)
     cached_positions = torch.zeros(layout.max_compact_slots, dtype=torch.long)
     cached_ordinals = torch.zeros(layout.max_compact_slots, dtype=torch.long)
+    cached_audio_positions = torch.zeros(
+        layout.max_compact_slots,
+        dtype=torch.long,
+    )
     logical_keys: list[torch.Tensor] = []
     logical_values: list[torch.Tensor] = []
     logical_active: list[bool] = []
+    logical_audio_positions: list[int] = []
     active_text_tokens = 0
 
     for frame in range(8):
+        # Every append carries audio; the offset decouples audio positions
+        # from frame indices so frame-keyed ring writes or window checks fail.
+        audio_position = frame + 5
+        frame_audio_positions = torch.full(
+            (DUPLEXIO_NUM_CELLS,),
+            audio_position,
+            dtype=torch.long,
+        )
         positions = torch.arange(
             frame * DUPLEXIO_NUM_CELLS,
             (frame + 1) * DUPLEXIO_NUM_CELLS,
@@ -75,12 +88,17 @@ def test_compact_attention_matches_logical_rows_across_audio_eviction() -> None:
         )
         active_text_tokens += int(text_active.sum())
 
-        primary_slots = duplexio_primary_compact_slots(positions, layout)
+        primary_slots = duplexio_primary_compact_slots(
+            positions,
+            frame_audio_positions,
+            layout,
+        )
         cached_keys[primary_slots] = frame_keys
         cached_values[primary_slots] = frame_values
         cached_epochs[primary_slots] = epoch
         cached_positions[primary_slots] = positions
         cached_ordinals[primary_slots] = frame_ordinals
+        cached_audio_positions[primary_slots] = audio_position
         for cell, ordinal in enumerate(frame_ordinals.tolist()):
             if ordinal == 0:
                 continue
@@ -90,10 +108,12 @@ def test_compact_attention_matches_logical_rows_across_audio_eviction() -> None:
             cached_epochs[slot] = epoch
             cached_positions[slot] = positions[cell]
             cached_ordinals[slot] = ordinal
+            cached_audio_positions[slot] = audio_position
 
         logical_keys.extend(frame_keys)
         logical_values.extend(frame_values)
         logical_active.extend(key_active.tolist())
+        logical_audio_positions.extend([audio_position] * DUPLEXIO_NUM_CELLS)
         all_keys = torch.stack(logical_keys)
         all_values = torch.stack(logical_values)
         all_positions = torch.arange(all_keys.shape[0])
@@ -105,6 +125,8 @@ def test_compact_attention_matches_logical_rows_across_audio_eviction() -> None:
             logical_visible = duplexio_attention_visible(
                 query_position,
                 all_positions,
+                torch.tensor(audio_position),
+                torch.tensor(logical_audio_positions),
                 torch.tensor(logical_active),
                 audio_attention_window_frames=layout.audio_window_frames,
             )
@@ -121,6 +143,8 @@ def test_compact_attention_matches_logical_rows_across_audio_eviction() -> None:
                 cached_epochs[:live_slots],
                 cached_positions[:live_slots],
                 cached_ordinals[:live_slots],
+                torch.tensor(audio_position),
+                cached_audio_positions[:live_slots],
                 layout,
             )
             compact_scores = query @ cached_keys[:live_slots][compact_visible].T
@@ -140,7 +164,8 @@ def test_audio_ring_usage_stays_constant_for_sustained_session() -> None:
     frames = torch.arange(100_000).repeat_interleave(2)
     cells = torch.tensor([4, 5]).repeat(100_000)
     positions = frames * DUPLEXIO_NUM_CELLS + cells
-    slots = duplexio_primary_compact_slots(positions, layout)
+    audio_positions = frames + 1
+    slots = duplexio_primary_compact_slots(positions, audio_positions, layout)
 
     assert slots.unique().numel() == 2 * (layout.audio_window_frames + 1)
     assert int(slots.max()) < layout.audio_slots
@@ -161,6 +186,8 @@ def test_cache_epoch_excludes_reused_pages_from_canceled_session() -> None:
         torch.tensor(2),
         torch.tensor(1),
         torch.tensor(4),
+        torch.tensor(0),
+        torch.tensor(0),
         torch.tensor(0),
         layout,
     )
@@ -183,8 +210,9 @@ def test_cache_metadata_does_not_change_attention_scores() -> None:
     epochs = torch.tensor([1, 2, 3, 4, 5])
     positions = torch.tensor([0, 6, 12, 18, 24])
     ordinals = torch.tensor([0, 1, 2, 3, 4])
+    audio_positions = torch.tensor([1, 2, 3, 3, 4])
     query_metadata = torch.cat(
-        (_encode_uint32(epochs, query.dtype), query.new_zeros(5, 12)),
+        (_encode_uint32(epochs, query.dtype), query.new_zeros(5, 16)),
         dim=-1,
     )
     key_metadata = torch.cat(
@@ -193,6 +221,7 @@ def test_cache_metadata_does_not_change_attention_scores() -> None:
             _encode_uint32(epochs, key.dtype),
             _encode_uint32(positions, key.dtype),
             _encode_uint32(ordinals, key.dtype),
+            _encode_uint32(audio_positions, key.dtype),
         ),
         dim=-1,
     )

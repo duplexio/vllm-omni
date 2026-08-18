@@ -42,6 +42,9 @@ from vllm.v1.attention.backends.flex_attention import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
+from vllm_omni.model_executor.models.duplexio.attention_semantics import (
+    key_visible,
+)
 from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
     DuplexIOKVCacheSpec,
     DuplexIOKVLayout,
@@ -59,7 +62,8 @@ _Q_EPOCH_OFFSET = 0
 _K_EPOCH_OFFSET = _Q_EPOCH_OFFSET + _METADATA_BYTES
 _K_POSITION_OFFSET = _K_EPOCH_OFFSET + _METADATA_BYTES
 _K_TEXT_ORDINAL_OFFSET = _K_POSITION_OFFSET + _METADATA_BYTES
-_CACHE_METADATA_SIZE = _K_TEXT_ORDINAL_OFFSET + _METADATA_BYTES
+_K_AUDIO_POS_OFFSET = _K_TEXT_ORDINAL_OFFSET + _METADATA_BYTES
+_CACHE_METADATA_SIZE = _K_AUDIO_POS_OFFSET + _METADATA_BYTES
 
 
 def _encode_uint32(values: Tensor, dtype: torch.dtype) -> Tensor:
@@ -79,6 +83,8 @@ def duplexio_compact_key_visible(
     key_epochs: Tensor,
     key_positions: Tensor,
     text_ordinals: Tensor,
+    query_audio_positions: Tensor,
+    key_audio_positions: Tensor,
     layout: DuplexIOKVLayout,
 ) -> Tensor:
     """Return exact visibility for keys stored in the compact physical layout."""
@@ -94,11 +100,24 @@ def duplexio_compact_key_visible(
         rounding_mode="floor",
     )
     key_cells = torch.remainder(key_positions, DUPLEXIO_NUM_CELLS)
-    prior_frame = query_frames > key_frames
+
+    # The compact layout stores only active keys: inactive text is confined to
+    # the self-visible transient region, and every cached audio key carries
+    # real audio (the protocol appends one PCM frame per step).
+    cross_frame_visible = key_visible(
+        query_frames,
+        key_frames,
+        query_audio_positions,
+        key_audio_positions,
+        key_cells,
+        torch.ones_like(key_cells, dtype=torch.bool),
+        layout.audio_window_frames,
+        False,
+    )
 
     audio_cell = key_cells - DUPLEXIO_NUM_TEXT_CELLS
     expected_audio_slot = (
-        torch.remainder(key_frames, layout.audio_ring_frames)
+        torch.remainder(key_audio_positions, layout.audio_ring_frames)
         * layout.num_audio_cells
         + audio_cell
     )
@@ -106,16 +125,7 @@ def duplexio_compact_key_visible(
         (compact_key_positions < layout.audio_slots)
         & (key_cells >= DUPLEXIO_NUM_TEXT_CELLS)
         & (compact_key_positions == expected_audio_slot)
-        & (
-            (query_positions == key_positions)
-            | (
-                prior_frame
-                & (
-                    query_frames - key_frames
-                    <= layout.audio_window_frames
-                )
-            )
-        )
+        & ((query_positions == key_positions) | cross_frame_visible)
     )
 
     transient_visible = (
@@ -140,7 +150,7 @@ def duplexio_compact_key_visible(
             compact_key_positions
             == layout.persistent_text_base + text_ordinals - 1
         )
-        & prior_frame
+        & cross_frame_visible
     )
     return same_request & (
         audio_visible | transient_visible | persistent_visible
@@ -149,13 +159,19 @@ def duplexio_compact_key_visible(
 
 def duplexio_primary_compact_slots(
     positions: Tensor,
+    audio_positions: Tensor,
     layout: DuplexIOKVLayout,
 ) -> Tensor:
-    """Map the six current frame cells to audio-ring or transient slots."""
+    """Map the six current frame cells to audio-ring or transient slots.
+
+    The audio ring is keyed by audio position, mirroring the training-side
+    eviction bound: window positions never decrease, so a ring of
+    ``audio_window_frames + 1`` distinct audio positions retains exactly the
+    keys still visible to any future query.
+    """
     cells = torch.remainder(positions, DUPLEXIO_NUM_CELLS)
-    frames = torch.div(positions, DUPLEXIO_NUM_CELLS, rounding_mode="floor")
     audio_slots = (
-        torch.remainder(frames, layout.audio_ring_frames)
+        torch.remainder(audio_positions, layout.audio_ring_frames)
         * layout.num_audio_cells
         + cells
         - DUPLEXIO_NUM_TEXT_CELLS
@@ -338,14 +354,32 @@ class DuplexIOFlexAttentionImpl(FlexAttentionImpl):
                     0,
                     self.head_size
                     - _CACHE_METADATA_SIZE
-                    + _K_TEXT_ORDINAL_OFFSET :,
+                    + _K_TEXT_ORDINAL_OFFSET : self.head_size
+                    - _CACHE_METADATA_SIZE
+                    + _K_TEXT_ORDINAL_OFFSET
+                    + _METADATA_BYTES,
+                ]
+            )
+            # Query row i and key row i of an append are the same frame token,
+            # so the incoming key metadata doubles as the query audio position.
+            token_audio_positions = _decode_uint32(
+                key[
+                    :,
+                    0,
+                    self.head_size
+                    - _CACHE_METADATA_SIZE
+                    + _K_AUDIO_POS_OFFSET :,
                 ]
             )
             request_indices = doc_ids[:num_actual_tokens].to(torch.long)
             primary_slots = _physical_slots(
                 attn_metadata.block_table,
                 request_indices,
-                duplexio_primary_compact_slots(key_positions, self.layout),
+                duplexio_primary_compact_slots(
+                    key_positions,
+                    token_audio_positions,
+                    self.layout,
+                ),
                 attn_metadata.block_size,
             )
             super().do_kv_cache_update(
@@ -426,6 +460,16 @@ class DuplexIOFlexAttentionImpl(FlexAttentionImpl):
                     + _METADATA_BYTES,
                 ]
             )
+            cached_audio_positions = _decode_uint32(
+                flat_key_cache[
+                    :,
+                    0,
+                    metadata_base
+                    + _K_AUDIO_POS_OFFSET : metadata_base
+                    + _K_AUDIO_POS_OFFSET
+                    + _METADATA_BYTES,
+                ]
+            )
 
             def mask_mod(
                 _batch: Tensor,
@@ -447,6 +491,8 @@ class DuplexIOFlexAttentionImpl(FlexAttentionImpl):
                     key_epochs[physical_key_index],
                     cached_key_positions[physical_key_index],
                     cached_text_ordinals[physical_key_index],
+                    token_audio_positions[query_index],
+                    cached_audio_positions[physical_key_index],
                     self.layout,
                 )
                 return is_valid & visible
@@ -580,6 +626,7 @@ class DuplexIOQwenAttention(nn.Module):
         hidden_states: Tensor,
         request_epochs: Tensor,
         text_ordinals: Tensor,
+        audio_positions: Tensor,
     ) -> Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
@@ -628,6 +675,7 @@ class DuplexIOQwenAttention(nn.Module):
                 _encode_uint32(request_epochs, key.dtype),
                 _encode_uint32(logical_positions, key.dtype),
                 _encode_uint32(text_ordinals, key.dtype),
+                _encode_uint32(audio_positions, key.dtype),
             ),
             dim=-1,
         )
@@ -816,6 +864,7 @@ class DuplexIOQwenDecoderLayer(nn.Module):
         key_active: Tensor,
         request_epochs: Tensor,
         text_ordinals: Tensor,
+        audio_positions: Tensor,
     ) -> tuple[Tensor, Tensor]:
         if residual is None:
             residual = hidden_states
@@ -834,6 +883,7 @@ class DuplexIOQwenDecoderLayer(nn.Module):
                 hidden_states,
                 request_epochs,
                 text_ordinals,
+                audio_positions,
             )
         if self.layer_scale:
             hidden_states = hidden_states * (
@@ -901,6 +951,7 @@ class DuplexIOQwenModel(nn.Module):
         key_active: Tensor,
         request_epochs: Tensor,
         text_ordinals: Tensor,
+        audio_positions: Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: Tensor | None = None,
     ) -> Tensor | IntermediateTensors:
@@ -921,6 +972,7 @@ class DuplexIOQwenModel(nn.Module):
                 logical_positions=logical_positions,
                 request_epochs=request_epochs,
                 text_ordinals=text_ordinals,
+                audio_positions=audio_positions,
             )
         if not get_pp_group().is_last_rank:
             assert residual is not None

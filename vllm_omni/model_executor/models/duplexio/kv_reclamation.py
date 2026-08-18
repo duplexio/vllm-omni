@@ -45,7 +45,11 @@ class DuplexIOKVLayout:
 
     @property
     def audio_ring_frames(self) -> int:
-        # Frame f sees audio from f-window through f, inclusive.
+        # The ring is keyed by audio position (a non-decreasing cumsum that
+        # advances only on frames carrying real audio). A query at audio
+        # position p sees audio positions p-window through p, inclusive, so
+        # window + 1 distinct positions must stay resident. Audio positions
+        # advance at most once per frame, so max_frames stays an upper bound.
         return min(self.audio_window_frames + 1, self.max_frames)
 
     @property
@@ -84,10 +88,10 @@ class DuplexIOKVLayout:
             self.max_persistent_text_tokens,
         )
 
-    def audio_slot(self, frame_index: int, audio_cell: int) -> int:
+    def audio_slot(self, audio_position: int, audio_cell: int) -> int:
         assert 0 <= audio_cell < self.num_audio_cells
         return (
-            frame_index % self.audio_ring_frames
+            audio_position % self.audio_ring_frames
         ) * self.num_audio_cells + audio_cell
 
     def transient_text_slot(self, text_cell: int) -> int:
