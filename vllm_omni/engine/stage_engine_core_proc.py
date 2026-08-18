@@ -103,6 +103,15 @@ class StageEngineCoreProc(EngineCoreProc):
                 "available."
             )
 
+        # Register omni model architectures in this subprocess. The main
+        # process registers them via OmniEngineArgs, but vLLM's ModelRegistry
+        # is per-process state: a spawned engine core starts fresh and would
+        # fail resolve_model_cls (e.g. in _align_hybrid_block_size) before
+        # ever loading the model.
+        from vllm_omni.engine.arg_utils import register_omni_models_to_vllm
+
+        register_omni_models_to_vllm()
+
         engine_core: StageEngineCoreProc | None = None
         coord_client = None
         try:
