@@ -56,6 +56,13 @@ from vllm_omni.model_executor.models.duplexio.row_semantics import (
     expand_stream_conv_weight,
     mask_inactive_gdn_gates,
 )
+from vllm_omni.model_executor.models.duplexio.wide_conv import (
+    install_wide_conv_fallback,
+)
+
+# The dilated 19-tap stream conv exceeds the widths upstream's Triton conv
+# kernels compile for; route wide kernels through the PyTorch fallback.
+install_wide_conv_fallback()
 
 _METADATA_BYTES = 4
 _Q_EPOCH_OFFSET = 0
