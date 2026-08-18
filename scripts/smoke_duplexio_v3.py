@@ -116,8 +116,11 @@ def pick_voice(model_path: Path, requested: str | None) -> str:
 def frame_output_metadata(output: object) -> dict:
     """Locate the per-frame multimodal metadata on an OmniRequestOutput.
 
-    Same attribute chain the DuplexIO data plane uses for projection.
+    Same attribute chain the DuplexIO data plane uses for projection. The
+    output processor delivers a MultimodalPayload (a Mapping, not a dict).
     """
+    from collections.abc import Mapping
+
     candidates = [output]
     inner = getattr(output, "request_output", None)
     if inner is not None and inner is not output:
@@ -128,8 +131,8 @@ def frame_output_metadata(output: object) -> dict:
             *(getattr(candidate, "outputs", None) or [])[:1],
         ):
             metadata = getattr(holder, "multimodal_output", None)
-            if isinstance(metadata, dict) and metadata:
-                return metadata
+            if isinstance(metadata, Mapping) and metadata:
+                return dict(metadata)
     return {}
 
 
