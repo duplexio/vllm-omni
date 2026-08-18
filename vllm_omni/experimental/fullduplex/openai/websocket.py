@@ -62,6 +62,8 @@ MODEL_OUTPUT_EVENTS = frozenset(
         "response.output_text.done",
         "response.text.delta",
         "response.text.done",
+        "response.tool_call.done",
+        "input.transcript.delta",
         "response.message",
         "response.output_item.done",
         "response.content_part.done",

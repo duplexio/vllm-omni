@@ -83,6 +83,20 @@ class MiniCPMO45ServingRuntimeAdapter:
         )
 
     @staticmethod
+    def initial_data_plane_payloads(
+        session: object,
+    ) -> tuple[dict[str, object], ...]:
+        return ()
+
+    @staticmethod
+    def tool_result_data_plane_payloads(
+        session: object,
+        output: str,
+    ) -> tuple[dict[str, object], ...]:
+        del session, output
+        return ()
+
+    @staticmethod
     def data_plane_context(
         *,
         epoch: int,

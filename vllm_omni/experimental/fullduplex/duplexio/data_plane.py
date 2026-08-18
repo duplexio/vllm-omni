@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from torch import Tensor
 
 from vllm_omni.experimental.fullduplex.duplexio.input import (
     DUPLEXIO_SAMPLE_RATE,
@@ -19,6 +21,7 @@ from vllm_omni.experimental.fullduplex.engine.contracts import (
 )
 
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
+DecodeTokens = Callable[[list[int]], str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,19 +41,47 @@ class DuplexIODataPlaneSession:
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         self._encode_audio = encode_audio
+        self._decode_tokens: DecodeTokens | None = None
+        self._silence_token_id: int | None = None
         self._terminal_request_ids: set[str] = set()
+        self._audio_sample_cursors: dict[str, int] = {}
+        self._agent_text_cursors: dict[str, str] = {}
+        self._user_token_ids: dict[str, list[int]] = {}
+        self._user_text_cursors: dict[str, str] = {}
+        self._tool_call_sequences: dict[str, int] = {}
+
+    def configure_text_decoder(
+        self,
+        decode_tokens: DecodeTokens,
+        *,
+        silence_token_id: int,
+    ) -> None:
+        self._decode_tokens = decode_tokens
+        self._silence_token_id = silence_token_id
+
+    @property
+    def silence_token_id(self) -> int:
+        if self._silence_token_id is None:
+            raise RuntimeError("DuplexIO tokenizer is not configured")
+        return self._silence_token_id
 
     def begin_request(self, request_id: str) -> None:
         self._terminal_request_ids.discard(request_id)
+        self._audio_sample_cursors.setdefault(request_id, 0)
+        self._agent_text_cursors.setdefault(request_id, "")
+        self._user_token_ids.setdefault(request_id, [])
+        self._user_text_cursors.setdefault(request_id, "")
 
     def is_terminal(self, request_id: str | None) -> bool:
         return request_id in self._terminal_request_ids if request_id else False
 
     def mark_terminal(self, request_id: str) -> None:
         self._terminal_request_ids.add(request_id)
+        self._discard_request_state(request_id)
 
     def close_stream(self, request_id: str) -> None:
         self._terminal_request_ids.discard(request_id)
+        self._discard_request_state(request_id)
 
     def close_session(
         self,
@@ -60,9 +91,49 @@ class DuplexIODataPlaneSession:
     ) -> None:
         if active_request_id is not None:
             self._terminal_request_ids.discard(active_request_id)
+            self._discard_request_state(active_request_id)
         self._terminal_request_ids = {
             request_id
             for request_id in self._terminal_request_ids
+            if not duplex_resource_request_belongs_to_session(request_id, session_id)
+        }
+        self._audio_sample_cursors = {
+            request_id: cursor
+            for request_id, cursor in self._audio_sample_cursors.items()
+            if not duplex_resource_request_belongs_to_session(request_id, session_id)
+        }
+        self._agent_text_cursors = self._without_session_requests(
+            self._agent_text_cursors,
+            session_id,
+        )
+        self._user_token_ids = self._without_session_requests(
+            self._user_token_ids,
+            session_id,
+        )
+        self._user_text_cursors = self._without_session_requests(
+            self._user_text_cursors,
+            session_id,
+        )
+        self._tool_call_sequences = self._without_session_requests(
+            self._tool_call_sequences,
+            session_id,
+        )
+
+    def _discard_request_state(self, request_id: str) -> None:
+        self._audio_sample_cursors.pop(request_id, None)
+        self._agent_text_cursors.pop(request_id, None)
+        self._user_token_ids.pop(request_id, None)
+        self._user_text_cursors.pop(request_id, None)
+        self._tool_call_sequences.pop(request_id, None)
+
+    @staticmethod
+    def _without_session_requests(
+        values: dict[str, Any],
+        session_id: str,
+    ) -> dict[str, Any]:
+        return {
+            request_id: value
+            for request_id, value in values.items()
             if not duplex_resource_request_belongs_to_session(request_id, session_id)
         }
 
@@ -104,6 +175,21 @@ class DuplexIODataPlaneSession:
         output_epoch = _metadata_int(metadata, "duplex_epoch", "epoch")
         if output_epoch is not None and output_epoch != context.epoch:
             return None
+        prefill_complete = _metadata_bool(
+            metadata,
+            "duplex_prefill_complete",
+            default=False,
+        )
+        if _metadata_bool(
+            metadata,
+            "duplex_prefill",
+            default=False,
+        ) or _metadata_bool(
+            metadata,
+            "duplex_system_input",
+            default=False,
+        ):
+            return None
 
         model_turn_id = _metadata_int(metadata, "duplex_turn_id", "turn_id")
         text = getattr(completion, "text", "") if completion is not None else ""
@@ -112,6 +198,24 @@ class DuplexIODataPlaneSession:
             text = metadata_text
         if not isinstance(text, str):
             text = ""
+        text = self._text_delta(
+            request_id,
+            text,
+            cursors=self._agent_text_cursors,
+            stream="agent",
+        )
+
+        user_token_id = _metadata_int(metadata, "user_token_id")
+        input_text_delta = self._user_text_delta(request_id, user_token_id)
+        tool_call = _metadata_json_mapping(metadata, "tool_call_json")
+        if tool_call is not None:
+            sequence = tool_call.pop("sequence")
+            assert isinstance(sequence, int)
+            previous_sequence = self._tool_call_sequences.get(request_id, 0)
+            if sequence <= previous_sequence:
+                tool_call = None
+            else:
+                self._tool_call_sequences[request_id] = sequence
 
         model_listen = _metadata_bool(metadata, "model_listen", default=False)
         end_of_turn = _metadata_bool(metadata, "end_of_turn", default=False)
@@ -119,6 +223,16 @@ class DuplexIODataPlaneSession:
         audio_data = None
         audio_duration_ms = 0
         sample_count = _audio_num_samples(raw_audio) if raw_audio is not None else 0
+        emitted_samples = self._audio_sample_cursors.get(request_id, 0)
+        if sample_count < emitted_samples:
+            raise RuntimeError(
+                "DuplexIO accumulated audio moved backwards for "
+                f"{request_id}: {sample_count} < {emitted_samples}"
+            )
+        if raw_audio is not None:
+            raw_audio = _audio_slice(raw_audio, emitted_samples)
+            self._audio_sample_cursors[request_id] = sample_count
+            sample_count -= emitted_samples
         if sample_count > 0 and "audio" in context.modalities:
             sample_rate_hz = _metadata_int(
                 metadata,
@@ -136,7 +250,7 @@ class DuplexIODataPlaneSession:
             )
             audio_duration_ms = round(sample_count * 1_000 / sample_rate_hz)
 
-        if model_listen and not text and not audio_data:
+        if model_listen and not text and not audio_data and tool_call is None:
             result = _runtime_result(
                 stage_role="duplexio",
                 is_listen=True,
@@ -145,7 +259,14 @@ class DuplexIODataPlaneSession:
                 data_plane_request_id=request_id,
                 end_of_turn=end_of_turn,
             )
-        elif not text and not audio_data and not end_of_turn:
+        elif (
+            not text
+            and not audio_data
+            and not end_of_turn
+            and not input_text_delta
+            and tool_call is None
+            and not prefill_complete
+        ):
             return None
         else:
             result = _runtime_result(
@@ -164,11 +285,58 @@ class DuplexIODataPlaneSession:
             )
         if model_turn_id is not None:
             result["model_turn_id"] = model_turn_id
+        if input_text_delta and "text" in context.modalities:
+            result["input_text_delta"] = input_text_delta
+        if tool_call is not None:
+            result["tool_call"] = tool_call
+        if prefill_complete:
+            result["initial_data_plane_complete"] = True
         for name in ("user_token_id", "agent_token_id", "tool_call_token_id"):
             token_id = _metadata_int(metadata, name)
             if token_id is not None:
                 result[name] = token_id
+        audio_token_ids = _metadata_int_list(metadata, "agent_audio_token_ids")
+        if audio_token_ids:
+            result["agent_audio_token_ids"] = audio_token_ids
         return result
+
+    def _user_text_delta(
+        self,
+        request_id: str,
+        token_id: int | None,
+    ) -> str:
+        if (
+            token_id is None
+            or token_id == self._silence_token_id
+            or self._decode_tokens is None
+        ):
+            return ""
+        token_ids = self._user_token_ids.setdefault(request_id, [])
+        token_ids.append(token_id)
+        text = self._decode_tokens(token_ids)
+        return self._text_delta(
+            request_id,
+            text,
+            cursors=self._user_text_cursors,
+            stream="user",
+        )
+
+    @staticmethod
+    def _text_delta(
+        request_id: str,
+        text: str,
+        *,
+        cursors: dict[str, str],
+        stream: str,
+    ) -> str:
+        previous = cursors.get(request_id, "")
+        if not text.startswith(previous):
+            raise RuntimeError(
+                f"DuplexIO accumulated {stream} text moved backwards for "
+                f"{request_id}: {text!r} does not extend {previous!r}"
+            )
+        cursors[request_id] = text
+        return text[len(previous) :]
 
 
 def _first_completion(output: object) -> object | None:
@@ -208,6 +376,20 @@ def _metadata_int(metadata: Mapping[str, object], *names: str) -> int | None:
     return None
 
 
+def _metadata_int_list(
+    metadata: Mapping[str, object],
+    name: str,
+) -> list[int] | None:
+    value = metadata.get(name)
+    if isinstance(value, Tensor):
+        return [int(item) for item in value.detach().cpu().flatten().tolist()]
+    if isinstance(value, np.ndarray):
+        return [int(item) for item in value.flatten().tolist()]
+    if isinstance(value, list) and all(isinstance(item, int) for item in value):
+        return value
+    return None
+
+
 def _metadata_bool(
     metadata: Mapping[str, object],
     name: str,
@@ -223,6 +405,62 @@ def _metadata_bool(
         if scalar is not None:
             return bool(scalar)
     return default
+
+
+def _metadata_json_mapping(
+    metadata: Mapping[str, object],
+    name: str,
+) -> dict[str, object] | None:
+    nested = metadata.get("meta")
+    candidates = [metadata.get(name), metadata.get(f"meta.{name}")]
+    if isinstance(nested, Mapping):
+        candidates.append(nested.get(name))
+    for value in candidates:
+        payload = _metadata_bytes(value)
+        if payload:
+            text = payload.decode("utf-8")
+            decoder = json.JSONDecoder()
+            offset = 0
+            decoded = None
+            while offset < len(text):
+                decoded, offset = decoder.raw_decode(text, offset)
+                while offset < len(text) and text[offset].isspace():
+                    offset += 1
+            if not isinstance(decoded, dict):
+                raise RuntimeError(
+                    "DuplexIO tool-call wire payload is not an object"
+                )
+            name_value = decoded.get("name")
+            arguments = decoded.get("arguments")
+            sequence = decoded.get("sequence")
+            if (
+                not isinstance(name_value, str)
+                or not isinstance(arguments, dict)
+                or not isinstance(sequence, int)
+                or sequence < 1
+            ):
+                raise RuntimeError("DuplexIO tool-call wire payload is invalid")
+            return {
+                "sequence": sequence,
+                "name": name_value,
+                "arguments": arguments,
+            }
+    return None
+
+
+def _metadata_bytes(value: Any) -> bytes | None:
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        tensor = value.detach().cpu().reshape(-1)
+        return bytes(tensor.tolist()) if tensor.numel() else None
+    if isinstance(value, np.ndarray):
+        return bytes(value.reshape(-1).tolist()) if value.size else None
+    if isinstance(value, (list, tuple)):
+        if all(isinstance(item, int) for item in value):
+            return bytes(value)
+        return _metadata_bytes(value[-1]) if value else None
+    return None
 
 
 def _scalar(value: Any) -> Any | None:
@@ -245,6 +483,12 @@ def _audio_num_samples(audio: Any) -> int:
     if hasattr(audio, "numel"):
         return int(audio.numel())
     return int(np.asarray(audio, dtype=np.float32).size)
+
+
+def _audio_slice(audio: Any, start: int) -> Any:
+    if hasattr(audio, "reshape"):
+        return audio.reshape(-1)[start:]
+    return np.asarray(audio, dtype=np.float32).reshape(-1)[start:]
 
 
 def _runtime_result(**values: object) -> dict[str, object]:

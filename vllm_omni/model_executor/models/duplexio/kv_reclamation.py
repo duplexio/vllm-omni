@@ -88,6 +88,33 @@ class DuplexIOKVLayout:
             self.max_persistent_text_tokens,
         )
 
+    def live_compact_pages(
+        self,
+        *,
+        live_audio_frames: int,
+        active_text_tokens: int,
+    ) -> tuple[int, ...]:
+        """Compact pages containing live audio, transient text, or active text."""
+        assert live_audio_frames >= 0
+        assert 0 <= active_text_tokens <= self.max_persistent_text_tokens
+
+        live_audio_slots = (
+            min(live_audio_frames, self.audio_ring_frames)
+            * self.num_audio_cells
+        )
+        audio_pages = range(cdiv(live_audio_slots, self.block_size))
+        transient_page = self.transient_text_base // self.block_size
+        live_persistent_tokens = min(
+            active_text_tokens + DUPLEXIO_NUM_TEXT_CELLS,
+            self.max_persistent_text_tokens,
+        )
+        persistent_page = self.persistent_text_base // self.block_size
+        persistent_pages = range(
+            persistent_page,
+            persistent_page + cdiv(live_persistent_tokens, self.block_size),
+        )
+        return (*audio_pages, transient_page, *persistent_pages)
+
     def audio_slot(self, audio_position: int, audio_cell: int) -> int:
         assert 0 <= audio_cell < self.num_audio_cells
         return (

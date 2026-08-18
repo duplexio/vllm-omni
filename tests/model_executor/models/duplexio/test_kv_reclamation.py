@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
+from torch.nn.attention.flex_attention import BlockMask
 from vllm.v1.attention.backends.flex_attention import FlexAttentionMetadata
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -22,7 +23,9 @@ from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
     _encode_uint32,
     duplexio_compact_key_visible,
     duplexio_primary_compact_slots,
+    duplexio_primary_write_slots,
     update_duplexio_attention_metadata,
+    update_duplexio_graph_block_mask,
 )
 from vllm_omni.model_executor.models.duplexio.row_semantics import (
     DUPLEXIO_NUM_CELLS,
@@ -45,6 +48,7 @@ def test_compact_attention_matches_logical_rows_across_audio_eviction() -> None:
     cached_epochs = torch.zeros(layout.max_compact_slots, dtype=torch.long)
     cached_positions = torch.zeros(layout.max_compact_slots, dtype=torch.long)
     cached_ordinals = torch.zeros(layout.max_compact_slots, dtype=torch.long)
+    cached_active = torch.zeros(layout.max_compact_slots, dtype=torch.bool)
     cached_audio_positions = torch.zeros(
         layout.max_compact_slots,
         dtype=torch.long,
@@ -98,6 +102,7 @@ def test_compact_attention_matches_logical_rows_across_audio_eviction() -> None:
         cached_epochs[primary_slots] = epoch
         cached_positions[primary_slots] = positions
         cached_ordinals[primary_slots] = frame_ordinals
+        cached_active[primary_slots] = key_active
         cached_audio_positions[primary_slots] = audio_position
         for cell, ordinal in enumerate(frame_ordinals.tolist()):
             if ordinal == 0:
@@ -108,6 +113,7 @@ def test_compact_attention_matches_logical_rows_across_audio_eviction() -> None:
             cached_epochs[slot] = epoch
             cached_positions[slot] = positions[cell]
             cached_ordinals[slot] = ordinal
+            cached_active[slot] = True
             cached_audio_positions[slot] = audio_position
 
         logical_keys.extend(frame_keys)
@@ -119,6 +125,14 @@ def test_compact_attention_matches_logical_rows_across_audio_eviction() -> None:
         all_positions = torch.arange(all_keys.shape[0])
         live_slots = layout.live_compact_slots(active_text_tokens)
         compact_positions = torch.arange(live_slots)
+        live_pages = layout.live_compact_pages(
+            live_audio_frames=frame + 1,
+            active_text_tokens=active_text_tokens,
+        )
+        gathered_slots = torch.zeros(live_slots, dtype=torch.bool)
+        for page in live_pages:
+            page_start = page * layout.block_size
+            gathered_slots[page_start : page_start + layout.block_size] = True
 
         queries = torch.randn(DUPLEXIO_NUM_CELLS, dim)
         for query, query_position in zip(queries, positions, strict=True):
@@ -143,10 +157,12 @@ def test_compact_attention_matches_logical_rows_across_audio_eviction() -> None:
                 cached_epochs[:live_slots],
                 cached_positions[:live_slots],
                 cached_ordinals[:live_slots],
+                cached_active[:live_slots],
                 torch.tensor(audio_position),
                 cached_audio_positions[:live_slots],
                 layout,
             )
+            assert not torch.any(compact_visible & ~gathered_slots)
             compact_scores = query @ cached_keys[:live_slots][compact_visible].T
             compact_output = (
                 compact_scores.softmax(dim=-1)
@@ -174,6 +190,88 @@ def test_audio_ring_usage_stays_constant_for_sustained_session() -> None:
     )
 
 
+def test_live_compact_pages_skip_unfilled_audio_ring() -> None:
+    layout = DuplexIOKVLayout(
+        block_size=16,
+        audio_window_frames=64,
+        max_model_len=600,
+    )
+
+    assert layout.live_compact_pages(
+        live_audio_frames=10,
+        active_text_tokens=5,
+    ) == (0, 1, 9, 10)
+
+
+def test_bulk_prefill_keeps_only_final_transient_text_writes() -> None:
+    layout = DuplexIOKVLayout(
+        block_size=16,
+        audio_window_frames=8,
+        max_model_len=60,
+    )
+    positions = torch.arange(3 * DUPLEXIO_NUM_CELLS)
+    request_indices = torch.zeros_like(positions)
+    # Text-only prefill frames share one frozen audio position and carry
+    # inactive audio cells.
+    audio_positions = torch.full_like(positions, 7)
+    key_active = (
+        torch.cat(
+            (
+                torch.ones(DUPLEXIO_NUM_TEXT_CELLS, dtype=torch.bool),
+                torch.zeros(2, dtype=torch.bool),
+            )
+        )
+        .repeat(3)
+    )
+
+    slots = duplexio_primary_write_slots(
+        positions,
+        audio_positions,
+        key_active,
+        request_indices,
+        layout,
+    ).view(3, DUPLEXIO_NUM_CELLS)
+
+    assert torch.equal(slots[:2, :DUPLEXIO_NUM_TEXT_CELLS], torch.full((2, 4), -1))
+    assert torch.equal(
+        slots[2, :DUPLEXIO_NUM_TEXT_CELLS],
+        torch.arange(
+            layout.transient_text_base,
+            layout.transient_text_base + DUPLEXIO_NUM_TEXT_CELLS,
+        ),
+    )
+    # Inactive audio never writes: it would clobber the live audio key
+    # resident at the same (frozen) audio position.
+    assert torch.equal(
+        slots[:, DUPLEXIO_NUM_TEXT_CELLS:],
+        torch.full((3, 2), -1),
+    )
+
+
+def test_live_frame_writes_audio_ring_by_audio_position() -> None:
+    layout = DuplexIOKVLayout(
+        block_size=16,
+        audio_window_frames=8,
+        max_model_len=60,
+    )
+    positions = torch.arange(DUPLEXIO_NUM_CELLS)
+    audio_positions = torch.full_like(positions, 3)
+    key_active = torch.ones(DUPLEXIO_NUM_CELLS, dtype=torch.bool)
+
+    slots = duplexio_primary_write_slots(
+        positions,
+        audio_positions,
+        key_active,
+        torch.zeros_like(positions),
+        layout,
+    )
+
+    assert torch.equal(
+        slots,
+        duplexio_primary_compact_slots(positions, audio_positions, layout),
+    )
+
+
 def test_cache_epoch_excludes_reused_pages_from_canceled_session() -> None:
     layout = DuplexIOKVLayout(
         block_size=16,
@@ -187,12 +285,51 @@ def test_cache_epoch_excludes_reused_pages_from_canceled_session() -> None:
         torch.tensor(1),
         torch.tensor(4),
         torch.tensor(0),
+        torch.tensor(True),
         torch.tensor(0),
         torch.tensor(0),
         layout,
     )
 
     assert not bool(visible)
+
+
+def test_compact_attention_keeps_inactive_audio_only_for_current_self() -> None:
+    layout = DuplexIOKVLayout(
+        block_size=16,
+        audio_window_frames=2,
+        max_model_len=60,
+    )
+    audio_position = torch.tensor(4)
+    audio_slot = torch.tensor(layout.audio_slot(0, 0))
+
+    current_visible = duplexio_compact_key_visible(
+        audio_position,
+        audio_slot,
+        torch.tensor(1),
+        torch.tensor(1),
+        audio_position,
+        torch.tensor(0),
+        torch.tensor(False),
+        torch.tensor(0),
+        torch.tensor(0),
+        layout,
+    )
+    next_frame_visible = duplexio_compact_key_visible(
+        torch.tensor(DUPLEXIO_NUM_CELLS),
+        audio_slot,
+        torch.tensor(1),
+        torch.tensor(1),
+        audio_position,
+        torch.tensor(0),
+        torch.tensor(False),
+        torch.tensor(0),
+        torch.tensor(0),
+        layout,
+    )
+
+    assert bool(current_visible)
+    assert not bool(next_frame_visible)
 
 
 def test_cache_metadata_round_trips_full_uint32_domain() -> None:
@@ -212,7 +349,7 @@ def test_cache_metadata_does_not_change_attention_scores() -> None:
     ordinals = torch.tensor([0, 1, 2, 3, 4])
     audio_positions = torch.tensor([1, 2, 3, 3, 4])
     query_metadata = torch.cat(
-        (_encode_uint32(epochs, query.dtype), query.new_zeros(5, 16)),
+        (_encode_uint32(epochs, query.dtype), query.new_zeros(5, 20)),
         dim=-1,
     )
     key_metadata = torch.cat(
@@ -221,6 +358,7 @@ def test_cache_metadata_does_not_change_attention_scores() -> None:
             _encode_uint32(epochs, key.dtype),
             _encode_uint32(positions, key.dtype),
             _encode_uint32(ordinals, key.dtype),
+            _encode_uint32(torch.ones_like(epochs), key.dtype),
             _encode_uint32(audio_positions, key.dtype),
         ),
         dim=-1,
@@ -350,6 +488,7 @@ def test_runtime_metadata_scans_only_live_compact_pages() -> None:
     update_duplexio_attention_metadata(
         {"first": metadata, "shared": metadata},
         [5, 19],
+        [10, 20],
     )
 
     expected_lengths = torch.tensor(
@@ -371,3 +510,35 @@ def test_runtime_metadata_scans_only_live_compact_pages() -> None:
         metadata.num_blocks_per_seq[0],
     ]
     assert metadata.physical_to_logical[0, first_unused_block] == -1
+
+
+def test_graph_block_mask_updates_stable_sparse_physical_candidates() -> None:
+    metadata = cast(Any, object.__new__(FlexAttentionMetadata))
+    metadata.block_table = torch.tensor([[3, 4, 7]], dtype=torch.int32)
+    metadata.block_size = 16
+    metadata.kv_block_size = 8
+    metadata.duplexio_graph_block_offsets = torch.arange(3, dtype=torch.int32)
+    block_mask = BlockMask(
+        seq_lengths=(6, 128),
+        kv_num_blocks=torch.zeros((1, 1, 1), dtype=torch.int32),
+        kv_indices=torch.full((1, 1, 1, 7), -1, dtype=torch.int32),
+        full_kv_num_blocks=None,
+        full_kv_indices=None,
+        q_num_blocks=None,
+        q_indices=None,
+        full_q_num_blocks=None,
+        full_q_indices=None,
+        BLOCK_SIZE=(16, 8),
+        mask_mod=lambda _b, _h, _q, _kv: torch.tensor(True),
+    )
+    metadata.duplexio_graph_block_mask = block_mask
+    indices_pointer = block_mask.kv_indices.data_ptr()
+
+    update_duplexio_graph_block_mask(metadata, (0, 2))
+
+    assert block_mask.kv_indices.data_ptr() == indices_pointer
+    assert block_mask.kv_num_blocks.item() == 4
+    assert torch.equal(
+        block_mask.kv_indices[0, 0, 0],
+        torch.tensor([6, 7, 14, 15, -1, -1, -1], dtype=torch.int32),
+    )

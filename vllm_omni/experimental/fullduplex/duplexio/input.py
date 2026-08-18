@@ -157,8 +157,10 @@ class DuplexIOPcmAppendBuffer:
         operation_id: str,
         chunk_period_ms: int,
     ) -> DuplexIOPcmAppendReservation | None:
-        """Reserve one complete frame already waiting behind an acknowledged one."""
+        """Reserve one complete frame when no wire reservation is ahead of it."""
         del chunk_period_ms
+        if self._reservations:
+            return None
         if len(self._buffer) < DUPLEXIO_FRAME_BYTES:
             return None
         sample_rate_hz = self._sample_rate_hz or DUPLEXIO_SAMPLE_RATE

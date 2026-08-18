@@ -12,6 +12,7 @@ DUPLEXIO_PIPELINE = PipelineConfig(
     model_type="duplexio",
     model_arch="DuplexIOForConditionalGeneration",
     hf_architectures=("DuplexIOForConditionalGeneration",),
+    default_deploy_config_name="duplexio.yaml",
     duplex_runtime_extension=(
         "vllm_omni.experimental.fullduplex.duplexio.runtime."
         "DuplexIORuntimeExtension"

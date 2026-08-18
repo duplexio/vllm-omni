@@ -145,6 +145,17 @@ class ServingRuntimeAdapter(Protocol):
         current: Mapping[str, object],
     ) -> None: ...
 
+    def initial_data_plane_payloads(
+        self,
+        session: object,
+    ) -> Iterable[dict[str, object]]: ...
+
+    def tool_result_data_plane_payloads(
+        self,
+        session: object,
+        output: str,
+    ) -> Iterable[dict[str, object]]: ...
+
     def data_plane_context(
         self,
         *,
@@ -181,6 +192,8 @@ def validate_serving_runtime_adapter(adapter: object) -> ServingRuntimeAdapter:
         "prepare_runtime_config",
         "runtime_config_for_update",
         "validate_runtime_config_for_session",
+        "initial_data_plane_payloads",
+        "tool_result_data_plane_payloads",
         "data_plane_context",
     )
     missing = [name for name in required_methods if not callable(getattr(adapter, name, None))]

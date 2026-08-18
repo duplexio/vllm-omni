@@ -90,6 +90,22 @@ def duplexio_frame_positions(token_positions: Tensor) -> Tensor:
     return torch.div(token_positions, DUPLEXIO_NUM_CELLS, rounding_mode="floor")
 
 
+def duplexio_logical_positions(token_positions: Tensor) -> Tensor:
+    """Return one logical position for vLLM's text-only position ids.
+
+    vLLM represents M-RoPE positions as three identical rows for text-only
+    inputs. DuplexIO stores one packed logical position in each KV entry.
+    """
+    if token_positions.ndim == 1:
+        return token_positions
+    if token_positions.ndim == 2:
+        return token_positions[0]
+    raise ValueError(
+        "DuplexIO positions must be one-dimensional or text-only M-RoPE "
+        f"with shape (3, tokens), got {tuple(token_positions.shape)}"
+    )
+
+
 def duplexio_cell_ids(token_positions: Tensor) -> Tensor:
     """Return the cell column for each flattened vLLM token position."""
     return torch.remainder(token_positions, DUPLEXIO_NUM_CELLS)
@@ -101,6 +117,7 @@ __all__ = [
     "duplexio_attention_visible",
     "duplexio_cell_ids",
     "duplexio_frame_positions",
+    "duplexio_logical_positions",
     "expand_stream_conv_weight",
     "mask_inactive_gdn_gates",
 ]

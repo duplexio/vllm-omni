@@ -46,6 +46,18 @@ class RealtimeOutputProjector:
             if event_type == "session.resumed":
                 self._hold_realtime_output_until_session_created = False
             return [dict(event)]
+        if event_type == "input.transcript.delta":
+            delta = event.get("delta")
+            if not isinstance(delta, str) or not delta:
+                return []
+            return [
+                {
+                    "type": "conversation.item.input_audio_transcription.delta",
+                    "item_id": event.get("item_id"),
+                    "content_index": 0,
+                    "delta": delta,
+                }
+            ]
         if event_type == "response.created":
             response_id = event.get("response_id")
             if isinstance(response_id, str) and response_id:
@@ -177,6 +189,59 @@ class RealtimeOutputProjector:
                 }
             )
             return payloads
+        if event_type == "response.tool_call.done":
+            response_id = event.get("response_id")
+            item = event.get("item")
+            if not isinstance(item, dict):
+                return []
+            item_id = item.get("id")
+            call_id = item.get("call_id")
+            name = item.get("name")
+            arguments = item.get("arguments")
+            if not all(
+                isinstance(value, str) and bool(value)
+                for value in (item_id, call_id, name)
+            ) or not isinstance(arguments, str):
+                return []
+            state = self._response_state(response_id, event=event)
+            output_index = 1
+            if state is not None:
+                output_index += len(state.tool_call_items)
+                state.tool_call_items.append(dict(item))
+            self._conversation_items[item_id] = item
+            return [
+                *self._conversation_item_added_events(item),
+                {
+                    "type": "response.output_item.added",
+                    "response_id": response_id,
+                    "output_index": output_index,
+                    "item": item,
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "response_id": response_id,
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "call_id": call_id,
+                    "delta": arguments,
+                },
+                {
+                    "type": "response.function_call_arguments.done",
+                    "response_id": response_id,
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                },
+                {
+                    "type": "response.output_item.done",
+                    "response_id": response_id,
+                    "output_index": output_index,
+                    "item": item,
+                },
+                self._conversation_item_done_event(item),
+            ]
         if event_type == "response.done":
             response_id = event.get("response_id")
             status = event.get("status") if isinstance(event.get("status"), str) else "completed"
@@ -894,7 +959,10 @@ class RealtimeOutputProjector:
                 "object": "realtime.response",
                 "status": status,
                 "status_details": status_details,
-                "output": [self._response_done_output_item(response_id, status=status)],
+                "output": [
+                    self._response_done_output_item(response_id, status=status),
+                    *(state.tool_call_items if state is not None else []),
+                ],
                 "metadata": event,
             },
         }

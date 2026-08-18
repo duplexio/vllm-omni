@@ -9,6 +9,9 @@ import torch
 from vllm_omni.model_executor.models.duplexio.audio_representation import (
     DelayedMimiState,
 )
+from vllm_omni.model_executor.models.duplexio.depth_sampler import (
+    DepthSpeakerConditioning,
+)
 from vllm_omni.model_executor.models.duplexio.mimi import (
     MimiStreamingState,
     MimiTransformerState,
@@ -42,18 +45,31 @@ def test_gdn_request_state_shape_is_fixed_for_the_session_lifetime() -> None:
     assert recurrent == (2, 8, 8)
 
 
-def test_sustained_request_counters_do_not_grow_request_tensor_state() -> None:
+def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
     generator = torch.Generator().manual_seed(7)
     state = DuplexIORequestState(
         text_input_ids=torch.zeros(4, dtype=torch.long),
         agent_audio_codes=torch.zeros(8, dtype=torch.long),
+        agent_input_delay=DelayedMimiState(torch.zeros(7, dtype=torch.long)),
+        agent_mimi=MimiStreamingState(
+            encoder_transformer=MimiTransformerState.empty(2),
+            decoder_transformer=MimiTransformerState.empty(2),
+        ),
         user_delay=DelayedMimiState(torch.zeros(7, dtype=torch.long)),
         agent_delay=DelayedMimiState(torch.zeros(7, dtype=torch.long)),
-        mimi=MimiStreamingState(
+        user_mimi=MimiStreamingState(
+            encoder_transformer=MimiTransformerState.empty(2),
+            decoder_transformer=MimiTransformerState.empty(2),
+        ),
+        output_mimi=MimiStreamingState(
             encoder_transformer=MimiTransformerState.empty(2),
             decoder_transformer=MimiTransformerState.empty(2),
         ),
         speaker_embedding=torch.zeros(512),
+        depth_speaker_conditioning=DepthSpeakerConditioning(
+            attention=(),
+            feedforward=(),
+        ),
         system_token_ids=(1, 2, 3),
         sampling_generator=generator,
         frames_seen=100_000,
@@ -69,9 +85,15 @@ def test_sustained_request_counters_do_not_grow_request_tensor_state() -> None:
     assert fork.active_text_tokens == 250_000
     assert fork.text_input_ids.shape == (4,)
     assert fork.agent_audio_codes.shape == (8,)
+    assert fork.agent_input_delay.previous_acoustic_codes.shape == (7,)
     assert fork.user_delay.previous_acoustic_codes.shape == (7,)
     assert fork.agent_delay.previous_acoustic_codes.shape == (7,)
     assert fork.speaker_embedding.shape == (512,)
-    assert fork.mimi is not state.mimi
-    assert fork.mimi.encoder_transformer is not state.mimi.encoder_transformer
-    assert fork.mimi.decoder_transformer is not state.mimi.decoder_transformer
+    assert fork.user_mimi is not state.user_mimi
+    assert fork.user_mimi.encoder_transformer is not state.user_mimi.encoder_transformer
+    assert fork.output_mimi is not state.output_mimi
+    assert fork.output_mimi.decoder_transformer is not state.output_mimi.decoder_transformer
+    assert fork.agent_mimi is not state.agent_mimi
+    assert fork.agent_mimi.encoder_transformer is not state.agent_mimi.encoder_transformer
+    assert fork.agent_mimi.decoder_transformer is not state.agent_mimi.decoder_transformer
+    assert fork.depth_speaker_conditioning is state.depth_speaker_conditioning

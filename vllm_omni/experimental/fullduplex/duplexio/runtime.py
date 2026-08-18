@@ -49,6 +49,41 @@ def build_duplexio_data_plane_prompt(
         raise ValueError("DuplexIO append payload must be a dictionary")
     frame_count = _validated_frame_count(payload)
     scheduler_token_budget = frame_count * DUPLEXIO_ROW_CELL_COUNT
+    duplexio_prefill = payload.get("duplexio_prefill", False)
+    duplexio_prefill_final = payload.get("duplexio_prefill_final", False)
+    duplexio_system_input = payload.get("duplexio_system_input", False)
+    duplexio_system_input_final = payload.get(
+        "duplexio_system_input_final",
+        False,
+    )
+    if not all(
+        isinstance(value, bool)
+        for value in (
+            duplexio_prefill,
+            duplexio_prefill_final,
+            duplexio_system_input,
+            duplexio_system_input_final,
+        )
+    ):
+        raise ValueError("DuplexIO text-input flags must be boolean when present")
+    if duplexio_prefill_final and not duplexio_prefill:
+        raise ValueError("DuplexIO prefill_final requires duplexio_prefill")
+    if duplexio_system_input_final and not duplexio_system_input:
+        raise ValueError(
+            "DuplexIO system_input_final requires duplexio_system_input"
+        )
+    if duplexio_prefill and duplexio_system_input:
+        raise ValueError("DuplexIO prefill and system input are mutually exclusive")
+    duplexio_system_token_ids = payload.get("duplexio_system_token_ids")
+    if duplexio_system_input and (
+        not isinstance(duplexio_system_token_ids, list)
+        or len(duplexio_system_token_ids) != frame_count
+        or not all(
+            isinstance(token_id, int) and token_id >= 0
+            for token_id in duplexio_system_token_ids
+        )
+    ):
+        raise ValueError("DuplexIO system input requires one token ID per frame")
     scheduler_token_id = runtime_config.get("duplexio_scheduler_token_id", 0)
     if not isinstance(scheduler_token_id, int) or scheduler_token_id < 0:
         raise ValueError("duplexio_scheduler_token_id must be a non-negative integer")
@@ -78,6 +113,11 @@ def build_duplexio_data_plane_prompt(
                 "row_cell_count": DUPLEXIO_ROW_CELL_COUNT,
                 "scheduler_token_budget": scheduler_token_budget,
                 "scheduler_token_id": scheduler_token_id,
+                "duplexio_prefill": duplexio_prefill,
+                "duplexio_prefill_final": duplexio_prefill_final,
+                "duplexio_system_input": duplexio_system_input,
+                "duplexio_system_input_final": duplexio_system_input_final,
+                "duplexio_system_token_ids": duplexio_system_token_ids,
             },
         },
     }
@@ -148,6 +188,11 @@ class DuplexIORuntimeExtension:
         segment_output_metadata: dict[str, Any],
         output: object,
     ) -> DuplexOutputDecision | None:
+        # Single-stage DuplexIO segments already reach the client as the raw
+        # stage-0 OutputMessage (the orchestrator only suppresses duplex
+        # stage-0 segments when a downstream stage exists). Emitting a
+        # direct-response decision as well would deliver two messages per
+        # frame and desynchronize per-frame collection.
         del (
             stage_id,
             final_stage_id,
@@ -171,27 +216,49 @@ def _validated_frame_count(payload: object) -> int:
             f"DuplexIO data plane requires frame_size={DUPLEXIO_FRAME_SIZE}"
         )
     frame_count = payload.get("frame_count")
-    if not isinstance(frame_count, int) or frame_count != 1:
-        raise ValueError("DuplexIO data plane requires exactly one frame per append")
+    if not isinstance(frame_count, int) or frame_count < 1:
+        raise ValueError("DuplexIO frame_count must be a positive integer")
+    is_prefill = payload.get("duplexio_prefill", False)
+    is_system_input = payload.get("duplexio_system_input", False)
+    if not isinstance(is_prefill, bool) or not isinstance(is_system_input, bool):
+        raise ValueError("DuplexIO text-input flags must be boolean when present")
+    if is_prefill and is_system_input:
+        raise ValueError("DuplexIO prefill and system input are mutually exclusive")
+    is_silent_text_input = is_prefill or is_system_input
+    if frame_count != 1 and not is_silent_text_input:
+        raise ValueError(
+            "DuplexIO live audio requires exactly one frame per append"
+        )
     audio = payload.get("audio")
     if not isinstance(audio, str):
         raise ValueError("DuplexIO data plane requires base64 audio")
-    try:
-        raw = base64.b64decode(audio, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError("DuplexIO data-plane audio is not valid base64") from exc
-    expected_bytes = frame_count * DUPLEXIO_FRAME_BYTES
-    if len(raw) != expected_bytes:
-        raise ValueError(
-            "DuplexIO data-plane frame count does not match PCM bytes: "
-            f"frame_count={frame_count}, bytes={len(raw)}, expected={expected_bytes}"
-        )
+    if is_silent_text_input:
+        if audio:
+            raise ValueError(
+                "DuplexIO text prefill creates silence inside the model"
+            )
+    else:
+        try:
+            raw = base64.b64decode(audio, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("DuplexIO data-plane audio is not valid base64") from exc
+        expected_bytes = frame_count * DUPLEXIO_FRAME_BYTES
+        if len(raw) != expected_bytes:
+            raise ValueError(
+                "DuplexIO data-plane frame count does not match PCM bytes: "
+                f"frame_count={frame_count}, bytes={len(raw)}, expected={expected_bytes}"
+            )
     valid_samples = payload.get("valid_samples")
     if (
         not isinstance(valid_samples, int)
-        or not 1 <= valid_samples <= DUPLEXIO_FRAME_SIZE
+        or not 1 <= valid_samples <= frame_count * DUPLEXIO_FRAME_SIZE
     ):
         raise ValueError("DuplexIO valid_samples is outside the framed PCM payload")
+    if (
+        is_silent_text_input
+        and valid_samples != frame_count * DUPLEXIO_FRAME_SIZE
+    ):
+        raise ValueError("DuplexIO text prefill must contain complete silent frames")
     return frame_count
 
 
