@@ -983,8 +983,20 @@ class DuplexIOQwenModel(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
+        # DuplexIO training replaces Qwen3.5's zero-centered RMSNorms with
+        # direct-scale norms, so exports store `norm.scale = weight + 1`.
+        # GemmaRMSNorm here keeps the zero-centered convention; convert back.
+        def convert_norm_scales(
+            weights: Iterable[tuple[str, Tensor]],
+        ) -> Iterable[tuple[str, Tensor]]:
+            for name, tensor in weights:
+                if name.endswith("norm.scale"):
+                    name = name.removesuffix("scale") + "weight"
+                    tensor = tensor.float() - 1.0
+                yield name, tensor
+
         return AutoWeightsLoader(self).load_weights(
-            weights,
+            convert_norm_scales(weights),
             mapper=self.hf_to_vllm_mapper,
         )
 
