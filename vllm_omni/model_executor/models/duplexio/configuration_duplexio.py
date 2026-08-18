@@ -244,9 +244,24 @@ def _text_config(
     value: dict[str, Any] | PretrainedConfig | None,
 ) -> PretrainedConfig:
     if isinstance(value, PretrainedConfig):
-        return value
+        return _strip_mrope(value)
     config = dict(value or {"model_type": "qwen3_5_text"})
     model_type = config.pop("model_type", None)
     if not isinstance(model_type, str):
         raise ValueError("DuplexIO text_config must contain a model_type")
-    return AutoConfig.for_model(model_type, **config)
+    return _strip_mrope(AutoConfig.for_model(model_type, **config))
+
+
+def _strip_mrope(config: PretrainedConfig) -> PretrainedConfig:
+    """Drop Qwen3.5's vestigial M-RoPE keys from the text config.
+
+    DuplexIO positions are 1-D frame indices; `mrope_section` would flip
+    vLLM's `uses_mrope` and feed (3, num_tokens) positions that the cache
+    metadata packing cannot accept. M-RoPE with identical position streams
+    is exactly standard RoPE, so stripping loses nothing.
+    """
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if rope_parameters:
+        rope_parameters.pop("mrope_section", None)
+        rope_parameters.pop("mrope_interleaved", None)
+    return config
