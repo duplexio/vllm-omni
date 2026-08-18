@@ -731,7 +731,13 @@ class DuplexIOForConditionalGeneration(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
+        # Exports carry the training-only system stream head; serving never
+        # decodes the system stream, so the module doesn't exist here.
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["llm.output_head_proj.system."],
+        )
+        return loader.load_weights(weights)
 
     @classmethod
     def get_mamba_state_dtype_from_config(
