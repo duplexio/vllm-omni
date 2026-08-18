@@ -44,8 +44,6 @@ class DuplexIODataPlaneSession:
         self._decode_tokens: DecodeTokens | None = None
         self._silence_token_id: int | None = None
         self._terminal_request_ids: set[str] = set()
-        self._audio_sample_cursors: dict[str, int] = {}
-        self._agent_text_cursors: dict[str, str] = {}
         self._user_token_ids: dict[str, list[int]] = {}
         self._user_text_cursors: dict[str, str] = {}
         self._tool_call_sequences: dict[str, int] = {}
@@ -67,8 +65,6 @@ class DuplexIODataPlaneSession:
 
     def begin_request(self, request_id: str) -> None:
         self._terminal_request_ids.discard(request_id)
-        self._audio_sample_cursors.setdefault(request_id, 0)
-        self._agent_text_cursors.setdefault(request_id, "")
         self._user_token_ids.setdefault(request_id, [])
         self._user_text_cursors.setdefault(request_id, "")
 
@@ -97,15 +93,6 @@ class DuplexIODataPlaneSession:
             for request_id in self._terminal_request_ids
             if not duplex_resource_request_belongs_to_session(request_id, session_id)
         }
-        self._audio_sample_cursors = {
-            request_id: cursor
-            for request_id, cursor in self._audio_sample_cursors.items()
-            if not duplex_resource_request_belongs_to_session(request_id, session_id)
-        }
-        self._agent_text_cursors = self._without_session_requests(
-            self._agent_text_cursors,
-            session_id,
-        )
         self._user_token_ids = self._without_session_requests(
             self._user_token_ids,
             session_id,
@@ -120,8 +107,6 @@ class DuplexIODataPlaneSession:
         )
 
     def _discard_request_state(self, request_id: str) -> None:
-        self._audio_sample_cursors.pop(request_id, None)
-        self._agent_text_cursors.pop(request_id, None)
         self._user_token_ids.pop(request_id, None)
         self._user_text_cursors.pop(request_id, None)
         self._tool_call_sequences.pop(request_id, None)
@@ -198,12 +183,6 @@ class DuplexIODataPlaneSession:
             text = metadata_text
         if not isinstance(text, str):
             text = ""
-        text = self._text_delta(
-            request_id,
-            text,
-            cursors=self._agent_text_cursors,
-            stream="agent",
-        )
 
         user_token_id = _metadata_int(metadata, "user_token_id")
         input_text_delta = self._user_text_delta(request_id, user_token_id)
@@ -223,16 +202,6 @@ class DuplexIODataPlaneSession:
         audio_data = None
         audio_duration_ms = 0
         sample_count = _audio_num_samples(raw_audio) if raw_audio is not None else 0
-        emitted_samples = self._audio_sample_cursors.get(request_id, 0)
-        if sample_count < emitted_samples:
-            raise RuntimeError(
-                "DuplexIO accumulated audio moved backwards for "
-                f"{request_id}: {sample_count} < {emitted_samples}"
-            )
-        if raw_audio is not None:
-            raw_audio = _audio_slice(raw_audio, emitted_samples)
-            self._audio_sample_cursors[request_id] = sample_count
-            sample_count -= emitted_samples
         if sample_count > 0 and "audio" in context.modalities:
             sample_rate_hz = _metadata_int(
                 metadata,
@@ -484,11 +453,6 @@ def _audio_num_samples(audio: Any) -> int:
         return int(audio.numel())
     return int(np.asarray(audio, dtype=np.float32).size)
 
-
-def _audio_slice(audio: Any, start: int) -> Any:
-    if hasattr(audio, "reshape"):
-        return audio.reshape(-1)[start:]
-    return np.asarray(audio, dtype=np.float32).reshape(-1)[start:]
 
 
 def _runtime_result(**values: object) -> dict[str, object]:

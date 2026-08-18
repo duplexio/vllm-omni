@@ -165,7 +165,7 @@ def test_data_plane_marks_the_final_prompt_prefill_output() -> None:
     assert result["initial_data_plane_complete"] is True
 
 
-def test_data_plane_emits_only_new_samples_from_accumulated_audio() -> None:
+def test_data_plane_passes_per_frame_audio_deltas_through() -> None:
     encoded: list[np.ndarray] = []
 
     def encode_audio(audio, *_args):
@@ -186,9 +186,7 @@ def test_data_plane_emits_only_new_samples_from_accumulated_audio() -> None:
     second = SimpleNamespace(
         request_id="request-1",
         outputs=[SimpleNamespace(text="")],
-        multimodal_output={
-            "audio": np.concatenate((first_frame, second_frame)),
-        },
+        multimodal_output={"audio": second_frame},
     )
 
     assert session.project_output(first, context=context) is not None
@@ -212,7 +210,7 @@ def test_data_plane_emits_agent_and_user_text_deltas() -> None:
     first = session.project_output(
         SimpleNamespace(
             request_id="request-1",
-            outputs=[SimpleNamespace(text="Hel")],
+            outputs=[SimpleNamespace(text="Hi")],
             multimodal_output={"user_token_id": 7},
         ),
         context=context,
@@ -220,17 +218,17 @@ def test_data_plane_emits_agent_and_user_text_deltas() -> None:
     second = session.project_output(
         SimpleNamespace(
             request_id="request-1",
-            outputs=[SimpleNamespace(text="Hello")],
+            outputs=[SimpleNamespace(text=" there")],
             multimodal_output={"user_token_id": 8},
         ),
         context=context,
     )
 
     assert first is not None
-    assert first["text"] == "Hel"
+    assert first["text"] == "Hi"
     assert first["input_text_delta"] == "you"
     assert second is not None
-    assert second["text"] == "lo"
+    assert second["text"] == " there"
     assert second["input_text_delta"] == " there"
 
 
