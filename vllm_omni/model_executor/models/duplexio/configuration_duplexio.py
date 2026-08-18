@@ -25,7 +25,7 @@ class DuplexIOConfig(PretrainedConfig):
         *,
         text_config: dict[str, Any] | PretrainedConfig | None = None,
         audio_codec_config: dict[str, Any] | None = None,
-        duplexio_export_version: int = 2,
+        duplexio_export_version: int = 3,
         stream_names: list[str] | None = None,
         audio_cell_names: list[str] | None = None,
         num_cells: int = 6,
@@ -40,7 +40,6 @@ class DuplexIOConfig(PretrainedConfig):
         speaker_embed_dim: int = 2_048,
         default_voice: str | None = None,
         audio_adapter_config: dict[str, Any] | None = None,
-        user_asr_encoder_config: dict[str, Any] | None = None,
         quantized_audio_config: dict[str, Any] | None = None,
         depth_transformer_config: dict[str, Any] | None = None,
         tied_weight_aliases: dict[str, str] | None = None,
@@ -66,7 +65,6 @@ class DuplexIOConfig(PretrainedConfig):
         self.audio_adapter_config = dict(
             audio_adapter_config or {"architecture": "mlp"}
         )
-        self.user_asr_encoder_config = dict(user_asr_encoder_config or {})
         self.quantized_audio_config = dict(
             quantized_audio_config or {"num_codebooks": 8}
         )
@@ -83,7 +81,8 @@ class DuplexIOConfig(PretrainedConfig):
         return self.text_config
 
     def _validate_duplexio_contract(self) -> None:
-        if self.duplexio_export_version != 2:
+        # Version 3 is version 2 minus the user-ASR (FastConformer) surface.
+        if self.duplexio_export_version != 3:
             raise ValueError(
                 "Unsupported DuplexIO export version: "
                 f"{self.duplexio_export_version}"
@@ -153,36 +152,6 @@ class DuplexIOConfig(PretrainedConfig):
             raise ValueError("DuplexIO audio embedding_dim must be positive")
         if self.quantized_audio_config.get("acoustic_delay_frames") != 1:
             raise ValueError("Native DuplexIO requires one acoustic delay frame")
-        if self.user_asr_encoder_config.get("implementation") != (
-            "nvidia_fastconformer_streaming_multi"
-        ):
-            raise ValueError(
-                "Native DuplexIO requires the frozen streaming FastConformer augment"
-            )
-        required_asr_values = {
-            "source_sample_rate": self.sample_rate,
-            "sample_rate": 16_000,
-            "frame_size": self.frame_size,
-            "features": 80,
-            "n_fft": 512,
-            "window_size": 400,
-            "window_stride": 160,
-            "subsampling_factor": 8,
-            "subsampling_conv_channels": 256,
-            "num_layers": 17,
-            "dim": 512,
-            "feedforward_dim": 2_048,
-            "num_heads": 8,
-            "attention_left_context": 70,
-            "attention_right_context": 0,
-            "convolution_kernel_size": 9,
-        }
-        for field, expected in required_asr_values.items():
-            if self.user_asr_encoder_config.get(field) != expected:
-                raise ValueError(
-                    f"Unsupported DuplexIO FastConformer {field}: "
-                    f"{self.user_asr_encoder_config.get(field)!r} != {expected!r}"
-                )
         if (
             self.depth_transformer_config.get("implementation")
             != "duplexio_speaker_adaptive_depth_v1"

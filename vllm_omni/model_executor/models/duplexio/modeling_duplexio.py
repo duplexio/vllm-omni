@@ -48,11 +48,6 @@ from vllm_omni.model_executor.models.duplexio.depth_sampler import (
     DepthAutoregressiveSampler,
     DepthSamplerConfig,
 )
-from vllm_omni.model_executor.models.duplexio.fastconformer import (
-    FastConformerConfig,
-    FastConformerStreamingState,
-    FastConformerUserEncoder,
-)
 from vllm_omni.model_executor.models.duplexio.mimi import (
     MimiModel,
     MimiStreamingState,
@@ -84,12 +79,12 @@ class DuplexIORequestState:
     user_delay: DelayedMimiState
     agent_delay: DelayedMimiState
     mimi: MimiStreamingState
-    user_asr: FastConformerStreamingState
     speaker_embedding: Tensor
     system_token_ids: tuple[int, ...]
     sampling_generator: torch.Generator
     system_token_offset: int = 0
     frames_seen: int = 0
+    audio_position: int = 0
     active_text_tokens: int = 0
     cache_epoch: int = 0
 
@@ -107,12 +102,12 @@ class DuplexIORequestState:
                 pending_semantic_code=self.agent_delay.pending_semantic_code,
             ),
             mimi=self.mimi.fork(),
-            user_asr=self.user_asr,
             speaker_embedding=self.speaker_embedding,
             system_token_ids=self.system_token_ids,
             sampling_generator=_fork_generator(self.sampling_generator),
             system_token_offset=self.system_token_offset,
             frames_seen=self.frames_seen,
+            audio_position=self.audio_position,
             active_text_tokens=self.active_text_tokens,
             cache_epoch=self.cache_epoch,
         )
@@ -239,21 +234,6 @@ class DuplexIOForConditionalGeneration(
             adapter_hidden_size,
             adapter_config.get("agent_audio_skip_dropout", 0.0),
         )
-        asr_config = FastConformerConfig(
-            **{
-                key: value
-                for key, value in config.user_asr_encoder_config.items()
-                if key != "implementation"
-                and key != "attention_right_context"
-                and key != "model_id"
-            }
-        )
-        self.user_asr_encoder = FastConformerUserEncoder(asr_config).float()
-        self.user_asr_proj = nn.Linear(
-            asr_config.dim,
-            representation_dim,
-            bias=False,
-        )
         depth_config = config.depth_transformer_config
         self.audio_sampler = DepthAutoregressiveSampler(
             DepthSamplerConfig(
@@ -372,14 +352,7 @@ class DuplexIOForConditionalGeneration(
             raw_user_codes,
             state.user_delay,
         )
-        asr_features, state.user_asr = self.user_asr_encoder.step(
-            waveform,
-            state.user_asr,
-        )
         user_features = self.user_audio_embedding(user_codes)
-        user_features = user_features + self.user_asr_proj(
-            asr_features.to(user_features.dtype)
-        )
         agent_features = self.agent_audio_embedding(state.agent_audio_codes)
         speaker = state.speaker_embedding.unsqueeze(0)
         request_index = torch.zeros(1, dtype=torch.long, device=input_ids.device)
@@ -421,6 +394,11 @@ class DuplexIOForConditionalGeneration(
         )
         state.active_text_tokens += int(text_active.sum().item())
         state.frames_seen += 1
+        # Audio time advances only on frames that carry real audio. Every
+        # append is a PCM frame today; a future token-only append mode must
+        # leave the counter frozen so burst frames do not consume the audio
+        # attention window.
+        state.audio_position += 1
         return input_ids, embeddings, {
             "duplexio_working_state": state,
             "duplexio_key_active": key_active,
@@ -431,6 +409,12 @@ class DuplexIOForConditionalGeneration(
                 device=input_ids.device,
             ),
             "duplexio_text_ordinals": text_ordinals,
+            "duplexio_audio_positions": torch.full(
+                (DUPLEXIO_NUM_CELLS,),
+                state.audio_position,
+                dtype=torch.long,
+                device=input_ids.device,
+            ),
             "duplexio_agent_audio_skip": agent_skip[0],
         }
 
@@ -458,12 +442,18 @@ class DuplexIOForConditionalGeneration(
             "duplexio_text_ordinals",
             inputs_embeds,
         )
+        audio_positions = _gather_frame_metadata(
+            infos,
+            "duplexio_audio_positions",
+            inputs_embeds,
+        )
         return self.llm.base_model.model(
             positions=duplexio_frame_positions(positions),
             logical_positions=positions,
             key_active=key_active,
             request_epochs=request_epochs,
             text_ordinals=text_ordinals,
+            audio_positions=audio_positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
@@ -731,7 +721,6 @@ class DuplexIOForConditionalGeneration(
             user_delay=self.audio_representation.new_state(device=device),
             agent_delay=self.audio_representation.new_state(device=device),
             mimi=self.audio_codec.new_streaming_state(),
-            user_asr=self.user_asr_encoder.new_state(device=device),
             speaker_embedding=pool[embedding_index].to(
                 device=device,
                 dtype=self.llm.channel_emb.dtype,
