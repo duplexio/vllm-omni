@@ -259,46 +259,74 @@ async def drive_session(
     session_config_cls,
     buffer_cls,
 ) -> None:
-    session_id = "duplexio-v3-smoke"
-    fence = fence_cls(session_id)
-    session_config = session_config_cls(
-        model=args.model,
-        voice=voice,
-        temperature=0.0,
-        extra_body={"full_duplex": True},
-    )
-    model_config = omni.engine.stage_vllm_configs[0].model_config
-    runtime_config = await adapter.prepare_runtime_config(
-        session_config,
-        model_config=model_config,
-    )
-    runtime_config["duplexio_sampling_seed"] = 0  # reproducible smoke
-    await omni.open_duplex_session_async(
-        session_id,
-        capabilities=adapter.capabilities(max_sessions=1).as_dict(),
-        session_config=session_config.as_dict(),
-        runtime_config=runtime_config,
-        fence=fence,
-        timeout=60.0,
-    )
-    print(f"[smoke] session open: {session_id}")
-
-    buffer = buffer_cls()
-    frame_count = len(speech) // FRAME_SIZE
-    audio_position = 0  # mirrors the model's per-request counter: every
-    # PCM append carries audio, so audio time advances by exactly one.
-    first_agent_frame: int | None = None
-    user_token_ids: list[int] = []
-    decoded_frames = 0
+    async def open_session(session_id: str):
+        fence = fence_cls(session_id)
+        session_config = session_config_cls(
+            model=args.model,
+            voice=voice,
+            # None: keep the export's sampling; 0.0 would divide top_p logits
+            # by zero (the realtime protocol forbids it, gt=0).
+            temperature=None,
+            extra_body={"full_duplex": True, "start_role": args.start_role},
+        )
+        model_config = omni.engine.stage_vllm_configs[0].model_config
+        runtime_config = await adapter.prepare_runtime_config(
+            session_config,
+            model_config=model_config,
+        )
+        runtime_config["duplexio_sampling_seed"] = 0  # reproducible smoke
+        if args.argmax:
+            runtime_config["duplexio_text_sampling"] = {
+                "mode": "argmax",
+                "temperature": 1.0,
+                "top_k": 1,
+                "top_p": 1.0,
+            }
+            runtime_config["duplexio_emit_temperatures"] = {
+                "user": 0.0,
+                "agent": 0.0,
+                "tool_call": 0.0,
+            }
+            runtime_config["duplexio_depth_sampling"] = {
+                "temperature": 1.0,
+                "top_k": 1,
+            }
+        if args.depth_top_k is not None or args.depth_temperature is not None:
+            depth = dict(runtime_config["duplexio_depth_sampling"])
+            if args.depth_top_k is not None:
+                depth["top_k"] = args.depth_top_k
+            if args.depth_temperature is not None:
+                depth["temperature"] = args.depth_temperature
+            runtime_config["duplexio_depth_sampling"] = depth
+            print(f"[smoke] depth sampling override: {depth}")
+        await omni.open_duplex_session_async(
+            session_id,
+            capabilities=adapter.capabilities(max_sessions=1).as_dict(),
+            session_config=session_config.as_dict(),
+            runtime_config=runtime_config,
+            fence=fence,
+            timeout=60.0,
+        )
+        print(f"[smoke] session open: {session_id}")
+        return fence, runtime_config
 
     def token_text(token_id: int) -> str:
         if token_id == silence_token_id:
             return "·"
         return tokenizer.decode([token_id]).replace("\n", "\\n") or "?"
 
-    try:
+    async def stream_pcm(
+        session_id: str,
+        fence,
+        pcm: np.ndarray,
+        *,
+        label: str,
+    ) -> list[dict]:
+        buffer = buffer_cls()
+        frame_count = len(pcm) // FRAME_SIZE
+        records: list[dict] = []
         for frame_index in range(frame_count):
-            chunk = speech[frame_index * FRAME_SIZE : (frame_index + 1) * FRAME_SIZE]
+            chunk = pcm[frame_index * FRAME_SIZE : (frame_index + 1) * FRAME_SIZE]
             framed = buffer.append(
                 {
                     "type": "audio",
@@ -321,19 +349,19 @@ async def drive_session(
                 timeout=600.0 if frame_index == 0 else 60.0,
                 collect_outputs=True,
             )
-            audio_position += 1
 
             outputs = result.get("data_plane_outputs")
             if not outputs:
-                fail(f"frame {frame_index} produced no data-plane output")
+                fail(f"{label} frame {frame_index} produced no data-plane output")
             metadata = frame_output_metadata(outputs[-1])
             if not metadata:
-                fail(f"frame {frame_index} output has no multimodal metadata")
+                fail(f"{label} frame {frame_index} has no multimodal metadata")
 
             user_id = scalar_int(metadata.get("user_token_id"))
             agent_id = scalar_int(metadata.get("agent_token_id"))
             tool_id = scalar_int(metadata.get("tool_call_token_id"))
             waveform = audio_samples(metadata.get("audio"))
+            codes = depth_codes(metadata.get("agent_audio_token_ids"))
 
             for name, token_id in (
                 ("user", user_id),
@@ -342,44 +370,248 @@ async def drive_session(
             ):
                 if token_id is None or not 0 <= token_id < vocab_size:
                     fail(
-                        f"frame {frame_index} {name} token {token_id!r} "
+                        f"{label} frame {frame_index} {name} token {token_id!r} "
                         f"outside vocab of {vocab_size}"
                     )
             if len(waveform) not in (0, FRAME_SIZE):
                 fail(
-                    f"frame {frame_index} audio has {len(waveform)} samples, "
-                    f"expected 0 (acoustic delay) or {FRAME_SIZE}"
+                    f"{label} frame {frame_index} audio has {len(waveform)} "
+                    f"samples, expected 0 (acoustic delay) or {FRAME_SIZE}"
                 )
             if not np.isfinite(waveform).all():
-                fail(f"frame {frame_index} audio contains non-finite samples")
+                fail(f"{label} frame {frame_index} audio has non-finite samples")
             rms = math.sqrt(float(np.mean(waveform**2))) if len(waveform) else 0.0
-
-            if user_id != silence_token_id:
-                user_token_ids.append(user_id)
-            if agent_id != silence_token_id and first_agent_frame is None:
-                first_agent_frame = frame_index
-            decoded_frames += 1
+            records.append(
+                {
+                    "user": user_id,
+                    "agent": agent_id,
+                    "tool": tool_id,
+                    "codes": codes,
+                    "audio": waveform,
+                    "rms": rms,
+                }
+            )
             print(
-                f"[frame {frame_index:3d}] audio_pos={audio_position:3d} "
+                f"[{label} {frame_index:3d}] "
                 f"user={token_text(user_id)!r} agent={token_text(agent_id)!r} "
                 f"tool={token_text(tool_id)!r} "
                 f"agent_audio={len(waveform)} samples (rms={rms:.4f})"
             )
+        return records
+
+    async def send_prefill(session_id: str, fence, runtime_config) -> list[dict]:
+        from types import SimpleNamespace
+
+        payloads = adapter.initial_data_plane_payloads(
+            SimpleNamespace(runtime_config=runtime_config, turn_id=0)
+        )
+        prefill_records: list[dict] = []
+        for payload_index, payload in enumerate(payloads):
+            result = await omni.append_duplex_input_async(
+                session_id,
+                mode="append_audio_chunk",
+                payload=dict(payload),
+                final=False,
+                fence=fence,
+                timeout=600.0,
+                collect_outputs=True,
+            )
+            outputs = result.get("data_plane_outputs")
+            if not outputs:
+                fail(f"prefill append {payload_index} produced no output")
+            metadata = frame_output_metadata(outputs[-1])
+            if payload.get("duplexio_prefill_final"):
+                prefill_records.append(
+                    {
+                        "user": scalar_int(metadata.get("user_token_id")),
+                        "agent": scalar_int(metadata.get("agent_token_id")),
+                        "tool": scalar_int(metadata.get("tool_call_token_id")),
+                        "codes": depth_codes(
+                            metadata.get("agent_audio_token_ids")
+                        ),
+                        "audio": audio_samples(metadata.get("audio")),
+                        "rms": 0.0,
+                        "prefill": True,
+                    }
+                )
+        print(f"[smoke] sent {len(payloads)} prefill appends "
+              f"({len(prefill_records)} sampled)")
+        return prefill_records
+
+    session_id = "duplexio-v3-smoke"
+    fence, runtime_config = await open_session(session_id)
+    try:
+        prefill_records: list[dict] = []
+        if args.prefill:
+            prefill_records = await send_prefill(session_id, fence, runtime_config)
+        records = await stream_pcm(session_id, fence, speech, label="frame")
     finally:
         await omni.close_duplex_session_async(session_id, fence=fence, timeout=30.0)
 
-    if decoded_frames != frame_count:
-        fail(f"decoded {decoded_frames} frames, appended {frame_count}")
+    frame_count = len(speech) // FRAME_SIZE
+    if len(records) != frame_count:
+        fail(f"decoded {len(records)} frames, appended {frame_count}")
     print(f"\n[smoke] all {frame_count} frames returned finite, well-shaped outputs")
+
+    sampled_records = [*prefill_records, *records]
+    user_token_ids = [r["user"] for r in records if r["user"] != silence_token_id]
+    agent_token_ids = [
+        r["agent"] for r in sampled_records if r["agent"] != silence_token_id
+    ]
+    agent_frames = [
+        index for index, r in enumerate(sampled_records)
+        if r["agent"] != silence_token_id
+    ]
     transcript = tokenizer.decode(user_token_ids) if user_token_ids else "(none)"
     print(f"[smoke] USER-stream transcription ({len(user_token_ids)} tokens): "
           f"{transcript}")
-    if first_agent_frame is None:
-        print("[smoke] agent never emitted (checkpoint-dependent; not asserted)")
+    agent_text = tokenizer.decode(agent_token_ids) if agent_token_ids else "(none)"
+    print(f"[smoke] AGENT text ({len(agent_token_ids)} tokens): {agent_text}")
+
+    if args.dump is not None:
+        import torch
+
+        torch.save(
+            {
+                "frames": [
+                    {
+                        "user": r["user"],
+                        "agent": r["agent"],
+                        "tool": r["tool"],
+                        "codes": (
+                            torch.as_tensor(r["codes"])
+                            if r["codes"] is not None
+                            else None
+                        ),
+                        "audio": torch.from_numpy(np.asarray(r["audio"]).copy()),
+                        "prefill": bool(r.get("prefill", False)),
+                    }
+                    for r in [*prefill_records, *records]
+                ],
+                "silence_token_id": silence_token_id,
+            },
+            args.dump,
+        )
+        print(f"[smoke] per-frame dump written to {args.dump}")
+
+    if args.verify_agent_speech:
+        await verify_agent_speech(
+            records=sampled_records,
+            agent_frames=agent_frames,
+            agent_text=agent_text,
+            open_session=open_session,
+            stream_pcm=stream_pcm,
+            close_session=lambda sid, f: omni.close_duplex_session_async(
+                sid, fence=f, timeout=30.0
+            ),
+            tokenizer=tokenizer,
+            silence_token_id=silence_token_id,
+        )
+    elif agent_frames:
+        print(f"[smoke] agent started emitting at frame {agent_frames[0]} "
+              f"(t={agent_frames[0] * 0.08:.2f}s)")
     else:
-        print(f"[smoke] agent started emitting at frame {first_agent_frame} "
-              f"(t={first_agent_frame * 0.08:.2f}s)")
+        print("[smoke] agent never emitted (checkpoint-dependent; not asserted)")
     print("SMOKE PASS")
+
+
+def depth_codes(value: object):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return depth_codes(value[-1]) if value else None
+    if hasattr(value, "detach"):
+        flat = value.detach().cpu().reshape(-1)
+        return flat.tolist() if flat.numel() else None
+    return None
+
+
+def normalized_words(text: str) -> list[str]:
+    cleaned = "".join(
+        character if character.isalnum() or character.isspace() else " "
+        for character in text.lower()
+    )
+    return cleaned.split()
+
+
+async def verify_agent_speech(
+    *,
+    records: list[dict],
+    agent_frames: list[int],
+    agent_text: str,
+    open_session,
+    stream_pcm,
+    close_session,
+    tokenizer,
+    silence_token_id: int,
+) -> None:
+    """Prove the agent's spoken audio matches its text stream.
+
+    The collected agent audio is played back through a second session as
+    user input; the USER stream is the model's own proven ASR, so its
+    transcription must (fuzzily) match the agent text.
+    """
+    from difflib import SequenceMatcher
+
+    if not agent_frames:
+        fail("agent never spoke; cannot verify agent speech "
+             "(increase --silence-seconds?)")
+
+    # Audio content trails the text stream (acoustic delay plus the depth
+    # sampler's own pacing); use a generous window for the loudness check.
+    span_start = agent_frames[0]
+    span_end = min(len(records), agent_frames[-1] + 25)
+    speech_rms_values = [
+        records[i]["rms"] for i in range(span_start, span_end)
+        if len(records[i]["audio"])
+    ]
+    quiet_rms_values = [
+        r["rms"] for i, r in enumerate(records)
+        if len(r["audio"]) and not span_start <= i < span_end
+    ]
+    speech_rms = float(np.mean(speech_rms_values)) if speech_rms_values else 0.0
+    quiet_rms = float(np.mean(quiet_rms_values)) if quiet_rms_values else 0.0
+    print(f"[smoke] agent audio rms: speaking={speech_rms:.4f} "
+          f"idle={quiet_rms:.4f} over frames [{span_start}, {span_end})")
+    loud_rms = max(
+        (records[i]["rms"] for i in range(span_start, span_end)
+         if len(records[i]["audio"])),
+        default=0.0,
+    )
+    if loud_rms < 1e-2:
+        fail(f"agent audio is silent around the agent's turn "
+             f"(peak frame rms={loud_rms:.5f})")
+
+    # Play back the ENTIRE agent output track: the model's audio may trail
+    # its text by several frames, and everything outside the agent's turn is
+    # near-silence anyway.
+    agent_audio = np.concatenate(
+        [r["audio"] for r in records if len(r["audio"])]
+        + [np.zeros(FRAME_SIZE, dtype=np.float32)] * 12
+    ).astype(np.float32)
+    session_id = "duplexio-v3-smoke-asr"
+    fence, _ = await open_session(session_id)
+    try:
+        asr_records = await stream_pcm(session_id, fence, agent_audio, label="asr")
+    finally:
+        await close_session(session_id, fence)
+    heard_ids = [
+        r["user"] for r in asr_records if r["user"] != silence_token_id
+    ]
+    heard_text = tokenizer.decode(heard_ids) if heard_ids else "(none)"
+    print(f"[smoke] playback USER-stream heard ({len(heard_ids)} tokens): "
+          f"{heard_text}")
+
+    expected = normalized_words(agent_text)
+    heard = normalized_words(heard_text)
+    ratio = SequenceMatcher(None, expected, heard).ratio()
+    print(f"[smoke] agent speech/text match ratio: {ratio:.2f} "
+          f"(expected words: {expected}) (heard words: {heard})")
+    if ratio < 0.6:
+        fail(
+            f"agent speech does not match agent text (ratio {ratio:.2f} < 0.60)"
+        )
+    print("[smoke] agent speech matches agent text")
 
 
 def main() -> None:
@@ -392,6 +624,53 @@ def main() -> None:
         help="Any speech wav (default: first Full-Duplex-Bench candor clip)",
     )
     parser.add_argument("--seconds", type=float, default=10.0)
+    parser.add_argument(
+        "--silence-seconds",
+        type=float,
+        default=0.0,
+        help="Append this much silent PCM after the clip so the model takes "
+        "its turn",
+    )
+    parser.add_argument(
+        "--argmax",
+        action="store_true",
+        help="Force deterministic argmax sampling for text, emit, and depth",
+    )
+    parser.add_argument(
+        "--dump",
+        type=Path,
+        default=None,
+        help="Save per-frame records (token ids, depth codebook codes, audio) "
+        "to this .pt file",
+    )
+    parser.add_argument(
+        "--start-role",
+        choices=("user", "agent"),
+        default="user",
+        help="agent: assistant-first session (model narrates over silent "
+        "user input)",
+    )
+    parser.add_argument(
+        "--silent-input",
+        action="store_true",
+        help="Feed pure silence instead of the speech clip",
+    )
+    parser.add_argument("--depth-top-k", type=int, default=None)
+    parser.add_argument("--depth-temperature", type=float, default=None)
+    parser.add_argument(
+        "--prefill",
+        action="store_true",
+        help="Send the adapter's system-prompt prefill appends before live "
+        "audio (the deployed session flow) instead of interleaving system "
+        "tokens over the first live frames",
+    )
+    parser.add_argument(
+        "--verify-agent-speech",
+        action="store_true",
+        help="Require the agent to speak, and require its audio (fed back "
+        "through a second session as user input) to transcribe to its own "
+        "text stream",
+    )
     parser.add_argument("--voice", default=None, help="Exported voice id")
     parser.add_argument("--max-model-len", type=int, default=32_768)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
@@ -410,13 +689,25 @@ def main() -> None:
         fail(f"{model_path} is not a DuplexIO export (no config.json)")
     validate_v3_config(model_path)
 
-    audio_path = args.audio if args.audio is not None else DEFAULT_FDB_CLIP
-    if not audio_path.is_file():
-        fail(
-            f"no speech input: {audio_path} does not exist "
-            "(pass --audio <wav>; this smoke takes real speech only)"
+    if args.silent_input:
+        frames = int(args.seconds * SAMPLE_RATE) // FRAME_SIZE
+        speech = np.zeros(frames * FRAME_SIZE, dtype=np.float32)
+        print(f"[smoke] silent input: {frames} frames")
+    else:
+        audio_path = args.audio if args.audio is not None else DEFAULT_FDB_CLIP
+        if not audio_path.is_file():
+            fail(
+                f"no speech input: {audio_path} does not exist "
+                "(pass --audio <wav>; this smoke takes real speech only)"
+            )
+        speech = load_speech(audio_path, args.seconds)
+    if args.silence_seconds > 0:
+        silent_frames = int(args.silence_seconds * SAMPLE_RATE) // FRAME_SIZE
+        speech = np.concatenate(
+            (speech, np.zeros(silent_frames * FRAME_SIZE, dtype=np.float32))
         )
-    speech = load_speech(audio_path, args.seconds)
+        print(f"[smoke] appended {silent_frames} silent frames "
+              f"({silent_frames * 0.08:.1f}s) for the agent's turn")
 
     try:
         asyncio.run(run_session(args, speech))
