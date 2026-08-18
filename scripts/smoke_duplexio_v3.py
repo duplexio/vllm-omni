@@ -206,11 +206,21 @@ async def run_session(args: argparse.Namespace, speech: np.ndarray) -> None:
     print(f"[smoke] voice: {voice}")
 
     with tempfile.TemporaryDirectory(prefix="duplexio-smoke-") as tmp:
-        deploy_yaml = write_deploy_yaml(Path(tmp), args)
+        if args.deploy_config is not None:
+            deploy_yaml = args.deploy_config
+            print(f"[smoke] deploy config: {deploy_yaml}")
+        else:
+            deploy_yaml = write_deploy_yaml(Path(tmp), args)
         # Engine init loads the checkpoint in the stage worker; vLLM's
         # AutoWeightsLoader raises on missing or unexpected weights, so
         # surviving this call is the zero-missing/zero-unexpected assertion.
-        omni = AsyncOmni(model=str(model_path), stage_configs_path=str(deploy_yaml))
+        # Generous init timeout: CUDA-graph configs compile on first start.
+        omni = AsyncOmni(
+            model=str(model_path),
+            stage_configs_path=str(deploy_yaml),
+            init_timeout=1_800,
+            stage_init_timeout=1_800,
+        )
         print("[smoke] engine initialized (weights loaded strictly)")
         try:
             await drive_session(
@@ -382,6 +392,14 @@ def main() -> None:
     parser.add_argument("--voice", default=None, help="Exported voice id")
     parser.add_argument("--max-model-len", type=int, default=32_768)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument(
+        "--deploy-config",
+        type=Path,
+        default=None,
+        help="Use an existing deploy YAML (e.g. vllm_omni/deploy/duplexio.yaml "
+        "to exercise the CUDA-graph frame path) instead of the eager smoke "
+        "overlay",
+    )
     args = parser.parse_args()
 
     model_path = Path(args.model)
