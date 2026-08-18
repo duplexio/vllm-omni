@@ -119,3 +119,15 @@ def test_data_plane_prompt_rejects_multiple_complete_frames() -> None:
             payload=payload,
             final=False,
         )
+
+
+def test_runtime_configures_per_frame_delta_outputs() -> None:
+    from vllm.sampling_params import RequestOutputKind, SamplingParams
+
+    configured = DuplexIORuntimeExtension().configure_sampling_params(
+        runtime_config={},
+        defaults=(SamplingParams(max_tokens=99),),
+    )
+
+    assert configured[0].max_tokens == 1
+    assert configured[0].output_kind == RequestOutputKind.DELTA

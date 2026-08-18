@@ -166,6 +166,9 @@ class DuplexIOForConditionalGeneration(
 
     packed_modules_mapping = Qwen3_5ForCausalLMBase.packed_modules_mapping
     have_multimodal_outputs = True
+    # The per-frame multimodal metadata carries everything the client needs;
+    # skip the per-append hidden-states D2H payload entirely.
+    omni_pooler_payload_include_hidden = False
     has_preprocess = True
     has_postprocess = True
     postprocess_uses_hidden_states = False

@@ -93,12 +93,19 @@ class DuplexIORuntimeExtension:
         defaults: tuple[object, ...],
     ) -> tuple[object, ...]:
         del runtime_config
+        from vllm.sampling_params import RequestOutputKind
+
         configured: list[object] = []
         for default in defaults:
             clone = getattr(default, "clone", None)
             params = clone() if callable(clone) else copy.copy(default)
             if hasattr(params, "max_tokens"):
                 setattr(params, "max_tokens", 1)
+            # Every append is one frame; DELTA drains the audio chunk after
+            # each segment so the resumable request does not hand cumulative
+            # audio to later frames.
+            if hasattr(params, "output_kind"):
+                setattr(params, "output_kind", RequestOutputKind.DELTA)
             configured.append(params)
         return tuple(configured)
 

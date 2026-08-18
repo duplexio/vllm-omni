@@ -7,13 +7,19 @@ from vllm_omni.outputs.output_modality import DRAINABLE_MODALITIES
 
 CHUNK_METADATA_KEYS: frozenset[str] = frozenset(
     {
+        "agent_token_id",
         "audio_text_total_chars",
         "duplex_epoch",
         "duplex_turn_id",
+        "end_of_turn",
         "llm_output_text_utf8",
+        "model_listen",
+        "sample_rate_hz",
         "segment_end",
+        "tool_call_token_id",
         "tts_is_last_chunk",
         "turn_end",
+        "user_token_id",
     }
 )
 
