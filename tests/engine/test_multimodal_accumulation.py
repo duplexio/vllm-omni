@@ -57,6 +57,7 @@ def test_duplexio_frame_keys_replace_instead_of_accumulating():
         incoming = MultimodalPayload.from_dict(
             {
                 "audio": torch.full((1920,), float(frame)),
+                "agent_audio_token_ids": torch.full((8,), token_id),
                 "user_token_id": torch.tensor(token_id),
                 "agent_token_id": torch.tensor(token_id + 1),
                 "tool_call_token_id": torch.tensor(token_id + 2),
@@ -76,5 +77,6 @@ def test_duplexio_frame_keys_replace_instead_of_accumulating():
     assert int(accumulated.get("agent_token_id")) == 23
     assert int(accumulated.get("tool_call_token_id")) == 24
     assert int(accumulated.get("sample_rate_hz")) == 24_000
+    assert accumulated.get("agent_audio_token_ids").tolist() == [22] * 8
     for key in ("user_token_id", "agent_token_id", "model_listen"):
         assert not isinstance(accumulated.get(key), list), key
