@@ -1239,15 +1239,20 @@ class Orchestrator:
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
-        # Duplex stage-0 segment boundaries are not client-visible outputs:
-        # direct decisions are emitted by the model runtime extension below,
-        # while spoken content flows through the next stage. Forwarding
-        # the raw stage-0 output as well injects one cumulative-text,
-        # no-audio message per unit that every downstream consumer must
-        # filter out again (the official implementation returns exactly one
-        # result per audio chunk).
+        # In multi-stage duplex pipelines, stage-0 segment boundaries are not
+        # client-visible outputs: direct decisions are emitted by the model
+        # runtime extension below, while spoken content flows through the
+        # next stage. Forwarding the raw stage-0 output as well injects one
+        # cumulative-text, no-audio message per unit that every downstream
+        # consumer must filter out again (the official implementation returns
+        # exactly one result per audio chunk). In a single-stage duplex
+        # pipeline (e.g. duplexio) there is no next stage: the stage-0
+        # segment IS the per-frame client output and must be emitted.
         is_duplex_stage0_segment = (
-            stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment_finished
+            stage_id == 0
+            and stage_id < req_state.final_stage_id
+            and self._is_duplex_session_request(req_state)
+            and req_state.streaming.segment_finished
         )
         if self.stage_pools[stage_id].final_output and not is_duplex_stage0_segment:
             await self.output_async_queue.put(

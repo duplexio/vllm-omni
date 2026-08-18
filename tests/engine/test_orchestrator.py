@@ -1941,6 +1941,72 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
     assert routed == [built_metrics]
 
 
+def _route_output_orchestrator(num_stages: int) -> tuple[Orchestrator, asyncio.Queue]:
+    orchestrator = object.__new__(Orchestrator)
+    output_queue: asyncio.Queue = asyncio.Queue()
+    orchestrator.output_async_queue = output_queue
+    orchestrator.stage_pools = [SimpleNamespace(final_output=stage_id == 0) for stage_id in range(num_stages)]
+    orchestrator.async_chunk = False
+    orchestrator._pd_pair = None
+    orchestrator._cfg_tracker = SimpleNamespace(
+        is_companion=lambda _req_id: False,
+        has_companions=lambda _req_id: False,
+    )
+    return orchestrator, output_queue
+
+
+def _duplex_segment_request_state(final_stage_id: int) -> OrchestratorRequestState:
+    from vllm_omni.experimental.fullduplex.engine.contracts import DuplexRequestIdentity
+
+    req_state = OrchestratorRequestState(
+        request_id="req-duplex",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=final_stage_id,
+    )
+    req_state.streaming.enabled = True
+    req_state.streaming.segment_finished = True
+    req_state.duplex_identity = DuplexRequestIdentity(
+        session_id="sid-duplex",
+        fence=DuplexFence("sid-duplex"),
+    )
+    return req_state
+
+
+@pytest.mark.asyncio
+async def test_single_stage_duplex_segment_output_reaches_client_queue() -> None:
+    """A single-stage duplex pipeline has no downstream stage: the stage-0
+    segment IS the per-frame client output and must not be suppressed."""
+    orchestrator, output_queue = _route_output_orchestrator(num_stages=1)
+    req_state = _duplex_segment_request_state(final_stage_id=0)
+    output = SimpleNamespace(request_id="req-duplex", finished=True)
+
+    await orchestrator._route_output(0, 0, output, req_state, None)
+
+    message = output_queue.get_nowait()
+    assert isinstance(message, OutputMessage)
+    assert message.engine_outputs is output
+    assert message.finished is True
+    assert output_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_multi_stage_duplex_stage0_segment_stays_suppressed() -> None:
+    orchestrator, output_queue = _route_output_orchestrator(num_stages=3)
+    forwarded: list[str] = []
+
+    async def record_forward(req_id, *_args, **_kwargs) -> None:
+        forwarded.append(req_id)
+
+    orchestrator._forward_to_next_stage = record_forward
+    req_state = _duplex_segment_request_state(final_stage_id=2)
+    output = SimpleNamespace(request_id="req-duplex", finished=True)
+
+    await orchestrator._route_output(0, 0, output, req_state, None)
+
+    assert output_queue.empty()
+    assert forwarded == ["req-duplex"]
+
+
 def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
     class SegmentMetricsOutputProcessor(FakeOutputProcessor):
         def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
