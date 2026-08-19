@@ -58,19 +58,13 @@ model_image = modal.Image.from_dockerfile(
 ).env(
     {
         "PYTHONPATH": str(APP_ROOT),
-        **(
-            {
-                "DUPLEXIO_MODAL_STAGING": "1",
-                # TCP connections do not survive snapshot restore; the NCCL
-                # heartbeat monitor then spams "Broken pipe" against the dead
-                # rank-0 TCPStore forever. World-size-1 inference only loses
-                # the flight recorder, so silence the monitor rather than
-                # mask real errors under the spam.
-                "TORCH_NCCL_ENABLE_MONITORING": "0",
-            }
-            if STAGING
-            else {}
-        ),
+        # TCP connections do not survive snapshot restore; the NCCL
+        # heartbeat monitor then spams "Broken pipe" against the dead
+        # rank-0 TCPStore forever. World-size-1 inference only loses
+        # the flight recorder, so silence the monitor rather than
+        # mask real errors under the spam.
+        "TORCH_NCCL_ENABLE_MONITORING": "0",
+        **({"DUPLEXIO_MODAL_STAGING": "1"} if STAGING else {}),
     }
 )
 frontend_image = (
@@ -266,104 +260,64 @@ def check_model_present() -> None:
         )
 
 
-if STAGING:
 
-    @app.cls(
-        image=model_image,
-        gpu="H100",
-        volumes={"/models": model_volume.with_mount_options(read_only=True)},
-        # Sleep level 1 offloads weights (~13 GB) + the kv_cache pool
-        # (~20 GB) into host RAM before the snapshot captures it.
-        memory=96_000,
-        timeout=24 * 60 * 60,
-        startup_timeout=MODEL_STARTUP_TIMEOUT_SECONDS,
-        scaledown_window=5 * 60,
-        max_containers=1,
-        # The ORIGINAL (2026-08-11, 58c2721) snapshot design, verbatim:
-        # sleep-mode CuMem pools engage at weight load, prewarm exercises the
-        # full path, sleep level 1 offloads weights to CPU pools and discards
-        # the rest of GPU memory, THEN memory + GPU snapshot capture the slept
-        # engine. That deployment served correct audio through restores; the
-        # live app's garbled restores coincided with workers logging "Sleep
-        # Mode DISABLED" (snapshot of a fully LIVE engine). The flag plumbing
-        # is code-identical 58c2721..HEAD and engages on the cluster via this
-        # exact CLI, so staging first re-tests the proven design end-to-end.
-        enable_memory_snapshot=True,
-        experimental_options={"enable_gpu_snapshot": True},
-    )
-    @modal.concurrent(max_inputs=100)
-    class SnapshotModelServer:
-        @modal.enter(snap=True)
-        def start_and_sleep(self) -> None:
-            check_model_present()
-            self.backend = start_backend(enable_sleep_mode=True)
-            prewarm_backend()
-            control_backend(
-                "/v1/omni/sleep",
-                {"stage_ids": SNAPSHOT_STAGE_IDS, "level": 1},
-            )
-            print("[staging] engine slept (weights offloaded); snapshotting")
+@app.cls(
+    image=model_image,
+    gpu="H100",
+    volumes={"/models": model_volume.with_mount_options(read_only=True)},
+    # Sleep level 1 offloads weights (~13 GB) + the kv_cache pool
+    # (~20 GB) into host RAM before the snapshot captures it.
+    memory=96_000,
+    timeout=24 * 60 * 60,
+    startup_timeout=MODEL_STARTUP_TIMEOUT_SECONDS,
+    scaledown_window=5 * 60,
+    max_containers=1,
+    # The ORIGINAL (2026-08-11, 58c2721) snapshot design, verbatim:
+    # sleep-mode CuMem pools engage at weight load, prewarm exercises the
+    # full path, sleep level 1 offloads weights to CPU pools and discards
+    # the rest of GPU memory, THEN memory + GPU snapshot capture the slept
+    # engine. That deployment served correct audio through restores; the
+    # live app's garbled restores coincided with workers logging "Sleep
+    # Mode DISABLED" (snapshot of a fully LIVE engine). The flag plumbing
+    # is code-identical 58c2721..HEAD and engages on the cluster via this
+    # exact CLI, so staging first re-tests the proven design end-to-end.
+    enable_memory_snapshot=True,
+    experimental_options={"enable_gpu_snapshot": True},
+)
+@modal.concurrent(max_inputs=100)
+class SnapshotModelServer:
+    @modal.enter(snap=True)
+    def start_and_sleep(self) -> None:
+        check_model_present()
+        self.backend = start_backend(enable_sleep_mode=True)
+        prewarm_backend()
+        control_backend(
+            "/v1/omni/sleep",
+            {"stage_ids": SNAPSHOT_STAGE_IDS, "level": 1},
+        )
+        print("[staging] engine slept (weights offloaded); snapshotting")
 
-        @modal.enter(snap=False)
-        def wake(self) -> None:
-            wake_started = time.monotonic()
-            control_backend(
-                "/v1/omni/wakeup",
-                {"stage_ids": SNAPSHOT_STAGE_IDS},
-            )
-            wait_for_backend(self.backend)
-            print(
-                f"[staging] engine woke in {time.monotonic() - wake_started:.1f}s"
-            )
+    @modal.enter(snap=False)
+    def wake(self) -> None:
+        wake_started = time.monotonic()
+        control_backend(
+            "/v1/omni/wakeup",
+            {"stage_ids": SNAPSHOT_STAGE_IDS},
+        )
+        wait_for_backend(self.backend)
+        print(
+            f"[staging] engine woke in {time.monotonic() - wake_started:.1f}s"
+        )
 
-        @modal.exit()
-        def stop(self) -> None:
-            stop_backend(self.backend)
+    @modal.exit()
+    def stop(self) -> None:
+        stop_backend(self.backend)
 
-        # Staging is non-production: no proxy auth so the remote
-        # agent-speech gate can drive it directly.
-        @modal.asgi_app(label=MODEL_WEB_LABEL, requires_proxy_auth=False)
-        def web(self) -> object:
-            return build_model_app(self.backend)
-
-else:
-
-    @app.cls(
-        image=model_image,
-        gpu="H100",
-        volumes={"/models": model_volume.with_mount_options(read_only=True)},
-        memory=32_768,
-        timeout=24 * 60 * 60,
-        startup_timeout=MODEL_STARTUP_TIMEOUT_SECONDS,
-        scaledown_window=10 * 60,
-        max_containers=1,
-        # Snapshots stay OFF: A/B-confirmed (2026-08-19) that GPU-snapshot
-        # restore garbles agent audio (fluent mumble, text unaffected). The
-        # pre-snapshot sleep also silently no-ops (workers log "Sleep Mode
-        # DISABLED"), so the snapshot captured a fully live engine. Do not
-        # re-enable without passing a remote agent-speech gate on a restored
-        # container.
-        enable_memory_snapshot=False,
-    )
-    @modal.concurrent(max_inputs=100)
-    class SnapshotModelServer:
-        # Plain start (no snapshot, no sleep/wakeup) — see the snapshot note
-        # on the class decorator for why.
-        @modal.enter()
-        def start(self) -> None:
-            check_model_present()
-            self.backend = start_backend(enable_sleep_mode=False)
-            prewarm_backend()
-            wait_for_backend(self.backend)
-
-        @modal.exit()
-        def stop(self) -> None:
-            stop_backend(self.backend)
-
-        @modal.asgi_app(label="model-snapshot", requires_proxy_auth=True)
-        def web(self) -> object:
-            return build_model_app(self.backend)
-
+    # Staging is non-production: no proxy auth so the remote
+    # agent-speech gate can drive it directly.
+    @modal.asgi_app(label=MODEL_WEB_LABEL, requires_proxy_auth=False)
+    def web(self) -> object:
+        return build_model_app(self.backend)
 
 @app.function(
     image=frontend_image,
