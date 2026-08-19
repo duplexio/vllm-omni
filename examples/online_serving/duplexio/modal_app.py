@@ -13,7 +13,11 @@ from pathlib import Path
 
 import modal
 
-APP_NAME = "duplexio-vllm-omni"
+# Staging variant (DUPLEXIO_MODAL_STAGING=1): separate app + web labels,
+# experimenting with memory snapshots of a genuinely SLEPT engine. The live
+# app is completely unaffected unless the env var is set at deploy time.
+STAGING = os.environ.get("DUPLEXIO_MODAL_STAGING") == "1"
+APP_NAME = "duplexio-vllm-omni-staging" if STAGING else "duplexio-vllm-omni"
 MODEL_VOLUME_NAME = "duplexio-vllm-models"
 MODEL_NAME = "duplexio-489780-checkpoint-1-vllm-v3"
 MODEL_PATH = Path("/models") / MODEL_NAME
@@ -22,7 +26,7 @@ MODEL_PATH = Path("/models") / MODEL_NAME
 VOICE = "id10014"
 APP_ROOT = Path("/app/vllm-omni")
 FRONTEND_ROOT = Path("/app/realtime_web")
-DEPLOY_CONFIG_NAME = "duplexio.yaml"
+DEPLOY_CONFIG_NAME = "duplexio-staging.yaml" if STAGING else "duplexio.yaml"
 KV_CACHE_MEMORY_BYTES = 19_947_344_692
 MODEL_STARTUP_TIMEOUT_SECONDS = 15 * 60
 BACKEND_PORT = 8099
@@ -34,8 +38,10 @@ AUTH_PASSWORD_HASH_ENV = "DEMO_PASSWORD_HASH"
 BACKEND_AUTH_SECRET_NAME = "duplexio-demo-backend-auth"
 BACKEND_KEY_ENV = "DUPLEXIO_BACKEND_MODAL_KEY"
 BACKEND_SECRET_ENV = "DUPLEXIO_BACKEND_MODAL_SECRET"
-BACKEND_WEBSOCKET_URL = "wss://duplexio--model-snapshot.modal.run"
-BACKEND_HEALTH_URL = "https://duplexio--model-snapshot.modal.run/healthz"
+MODEL_WEB_LABEL = "model-snapshot-staging" if STAGING else "model-snapshot"
+DEMO_WEB_LABEL = "demo-staging" if STAGING else "demo"
+BACKEND_WEBSOCKET_URL = f"wss://duplexio--{MODEL_WEB_LABEL}.modal.run"
+BACKEND_HEALTH_URL = f"https://duplexio--{MODEL_WEB_LABEL}.modal.run/healthz"
 
 repo_root = Path(__file__).resolve().parents[3] if modal.is_local() else APP_ROOT
 model_image = modal.Image.from_dockerfile(
@@ -49,7 +55,12 @@ model_image = modal.Image.from_dockerfile(
         "**/__pycache__",
         "**/.pytest_cache",
     ],
-).env({"PYTHONPATH": str(APP_ROOT)})
+).env(
+    {
+        "PYTHONPATH": str(APP_ROOT),
+        **({"DUPLEXIO_MODAL_STAGING": "1"} if STAGING else {}),
+    }
+)
 frontend_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
@@ -235,45 +246,106 @@ def build_model_app(process: subprocess.Popen[bytes]) -> object:
     )
 
 
-@app.cls(
-    image=model_image,
-    gpu="H100",
-    volumes={"/models": model_volume.with_mount_options(read_only=True)},
-    memory=32_768,
-    timeout=24 * 60 * 60,
-    startup_timeout=MODEL_STARTUP_TIMEOUT_SECONDS,
-    scaledown_window=10 * 60,
-    max_containers=1,
-    # Snapshots stay OFF: A/B-confirmed (2026-08-19) that GPU-snapshot
-    # restore garbles agent audio (fluent mumble, text unaffected). The
-    # pre-snapshot sleep also silently no-ops (workers log "Sleep Mode
-    # DISABLED"), so the snapshot captured a fully live engine. Do not
-    # re-enable without passing a remote agent-speech gate on a restored
-    # container.
-    enable_memory_snapshot=False,
-)
-@modal.concurrent(max_inputs=100)
-class SnapshotModelServer:
-    # Plain start (no snapshot, no sleep/wakeup) — see the snapshot note
-    # on the class decorator for why.
-    @modal.enter()
-    def start(self) -> None:
-        if not MODEL_PATH.is_dir():
-            raise RuntimeError(
-                f"Model checkpoint not found at {MODEL_PATH}. Upload {MODEL_NAME} "
-                f"to the {MODEL_VOLUME_NAME!r} Modal Volume."
+def check_model_present() -> None:
+    if not MODEL_PATH.is_dir():
+        raise RuntimeError(
+            f"Model checkpoint not found at {MODEL_PATH}. Upload {MODEL_NAME} "
+            f"to the {MODEL_VOLUME_NAME!r} Modal Volume."
+        )
+
+
+if STAGING:
+
+    @app.cls(
+        image=model_image,
+        gpu="H100",
+        volumes={"/models": model_volume.with_mount_options(read_only=True)},
+        memory=64_000,
+        timeout=24 * 60 * 60,
+        startup_timeout=MODEL_STARTUP_TIMEOUT_SECONDS,
+        scaledown_window=5 * 60,
+        max_containers=1,
+        # Memory (CPU) snapshot of a GENUINELY SLEPT engine: sleep-mode CuMem
+        # pools engage at weight load, prewarm exercises the full path, then
+        # sleep level 1 offloads the weights into CPU pools and discards the
+        # rest of GPU memory before capture. The GPU snapshot stays OFF (the
+        # A/B showed restoring a live GPU engine garbles agent audio); the
+        # restored container wakes the engine by remapping weights H2D.
+        enable_memory_snapshot=True,
+        experimental_options={"enable_gpu_snapshot": False},
+    )
+    @modal.concurrent(max_inputs=100)
+    class SnapshotModelServer:
+        @modal.enter(snap=True)
+        def start_and_sleep(self) -> None:
+            check_model_present()
+            self.backend = start_backend(enable_sleep_mode=True)
+            prewarm_backend()
+            control_backend(
+                "/v1/omni/sleep",
+                {"stage_ids": SNAPSHOT_STAGE_IDS, "level": 1},
             )
-        self.backend = start_backend(enable_sleep_mode=False)
-        prewarm_backend()
-        wait_for_backend(self.backend)
+            print("[staging] engine slept (weights offloaded); snapshotting")
 
-    @modal.exit()
-    def stop(self) -> None:
-        stop_backend(self.backend)
+        @modal.enter(snap=False)
+        def wake(self) -> None:
+            wake_started = time.monotonic()
+            control_backend(
+                "/v1/omni/wakeup",
+                {"stage_ids": SNAPSHOT_STAGE_IDS},
+            )
+            wait_for_backend(self.backend)
+            print(
+                f"[staging] engine woke in {time.monotonic() - wake_started:.1f}s"
+            )
 
-    @modal.asgi_app(label="model-snapshot", requires_proxy_auth=True)
-    def web(self) -> object:
-        return build_model_app(self.backend)
+        @modal.exit()
+        def stop(self) -> None:
+            stop_backend(self.backend)
+
+        # Staging is non-production: no proxy auth so the remote
+        # agent-speech gate can drive it directly.
+        @modal.asgi_app(label=MODEL_WEB_LABEL, requires_proxy_auth=False)
+        def web(self) -> object:
+            return build_model_app(self.backend)
+
+else:
+
+    @app.cls(
+        image=model_image,
+        gpu="H100",
+        volumes={"/models": model_volume.with_mount_options(read_only=True)},
+        memory=32_768,
+        timeout=24 * 60 * 60,
+        startup_timeout=MODEL_STARTUP_TIMEOUT_SECONDS,
+        scaledown_window=10 * 60,
+        max_containers=1,
+        # Snapshots stay OFF: A/B-confirmed (2026-08-19) that GPU-snapshot
+        # restore garbles agent audio (fluent mumble, text unaffected). The
+        # pre-snapshot sleep also silently no-ops (workers log "Sleep Mode
+        # DISABLED"), so the snapshot captured a fully live engine. Do not
+        # re-enable without passing a remote agent-speech gate on a restored
+        # container.
+        enable_memory_snapshot=False,
+    )
+    @modal.concurrent(max_inputs=100)
+    class SnapshotModelServer:
+        # Plain start (no snapshot, no sleep/wakeup) — see the snapshot note
+        # on the class decorator for why.
+        @modal.enter()
+        def start(self) -> None:
+            check_model_present()
+            self.backend = start_backend(enable_sleep_mode=False)
+            prewarm_backend()
+            wait_for_backend(self.backend)
+
+        @modal.exit()
+        def stop(self) -> None:
+            stop_backend(self.backend)
+
+        @modal.asgi_app(label="model-snapshot", requires_proxy_auth=True)
+        def web(self) -> object:
+            return build_model_app(self.backend)
 
 
 @app.function(
@@ -289,7 +361,7 @@ class SnapshotModelServer:
     ],
 )
 @modal.concurrent(max_inputs=100)
-@modal.asgi_app(label="demo")
+@modal.asgi_app(label=DEMO_WEB_LABEL)
 def demo() -> object:
     """Serve authentication and proxy authenticated streams to the GPU."""
     from realtime_web.server import (

@@ -223,6 +223,7 @@ async def run_session(args: argparse.Namespace, speech: np.ndarray) -> None:
             stage_configs_path=str(deploy_yaml),
             init_timeout=1_800,
             stage_init_timeout=1_800,
+            **({"enable_sleep_mode": True} if args.sleep_mode else {}),
         )
         print("[smoke] engine initialized (weights loaded strictly)")
         try:
@@ -656,6 +657,11 @@ def main() -> None:
         help="Feed pure silence instead of the speech clip",
     )
     parser.add_argument("--depth-top-k", type=int, default=None)
+    parser.add_argument(
+        "--sleep-mode",
+        action="store_true",
+        help="Enable the CuMem sleep-mode pools (weights become offloadable)",
+    )
     parser.add_argument("--depth-temperature", type=float, default=None)
     parser.add_argument(
         "--prefill",
