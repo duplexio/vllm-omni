@@ -244,15 +244,18 @@ def build_model_app(process: subprocess.Popen[bytes]) -> object:
     startup_timeout=MODEL_STARTUP_TIMEOUT_SECONDS,
     scaledown_window=10 * 60,
     max_containers=1,
-    # Snapshots disabled while diagnosing garbled live audio: the GPU
-    # memory snapshot restore path is the one Modal-specific mechanism the
-    # agent-speech gate has never validated. Re-enable after the A/B listen.
+    # Snapshots stay OFF: A/B-confirmed (2026-08-19) that GPU-snapshot
+    # restore garbles agent audio (fluent mumble, text unaffected). The
+    # pre-snapshot sleep also silently no-ops (workers log "Sleep Mode
+    # DISABLED"), so the snapshot captured a fully live engine. Do not
+    # re-enable without passing a remote agent-speech gate on a restored
+    # container.
     enable_memory_snapshot=False,
 )
 @modal.concurrent(max_inputs=100)
 class SnapshotModelServer:
-    # A/B diagnosis: plain start with no snapshot and no sleep/wakeup
-    # round-trip; both are suspects for the garbled live audio.
+    # Plain start (no snapshot, no sleep/wakeup) — see the snapshot note
+    # on the class decorator for why.
     @modal.enter()
     def start(self) -> None:
         if not MODEL_PATH.is_dir():
