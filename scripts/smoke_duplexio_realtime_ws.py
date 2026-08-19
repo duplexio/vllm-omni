@@ -86,7 +86,8 @@ async def run_client(args: argparse.Namespace) -> None:
     connect_started = time.monotonic()
     audio_chunks: list[dict] = []
     transcript_parts: list[str] = []
-    listen_seen = asyncio.Event()
+    event_counts: dict[str, int] = {}
+    session_ready = asyncio.Event()
     done = asyncio.Event()
 
     async with websockets.connect(
@@ -101,14 +102,15 @@ async def run_client(args: argparse.Namespace) -> None:
                 while True:
                     event = json.loads(await ws.recv())
                     event_type = event.get("type")
+                    event_counts[event_type] = event_counts.get(event_type, 0) + 1
                     if event_type == "error":
                         print(f"[ws] error event: {event}", file=sys.stderr)
+                    elif event_type == "session.updated":
+                        session_ready.set()
                     elif event_type == "response.audio.delta":
                         audio_chunks.append(event)
                     elif event_type == "response.audio_transcript.delta":
                         transcript_parts.append(event.get("delta") or "")
-                    elif event_type == "response.listen":
-                        listen_seen.set()
             except websockets.ConnectionClosed:
                 done.set()
 
@@ -129,6 +131,10 @@ async def run_client(args: argparse.Namespace) -> None:
                 },
             },
         }))
+        # The web client and prewarm both wait for session readiness before
+        # sending audio; frames sent earlier reach a not-yet-duplex session.
+        await asyncio.wait_for(session_ready.wait(), timeout=120.0)
+        print("[ws] session ready")
         # Stream silent f32 frames at the browser cadence (80 ms).
         silent = base64.b64encode(bytes(FRAME_SIZE * 4)).decode()
         frames = int(args.seconds / 0.08)
@@ -153,6 +159,7 @@ async def run_client(args: argparse.Namespace) -> None:
         reader_task.cancel()
 
     transcript = "".join(transcript_parts).strip()
+    print(f"[ws] event counts: {event_counts}")
     print(f"[ws] audio.delta chunks: {len(audio_chunks)}")
     print(f"[ws] transcript deltas: {transcript!r}")
     if not audio_chunks:
