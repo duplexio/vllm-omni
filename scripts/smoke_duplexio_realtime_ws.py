@@ -49,9 +49,35 @@ def fail(message: str) -> None:
     sys.exit(1)
 
 
+# Whisper canonicalizes speech orthography ("gonna" -> "going to",
+# "I'm" -> "I am" or vice versa); expand both sides so the word-level
+# ratio measures intelligibility, not transcription style.
+CONTRACTIONS = {
+    "gonna": "going to",
+    "wanna": "want to",
+    "gotta": "got to",
+    "cannot": "can not",
+    "can't": "can not",
+    "won't": "will not",
+    "n't": " not",
+    "'m": " am",
+    "'re": " are",
+    "'ve": " have",
+    "'ll": " will",
+    "'d": " would",
+    "it's": "it is",
+    "that's": "that is",
+    "what's": "what is",
+    "let's": "let us",
+}
+
+
 def normalized_words(text: str) -> list[str]:
+    lowered = text.lower()
+    for contraction, expansion in CONTRACTIONS.items():
+        lowered = lowered.replace(contraction, expansion)
     cleaned = "".join(
-        c if c.isalnum() or c.isspace() else " " for c in text.lower()
+        c if c.isalnum() or c.isspace() else " " for c in lowered
     )
     return cleaned.split()
 
@@ -214,10 +240,10 @@ async def run_client(args: argparse.Namespace) -> None:
         normalized_words(heard),
     ).ratio()
     print(f"[ws] whisper/transcript match ratio: {ratio:.2f}")
-    if ratio < 0.6:
+    if ratio < 0.9:
         fail(
             f"browser-side audio does not transcribe to the agent text "
-            f"(ratio {ratio:.2f} < 0.60)"
+            f"(ratio {ratio:.2f} < 0.90)"
         )
     print("[ws] browser-side audio is intelligible and matches the text")
     print("SMOKE PASS")

@@ -58,7 +58,19 @@ model_image = modal.Image.from_dockerfile(
 ).env(
     {
         "PYTHONPATH": str(APP_ROOT),
-        **({"DUPLEXIO_MODAL_STAGING": "1"} if STAGING else {}),
+        **(
+            {
+                "DUPLEXIO_MODAL_STAGING": "1",
+                # TCP connections do not survive snapshot restore; the NCCL
+                # heartbeat monitor then spams "Broken pipe" against the dead
+                # rank-0 TCPStore forever. World-size-1 inference only loses
+                # the flight recorder, so silence the monitor rather than
+                # mask real errors under the spam.
+                "TORCH_NCCL_ENABLE_MONITORING": "0",
+            }
+            if STAGING
+            else {}
+        ),
     }
 )
 frontend_image = (
