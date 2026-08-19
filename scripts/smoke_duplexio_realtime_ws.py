@@ -228,6 +228,12 @@ def main() -> None:
         "local server",
     )
     parser.add_argument(
+        "--sleep-mode",
+        action="store_true",
+        help="Pass --enable-sleep-mode to the served engine (CLI route, as "
+        "the Modal app does)",
+    )
+    parser.add_argument(
         "--connect-timeout",
         type=float,
         default=900.0,
@@ -270,21 +276,24 @@ def main() -> None:
                 gpu_memory_utilization=0.8,
             )
             deploy_yaml = write_deploy_yaml(Path(tmp), overlay)
-        server = subprocess.Popen(
-            [
-                ".venv/bin/vllm-omni",
-                "serve",
-                args.model,
-                "--omni",
-                "--deploy-config",
-                str(deploy_yaml),
-                "--trust-remote-code",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(args.port),
-            ],
-        )
+        command = [
+            sys.executable,
+            "-m",
+            "vllm_omni.entrypoints.cli.main",
+            "serve",
+            args.model,
+            "--omni",
+            "--deploy-config",
+            str(deploy_yaml),
+            "--trust-remote-code",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(args.port),
+        ]
+        if args.sleep_mode:
+            command.append("--enable-sleep-mode")
+        server = subprocess.Popen(command)
         try:
             deadline = time.monotonic() + 900
             while time.monotonic() < deadline:
