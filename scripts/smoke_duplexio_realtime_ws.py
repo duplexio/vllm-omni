@@ -90,10 +90,12 @@ async def run_client(args: argparse.Namespace) -> None:
     session_ready = asyncio.Event()
     done = asyncio.Event()
 
+    headers = [tuple(h.split("=", 1)) for h in args.header]
     async with websockets.connect(
         url,
         max_size=64 * 1024 * 1024,
         open_timeout=args.connect_timeout,
+        additional_headers=headers,
     ) as ws:
         print(f"[ws] connected after {time.monotonic() - connect_started:.1f}s "
               "(includes any cold start)")
@@ -235,10 +237,23 @@ def main() -> None:
         "local server",
     )
     parser.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra websocket handshake header (e.g. Modal proxy auth)",
+    )
+    parser.add_argument(
         "--sleep-mode",
         action="store_true",
         help="Pass --enable-sleep-mode to the served engine (CLI route, as "
         "the Modal app does)",
+    )
+    parser.add_argument(
+        "--sleep-cycle",
+        action="store_true",
+        help="After the server is healthy, sleep(level 1) + wakeup stage 0 "
+        "before the session — the Modal snapshot flow minus the snapshot",
     )
     parser.add_argument(
         "--connect-timeout",
@@ -317,6 +332,19 @@ def main() -> None:
             else:
                 fail("server did not become healthy within 900s")
             print("[ws] server healthy")
+            if args.sleep_cycle:
+                for path, payload in (
+                    ("/v1/omni/sleep", {"stage_ids": [0], "level": 1}),
+                    ("/v1/omni/wakeup", {"stage_ids": [0]}),
+                ):
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{args.port}{path}",
+                        data=json.dumps(payload).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=600) as reply:
+                        print(f"[ws] {path}: {json.load(reply)}")
             asyncio.run(run_client(args))
         except SystemExit:
             raise
