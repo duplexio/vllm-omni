@@ -218,6 +218,18 @@ class OmniGPUWorkerBase(GPUWorker):
 
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags)
+        if tags is None or "kv_cache" in tags:
+            # Waking maps fresh physical pages into the kv-cache virtual
+            # addresses; their content is undefined (often the stale
+            # pre-sleep pages). Vanilla attention never reads unwritten
+            # slots, but models that store per-slot visibility metadata in
+            # the cache (DuplexIO appends it to head_dim and CUDA-graph
+            # replay evaluates it in-kernel) would see ghost keys, so
+            # restore the zeroed state the startup allocation provided.
+            for cache_tensor in self.model_runner.kv_caches:
+                cache_tensor.zero_()
+            # Upstream hook: re-init FP8 KV scales after the remap.
+            self.model_runner.post_kv_cache_wake_up()
         current_omni_platform.synchronize()
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")
         return True
