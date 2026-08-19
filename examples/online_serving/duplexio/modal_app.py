@@ -244,8 +244,10 @@ def build_model_app(process: subprocess.Popen[bytes]) -> object:
     startup_timeout=MODEL_STARTUP_TIMEOUT_SECONDS,
     scaledown_window=10 * 60,
     max_containers=1,
-    enable_memory_snapshot=True,
-    experimental_options={"enable_gpu_snapshot": True},
+    # Snapshots disabled while diagnosing garbled live audio: the GPU
+    # memory snapshot restore path is the one Modal-specific mechanism the
+    # agent-speech gate has never validated. Re-enable after the A/B listen.
+    enable_memory_snapshot=False,
 )
 @modal.concurrent(max_inputs=100)
 class SnapshotModelServer:
