@@ -58,12 +58,16 @@ model_image = modal.Image.from_dockerfile(
 ).env(
     {
         "PYTHONPATH": str(APP_ROOT),
-        # TCP connections do not survive snapshot restore; the NCCL
-        # heartbeat monitor then spams "Broken pipe" against the dead
-        # rank-0 TCPStore forever. World-size-1 inference only loses
-        # the flight recorder, so silence the monitor rather than
-        # mask real errors under the spam.
+        # TCP connections do not survive snapshot restore (the container IP
+        # changes), so the NCCL monitor thread's periodic flight-recorder
+        # dump-flag poll spams "Broken pipe" against the dead rank-0
+        # TCPStore forever. The monitor thread always runs regardless of
+        # ENABLE_MONITORING=0 (that only disables its kill action, verified
+        # on a restored container); DUMP_ON_TIMEOUT=0 stops the TCPStore
+        # polling. World-size-1 inference only loses the flight recorder.
         "TORCH_NCCL_ENABLE_MONITORING": "0",
+        "TORCH_NCCL_DUMP_ON_TIMEOUT": "0",
+        "TORCH_NCCL_PROPAGATE_ERROR": "0",
         **({"DUPLEXIO_MODAL_STAGING": "1"} if STAGING else {}),
     }
 )
