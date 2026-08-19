@@ -260,7 +260,9 @@ if STAGING:
         image=model_image,
         gpu="H100",
         volumes={"/models": model_volume.with_mount_options(read_only=True)},
-        memory=64_000,
+        # Sleep level 1 offloads weights (~13 GB) + the kv_cache pool
+        # (~20 GB) into host RAM before the snapshot captures it.
+        memory=96_000,
         timeout=24 * 60 * 60,
         startup_timeout=MODEL_STARTUP_TIMEOUT_SECONDS,
         scaledown_window=5 * 60,
