@@ -251,26 +251,17 @@ def build_model_app(process: subprocess.Popen[bytes]) -> object:
 )
 @modal.concurrent(max_inputs=100)
 class SnapshotModelServer:
-    @modal.enter(snap=True)
-    def start_and_snapshot(self) -> None:
+    # A/B diagnosis: plain start with no snapshot and no sleep/wakeup
+    # round-trip; both are suspects for the garbled live audio.
+    @modal.enter()
+    def start(self) -> None:
         if not MODEL_PATH.is_dir():
             raise RuntimeError(
                 f"Model checkpoint not found at {MODEL_PATH}. Upload {MODEL_NAME} "
                 f"to the {MODEL_VOLUME_NAME!r} Modal Volume."
             )
-        self.backend = start_backend(enable_sleep_mode=True)
+        self.backend = start_backend(enable_sleep_mode=False)
         prewarm_backend()
-        control_backend(
-            "/v1/omni/sleep",
-            {"stage_ids": SNAPSHOT_STAGE_IDS, "level": 1},
-        )
-
-    @modal.enter(snap=False)
-    def restore(self) -> None:
-        control_backend(
-            "/v1/omni/wakeup",
-            {"stage_ids": SNAPSHOT_STAGE_IDS},
-        )
         wait_for_backend(self.backend)
 
     @modal.exit()
