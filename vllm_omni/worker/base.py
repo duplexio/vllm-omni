@@ -197,7 +197,14 @@ class OmniGPUWorkerBase(GPUWorker):
         from vllm.device_allocator.cumem import CuMemAllocator
 
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
-        offload_tags = ("weights",) if level == 1 else tuple()
+        # Level 1 offloads the kv_cache pool too (upstream discards it):
+        # attention metadata builders are constructed inside the pooled
+        # initialize_kv_cache, so the pool holds their persistent constants
+        # (e.g. the DuplexIO flex builder's graph_kv_indices / block offsets
+        # baked into captured FULL cudagraphs). Discarding maps garbage into
+        # those constants at wake-up and graph replay reads phantom KV
+        # blocks; offloading restores every pool byte exactly.
+        offload_tags = ("weights", "kv_cache") if level == 1 else tuple()
         allocator = CuMemAllocator.get_instance()
         allocator.sleep(offload_tags=offload_tags)
         current_omni_platform.empty_cache()
@@ -218,18 +225,6 @@ class OmniGPUWorkerBase(GPUWorker):
 
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags)
-        if tags is None or "kv_cache" in tags:
-            # Waking maps fresh physical pages into the kv-cache virtual
-            # addresses; their content is undefined (often the stale
-            # pre-sleep pages). Vanilla attention never reads unwritten
-            # slots, but models that store per-slot visibility metadata in
-            # the cache (DuplexIO appends it to head_dim and CUDA-graph
-            # replay evaluates it in-kernel) would see ghost keys, so
-            # restore the zeroed state the startup allocation provided.
-            for cache_tensor in self.model_runner.kv_caches:
-                cache_tensor.zero_()
-            # Upstream hook: re-init FP8 KV scales after the remap.
-            self.model_runner.post_kv_cache_wake_up()
         current_omni_platform.synchronize()
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")
         return True
