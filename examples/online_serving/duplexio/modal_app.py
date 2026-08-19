@@ -26,7 +26,7 @@ MODEL_PATH = Path("/models") / MODEL_NAME
 VOICE = "id10014"
 APP_ROOT = Path("/app/vllm-omni")
 FRONTEND_ROOT = Path("/app/realtime_web")
-DEPLOY_CONFIG_NAME = "duplexio-staging.yaml" if STAGING else "duplexio.yaml"
+DEPLOY_CONFIG_NAME = "duplexio.yaml"
 KV_CACHE_MEMORY_BYTES = 19_947_344_692
 MODEL_STARTUP_TIMEOUT_SECONDS = 15 * 60
 BACKEND_PORT = 8099
@@ -265,14 +265,17 @@ if STAGING:
         startup_timeout=MODEL_STARTUP_TIMEOUT_SECONDS,
         scaledown_window=5 * 60,
         max_containers=1,
-        # Memory (CPU) snapshot of a GENUINELY SLEPT engine: sleep-mode CuMem
-        # pools engage at weight load, prewarm exercises the full path, then
-        # sleep level 1 offloads the weights into CPU pools and discards the
-        # rest of GPU memory before capture. The GPU snapshot stays OFF (the
-        # A/B showed restoring a live GPU engine garbles agent audio); the
-        # restored container wakes the engine by remapping weights H2D.
+        # The ORIGINAL (2026-08-11, 58c2721) snapshot design, verbatim:
+        # sleep-mode CuMem pools engage at weight load, prewarm exercises the
+        # full path, sleep level 1 offloads weights to CPU pools and discards
+        # the rest of GPU memory, THEN memory + GPU snapshot capture the slept
+        # engine. That deployment served correct audio through restores; the
+        # live app's garbled restores coincided with workers logging "Sleep
+        # Mode DISABLED" (snapshot of a fully LIVE engine). The flag plumbing
+        # is code-identical 58c2721..HEAD and engages on the cluster via this
+        # exact CLI, so staging first re-tests the proven design end-to-end.
         enable_memory_snapshot=True,
-        experimental_options={"enable_gpu_snapshot": False},
+        experimental_options={"enable_gpu_snapshot": True},
     )
     @modal.concurrent(max_inputs=100)
     class SnapshotModelServer:
