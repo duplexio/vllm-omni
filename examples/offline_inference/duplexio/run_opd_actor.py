@@ -167,7 +167,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=17000)
     parser.add_argument("--init-timeout", type=int, default=1200)
     parser.add_argument("--record-hiddens", action="store_true", help="Also stream predictor states (parity probes only)")
-    parser.add_argument("--deploy-config", default="vllm_omni/deploy/duplexio_opd_h100.yaml")
+    parser.add_argument("--deploy-config", default="vllm_omni/deploy/duplexio_opd_h100_32.yaml")
     parser.add_argument("--tool-model", help="Answer tool calls with this OpenAI-compatible model; omit to leave calls unanswered")
     parser.add_argument("--tool-base-url", default="https://openrouter.ai/api/v1")
     parser.add_argument("--max-session-rows", type=int, default=4096, help="Engine max_model_len / 6 cells")
