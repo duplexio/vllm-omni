@@ -275,12 +275,20 @@ async def rollout_conversation(
     async def collect() -> tuple[float, float]:
         await first_submitted.wait()
         completed = 0
+        idle_since: float | None = None
+        # Tool tasks may still be waiting on their LLM after every queued segment
+        # has returned, so poll briefly and only fail when segments are outstanding.
         while completed < expected_segments or any(not task.done() for task in tool_tasks):
             outputs = await engine.collect_duplex_data_plane_outputs_async(
-                duplex_resource_request_id(fence, "stage0"), timeout=120.0,
+                duplex_resource_request_id(fence, "stage0"), timeout=5.0,
             )
             if not outputs:
-                raise TimeoutError("Timed out waiting for a queued input segment")
+                if completed < expected_segments:
+                    idle_since = idle_since or time.monotonic()
+                    if time.monotonic() - idle_since > 120.0:
+                        raise TimeoutError("Timed out waiting for a queued input segment")
+                continue
+            idle_since = None
             for output in outputs:
                 if output.error is not None:
                     raise RuntimeError(output.error)
