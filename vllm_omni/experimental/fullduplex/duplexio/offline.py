@@ -95,17 +95,27 @@ def load_pool_shard(pool_dir: Path, shard: int, shards: int) -> list[PoolConvers
     return entries[shard::shards]
 
 
-def prepared_from_pool(pool_dir: Path, entry: PoolConversation) -> PreparedConversation:
-    """Load one conversation's inputs when its session starts."""
+def prepared_from_pool(
+    pool_dir: Path, entry: PoolConversation, *, max_rows: int, reserved_rows: int = 512,
+) -> PreparedConversation:
+    """Load one conversation's inputs when its session starts.
+
+    Live frames are cut so prefix + live + `reserved_rows` (tool results) fit the
+    engine's request budget of `max_rows` (max_model_len / 6 cells).
+    """
     from safetensors.torch import load_file
 
     info = json.loads((pool_dir / f"{entry.file_stem}.json").read_text())
     tensors = load_file(pool_dir / f"{entry.file_stem}.safetensors")
+    system_token_ids = tensors["system_token_ids"].tolist()
+    live_limit = max_rows - len(system_token_ids) - reserved_rows
+    if live_limit < 1:
+        raise ValueError(f"{info['conversation_id']}: prefix of {len(system_token_ids)} rows leaves no room for audio")
     return PreparedConversation(
         conversation_id=info["conversation_id"],
-        system_token_ids=tensors["system_token_ids"].tolist(),
-        user_features=tensors["user_features"].float(),
-        user_token_ids=tensors["user_token_ids"],
+        system_token_ids=system_token_ids,
+        user_features=tensors["user_features"][:live_limit].float(),
+        user_token_ids=tensors["user_token_ids"][:live_limit],
         voice=info["voice"],
         voice_embedding_index=info["voice_embedding_index"],
         tools=info["tools"],

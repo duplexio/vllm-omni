@@ -113,7 +113,7 @@ async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
             gate=gate,
             passes=None,
             tools=tools,
-            load=partial(prepared_from_pool, args.inputs),
+            load=partial(prepared_from_pool, args.inputs, max_rows=args.max_session_rows),
         )
     )
     try:
