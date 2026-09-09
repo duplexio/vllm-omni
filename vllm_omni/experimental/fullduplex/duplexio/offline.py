@@ -169,6 +169,7 @@ async def rollout_conversation(
     tool_tasks: set[asyncio.Task[None]] = set()
     tool_rows_budget = (tools.max_session_rows - prefix_frames - frame_count) if tools else 0
     answered_calls = 0
+    last_tool_sequence = 0  # the engine re-reports a call every frame until the next one
 
     async def append(payload: dict[str, Any], *, final: bool = False) -> None:
         await pending.acquire()
@@ -273,6 +274,7 @@ async def rollout_conversation(
             )
 
     async def collect() -> tuple[float, float]:
+        nonlocal last_tool_sequence
         await first_submitted.wait()
         completed = 0
         idle_since: float | None = None
@@ -300,6 +302,9 @@ async def rollout_conversation(
                 pending.release()
                 if tools is not None:
                     for call in decode_tool_calls(output.multimodal_output.get("tool_call_json")):
+                        if call["sequence"] <= last_tool_sequence:
+                            continue
+                        last_tool_sequence = call["sequence"]
                         task = asyncio.create_task(answer(call))
                         tool_tasks.add(task)
                         task.add_done_callback(tool_tasks.discard)
