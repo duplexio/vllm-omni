@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 import hashlib
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -56,13 +56,47 @@ def conversation_seed(base_seed: int, conversation_id: str) -> int:
     return (base_seed + int.from_bytes(digest)) % (2**63 - 1)
 
 
+class RolloutGate:
+    """Pause point shared by every session of one actor.
+
+    Weights change only while no engine input is outstanding, so each prediction
+    row belongs to exactly one policy version. Sessions keep their caches and
+    continue under the new weights.
+    """
+
+    def __init__(self, version: int = 0) -> None:
+        self.version = version
+        self.open = asyncio.Event()
+        self.open.set()
+        self.idle = asyncio.Event()
+        self.idle.set()
+        self.outstanding = 0
+
+    def submitted(self) -> None:
+        self.outstanding += 1
+        self.idle.clear()
+
+    def collected(self) -> None:
+        self.outstanding -= 1
+        if self.outstanding == 0:
+            self.idle.set()
+
+    async def pause(self) -> None:
+        self.open.clear()
+        await self.idle.wait()
+
+    def resume(self, version: int) -> None:
+        self.version = version
+        self.open.set()
+
+
 async def rollout_conversation(
     engine: AsyncOmni,
     conversation: PreparedConversation,
     *,
-    policy_version: str,
     sampling_config: dict[str, Any],
     seed: int,
+    gate: RolloutGate,
 ) -> dict[str, Any]:
     """Run one full prefix followed by causal inputs; never inject agent targets.
 
@@ -103,6 +137,8 @@ async def rollout_conversation(
 
     async def append(payload: dict[str, Any], *, final: bool = False) -> None:
         await pending.acquire()
+        await gate.open.wait()
+        gate.submitted()
         await engine.append_duplex_input_async(
             session_id,
             mode="append_audio_chunk",
@@ -154,10 +190,11 @@ async def rollout_conversation(
             for output in outputs:
                 if output.error is not None:
                     raise RuntimeError(output.error)
-                recorder.append(output.multimodal_output)
+                recorder.append(output.multimodal_output, gate.version)
                 completed += 1
                 if completed == prefix_segments:
                     prefill_finished = time.perf_counter()
+                gate.collected()
                 pending.release()
         return prefill_finished, time.perf_counter()
 
@@ -169,7 +206,6 @@ async def rollout_conversation(
     finally:
         await engine.close_duplex_session_async(session_id, fence=fence, timeout=120.0)
     return {
-        "policy_version": policy_version,
         "conversation_id": conversation.conversation_id,
         "runtime_config": runtime,
         "metadata": conversation.metadata,
@@ -180,33 +216,49 @@ async def rollout_conversation(
     }
 
 
+TrajectorySink = Callable[[int, dict[str, Any]], Awaitable[None]]
+
+
 async def rollout_conversations(
     engine: AsyncOmni,
     conversations: list[PreparedConversation],
     *,
     concurrency: int,
-    policy_version: str,
     sampling_config: dict[str, Any],
     seed: int,
-    output_dir: Path,
+    sink: TrajectorySink,
+    gate: RolloutGate,
+    passes: int | None = 1,
 ) -> None:
-    """Continuously refill independent sessions; no cross-conversation barrier."""
+    """Continuously refill independent sessions; no cross-conversation barrier.
+
+    `passes=None` cycles the pool forever with a fresh seed per pass. The sink
+    receives each completed trajectory with its running index.
+    """
     if concurrency < 1:
         raise ValueError("Rollout concurrency must be positive")
-    pending = iter(enumerate(conversations))
-    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def schedule():
+        index = 0
+        pass_index = 0
+        while passes is None or pass_index < passes:
+            for conversation in conversations:
+                yield index, pass_index, conversation
+                index += 1
+            pass_index += 1
+
+    pending = schedule()
 
     async def worker() -> None:
-        for index, conversation in pending:
+        for index, pass_index, conversation in pending:
             trace = await rollout_conversation(
                 engine,
                 conversation,
-                policy_version=policy_version,
                 sampling_config=sampling_config,
-                seed=conversation_seed(seed, conversation.conversation_id),
+                seed=conversation_seed(seed + 1_000_003 * pass_index, conversation.conversation_id),
+                gate=gate,
             )
-            # File names do not depend on potentially path-like dataset IDs.
-            torch.save(trace, output_dir / f"trajectory_{index:06d}.pt")
+            await sink(index, trace)
 
     async with asyncio.TaskGroup() as group:
         for _ in range(min(concurrency, len(conversations))):

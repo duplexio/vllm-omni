@@ -17,13 +17,15 @@ class TrajectoryRecorder:
     A final prefix row can predict audio before any live user frame is consumed.
     Intermediate prefix/tool-result segments have inputs but no predictions.
     Keeping explicit row indices avoids manufacturing a next-frame target shift.
+    Each prediction records the policy version whose weights produced it.
     """
 
     segments: list[dict[str, Tensor]] = field(default_factory=list)
     prediction_rows: list[int] = field(default_factory=list)
+    row_versions: list[int] = field(default_factory=list)
     frames: int = 0
 
-    def append(self, output: Mapping[str, Tensor]) -> None:
+    def append(self, output: Mapping[str, Tensor], version: int = 0) -> None:
         """Own the tensors crossing the output boundary, without shared storage."""
         segment = {
             name: output[f"replay_{name}"].detach().cpu().clone()
@@ -34,6 +36,7 @@ class TrajectoryRecorder:
         self.frames += frames
         if output["agent_audio_token_ids"].numel():
             self.prediction_rows.append(self.frames - 1)
+            self.row_versions.append(version)
             segment["sampled_agent_ids"] = output["agent_token_id"].detach().cpu().clone()
             segment["sampled_tool_ids"] = output["tool_call_token_id"].detach().cpu().clone()
             segment["sampled_audio"] = output["agent_audio_token_ids"].detach().cpu().clone().unsqueeze(0)
@@ -55,6 +58,7 @@ class TrajectoryRecorder:
                 for name in ("sampled_agent_ids", "sampled_tool_ids", "sampled_audio")
             },
             "prediction_rows": torch.tensor(self.prediction_rows, dtype=torch.long),
+            "row_versions": torch.tensor(self.row_versions, dtype=torch.long),
             **(
                 {"predictor_hiddens": torch.cat([part["predictor_hiddens"] for part in predictions])}
                 if "predictor_hiddens" in predictions[0] else {}

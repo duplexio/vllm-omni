@@ -35,7 +35,6 @@ def main() -> None:
     batch = pack_policy_replay(
         traces,
         speakers,
-        policy_version=traces[0].policy_version,
         silence_token_id=model.silence_token_id,
         device=torch.device("cuda"),
     )

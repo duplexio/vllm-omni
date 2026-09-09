@@ -15,6 +15,7 @@ from pydantic import TypeAdapter
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.experimental.fullduplex.duplexio.offline import (
     PreparedConversation,
+    RolloutGate,
     rollout_conversations,
 )
 from vllm_omni.model_executor.models.duplexio.configuration_duplexio import DuplexIOConfig
@@ -80,16 +81,22 @@ async def run(args: argparse.Namespace, actor_index: int = 0, round_barrier: Bar
             profiled = args.profile_dir is not None and round_index == args.rounds - 1
             if profiled:
                 await engine.start_profile()
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            async def save(index: int, trace: dict, output_dir: Path = output_dir) -> None:
+                # File names do not depend on potentially path-like dataset IDs.
+                torch.save(trace, output_dir / f"trajectory_{index:06d}.pt")
+
             round_started = time.perf_counter()
             try:
                 await rollout_conversations(
                     engine,
                     conversations,
                     concurrency=args.concurrency,
-                    policy_version=args.policy_version,
                     sampling_config=runtime,
                     seed=args.seed,
-                    output_dir=output_dir,
+                    sink=save,
+                    gate=RolloutGate(),
                 )
             finally:
                 round_finished = time.perf_counter()
@@ -137,7 +144,6 @@ def main() -> None:
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("inputs", type=Path)
     parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--policy-version", required=True)
     parser.add_argument("--concurrency", type=int, default=1, help="Concurrent conversations per actor")
     parser.add_argument("--devices", type=int, nargs="+", help="One independent rollout actor per listed GPU")
     parser.add_argument("--init-timeout", type=int, default=600, help="Total worker startup allowance in seconds")
