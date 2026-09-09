@@ -78,7 +78,7 @@ def load_training_checkpoint(config_path: Path, checkpoint: Path):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("export", type=Path, help="Native export the actors started from")
-    parser.add_argument("prepared", type=Path, help="Prepared conversation pool the actors use")
+    parser.add_argument("prepared", type=Path, help="Rollout pool directory the actors use")
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--port", type=int, default=29600)
     parser.add_argument("--actors", type=int, default=1)

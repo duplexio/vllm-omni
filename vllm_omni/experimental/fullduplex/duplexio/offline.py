@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 import hashlib
 import json
+from pathlib import Path
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -73,6 +74,43 @@ class PreparedConversation(BaseModel):
         if (tokens < 0).any() or any(token < 0 for token in self.system_token_ids):
             raise ValueError("Input token IDs must be nonnegative")
         return self
+
+
+@dataclass(frozen=True)
+class PoolConversation:
+    """Index entry of a rollout pool built by duplexio's prepare_opd_pool."""
+
+    conversation_id: str
+    file_stem: str
+    frames: int
+
+
+def load_pool_shard(pool_dir: Path, shard: int, shards: int) -> list[PoolConversation]:
+    """Return this actor's slice of the pool index, sorted by conversation ID."""
+    index = json.loads((pool_dir / "index.json").read_text())
+    entries = sorted(
+        (PoolConversation(c["conversation_id"], c["file_stem"], c["frames"]) for c in index["conversations"]),
+        key=lambda entry: entry.conversation_id,
+    )
+    return entries[shard::shards]
+
+
+def prepared_from_pool(pool_dir: Path, entry: PoolConversation) -> PreparedConversation:
+    """Load one conversation's inputs when its session starts."""
+    from safetensors.torch import load_file
+
+    info = json.loads((pool_dir / f"{entry.file_stem}.json").read_text())
+    tensors = load_file(pool_dir / f"{entry.file_stem}.safetensors")
+    return PreparedConversation(
+        conversation_id=info["conversation_id"],
+        system_token_ids=tensors["system_token_ids"].tolist(),
+        user_features=tensors["user_features"].float(),
+        user_token_ids=tensors["user_token_ids"],
+        voice=info["voice"],
+        voice_embedding_index=info["voice_embedding_index"],
+        tools=info["tools"],
+        metadata={**info["metadata"], "teacher_system": info["teacher_system"]},
+    )
 
 
 def conversation_seed(base_seed: int, conversation_id: str) -> int:
@@ -333,7 +371,7 @@ TrajectorySink = Callable[[int, dict[str, Any]], Awaitable[None]]
 
 async def rollout_conversations(
     engine: AsyncOmni,
-    conversations: list[PreparedConversation],
+    conversations: Sequence[Any],
     *,
     concurrency: int,
     sampling_config: dict[str, Any],
@@ -342,11 +380,13 @@ async def rollout_conversations(
     gate: RolloutGate,
     passes: int | None = 1,
     tools: ToolParticipant | None = None,
+    load: Callable[[Any], PreparedConversation] | None = None,
 ) -> None:
     """Continuously refill independent sessions; no cross-conversation barrier.
 
     `passes=None` cycles the pool forever with a fresh seed per pass. The sink
-    receives each completed trajectory with its running index.
+    receives each completed trajectory with its running index. With `load`,
+    `conversations` are lightweight entries materialized as a session starts.
     """
     if concurrency < 1:
         raise ValueError("Rollout concurrency must be positive")
@@ -363,7 +403,8 @@ async def rollout_conversations(
     pending = schedule()
 
     async def worker() -> None:
-        for index, pass_index, conversation in pending:
+        for index, pass_index, entry in pending:
+            conversation = load(entry) if load is not None else entry
             trace = await rollout_conversation(
                 engine,
                 conversation,

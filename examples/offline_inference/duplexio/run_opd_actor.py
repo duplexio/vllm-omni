@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+from functools import partial
 import json
 import socket
 from pathlib import Path
@@ -18,13 +19,13 @@ from typing import Any
 
 import torch
 from duplexio.opd_link import JOIN_GROUP, JOINED, PREPARE_UPDATE, READY, SHUTDOWN, UPDATED, ActorLink
-from pydantic import TypeAdapter
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.experimental.fullduplex.duplexio.offline import (
-    PreparedConversation,
     RolloutGate,
     ToolParticipant,
+    load_pool_shard,
+    prepared_from_pool,
     rollout_conversations,
 )
 from vllm_omni.experimental.fullduplex.duplexio.tool_simulator import ToolSimulator
@@ -64,9 +65,7 @@ async def rpc(engine: AsyncOmni, method: str, args: tuple[Any, ...], timeout: fl
 async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
     device = args.devices[actor_index]
     config = DuplexIOConfig.from_pretrained(args.checkpoint, local_files_only=True)
-    conversations = TypeAdapter(list[PreparedConversation]).validate_python(
-        torch.load(args.inputs, map_location="cpu", weights_only=True)
-    )[actor_index::len(args.devices)]
+    conversations = load_pool_shard(args.inputs, actor_index, len(args.devices))
     if not conversations:
         raise ValueError("Each rollout actor needs at least one conversation")
     engine = AsyncOmni(
@@ -114,6 +113,7 @@ async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
             gate=gate,
             passes=None,
             tools=tools,
+            load=partial(prepared_from_pool, args.inputs),
         )
     )
     try:
@@ -159,7 +159,7 @@ def run_actor(actor_index: int, args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path, help="Native export the engine starts from")
-    parser.add_argument("inputs", type=Path, help="Prepared conversation pool (prepare_convogen.py)")
+    parser.add_argument("inputs", type=Path, help="Rollout pool directory (duplexio prepare_opd_pool)")
     parser.add_argument("--trainer", required=True, help="Trainer rank-0 endpoint, e.g. tcp://dgx065:29600")
     parser.add_argument("--devices", type=int, nargs="+", required=True, help="One actor per GPU")
     parser.add_argument("--concurrency", type=int, default=32, help="Concurrent conversations per actor")
