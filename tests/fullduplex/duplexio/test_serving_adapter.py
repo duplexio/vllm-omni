@@ -124,8 +124,8 @@ async def test_serving_config_selects_exported_default_voice(
         "agent": 1.0,
         "tool_call": 1.0,
     }
-    assert runtime["duplexio_suppressed_token_ids"] == [11, 12]
-    assert runtime["duplexio_agent_suppressed_token_ids"] == [18, 19]
+    assert "duplexio_suppressed_token_ids" not in runtime
+    assert "duplexio_agent_suppressed_token_ids" not in runtime
 
 
 @pytest.mark.asyncio

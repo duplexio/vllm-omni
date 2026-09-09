@@ -4,24 +4,47 @@
 
 from __future__ import annotations
 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from vllm_omni.model_executor.models.duplexio.numerics import FixedLinear, call_compiled_function
+
+
+@torch.compile(dynamic=True, fullgraph=True)
+def audio_adapter_hidden(gate_up: Tensor, modulation: Tensor | None) -> Tensor:
+    """Keep gate, normalization and speaker rounding identical in train/decode."""
+    gate, value = gate_up.chunk(2, dim=-1)
+    hidden = F.silu(gate) * value
+    # Normalize in FP32 with a row-local reduction independent of batch size.
+    hidden = hidden.float()
+    eps = torch.finfo(torch.float32).eps
+    if hidden.is_cuda:
+        from quack import rmsnorm
+
+        hidden = rmsnorm(hidden, eps=eps)
+    else:
+        hidden = F.rms_norm(hidden, (hidden.shape[-1],), eps=eps)
+    if modulation is not None:
+        scale, shift = modulation.chunk(2, dim=-1)
+        hidden = hidden * (1 + scale) + shift
+    return hidden
+
 
 class AudioInputAdapter(nn.Module):
-    """Map one frame of user-audio features into Qwen and retain its local skip."""
+    """Map one frame of user-audio features into Qwen."""
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int) -> None:
         super().__init__()
-        self.gate_up_proj = nn.Linear(input_dim, 2 * hidden_dim, bias=False)
-        self.norm = nn.RMSNorm(hidden_dim, elementwise_affine=False)
-        self.output_proj = nn.Linear(hidden_dim, output_dim, bias=False)
+        self.gate_up_proj = FixedLinear(input_dim, 2 * hidden_dim, bias=False)
+        self.output_proj = FixedLinear(hidden_dim, output_dim, bias=False)
 
-    def forward(self, audio_features: Tensor) -> tuple[Tensor, Tensor]:
-        gate, value = self.gate_up_proj(audio_features).chunk(2, dim=-1)
-        skip = F.silu(gate) * value
-        return self.output_proj(self.norm(skip)), skip
+    def forward(self, audio_features: Tensor) -> Tensor:
+        hidden = call_compiled_function(
+            audio_adapter_hidden, self.gate_up_proj(audio_features), None
+        )
+        return self.output_proj(hidden)
 
 
 class AgentAudioInputAdapter(nn.Module):
@@ -35,70 +58,18 @@ class AgentAudioInputAdapter(nn.Module):
         output_dim: int,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = nn.Linear(input_dim, 2 * hidden_dim, bias=False)
-        self.norm = nn.RMSNorm(hidden_dim, elementwise_affine=False)
-        self.speaker_modulation = nn.Linear(speaker_dim, 2 * hidden_dim, bias=False)
-        self.output_proj = nn.Linear(hidden_dim, output_dim, bias=False)
+        self.gate_up_proj = FixedLinear(input_dim, 2 * hidden_dim, bias=False)
+        self.speaker_modulation = FixedLinear(speaker_dim, 2 * hidden_dim, bias=False)
+        self.output_proj = FixedLinear(hidden_dim, output_dim, bias=False)
 
     def forward(
         self,
         audio_features: Tensor,
         speaker_embeddings: Tensor,
-        request_indices: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        gate, value = self.gate_up_proj(audio_features).chunk(2, dim=-1)
-        skip = F.silu(gate) * value
-        scale, shift = self.speaker_modulation(speaker_embeddings).index_select(
-            0,
-            request_indices,
-        ).chunk(2, dim=-1)
-        conditioned = self.norm(skip) * (1 + scale) + shift
-        return self.output_proj(conditioned), skip
-
-
-class AgentAudioOutputAdapter(nn.Module):
-    """Map Qwen's agent-audio state and local conditioning to the depth head."""
-
-    def __init__(
-        self,
-        backbone_dim: int,
-        skip_dim: int,
-        speaker_dim: int,
-        hidden_dim: int,
-        skip_dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        gate_up_dim = 2 * hidden_dim
-        self.backbone_gate_up_proj = nn.Linear(
-            backbone_dim,
-            gate_up_dim,
-            bias=False,
-        )
-        self.skip_gate_up_proj = nn.Linear(skip_dim, gate_up_dim, bias=False)
-        self.skip_dropout = nn.Dropout1d(skip_dropout)
-        self.speaker_gate_up_proj = nn.Linear(
-            speaker_dim,
-            gate_up_dim,
-            bias=False,
-        )
-        self.output_proj = nn.Linear(hidden_dim, backbone_dim, bias=False)
-
-    def forward(
-        self,
-        backbone_hidden: Tensor,
-        audio_skip: Tensor,
-        speaker_embeddings: Tensor,
-        request_indices: Tensor,
     ) -> Tensor:
-        speaker_gate_up = self.speaker_gate_up_proj(
-            speaker_embeddings
-        ).index_select(0, request_indices)
-        skip_gate_up = self.skip_gate_up_proj(audio_skip)
-        skip_gate_up = self.skip_dropout(skip_gate_up.unsqueeze(0)).squeeze(0)
-        gate_up = (
-            self.backbone_gate_up_proj(backbone_hidden)
-            + skip_gate_up
-            + speaker_gate_up
+        hidden = call_compiled_function(
+            audio_adapter_hidden,
+            self.gate_up_proj(audio_features),
+            self.speaker_modulation(speaker_embeddings),
         )
-        gate, value = gate_up.chunk(2, dim=-1)
-        return self.output_proj(F.silu(gate) * value)
+        return self.output_proj(hidden)

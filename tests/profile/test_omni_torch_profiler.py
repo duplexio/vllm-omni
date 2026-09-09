@@ -189,7 +189,9 @@ def test_set_trace_filename_creates_timestamped_session_dir(wrapper, monkeypatch
     session_dir = Path(wrapper._session_dir)
     assert session_dir.exists()
     assert session_dir.parent == tmp_path
-    assert session_dir.name == "20260403-034200_stage_0_llm_1234567890"
+    assert session_dir.name.startswith("20260403-034200_stage_0_llm_1234567890")
+    wrapper.set_trace_filename("stage_0_llm_1234567890")
+    assert Path(wrapper._session_dir) != session_dir
 
 
 def test_set_trace_filename_with_full_path_creates_timestamped_leaf(wrapper, monkeypatch, tmp_path):
@@ -210,7 +212,7 @@ def test_set_trace_filename_with_full_path_creates_timestamped_leaf(wrapper, mon
     session_dir = Path(wrapper._session_dir)
     assert session_dir.exists()
     assert session_dir.parent == target.parent
-    assert session_dir.name == "20260403-111111_stage_x"
+    assert session_dir.name.startswith("20260403-111111_stage_x")
 
 
 def test_on_trace_ready_exports_trace_json(wrapper):

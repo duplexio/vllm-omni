@@ -8,7 +8,11 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
+from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.experimental.fullduplex.duplexio.input import (
     DuplexIOPcmAppendBuffer,
 )
@@ -24,15 +28,43 @@ from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_prepared_frame_preserves_features_and_user_token_without_audio_transport() -> None:
+    features = torch.randn(1, 1024)
+    prompt = build_duplexio_data_plane_prompt(
+        request_id="request-1",
+        fence=DuplexFence("session-1"),
+        session_config={},
+        runtime_config={},
+        seq=1,
+        turn_seq=1,
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        payload={
+            "format": "duplexio_features",
+            "features": features,
+            "user_token_id": 17,
+        },
+        final=False,
+    )
+    wire = serialize_additional_information(prompt["model_intermediate_buffer"])
+    decoded_wire = MsgpackDecoder(AdditionalInformationPayload).decode(MsgpackEncoder().encode(wire))
+    restored = deserialize_additional_information(decoded_wire)
+    torch.testing.assert_close(restored["embed"]["speech_feat"], features)
+    duplex = prompt["model_intermediate_buffer"]["duplex"]
+    assert prompt["prompt_token_ids"] == [0] * 6
+    assert prompt["model_intermediate_buffer"]["embed"]["speech_feat"] is features
+    assert "features" not in duplex["payload"]
+    assert duplex["user_token_id"] == 17
+    assert "audio" not in duplex["payload"]
+    assert duplex["decode_audio"] is False
+
+
 def test_data_plane_prompt_reserves_six_cells_for_one_frame() -> None:
     buffer = DuplexIOPcmAppendBuffer()
     payload = buffer.append(
         {
             "format": "pcm_f32le",
             "sample_rate_hz": 24_000,
-            "audio": base64.b64encode(
-                np.zeros(2 * 1_920, dtype="<f4").tobytes()
-            ).decode("ascii"),
+            "audio": base64.b64encode(np.zeros(2 * 1_920, dtype="<f4").tobytes()).decode("ascii"),
         },
         chunk_period_ms=80,
     )
@@ -222,9 +254,7 @@ def test_data_plane_prompt_rejects_declared_frame_mismatch() -> None:
         "frame_size": 1_920,
         "frame_count": 2,
         "valid_samples": 1_920,
-        "audio": base64.b64encode(
-            np.zeros(1_920, dtype="<f4").tobytes()
-        ).decode("ascii"),
+        "audio": base64.b64encode(np.zeros(1_920, dtype="<f4").tobytes()).decode("ascii"),
     }
     with pytest.raises(ValueError, match="exactly one frame"):
         build_duplexio_data_plane_prompt(
@@ -247,9 +277,7 @@ def test_data_plane_prompt_rejects_multiple_complete_frames() -> None:
         "frame_size": 1_920,
         "frame_count": 2,
         "valid_samples": 3_840,
-        "audio": base64.b64encode(
-            np.zeros(3_840, dtype="<f4").tobytes()
-        ).decode("ascii"),
+        "audio": base64.b64encode(np.zeros(3_840, dtype="<f4").tobytes()).decode("ascii"),
     }
 
     with pytest.raises(ValueError, match="exactly one frame"):

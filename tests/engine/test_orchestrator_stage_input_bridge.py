@@ -55,11 +55,11 @@ class FakeStageClient:
     async def add_request_async(self, *args, **_kwargs) -> None:
         self.add_request_calls.append(args)
 
-    async def get_output_async(self):
+    def get_output_nowait(self):
         try:
             return self._engine_core_outputs.get_nowait()
         except queue.Empty:
-            return SimpleNamespace(outputs=[])
+            return None
 
     def process_engine_inputs(self, _source_outputs, prompt=None, streaming_context=None):
         decoder = getattr(streaming_context, "source_token_decoder", None)

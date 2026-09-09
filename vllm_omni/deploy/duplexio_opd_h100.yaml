@@ -1,0 +1,11 @@
+# One graph-replayed rollout actor, batching eight independent conversations.
+base_config: duplexio_opd.yaml
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    enforce_eager: false
+    compilation_config:
+      mode: 0
+      cudagraph_mode: FULL_DECODE_ONLY
+      cudagraph_capture_sizes: [6, 12, 18, 24, 30, 36, 42, 48]
+      cudagraph_copy_inputs: true

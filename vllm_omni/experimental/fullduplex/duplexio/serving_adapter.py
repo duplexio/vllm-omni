@@ -120,8 +120,6 @@ class DuplexIOServingRuntimeAdapter:
             "duplexio_depth_sampling",
             "duplexio_emit_temperatures",
             "duplexio_text_sampling",
-            "duplexio_suppressed_token_ids",
-            "duplexio_agent_suppressed_token_ids",
             "duplexio_tools",
             "duplexio_tool_choice",
             "duplex_stage_max_tokens",
@@ -334,13 +332,6 @@ class DuplexIOServingRuntimeAdapter:
             ),
             "duplexio_emit_temperatures": emit_temperatures,
             "duplexio_text_sampling": text_sampling,
-            "duplexio_suppressed_token_ids": _suppressed_special_token_ids(
-                tokenizer,
-                silence_token_id,
-            ),
-            "duplexio_agent_suppressed_token_ids": (
-                _agent_suppressed_token_ids(tokenizer, silence_token_id)
-            ),
             "duplexio_tools": tools,
             "duplexio_tool_choice": tool_choice,
             "duplexio_depth_sampling": depth_sampling,
@@ -660,34 +651,6 @@ def _load_voice_manifest(model_config: object) -> tuple[tuple[str, ...], str | N
     if default is not None and default not in voices:
         raise ValueError(f"DuplexIO default voice is not present in {path}")
     return tuple(sorted(voices)), default
-
-
-def _suppressed_special_token_ids(
-    tokenizer: Any,
-    silence_token_id: int,
-) -> list[int]:
-    token_ids = {
-        int(token_id)
-        for token_id in tokenizer.all_special_ids
-        if int(token_id) != silence_token_id
-    }
-    for text in ("<|im_start|>", "<|im_end|>", "<think>", "</think>"):
-        encoded = tokenizer.encode(text, add_special_tokens=False)
-        if len(encoded) == 1 and int(encoded[0]) != silence_token_id:
-            token_ids.add(int(encoded[0]))
-    return sorted(token_ids)
-
-
-def _agent_suppressed_token_ids(
-    tokenizer: Any,
-    silence_token_id: int,
-) -> list[int]:
-    token_ids = []
-    for text in ("<tool_call>", "</tool_call>"):
-        encoded = tokenizer.encode(text, add_special_tokens=False)
-        if len(encoded) == 1 and int(encoded[0]) != silence_token_id:
-            token_ids.append(int(encoded[0]))
-    return sorted(set(token_ids))
 
 
 def _validate_full_duplex_mode(config: DuplexSessionConfig) -> None:

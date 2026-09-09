@@ -6,6 +6,7 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 import socket
@@ -31,7 +32,7 @@ from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
 if TYPE_CHECKING:
-    from vllm.v1.engine import EngineCoreOutput
+    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
 
     from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -75,6 +76,17 @@ class StageEngineCoreClientBase(StageClientBase):
     """
 
     replica_id: int = 0
+
+    def get_output_nowait(self) -> EngineCoreOutputs | None:
+        """Read a ready output without delaying other stage replicas."""
+        self._ensure_output_queue_task()
+        try:
+            outputs = self.outputs_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+        if isinstance(outputs, Exception):
+            raise self._format_exception(outputs) from None
+        return outputs
 
     @staticmethod
     def make_async_mp_client(

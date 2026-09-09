@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine.serialization import deserialize_additional_information
 
 
 class OmniRequest(Request):
@@ -97,7 +98,7 @@ class OmniRequest(Request):
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
             additional_information=request.additional_information,
-            model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            model_intermediate_buffer=deserialize_additional_information(request.model_intermediate_buffer),
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,

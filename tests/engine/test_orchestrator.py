@@ -141,11 +141,11 @@ class FakeStageClient:
     async def add_request_async(self, *args, **kwargs) -> None:
         self.add_request_calls.append(args)
 
-    async def get_output_async(self):
+    def get_output_nowait(self):
         try:
             return self._engine_core_outputs.get_nowait()
         except queue.Empty:
-            return SimpleNamespace(outputs=[])
+            return None
 
     def get_diffusion_output_nowait(self):
         try:
@@ -1745,7 +1745,7 @@ async def test_stage_pool_failed_replica_releases_distributed_affinity_and_stops
     assert set(affected) == {"distributed-request", "legacy-request"}
     assert pool.get_bound_replica_id("distributed-request") is None
     assert pool.get_bound_replica_id("legacy-request") is None
-    assert await pool.poll_llm_raw_output(0) is None
+    assert pool.poll_llm_raw_output(0) is None
 
 
 def test_stage_pool_reattached_replica_becomes_available_again() -> None:

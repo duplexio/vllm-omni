@@ -180,6 +180,9 @@ class OmniGPUModelRunner(GPUModelRunner):
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         model = getattr(self, "model", None)
+        # Frame models append several cells per decode, not one text token.
+        self.uniform_decode_query_len = getattr(model, "decode_query_len", self.uniform_decode_query_len)
+        self.cudagraph_dispatcher.uniform_decode_query_len = self.uniform_decode_query_len
         override_fn = None
         if bool(getattr(model, "supports_sampled_token_ids_cpu_override", False)):
             candidate = getattr(model, "consume_sampled_token_ids_cpu_override", None)

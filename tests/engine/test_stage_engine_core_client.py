@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -30,3 +31,21 @@ def test_check_health_raises_when_resources_engine_dead():
     client = _make_client(engine_dead=True)
     with pytest.raises(EngineDeadError, match="engine core is dead"):
         client.check_health()
+
+
+@pytest.mark.asyncio
+async def test_output_poll_is_nonblocking_and_preserves_fifo_and_errors():
+    client = _make_client()
+    client.resources.output_queue_task = asyncio.current_task()
+    client.outputs_queue = asyncio.Queue()
+    assert client.get_output_nowait() is None
+    first = SimpleNamespace(outputs=["first"])
+    second = SimpleNamespace(outputs=["second"])
+    client.outputs_queue.put_nowait(first)
+    client.outputs_queue.put_nowait(second)
+    client.outputs_queue.put_nowait(EngineDeadError())
+    assert client.get_output_nowait() is first
+    assert client.get_output_nowait() is second
+    with pytest.raises(EngineDeadError):
+        client.get_output_nowait()
+    assert client.get_output_nowait() is None

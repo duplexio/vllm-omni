@@ -95,6 +95,15 @@ quack = [
     "quack-kernels>=0.3.11",
 ]
 
+duplexio = [
+    # Native parity requires vLLM built against the training compiler stack.
+    "torch==2.13.0",
+    "triton==3.7.1",
+    "quack-kernels==0.5.3",
+    "flash-linear-attention==0.5.1",
+    "fla-core==0.5.1",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",
@@ -140,7 +149,7 @@ include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
 "vllm_omni" = ["_version.py", "py.typed"]
-"vllm_omni.model_executor.models.duplexio" = ["MoshiLicense.txt"]
+"vllm_omni.model_executor.models.duplexio" = ["MoshiLicense.txt", "PocketTTSLicense.txt", "GDN_LICENSE"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm

@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -18,31 +19,32 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
-    MambaStateCopyFuncCalculator,
-    MambaStateDtypeCalculator,
-    MambaStateShapeCalculator,
+    get_conv_copy_spec,
+    get_temporal_copy_spec,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLMBase
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.sequence import IntermediateTensors
-from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.tokenizers import TokenizerLike, cached_tokenizer_from_config
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.duplexio.audio_adapters import (
     AgentAudioInputAdapter,
-    AgentAudioOutputAdapter,
     AudioInputAdapter,
 )
+from vllm_omni.model_executor.models.duplexio.audio_input_graph import AudioInputGraph
 from vllm_omni.model_executor.models.duplexio.audio_representation import (
+    ContinuousAudioRepresentation,
     DelayedMimiRepresentation,
     DelayedMimiState,
     MimiEmbedding,
 )
 from vllm_omni.model_executor.models.duplexio.checkpoint import (
     load_voice_pools,
+    resolve_checkpoint_directory,
 )
 from vllm_omni.model_executor.models.duplexio.configuration_duplexio import (
     DuplexIOConfig,
@@ -52,9 +54,20 @@ from vllm_omni.model_executor.models.duplexio.depth_sampler import (
     DepthSamplerConfig,
     DepthSpeakerConditioning,
 )
+from vllm_omni.model_executor.models.duplexio.fastconformer import (
+    FastConformerAudioStreamState,
+    FastConformerRNNT,
+    streaming_resample_chunk,
+)
+from vllm_omni.model_executor.models.duplexio.flowmap import FlowMapSampler
 from vllm_omni.model_executor.models.duplexio.mimi import (
     MimiModel,
     MimiStreamingState,
+)
+from vllm_omni.model_executor.models.duplexio.numerics import FixedLinear, fixed_linear
+from vllm_omni.model_executor.models.duplexio.pocket_mimi import (
+    ContinuousMimiState,
+    PocketMimi,
 )
 from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
     DuplexIOQwenModel,
@@ -65,6 +78,8 @@ from vllm_omni.model_executor.models.duplexio.row_semantics import (
     duplexio_frame_positions,
     duplexio_logical_positions,
 )
+from vllm_omni.model_executor.models.duplexio.stream_gdn import gdn_cache_dtypes, gdn_cache_shapes
+from vllm_omni.model_executor.models.duplexio.text_sampling import TokenSamplingOptions, content_distribution
 from vllm_omni.model_executor.models.duplexio.tool_calling import (
     ToolCallConstraintCompiler,
     ToolCallConstraintState,
@@ -80,19 +95,25 @@ AGENT_AUDIO_CELL = 5
 
 
 @dataclass
-class DuplexIORequestState:
-    """Small request-owned state not represented by Qwen's KV caches."""
+class FramePrediction:
+    """One sampled output, before request feedback and optional codec decoding."""
 
-    text_input_ids: Tensor
+    text_ids: Tensor
+    audio: Tensor
+    tool_call: dict[str, Any] | None
+
+
+@dataclass
+class DuplexIORequestState:
+    """Request-owned state; Qwen KV/GDN caches belong to the native runner."""
+
+    text_input_ids: Tensor  # CPU feedback, also used for scheduler text counts.
     agent_audio_codes: Tensor
-    agent_input_delay: DelayedMimiState
-    agent_mimi: MimiStreamingState
-    user_delay: DelayedMimiState
-    agent_delay: DelayedMimiState
-    user_mimi: MimiStreamingState
-    output_mimi: MimiStreamingState
+    user_asr: FastConformerAudioStreamState
+    output_mimi: ContinuousMimiState | MimiStreamingState
+    agent_delay: DelayedMimiState | None
     speaker_embedding: Tensor
-    depth_speaker_conditioning: DepthSpeakerConditioning
+    depth_speaker_conditioning: DepthSpeakerConditioning | None
     system_token_ids: tuple[int, ...]
     sampling_generator: torch.Generator
     tool_call_constraint: ToolCallConstraintState | None = None
@@ -104,50 +125,18 @@ class DuplexIORequestState:
     cache_epoch: int = 0
 
     def fork(self) -> DuplexIORequestState:
-        """Create an append-local state whose updates commit on success."""
-        return DuplexIORequestState(
-            text_input_ids=self.text_input_ids,
-            agent_audio_codes=self.agent_audio_codes,
-            agent_input_delay=DelayedMimiState(
-                previous_acoustic_codes=self.agent_input_delay.previous_acoustic_codes,
-                pending_semantic_code=self.agent_input_delay.pending_semantic_code,
-            ),
-            agent_mimi=self.agent_mimi.fork(),
-            user_delay=DelayedMimiState(
-                previous_acoustic_codes=self.user_delay.previous_acoustic_codes,
-                pending_semantic_code=self.user_delay.pending_semantic_code,
-            ),
-            agent_delay=DelayedMimiState(
-                previous_acoustic_codes=self.agent_delay.previous_acoustic_codes,
-                pending_semantic_code=self.agent_delay.pending_semantic_code,
-            ),
-            user_mimi=self.user_mimi.fork(),
-            output_mimi=self.output_mimi.fork(),
-            speaker_embedding=self.speaker_embedding,
-            depth_speaker_conditioning=self.depth_speaker_conditioning,
-            system_token_ids=self.system_token_ids,
-            sampling_generator=_fork_generator(self.sampling_generator),
-            tool_call_constraint=(
-                self.tool_call_constraint.fork()
-                if self.tool_call_constraint is not None
-                else None
-            ),
-            system_token_offset=self.system_token_offset,
-            frames_seen=self.frames_seen,
-            audio_position=self.audio_position,
-            active_text_tokens=self.active_text_tokens,
-            tool_call_sequence=self.tool_call_sequence,
-            cache_epoch=self.cache_epoch,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class TokenSamplingOptions:
-    mode: str
-    temperature: float
-    top_k: int
-    top_p: float
-    suppressed_token_ids: tuple[int, ...]
+        """Commit an append only after its model step succeeds."""
+        result = copy.copy(self)
+        result.sampling_generator = _fork_generator(self.sampling_generator)
+        if self.agent_delay is not None:
+            result.agent_delay = copy.copy(self.agent_delay)
+        if isinstance(self.output_mimi, MimiStreamingState):
+            result.output_mimi = self.output_mimi.fork()
+        if self.tool_call_constraint is not None:
+            result.tool_call_constraint = self.tool_call_constraint.fork()
+        # Pocket codec state is functional. The mutable HF ASR cache is copied
+        # only when processing raw audio, not for cached offline input frames.
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +144,18 @@ class EmitSamplingTemperatures:
     user: float
     agent: float
     tool_call: float
+
+
+class DuplexIOLogitsProcessor(LogitsProcessor):
+    """Use the learner's fixed BF16 projection before vLLM's vocabulary gather."""
+
+    def _apply_head(
+        self,
+        lm_head: ParallelLMHead,
+        hidden_states: Tensor,
+        embedding_bias: Tensor | None,
+    ) -> Tensor:
+        return fixed_linear(hidden_states, lm_head.weight, embedding_bias)
 
 
 class _DuplexIOBaseModel(nn.Module):
@@ -189,14 +190,9 @@ class _DuplexIOMultiStreamQwen(nn.Module):
             vllm_config=vllm_config,
             prefix=f"{prefix}.base_model",
         )
-        self.channel_emb = nn.Parameter(
-            torch.zeros(len(TEXT_STREAM_NAMES), text_config.hidden_size)
-        )
+        self.channel_emb = nn.Parameter(torch.zeros(len(TEXT_STREAM_NAMES), text_config.hidden_size))
         self.output_head_proj = nn.ModuleDict(
-            {
-                name: nn.Linear(text_config.hidden_size, text_config.hidden_size)
-                for name in TARGET_STREAM_NAMES
-            }
+            {name: FixedLinear(text_config.hidden_size, text_config.hidden_size) for name in TARGET_STREAM_NAMES}
         )
 
 
@@ -214,6 +210,7 @@ class DuplexIOForConditionalGeneration(
     # skip the per-append hidden-states D2H payload entirely.
     omni_pooler_payload_include_hidden = False
     has_preprocess = True
+    decode_query_len = DUPLEXIO_NUM_CELLS
     has_postprocess = True
     postprocess_uses_hidden_states = False
     postprocess_uses_multimodal_outputs = False
@@ -228,24 +225,37 @@ class DuplexIOForConditionalGeneration(
         nn.Module.__init__(self)
         config = vllm_config.model_config.hf_config
         if not isinstance(config, DuplexIOConfig):
-            raise TypeError(
-                "DuplexIOForConditionalGeneration requires DuplexIOConfig"
-            )
+            raise TypeError("DuplexIOForConditionalGeneration requires DuplexIOConfig")
         _validate_vllm_runtime_contract(vllm_config)
         self.vllm_config = vllm_config
         self.config = config
         self.text_config = vllm_config.model_config.hf_text_config
         self.full_cudagraph_enabled = (
-            vllm_config.compilation_config.cudagraph_mode
-            == CUDAGraphMode.FULL
+            vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
             and not vllm_config.model_config.enforce_eager
+        )
+        self.audio_input_graphs: dict[int, AudioInputGraph] = {}
+        self.content_distribution = (
+            torch.compile(
+                content_distribution, fullgraph=True, dynamic=True,
+                options={"emulate_precision_casts": True, "triton.cudagraphs": True},
+            )
+            if self.full_cudagraph_enabled else content_distribution
+        )
+        self.frame_inputs = (
+            torch.compile(frame_inputs, fullgraph=True, dynamic=True, options={"emulate_precision_casts": True})
+            if self.full_cudagraph_enabled else frame_inputs
         )
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("duplexio", "key_active"),
             ("duplexio", "request_epochs"),
             ("duplexio", "text_ordinals"),
             ("duplexio", "audio_positions"),
-            ("duplexio", "agent_audio_skip"),
+            ("duplexio", "user_token_id"),
+            ("duplexio_replay", "text_ids"),
+            ("duplexio_replay", "user_features"),
+            ("duplexio_replay", "agent_audio"),
+            ("duplexio_replay", "audio_mask"),
         }
         graph_device = vllm_config.device_config.device
         graph_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -278,80 +288,94 @@ class DuplexIOForConditionalGeneration(
             vllm_config=vllm_config,
             prefix=f"{prefix}.llm" if prefix else "llm",
         )
-        quantized_config = config.quantized_audio_config
-        adapter_config = config.audio_adapter_config
-        num_codebooks = quantized_config["num_codebooks"]
-        codebook_size = quantized_config["codebook_size"]
-        representation_dim = quantized_config["embedding_dim"]
         hidden_size = self.text_config.hidden_size
-        adapter_hidden_size = adapter_config.get("hidden_size") or hidden_size
-
-        self.audio_codec = MimiModel(config.audio_codec_config)
-        self.audio_representation = DelayedMimiRepresentation(
-            num_codebooks=num_codebooks,
-            codebook_size=codebook_size,
-            acoustic_delay_frames=quantized_config["acoustic_delay_frames"],
+        adapter_hidden_size = config.audio_adapter_config.get("hidden_size") or hidden_size
+        speaker_dim = config.speaker_lda_dim or config.speaker_embed_dim
+        root = resolve_checkpoint_directory(
+            vllm_config.model_config.model,
+            revision=vllm_config.model_config.revision,
         )
-        self.user_audio_embedding = MimiEmbedding(
-            num_codebooks,
-            codebook_size,
-            representation_dim,
-        )
-        self.agent_audio_embedding = MimiEmbedding(
-            num_codebooks,
-            codebook_size,
-            representation_dim,
-        )
+        self.user_asr = FastConformerRNNT.from_export(config.user_asr_config, root)
+        if config.speaker_lda_dim is None:
+            self.register_buffer("speaker_lda_projection", None)
+            self.register_buffer("speaker_lda_mean", None)
+        else:
+            self.register_buffer(
+                "speaker_lda_projection",
+                torch.empty(
+                    speaker_dim,
+                    config.speaker_embed_dim,
+                    dtype=torch.float32,
+                ),
+            )
+            self.register_buffer(
+                "speaker_lda_mean",
+                torch.empty(
+                    config.speaker_embed_dim,
+                    dtype=torch.float32,
+                ),
+            )
+        if config.audio_representation == "continuous":
+            representation_dim = config.continuous_audio_config["embedding_dim"]
+            self.audio_codec = PocketMimi()
+            self.audio_representation = ContinuousAudioRepresentation(representation_dim)
+            self.agent_audio_embedding = nn.Identity()
+            self.audio_sampler = FlowMapSampler(
+                representation_dim,
+                hidden_size,
+                config.flowmap_config["mlp_dim"],
+                config.flowmap_config["mlp_depth"],
+                inference_steps=config.flowmap_config["inference_steps"],
+                sampling_temperature=config.flowmap_config["sampling_temperature"],
+                use_cuda_graph=self.full_cudagraph_enabled,
+            )
+        else:
+            quantized = config.quantized_audio_config
+            depth = config.depth_transformer_config
+            representation_dim = quantized["embedding_dim"]
+            self.audio_codec = MimiModel(config.audio_codec_config)
+            self.audio_representation = DelayedMimiRepresentation(
+                num_codebooks=quantized["num_codebooks"],
+                codebook_size=quantized["codebook_size"],
+                acoustic_delay_frames=quantized["acoustic_delay_frames"],
+            )
+            self.agent_audio_embedding = MimiEmbedding(
+                quantized["num_codebooks"],
+                quantized["codebook_size"],
+                representation_dim,
+            )
+            self.audio_sampler = DepthAutoregressiveSampler(
+                DepthSamplerConfig(
+                    conditioning_dim=hidden_size,
+                    speaker_embedding_dim=speaker_dim,
+                    text_vocab_size=self.text_config.vocab_size,
+                    codebook_size=quantized["codebook_size"],
+                    num_codebooks=quantized["num_codebooks"],
+                    low_rank_embeddings=depth["low_rank_embeddings"],
+                    dim=depth["dim"],
+                    num_layers=depth["num_layers"],
+                    num_heads=depth["num_heads"],
+                    feedforward_dim=depth["mlp_dim"],
+                    sampling_temperature=depth["sampling_temperature"],
+                    sampling_top_k=depth["sampling_top_k"],
+                    semantic_sampling_top_k=depth.get("semantic_sampling_top_k"),
+                )
+            )
         self.user_audio_input_adapter = AudioInputAdapter(
-            representation_dim,
+            self.user_asr.output_dim,
             adapter_hidden_size,
             hidden_size,
         )
         self.agent_audio_input_adapter = AgentAudioInputAdapter(
             representation_dim,
-            config.speaker_embed_dim,
+            speaker_dim,
             adapter_hidden_size,
             hidden_size,
         )
-        self.agent_audio_output_adapter = AgentAudioOutputAdapter(
-            hidden_size,
-            adapter_hidden_size,
-            config.speaker_embed_dim,
-            adapter_hidden_size,
-            adapter_config.get("agent_audio_skip_dropout", 0.0),
-        )
-        depth_config = config.depth_transformer_config
-        self.audio_sampler = DepthAutoregressiveSampler(
-            DepthSamplerConfig(
-                conditioning_dim=hidden_size,
-                speaker_embedding_dim=config.speaker_embed_dim,
-                text_vocab_size=self.text_config.vocab_size,
-                codebook_size=codebook_size,
-                num_codebooks=num_codebooks,
-                low_rank_embeddings=depth_config.get("low_rank_embeddings", 128),
-                dim=depth_config.get("dim", 1_024),
-                num_layers=depth_config.get("num_layers", 6),
-                num_heads=depth_config.get("num_heads", 16),
-                feedforward_dim=depth_config.get("mlp_dim", 4_224),
-                sampling_temperature=depth_config.get(
-                    "sampling_temperature", 0.8
-                ),
-                sampling_top_k=depth_config.get("sampling_top_k", 250),
-                semantic_sampling_top_k=depth_config.get(
-                    "semantic_sampling_top_k"
-                ),
-            )
-        )
-        self.emit_heads = nn.ModuleDict(
-            {
-                name: nn.Linear(hidden_size, 1)
-                for name in TARGET_STREAM_NAMES
-            }
-        )
-        self.logits_processor = LogitsProcessor(self.text_config.vocab_size)
-        self.make_empty_intermediate_tensors = (
-            self.llm.base_model.model.make_empty_intermediate_tensors
-        )
+        self.agent_emit_head = nn.Linear(DUPLEXIO_NUM_CELLS * hidden_size, 1)
+        self.tool_call_emit_head = nn.Linear(DUPLEXIO_NUM_CELLS * hidden_size, 1)
+        self.logits_processor = DuplexIOLogitsProcessor(self.text_config.vocab_size)
+        self.make_empty_intermediate_tensors = self.llm.base_model.model.make_empty_intermediate_tensors
         self._voice_pools = load_voice_pools(
             vllm_config.model_config.model,
             speaker_embed_dim=config.speaker_embed_dim,
@@ -360,10 +384,19 @@ class DuplexIOForConditionalGeneration(
         )
         self._forced_next_token_ids: list[int] | None = None
         self._next_cache_epoch = 1
-        self.tool_call_compiler = ToolCallConstraintCompiler(
-            cached_tokenizer_from_config(vllm_config.model_config),
-            self.text_config.vocab_size,
+        tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
+        agent_suppressed, tool_suppressed = text_suppression_ids(tokenizer, self.silence_token_id)
+        self.register_buffer(
+            "agent_suppressed_token_ids",
+            torch.tensor(agent_suppressed, dtype=torch.long, device=self.llm.channel_emb.device),
+            persistent=False,
         )
+        self.register_buffer(
+            "tool_suppressed_token_ids",
+            torch.tensor(tool_suppressed, dtype=torch.long, device=self.llm.channel_emb.device),
+            persistent=False,
+        )
+        self.tool_call_compiler = ToolCallConstraintCompiler(tokenizer, self.text_config.vocab_size)
         self.set_custom_preprocess(self.preprocess)
         self.set_custom_postprocess(self.postprocess)
 
@@ -380,37 +413,18 @@ class DuplexIOForConditionalGeneration(
         live_audio_frames = []
         for info in request_infos:
             state = info.get("duplexio_model_state")
-            accepted_text_tokens = (
-                state.active_text_tokens
-                if isinstance(state, DuplexIORequestState)
-                else 0
-            )
-            accepted_audio_positions = (
-                state.audio_position
-                if isinstance(state, DuplexIORequestState)
-                else 0
-            )
+            accepted_text_tokens = state.active_text_tokens if isinstance(state, DuplexIORequestState) else 0
+            accepted_audio_positions = state.audio_position if isinstance(state, DuplexIORequestState) else 0
             duplex = info.get("duplex")
-            frame_count = (
-                duplex.get("frame_count", 1)
-                if isinstance(duplex, Mapping)
-                else 1
-            )
+            frame_count = duplex.get("frame_count", 1) if isinstance(duplex, Mapping) else 1
             assert isinstance(frame_count, int) and frame_count > 0
             is_text_only = isinstance(duplex, Mapping) and (
-                bool(duplex.get("duplexio_prefill", False))
-                or bool(duplex.get("duplexio_system_input", False))
+                bool(duplex.get("duplexio_prefill", False)) or bool(duplex.get("duplexio_system_input", False))
             )
-            active_text_tokens.append(
-                accepted_text_tokens
-                + (frame_count - 1) * len(TEXT_STREAM_NAMES)
-            )
+            active_text_tokens.append(accepted_text_tokens + (frame_count - 1) * len(TEXT_STREAM_NAMES))
             # The audio ring is keyed by audio position; text-only frames do
             # not advance audio time and therefore add no live ring entries.
-            live_audio_frames.append(
-                accepted_audio_positions
-                + (0 if is_text_only else frame_count)
-            )
+            live_audio_frames.append(accepted_audio_positions + (0 if is_text_only else frame_count))
         update_duplexio_attention_metadata(
             attn_metadata,
             active_text_tokens,
@@ -431,15 +445,9 @@ class DuplexIOForConditionalGeneration(
 
         duplex_infos = [info["duplexio"] for info in request_infos]
         key_active = torch.cat([info["key_active"] for info in duplex_infos])
-        request_epochs = torch.cat(
-            [info["request_epochs"] for info in duplex_infos]
-        )
-        text_ordinals = torch.cat(
-            [info["text_ordinals"] for info in duplex_infos]
-        )
-        audio_positions = torch.cat(
-            [info["audio_positions"] for info in duplex_infos]
-        )
+        request_epochs = torch.cat([info["request_epochs"] for info in duplex_infos])
+        text_ordinals = torch.cat([info["text_ordinals"] for info in duplex_infos])
+        audio_positions = torch.cat([info["audio_positions"] for info in duplex_infos])
         token_count = key_active.shape[0]
         self.graph_key_active[:token_count].copy_(key_active)
         self.graph_request_epochs[:token_count].copy_(request_epochs)
@@ -458,6 +466,54 @@ class DuplexIOForConditionalGeneration(
         )
 
     @torch.inference_mode()
+    def preprocess_batch(
+        self,
+        *,
+        req_ids: list[str],
+        model_intermediate_buffer: dict[str, dict[str, Any]],
+        device: torch.device,
+    ) -> None:
+        """Batch live user features and committed agent audio at the input boundary."""
+        requests = [
+            model_intermediate_buffer[request_id]
+            for request_id in req_ids
+            if not model_intermediate_buffer[request_id]["duplex"].get("duplexio_prefill", False)
+            and not model_intermediate_buffer[request_id]["duplex"].get("duplexio_system_input", False)
+            and model_intermediate_buffer[request_id]["duplex"]["payload"]["format"] == "duplexio_features"
+        ]
+        if not requests:
+            return
+        features = torch.cat([request["embed"]["speech_feat"] for request in requests]).to(device)
+        # A session's first frame has no committed audio state yet.
+        agent_requests = [request for request in requests if "duplexio_model_state" in request]
+        if agent_requests:
+            states = [request["duplexio_model_state"] for request in agent_requests]
+            codes = torch.stack([state.agent_audio_codes for state in states])
+            speakers = torch.stack([state.speaker_embedding for state in states])
+        if self.full_cudagraph_enabled and len(agent_requests) == len(requests):
+            batch_size = len(requests)
+            if batch_size not in self.audio_input_graphs:
+                self.audio_input_graphs[batch_size] = AudioInputGraph(
+                    self.user_audio_input_adapter, self.agent_audio_embedding, self.agent_audio_input_adapter,
+                    features, codes, speakers, self.vllm_config.model_config.dtype,
+                )
+            hidden, agent_hidden = self.audio_input_graphs[batch_size](features, codes, speakers)
+        else:
+            with torch.autocast(
+                device.type, dtype=self.vllm_config.model_config.dtype,
+                enabled=device.type == "cuda" and self.vllm_config.model_config.dtype != torch.float32,
+            ):
+                hidden = self.user_audio_input_adapter(features)
+                if agent_requests:
+                    agent_hidden = self.agent_audio_input_adapter(self.agent_audio_embedding(codes), speakers)
+        for index, request in enumerate(requests):
+            request["embed"]["speech_feat"] = features[index : index + 1]
+            request["embed"]["user_hidden"] = hidden[index : index + 1]
+        if agent_requests:
+            for index, request in enumerate(agent_requests):
+                request["embed"]["agent_hidden"] = agent_hidden[index : index + 1]
+
+    @torch.inference_mode()
     def preprocess(
         self,
         input_ids: Tensor,
@@ -465,19 +521,14 @@ class DuplexIOForConditionalGeneration(
         **info: Any,
     ) -> tuple[Tensor, Tensor, dict[str, object]]:
         del input_embeds
-        # Appends arrive with CPU token ids; bind the whole request state
-        # (masks, speaker embedding, sampling generator) to the engine device
-        # so nothing downstream mixes devices.
+        # Token feedback stays on the CPU for scheduler bookkeeping; embeddings,
+        # audio state and model metadata belong to the engine device.
         input_ids = input_ids.to(self.llm.channel_emb.device)
         duplex = info.get("duplex")
         if not isinstance(duplex, Mapping):
             raise ValueError("Native DuplexIO accepts only framed duplex appends")
         frame_count = duplex.get("frame_count")
-        if (
-            not isinstance(frame_count, int)
-            or frame_count < 1
-            or input_ids.numel() != frame_count * DUPLEXIO_NUM_CELLS
-        ):
+        if not isinstance(frame_count, int) or frame_count < 1 or input_ids.numel() != frame_count * DUPLEXIO_NUM_CELLS:
             raise ValueError(
                 "Native DuplexIO requires complete six-cell frames; "
                 f"got frame_count={frame_count}, tokens={input_ids.numel()}"
@@ -504,21 +555,15 @@ class DuplexIOForConditionalGeneration(
                 system_input_final,
             )
         ):
-            raise ValueError(
-                "DuplexIO text-input flags must be boolean when present"
-            )
+            raise ValueError("DuplexIO text-input flags must be boolean when present")
         if prefill_final and not is_prefill:
             raise ValueError("DuplexIO prefill_final requires duplexio_prefill")
         if system_input_final and not is_system_input:
-            raise ValueError(
-                "DuplexIO system_input_final requires duplexio_system_input"
-            )
+            raise ValueError("DuplexIO system_input_final requires duplexio_system_input")
         if is_prefill and is_system_input:
             raise ValueError("DuplexIO prefill and system input are mutually exclusive")
         if frame_count != 1 and not (is_prefill or is_system_input):
-            raise ValueError(
-                "Native DuplexIO batches only silent text-input frames"
-            )
+            raise ValueError("Native DuplexIO batches only silent text-input frames")
 
         text_ids = state.text_input_ids.expand(frame_count, -1).clone()
         if is_system_input:
@@ -526,19 +571,14 @@ class DuplexIOForConditionalGeneration(
             if (
                 not isinstance(system_token_ids, list)
                 or len(system_token_ids) != frame_count
-                or not all(
-                    isinstance(token_id, int) and token_id >= 0
-                    for token_id in system_token_ids
-                )
+                or not all(isinstance(token_id, int) and token_id >= 0 for token_id in system_token_ids)
             ):
-                raise ValueError(
-                    "DuplexIO system input requires one token ID per frame"
-                )
+                raise ValueError("DuplexIO system input requires one token ID per frame")
             text_ids.fill_(self.silence_token_id)
             text_ids[:, 0] = torch.tensor(
                 system_token_ids,
                 dtype=torch.long,
-                device=input_ids.device,
+                device="cpu",
             )
             state.text_input_ids = torch.full_like(
                 state.text_input_ids,
@@ -548,190 +588,114 @@ class DuplexIOForConditionalGeneration(
             system_token_start = state.system_token_offset
             system_token_end = system_token_start + frame_count
             if is_prefill and system_token_end > len(state.system_token_ids):
-                raise ValueError(
-                    "DuplexIO prefill exceeds the remaining system tokens"
-                )
-            system_tokens = state.system_token_ids[
-                system_token_start:system_token_end
-            ]
+                raise ValueError("DuplexIO prefill exceeds the remaining system tokens")
+            system_tokens = state.system_token_ids[system_token_start:system_token_end]
             if system_tokens:
                 text_ids[: len(system_tokens), 0] = torch.tensor(
                     system_tokens,
                     dtype=torch.long,
-                    device=input_ids.device,
+                    device="cpu",
                 )
                 state.system_token_offset += len(system_tokens)
             if len(system_tokens) < frame_count:
                 text_ids[len(system_tokens) :, 0] = self.silence_token_id
 
-        codec_parameter = next(self.audio_codec.parameters())
+        prepared_features = not (is_prefill or is_system_input) and duplex["payload"]["format"] == "duplexio_features"
         if is_prefill or is_system_input:
-            waveform = torch.zeros(
-                1,
-                1,
-                frame_count * self.config.frame_size,
-                device=input_ids.device,
-                dtype=codec_parameter.dtype,
-            )
+            user_features = self.llm.channel_emb.new_zeros(frame_count, self.user_asr.output_dim)
+            agent_codes = self.initial_agent_audio(frame_count)
+            if is_prefill:
+                remaining = state.system_token_offset < len(state.system_token_ids)
+                if prefill_final == remaining:
+                    raise ValueError("DuplexIO final-prefill flag disagrees with remaining system tokens")
         else:
-            waveform = _decode_frame(
-                duplex["payload"],
-                input_ids.device,
-                codec_parameter.dtype,
+            # The input owner supplies user tokens on their actual arrival frame.
+            # There is no learned DuplexIO user emit head in version four.
+            text_ids[:, USER_CELL] = duplex["user_token_id"]
+            user_features = (
+                info["embed"]["speech_feat"]
+                if prepared_features
+                else None
             )
-        expected_samples = frame_count * self.config.frame_size
-        if waveform.shape[-1] != expected_samples:
-            raise ValueError(
-                "DuplexIO append PCM does not match its frame count: "
-                f"{waveform.shape[-1]} != {expected_samples}"
-            )
-        with torch.profiler.record_function("duplexio.user_codec_encode"):
-            raw_user_codes = self.audio_codec.encode(
-                waveform,
-                self.audio_representation.num_codebooks,
-                state.user_mimi,
-            )[0].T
-        user_codes = self.audio_representation.encode_sequence(
-            raw_user_codes,
-            state.user_delay,
-        )
-        user_features = self.user_audio_embedding(user_codes)
-        if is_system_input:
-            agent_codes = self.encode_silent_agent_frames(
-                frame_count,
-                state.agent_mimi,
-                state.agent_input_delay,
-                input_ids.device,
-            )
-            state.agent_audio_codes = agent_codes[-1]
-        elif is_prefill:
-            has_remaining_system_tokens = (
-                state.system_token_offset < len(state.system_token_ids)
-            )
-            frames_to_encode = frame_count if has_remaining_system_tokens else frame_count - 1
-            following_codes = self.encode_silent_agent_frames(
-                frames_to_encode,
-                state.agent_mimi,
-                state.agent_input_delay,
-                input_ids.device,
-            )
-            agent_codes = torch.cat(
-                (
-                    state.agent_audio_codes.unsqueeze(0),
-                    following_codes[: frame_count - 1],
+            if user_features is None:
+                waveform = _decode_frame(duplex["payload"], input_ids.device, torch.float32)
+                if waveform.shape[-1] != self.config.frame_size:
+                    raise ValueError("A live DuplexIO append must contain one 80 ms audio frame")
+                asr_state = copy.deepcopy(state.user_asr)
+                waveform, tail = streaming_resample_chunk(
+                    waveform[0, 0],
+                    asr_state.resample_tail,
+                    self.config.sample_rate,
+                    16_000,
                 )
-            )
-            if following_codes.shape[0] > 0:
-                state.agent_audio_codes = following_codes[-1]
-        else:
+                encoded, state.user_asr = self.user_asr.encode_audio_chunk(waveform, asr_state)
+                state.user_asr.resample_tail = tail
+                user_features = encoded[0]
             agent_codes = state.agent_audio_codes.unsqueeze(0)
-        agent_features = self.agent_audio_embedding(agent_codes)
-        speaker = state.speaker_embedding.unsqueeze(0)
-        request_index = torch.zeros(
-            frame_count,
-            dtype=torch.long,
-            device=input_ids.device,
-        )
-        user_hidden, _ = self.user_audio_input_adapter(user_features)
-        agent_hidden, agent_skip = self.agent_audio_input_adapter(
-            agent_features,
-            speaker,
-            request_index,
-        )
-
-        if is_prefill:
-            has_remaining_system_tokens = (
-                state.system_token_offset < len(state.system_token_ids)
+        with torch.autocast(
+            device_type=input_ids.device.type,
+            dtype=self.vllm_config.model_config.dtype,
+            enabled=input_ids.is_cuda and self.vllm_config.model_config.dtype != torch.float32,
+        ):
+            user_hidden = (
+                info["embed"]["user_hidden"] if prepared_features else self.user_audio_input_adapter(user_features)
             )
-            if prefill_final and has_remaining_system_tokens:
-                raise ValueError(
-                    "DuplexIO final prefill frame left system tokens unconsumed"
+            agent_hidden = info["embed"].get("agent_hidden") if prepared_features else None
+            if agent_hidden is None:
+                agent_hidden = self.agent_audio_input_adapter(
+                    self.agent_audio_embedding(agent_codes),
+                    state.speaker_embedding.unsqueeze(0),
                 )
-            if not prefill_final and not has_remaining_system_tokens:
-                raise ValueError(
-                    "DuplexIO non-final prefill frame consumed all system tokens"
-                )
-            if prefill_final:
-                # Validation encodes continuation user audio as a fresh stream;
-                # prompt audio only conditions the prompt's cached activations.
-                state.user_mimi = self.audio_codec.new_streaming_state()
-                state.user_delay = self.audio_representation.new_state(
-                    device=input_ids.device
-                )
-        text_hidden = self.llm.base_model.model.embed_input_ids(
-            text_ids.flatten()
-        ).view(frame_count, len(TEXT_STREAM_NAMES), -1)
-        text_hidden = text_hidden.masked_fill(
-            (text_ids == self.silence_token_id).unsqueeze(-1),
-            0,
+        active_text_count = ((text_ids != self.pad_token_id) & (text_ids != self.silence_token_id)).sum().item()
+        text_ids = text_ids.to(input_ids.device, non_blocking=True)
+        text_hidden = self.llm.base_model.model.embed_input_ids(text_ids.flatten()).view(
+            frame_count, len(TEXT_STREAM_NAMES), -1
         )
-        text_hidden = text_hidden + self.llm.channel_emb
-        embeddings = torch.cat(
-            (
-                text_hidden,
-                user_hidden.unsqueeze(1),
-                agent_hidden.unsqueeze(1),
-            ),
-            dim=1,
-        ).flatten(0, 1)
-        text_active = (
-            (text_ids != self.pad_token_id)
-            & (text_ids != self.silence_token_id)
+        embeddings, key_active, text_ordinals = self.frame_inputs(
+            text_ids, text_hidden, self.llm.channel_emb, user_hidden, agent_hidden,
+            self.pad_token_id, self.silence_token_id, state.active_text_tokens,
+            not is_prefill and not is_system_input,
         )
-        key_active = torch.cat(
-            (
-                text_active,
-                torch.full(
-                    (frame_count, 2),
-                    not is_prefill and not is_system_input,
-                    dtype=torch.bool,
-                    device=input_ids.device,
-                ),
-            ),
-            dim=1,
-        ).flatten()
-        text_ordinals = torch.zeros(
-            frame_count,
-            DUPLEXIO_NUM_CELLS,
-            dtype=torch.long,
-            device=input_ids.device,
-        )
-        frame_ordinals = (
-            torch.cumsum(text_active.flatten().to(torch.long), dim=0)
-            + state.active_text_tokens
-        ).view_as(text_active)
-        text_ordinals[:, : len(TEXT_STREAM_NAMES)] = torch.where(
-            text_active,
-            frame_ordinals,
-            0,
-        )
-        state.active_text_tokens += int(text_active.sum().item())
+        state.active_text_tokens += active_text_count
         state.frames_seen += frame_count
         # Audio time advances only on frames that carry real audio: text-only
         # prefill and system-token bursts leave the counter frozen so they do
         # not consume the audio attention window.
         if not is_prefill and not is_system_input:
             state.audio_position += frame_count
-        return input_ids, embeddings, {
-            "duplexio_working_state": state,
-            "duplexio": {
-                "key_active": key_active,
-                "request_epochs": torch.full(
-                    (frame_count * DUPLEXIO_NUM_CELLS,),
-                    state.cache_epoch,
-                    dtype=torch.long,
-                    device=input_ids.device,
-                ),
-                "text_ordinals": text_ordinals.flatten(),
-                "audio_positions": torch.full(
-                    (frame_count * DUPLEXIO_NUM_CELLS,),
-                    state.audio_position,
-                    dtype=torch.long,
-                    device=input_ids.device,
-                ),
-                "agent_audio_skip": agent_skip[-1],
+        replay = {}
+        if runtime_config.get("duplexio_record_inputs", False):
+            replay = {
+                "text_ids": text_ids,
+                "user_features": user_features,
+                "agent_audio": agent_codes,
+                "audio_mask": key_active.view(frame_count, DUPLEXIO_NUM_CELLS)[:, 4],
+            }
+        return (
+            input_ids,
+            embeddings,
+            {
+                "duplexio_working_state": state,
+                "duplexio_replay": replay,
+                "duplexio": {
+                    "key_active": key_active,
+                    "user_token_id": text_ids[-1, USER_CELL],
+                    "request_epochs": torch.full(
+                        (frame_count * DUPLEXIO_NUM_CELLS,),
+                        state.cache_epoch,
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    ),
+                    "text_ordinals": text_ordinals,
+                    "audio_positions": torch.full(
+                        (frame_count * DUPLEXIO_NUM_CELLS,),
+                        state.audio_position,
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    ),
+                },
             },
-        }
+        )
 
     def forward(
         self,
@@ -759,18 +723,10 @@ class DuplexIOForConditionalGeneration(
             # Session-side appends may build these on CPU; the engine runs on
             # the accelerator.
             device = inputs_embeds.device
-            key_active = torch.cat(
-                [info["key_active"] for info in duplex_infos]
-            ).to(device)
-            request_epochs = torch.cat(
-                [info["request_epochs"] for info in duplex_infos]
-            ).to(device)
-            text_ordinals = torch.cat(
-                [info["text_ordinals"] for info in duplex_infos]
-            ).to(device)
-            audio_positions = torch.cat(
-                [info["audio_positions"] for info in duplex_infos]
-            ).to(device)
+            key_active = torch.cat([info["key_active"] for info in duplex_infos]).to(device)
+            request_epochs = torch.cat([info["request_epochs"] for info in duplex_infos]).to(device)
+            text_ordinals = torch.cat([info["text_ordinals"] for info in duplex_infos]).to(device)
+            audio_positions = torch.cat([info["audio_positions"] for info in duplex_infos]).to(device)
         with torch.profiler.record_function("duplexio.backbone"):
             return self.llm.base_model.model(
                 positions=duplexio_frame_positions(positions),
@@ -814,29 +770,21 @@ class DuplexIOForConditionalGeneration(
             raw_request_token_spans,
         )
         if len(request_token_spans) != len(infos):
-            raise RuntimeError(
-                "DuplexIO received "
-                f"{len(request_token_spans)} spans for {len(infos)} requests"
-            )
+            raise RuntimeError(f"DuplexIO received {len(request_token_spans)} spans for {len(infos)} requests")
         raw_request_sample_eligible = kwargs.get("request_sample_eligible")
         if not isinstance(raw_request_sample_eligible, list):
-            raise RuntimeError(
-                "DuplexIO live execution requires request_sample_eligible"
-            )
+            raise RuntimeError("DuplexIO live execution requires request_sample_eligible")
         request_sample_eligible = cast(
             list[bool],
             raw_request_sample_eligible,
         )
         if len(request_sample_eligible) != len(infos):
             raise RuntimeError(
-                "DuplexIO received "
-                f"{len(request_sample_eligible)} sampling flags for "
-                f"{len(infos)} requests"
+                f"DuplexIO received {len(request_sample_eligible)} sampling flags for {len(infos)} requests"
             )
         if not all(request_sample_eligible):
             raise RuntimeError(
-                "DuplexIO frames must be scheduled atomically; disable chunked "
-                "prefill and speculative decoding"
+                "DuplexIO frames must be scheduled atomically; disable chunked prefill and speculative decoding"
             )
 
         forced_ids: list[int] = []
@@ -855,35 +803,29 @@ class DuplexIOForConditionalGeneration(
         system_input_complete_flags: list[Tensor] = []
         tool_call_complete_flags: list[Tensor] = []
         tool_call_payloads: list[Tensor] = []
-        for request_index, ((start, end), info) in enumerate(
-            zip(request_token_spans, infos, strict=True)
-        ):
+        predictor_hiddens: list[Tensor] = []
+        replay_outputs: dict[str, list[Tensor]] = {
+            f"replay_{name}": [] for name in ("text_ids", "user_features", "agent_audio", "audio_mask")
+        }
+        predictions = self.sample_frames(hidden_states, request_token_spans, infos)
+        sampled_ids = dict(zip(
+            predictions,
+            torch.stack([prediction.text_ids for prediction in predictions.values()]).tolist() if predictions else [],
+            strict=True,
+        ))
+        for request_index, ((start, end), info) in enumerate(zip(request_token_spans, infos, strict=True)):
             state = info.get("duplexio_working_state")
             if not isinstance(state, DuplexIORequestState):
-                raise RuntimeError(
-                    f"DuplexIO request {request_index} is missing working state"
-                )
+                raise RuntimeError(f"DuplexIO request {request_index} is missing working state")
             span_length = end - start
             if span_length < DUPLEXIO_NUM_CELLS or span_length % DUPLEXIO_NUM_CELLS:
-                raise ValueError(
-                    "DuplexIO request span must contain complete frames, got "
-                    f"({start}, {end})"
-                )
+                raise ValueError(f"DuplexIO request span must contain complete frames, got ({start}, {end})")
             duplex_info = info.get("duplexio")
             if not isinstance(duplex_info, Mapping):
-                raise RuntimeError(
-                    f"DuplexIO request {request_index} is missing frame metadata"
-                )
-            agent_audio_skip = duplex_info.get("agent_audio_skip")
-            if not isinstance(agent_audio_skip, Tensor):
-                raise RuntimeError(
-                    f"DuplexIO request {request_index} is missing audio skip metadata"
-                )
+                raise RuntimeError(f"DuplexIO request {request_index} is missing frame metadata")
             duplex = info.get("duplex", {})
             if not isinstance(duplex, Mapping):
-                raise RuntimeError(
-                    f"DuplexIO request {request_index} is missing duplex metadata"
-                )
+                raise RuntimeError(f"DuplexIO request {request_index} is missing duplex metadata")
             is_prefill = duplex.get("duplexio_prefill", False)
             prefill_final = duplex.get("duplexio_prefill_final", False)
             is_system_input = duplex.get("duplexio_system_input", False)
@@ -900,27 +842,24 @@ class DuplexIOForConditionalGeneration(
                     system_input_final,
                 )
             ):
-                raise RuntimeError(
-                    f"DuplexIO request {request_index} has invalid text-input flags"
-                )
+                raise RuntimeError(f"DuplexIO request {request_index} has invalid text-input flags")
             if prefill_final and not is_prefill:
-                raise RuntimeError(
-                    f"DuplexIO request {request_index} has invalid final prefill flag"
-                )
+                raise RuntimeError(f"DuplexIO request {request_index} has invalid final prefill flag")
             if system_input_final and not is_system_input:
-                raise RuntimeError(
-                    f"DuplexIO request {request_index} has invalid final system-input flag"
-                )
+                raise RuntimeError(f"DuplexIO request {request_index} has invalid final system-input flag")
             frame_count = duplex.get("frame_count")
             if frame_count != span_length // DUPLEXIO_NUM_CELLS:
-                raise RuntimeError(
-                    f"DuplexIO request {request_index} frame span does not match metadata"
-                )
+                raise RuntimeError(f"DuplexIO request {request_index} frame span does not match metadata")
             row_hidden = hidden_states[end - DUPLEXIO_NUM_CELLS : end]
-            suppress_output = (is_prefill and not prefill_final) or (
-                is_system_input and not system_input_final
+            prediction = predictions.get(request_index)
+            record_hiddens = duplex["runtime_config"].get("duplexio_record_hiddens", False)
+            predictor_hiddens.append(
+                row_hidden.detach() if record_hiddens and prediction is not None else row_hidden.new_empty(0)
             )
-            if suppress_output:
+            replay = info.get("duplexio_replay", {})
+            for name, values in replay_outputs.items():
+                values.append(replay.get(name.removeprefix("replay_"), row_hidden.new_empty(0)))
+            if prediction is None:
                 silence_ids = row_hidden.new_full(
                     (1,),
                     self.silence_token_id,
@@ -941,92 +880,55 @@ class DuplexIOForConditionalGeneration(
                 system_input_flags.append(torch.tensor([is_system_input]))
                 system_input_complete_flags.append(torch.tensor([False]))
                 tool_call_complete_flags.append(torch.tensor([False]))
-                tool_call_payloads.append(
-                    row_hidden.new_empty(0, dtype=torch.uint8)
-                )
+                tool_call_payloads.append(row_hidden.new_empty(0, dtype=torch.uint8))
                 continue
-            with torch.profiler.record_function("duplexio.text_sampling"):
-                predicted_text, tool_call = self._sample_text(
-                    row_hidden,
-                    info,
-                    state.tool_call_constraint,
-                    state.sampling_generator,
-                )
-            # Session-side payloads may cross the IPC hop as CPU tensors.
-            audio_condition = self.agent_audio_output_adapter(
-                row_hidden[AGENT_AUDIO_CELL : AGENT_AUDIO_CELL + 1],
-                agent_audio_skip.to(row_hidden.device).unsqueeze(0),
-                state.speaker_embedding.to(row_hidden.device).unsqueeze(0),
-                torch.zeros(1, dtype=torch.long, device=row_hidden.device),
-            )
-            depth_sampling = _depth_sampling(info)
-            with torch.profiler.record_function("duplexio.depth_sampling"):
-                with torch.autocast(
-                    device_type=row_hidden.device.type,
-                    dtype=self.vllm_config.model_config.dtype,
-                    enabled=(
-                        row_hidden.is_cuda
-                        and self.vllm_config.model_config.dtype != torch.float32
-                    ),
-                ):
-                    predicted_audio = self.audio_sampler.sample(
-                        audio_condition,
-                        predicted_text[1:2],
-                        state.depth_speaker_conditioning,
-                        temperature=depth_sampling[0],
-                        top_k=depth_sampling[1],
-                        generator=state.sampling_generator,
-                    )[0]
-            state.text_input_ids = torch.cat(
-                (
-                    predicted_text.new_tensor([self.silence_token_id]),
-                    predicted_text,
-                )
+            predicted_audio, tool_call = prediction.audio, prediction.tool_call
+            _, agent_token_id, tool_token_id = sampled_ids[request_index]
+            state.text_input_ids = torch.tensor(
+                [self.silence_token_id, *sampled_ids[request_index]], dtype=torch.long, device="cpu",
             )
             state.agent_audio_codes = predicted_audio
-            raw_audio_codes = self.audio_representation.decode_column(
-                predicted_audio,
-                state.agent_delay,
-            )
-            with torch.profiler.record_function("duplexio.output_codec_decode"):
-                waveform = (
-                    row_hidden.new_empty(0, dtype=torch.float32)
-                    if raw_audio_codes is None
-                    else self.audio_codec.decode(
-                        raw_audio_codes.view(1, -1, 1),
-                        state.output_mimi,
-                    )[0, 0]
-                )
-            forced_ids.append(int(predicted_text[1].item()))
+            waveform = row_hidden.new_empty(0, dtype=torch.float32)
+            if duplex.get("decode_audio", True):
+                with (
+                    torch.profiler.record_function("duplexio.output_codec_decode"),
+                    torch.autocast(
+                        device_type=row_hidden.device.type,
+                        dtype=self.vllm_config.model_config.dtype,
+                        enabled=row_hidden.is_cuda and self.vllm_config.model_config.dtype != torch.float32,
+                    ),
+                ):
+                    if isinstance(self.audio_codec, PocketMimi):
+                        latent = self.audio_representation.denormalize(predicted_audio)
+                        decoded, state.output_mimi = self.audio_codec.decode(
+                            latent[None, :, None],
+                            state.output_mimi,
+                        )
+                        waveform = decoded[0, 0]
+                    else:
+                        raw_codes = self.audio_representation.decode_column(predicted_audio, state.agent_delay)
+                        if raw_codes is not None:
+                            waveform = self.audio_codec.decode(
+                                raw_codes[None, :, None],
+                                state.output_mimi,
+                            )[0, 0]
+            forced_ids.append(agent_token_id)
 
-            user_ids.append(predicted_text[0:1].detach())
-            agent_ids.append(predicted_text[1:2].detach())
-            tool_ids.append(predicted_text[2:3].detach())
+            user_ids.append(state.text_input_ids[1:2])
+            agent_ids.append(state.text_input_ids[2:3])
+            tool_ids.append(state.text_input_ids[3:4])
             audio_outputs.append(waveform.detach())
             audio_token_ids.append(predicted_audio.detach())
-            model_listen = bool(
-                predicted_text[1].item() == self.silence_token_id
-                and predicted_text[2].item() == self.silence_token_id
-            )
+            model_listen = agent_token_id == self.silence_token_id and tool_token_id == self.silence_token_id
             listen_flags.append(torch.tensor([model_listen]))
             end_flags.append(torch.tensor([bool(duplex.get("final", False))]))
             epochs.append(torch.tensor([int(duplex.get("epoch", 0))]))
             turn_ids.append(torch.tensor([int(duplex.get("turn_id", 0))]))
-            prefill_flags.append(
-                torch.tensor([is_prefill and not prefill_final])
-            )
-            prefill_complete_flags.append(
-                torch.tensor([is_prefill and prefill_final])
-            )
-            system_input_flags.append(
-                torch.tensor([is_system_input and not system_input_final])
-            )
-            system_input_complete_flags.append(
-                torch.tensor([is_system_input and system_input_final])
-            )
-            tool_call_complete_flags.append(
-                torch.tensor([tool_call is not None])
-            )
+            prefill_flags.append(torch.tensor([is_prefill and not prefill_final]))
+            prefill_complete_flags.append(torch.tensor([is_prefill and prefill_final]))
+            system_input_flags.append(torch.tensor([is_system_input and not system_input_final]))
+            system_input_complete_flags.append(torch.tensor([is_system_input and system_input_final]))
+            tool_call_complete_flags.append(torch.tensor([tool_call is not None]))
             if tool_call is not None:
                 state.tool_call_sequence += 1
             tool_call_payloads.append(
@@ -1043,8 +945,7 @@ class DuplexIOForConditionalGeneration(
             {
                 "audio": audio_outputs,
                 "agent_audio_token_ids": audio_token_ids,
-                "sample_rate_hz": [torch.tensor([self.config.sample_rate])]
-                * len(audio_outputs),
+                "sample_rate_hz": [torch.tensor([self.config.sample_rate])] * len(audio_outputs),
                 "user_token_id": user_ids,
                 "agent_token_id": agent_ids,
                 "tool_call_token_id": tool_ids,
@@ -1058,6 +959,8 @@ class DuplexIOForConditionalGeneration(
                 "duplex_system_input_complete": system_input_complete_flags,
                 "tool_call_complete": tool_call_complete_flags,
                 "tool_call_json": tool_call_payloads,
+                "predictor_hiddens": predictor_hiddens,
+                **replay_outputs,
             },
         )
         return OmniOutput(
@@ -1065,77 +968,169 @@ class DuplexIOForConditionalGeneration(
             multimodal_outputs=multimodal_outputs,
         )
 
-    def _sample_text(
+    def sample_frames(
         self,
-        row_hidden: Tensor,
-        info: Mapping[str, object],
-        tool_call_constraint: ToolCallConstraintState | None,
-        generator: torch.Generator,
-    ) -> tuple[Tensor, dict[str, Any] | None]:
-        cells = row_hidden[[USER_CELL, AGENT_CELL, TOOL_CALL_CELL]]
-        projected = torch.stack(
-            [
-                self.llm.output_head_proj[name](cells[index])
-                for index, name in enumerate(TARGET_STREAM_NAMES)
-            ]
+        hidden_states: Tensor,
+        request_token_spans: list[tuple[int, int]],
+        infos: list[dict[str, Any]],
+    ) -> dict[int, FramePrediction]:
+        """Batch deterministic heads while preserving each request's RNG order."""
+        indices: list[int] = []
+        for index, info in enumerate(infos):
+            duplex = info["duplex"]
+            if (duplex.get("duplexio_prefill", False) and not duplex.get("duplexio_prefill_final", False)) or (
+                duplex.get("duplexio_system_input", False) and not duplex.get("duplexio_system_input_final", False)
+            ):
+                continue
+            indices.append(index)
+        if not indices:
+            return {}
+        ends = [request_token_spans[index][1] for index in indices]
+        rows = torch.stack([hidden_states[end - DUPLEXIO_NUM_CELLS : end] for end in ends])
+        with torch.profiler.record_function("duplexio.text_projection"):
+            text_logits, emit_logits = self.project_text(rows)
+        with torch.profiler.record_function("duplexio.text_sampling"):
+            texts, calls = self.sample_text_batch(text_logits, emit_logits, [infos[index] for index in indices])
+        noises: list[Tensor] = []
+        depth_audio: list[Tensor] = []
+        continuous = isinstance(self.audio_sampler, FlowMapSampler)
+        for row, index in enumerate(indices):
+            info = infos[index]
+            state = info["duplexio_working_state"]
+            if continuous:
+                noises.append(torch.randn(
+                    1, self.audio_representation.embedding_dim, device=rows.device,
+                    dtype=torch.float32, generator=state.sampling_generator,
+                ))
+            else:
+                temperature, top_k = _depth_sampling(info)
+                with torch.autocast(
+                    rows.device.type, dtype=self.vllm_config.model_config.dtype,
+                    enabled=rows.is_cuda and self.vllm_config.model_config.dtype != torch.float32,
+                ):
+                    depth_audio.append(self.audio_sampler.sample(
+                        rows[row, AGENT_AUDIO_CELL : AGENT_AUDIO_CELL + 1], texts[row][1:2],
+                        state.depth_speaker_conditioning, temperature=temperature, top_k=top_k,
+                        generator=state.sampling_generator,
+                    )[0])
+        if continuous:
+            with torch.profiler.record_function("duplexio.audio_sampling"), torch.autocast(
+                rows.device.type, dtype=self.vllm_config.model_config.dtype,
+                enabled=rows.is_cuda and self.vllm_config.model_config.dtype != torch.float32,
+            ):
+                audio = self.audio_sampler.sample(rows[:, AGENT_AUDIO_CELL].float(), torch.cat(noises)).unbind(0)
+        else:
+            audio = depth_audio
+        return {
+            index: FramePrediction(text, latent, call)
+            for index, text, latent, call in zip(indices, texts, audio, calls, strict=True)
+        }
+
+    def project_text(self, rows: Tensor) -> tuple[Tensor, Tensor]:
+        """Project the entire request batch before any CPU-side tool decisions."""
+        projected = torch.cat(
+            (
+                self.llm.output_head_proj["agent"](rows[:, AGENT_CELL]),
+                self.llm.output_head_proj["tool_call"](rows[:, TOOL_CALL_CELL]),
+            )
         )
         logits = self.logits_processor(self.llm.base_model.lm_head, projected)
-        emit_logits = torch.stack(
-            [
-                self.emit_heads[name](projected[index]).squeeze(-1)
-                for index, name in enumerate(TARGET_STREAM_NAMES)
-            ]
+        logits = logits.view(2, rows.shape[0], -1).transpose(0, 1)
+        full_frames = rows.flatten(1)
+        emit_logits = torch.cat(
+            (self.agent_emit_head(full_frames), self.tool_call_emit_head(full_frames)), dim=-1,
         )
-        sampling = _text_sampling(info)
-        emit_temperatures = _emit_temperatures(info)
-        user_sampling = TokenSamplingOptions(
-            mode="argmax",
-            temperature=1.0,
-            top_k=sampling.top_k,
-            top_p=sampling.top_p,
-            suppressed_token_ids=sampling.suppressed_token_ids,
-        )
-        user_id = _sample_factorized_text_ids(
-            logits[:1],
-            emit_logits[:1],
-            silence_token_id=self.silence_token_id,
-            sampling=user_sampling,
-            emit_temperature=emit_temperatures.user,
-            generator=generator,
-        )
-        agent_sampling = TokenSamplingOptions(
-            mode=sampling.mode,
-            temperature=sampling.temperature,
-            top_k=sampling.top_k,
-            top_p=sampling.top_p,
-            suppressed_token_ids=(
-                *sampling.suppressed_token_ids,
-                *_agent_suppressed_token_ids(info),
-            ),
-        )
-        agent_id = _sample_factorized_text_ids(
-            logits[1:2],
-            emit_logits[1:2],
-            silence_token_id=self.silence_token_id,
-            sampling=agent_sampling,
-            emit_temperature=emit_temperatures.agent,
-            generator=generator,
-        )
-        tool_id, tool_call_complete = _sample_tool_call_token_id(
-            logits[2:3],
-            emit_logits[2:3],
-            constraint=tool_call_constraint,
-            silence_token_id=self.silence_token_id,
-            sampling=sampling,
-            emit_temperature=emit_temperatures.tool_call,
-            generator=generator,
-        )
-        tool_call = (
-            self.tool_call_compiler.take_completed_call(tool_call_constraint)
-            if tool_call_complete and tool_call_constraint is not None
-            else None
-        )
-        return torch.cat((user_id, agent_id, tool_id)), tool_call
+        return logits, emit_logits
+
+    def sample_text_batch(
+        self,
+        logits: Tensor,
+        emit_logits: Tensor,
+        infos: list[dict[str, Any]],
+    ) -> tuple[list[Tensor], list[dict[str, Any] | None]]:
+        """Batch tool decisions and token readback without changing per-request RNG."""
+        agent_ids = self.sample_agent_tokens(logits[:, 0], emit_logits[:, 0], infos)
+        samplings: list[TokenSamplingOptions] = []
+        tool_starts = [False] * len(infos)
+        pending_indices: list[int] = []
+        pending_starts: list[Tensor] = []
+        for row, info in enumerate(infos):
+            state = info["duplexio_working_state"]
+            sampling = _text_sampling(info, self.tool_suppressed_token_ids)
+            samplings.append(sampling)
+            temperatures = _emit_temperatures(info)
+            constraint = state.tool_call_constraint
+            if constraint is not None and constraint.enabled and not constraint.active:
+                if constraint.force_next_call:
+                    tool_starts[row] = True
+                else:
+                    pending_indices.append(row)
+                    pending_starts.append(_sample_emit(
+                        emit_logits[row, 1:2],
+                        0.0 if sampling.mode in {"argmax", "max"} else temperatures.tool_call,
+                        generator=state.sampling_generator,
+                    ))
+        if pending_starts:
+            for row, start in zip(pending_indices, torch.cat(pending_starts).tolist(), strict=True):
+                tool_starts[row] = start
+
+        texts: list[Tensor] = []
+        calls: list[dict[str, Any] | None] = [None] * len(infos)
+        token_indices: list[int] = []
+        tool_tokens: list[Tensor] = []
+        for row, info in enumerate(infos):
+            state = info["duplexio_working_state"]
+            tool_id = sample_tool_token_id(
+                logits[row, 1:2], constraint=state.tool_call_constraint,
+                emit=tool_starts[row],
+                sampling=samplings[row], generator=state.sampling_generator,
+                distribution=self.content_distribution,
+            )
+            if tool_id is None:
+                tool_id = logits.new_full((1,), self.silence_token_id, dtype=torch.long)
+            else:
+                token_indices.append(row)
+                tool_tokens.append(tool_id)
+            texts.append(torch.cat((info["duplexio"]["user_token_id"].view(1), agent_ids[row], tool_id)))
+        if tool_tokens:
+            for row, token_id in zip(token_indices, torch.cat(tool_tokens).tolist(), strict=True):
+                constraint = infos[row]["duplexio_working_state"].tool_call_constraint
+                if constraint.accept(token_id):
+                    calls[row] = self.tool_call_compiler.take_completed_call(constraint)
+        return texts, calls
+
+    def sample_agent_tokens(self, logits: Tensor, emit_logits: Tensor, infos: list[dict[str, Any]]) -> list[Tensor]:
+        """Filter equal-policy requests together; keep their random draws independent."""
+        samplings = [_text_sampling(info, self.agent_suppressed_token_ids) for info in infos]
+        groups: dict[tuple[str, float, int, float], list[int]] = {}
+        for row, sampling in enumerate(samplings):
+            key = sampling.mode, sampling.temperature, sampling.top_k, sampling.top_p
+            groups.setdefault(key, []).append(row)
+        tokens: dict[int, Tensor] = {}
+        for rows in groups.values():
+            sampling = samplings[rows[0]]
+            group_logits = torch.stack([logits[row] for row in rows])
+            greedy = sampling.mode in {"argmax", "max"}
+            if greedy:
+                content = _sample_content_token_ids(
+                    group_logits, sampling, generator=infos[rows[0]]["duplexio_working_state"].sampling_generator,
+                )
+            else:
+                indices, probabilities = self.content_distribution(group_logits, sampling)
+            for index, row in enumerate(rows):
+                info = infos[row]
+                generator = info["duplexio_working_state"].sampling_generator
+                emit = _sample_emit(
+                    emit_logits[row:row + 1], 0.0 if greedy else _emit_temperatures(info).agent,
+                    generator=generator,
+                )
+                if greedy:
+                    token = content[index:index + 1]
+                else:
+                    selected = torch.multinomial(probabilities[index:index + 1], 1, generator=generator)
+                    token = indices[index:index + 1].gather(-1, selected).squeeze(-1)
+                tokens[row] = torch.where(emit, token, torch.full_like(token, self.silence_token_id))
+        return [tokens[row] for row in range(len(infos))]
 
     def compute_logits(
         self,
@@ -1151,8 +1146,7 @@ class DuplexIOForConditionalGeneration(
             token_ids = [self.silence_token_id] * hidden_states.shape[0]
         if len(token_ids) != hidden_states.shape[0]:
             raise RuntimeError(
-                "DuplexIO forced-token batch mismatch: "
-                f"{len(token_ids)} ids for {hidden_states.shape[0]} rows"
+                f"DuplexIO forced-token batch mismatch: {len(token_ids)} ids for {hidden_states.shape[0]} rows"
             )
         logits = torch.full(
             (hidden_states.shape[0], self.text_config.vocab_size),
@@ -1186,13 +1180,9 @@ class DuplexIOForConditionalGeneration(
         pool = self._voice_pools[voice]
         embedding_index = runtime_config.get("duplexio_voice_embedding_index", 0)
         if not isinstance(embedding_index, int) or not 0 <= embedding_index < len(pool):
-            raise ValueError(
-                f"Voice embedding index {embedding_index!r} is invalid for {voice!r}"
-            )
+            raise ValueError(f"Voice embedding index {embedding_index!r} is invalid for {voice!r}")
         system_tokens = runtime_config.get("duplexio_system_token_ids", ())
-        if not isinstance(system_tokens, (list, tuple)) or not all(
-            isinstance(token, int) for token in system_tokens
-        ):
+        if not isinstance(system_tokens, (list, tuple)) or not all(isinstance(token, int) for token in system_tokens):
             raise ValueError("duplexio_system_token_ids must be integer token IDs")
         sampling_seed = runtime_config.get("duplexio_sampling_seed")
         if not isinstance(sampling_seed, int) or sampling_seed < 0:
@@ -1204,9 +1194,7 @@ class DuplexIOForConditionalGeneration(
             "duplexio_tool_choice",
             {"mode": "none"},
         )
-        if not isinstance(tools, list) or not all(
-            isinstance(tool, Mapping) for tool in tools
-        ):
+        if not isinstance(tools, list) or not all(isinstance(tool, Mapping) for tool in tools):
             raise ValueError("duplexio_tools must be a list of tool definitions")
         if not isinstance(tool_choice, Mapping):
             raise ValueError("duplexio_tool_choice must be an object")
@@ -1214,33 +1202,29 @@ class DuplexIOForConditionalGeneration(
         if cache_epoch >= 2**32:
             raise RuntimeError("DuplexIO cache epoch space is exhausted")
         self._next_cache_epoch += 1
-        agent_input_delay = self.audio_representation.new_state(device=device)
-        agent_mimi = self.audio_codec.new_streaming_state()
         speaker_embedding = pool[embedding_index].to(
             device=device,
             dtype=self.llm.channel_emb.dtype,
         )
+        if self.speaker_lda_projection is not None:
+            speaker_embedding = (
+                (speaker_embedding.float() - self.speaker_lda_mean) @ self.speaker_lda_projection.T
+            ).to(self.llm.channel_emb.dtype)
+        continuous = isinstance(self.audio_codec, PocketMimi)
         return DuplexIORequestState(
             text_input_ids=torch.full(
                 (len(TEXT_STREAM_NAMES),),
                 self.silence_token_id,
                 dtype=torch.long,
-                device=device,
+                device="cpu",
             ),
-            agent_audio_codes=self.encode_silent_agent_frame(
-                agent_mimi,
-                agent_input_delay,
-                device,
-            ),
-            agent_input_delay=agent_input_delay,
-            agent_mimi=agent_mimi,
-            user_delay=self.audio_representation.new_state(device=device),
-            agent_delay=self.audio_representation.new_state(device=device),
-            user_mimi=self.audio_codec.new_streaming_state(),
-            output_mimi=self.audio_codec.new_streaming_state(),
+            agent_audio_codes=self.initial_agent_audio(1)[0],
+            user_asr=FastConformerAudioStreamState(),
+            agent_delay=(None if continuous else self.audio_representation.new_state(device=device)),
+            output_mimi=(self.audio_codec.new_state(1) if continuous else self.audio_codec.new_streaming_state()),
             speaker_embedding=speaker_embedding,
-            depth_speaker_conditioning=self.audio_sampler.prepare_speaker(
-                speaker_embedding.unsqueeze(0)
+            depth_speaker_conditioning=(
+                None if continuous else self.audio_sampler.prepare_speaker(speaker_embedding.unsqueeze(0))
             ),
             system_token_ids=cast(tuple[int, ...], tuple(system_tokens)),
             sampling_generator=sampling_generator,
@@ -1251,44 +1235,16 @@ class DuplexIOForConditionalGeneration(
             cache_epoch=cache_epoch,
         )
 
-    @torch.inference_mode()
-    def encode_silent_agent_frame(
-        self,
-        mimi: MimiStreamingState,
-        delay: DelayedMimiState,
-        device: torch.device,
-    ) -> Tensor:
-        """Encode one zero waveform frame for the agent prompt stream."""
-        return self.encode_silent_agent_frames(1, mimi, delay, device)[0]
-
-    @torch.inference_mode()
-    def encode_silent_agent_frames(
-        self,
-        frame_count: int,
-        mimi: MimiStreamingState,
-        delay: DelayedMimiState,
-        device: torch.device,
-    ) -> Tensor:
-        """Encode silent agent prompt frames in one Mimi sequence."""
-        if frame_count == 0:
-            return delay.previous_acoustic_codes.new_empty(
-                0,
-                self.audio_representation.num_codebooks,
-            )
-        codec_parameter = next(self.audio_codec.parameters())
-        waveform = torch.zeros(
-            1,
-            1,
-            frame_count * self.config.frame_size,
-            device=device,
-            dtype=codec_parameter.dtype,
+    def initial_agent_audio(self, frames: int) -> Tensor:
+        """The masked-prefix representation, not encoded silence."""
+        if isinstance(self.audio_representation, ContinuousAudioRepresentation):
+            return self.llm.channel_emb.new_zeros(frames, self.audio_representation.embedding_dim)
+        return torch.full(
+            (frames, self.audio_representation.num_codebooks),
+            self.audio_representation.codebook_size,
+            dtype=torch.long,
+            device=self.llm.channel_emb.device,
         )
-        raw_codes = self.audio_codec.encode(
-            waveform,
-            self.audio_representation.num_codebooks,
-            mimi,
-        )[0].T
-        return self.audio_representation.encode_sequence(raw_codes, delay)
 
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(
@@ -1300,37 +1256,29 @@ class DuplexIOForConditionalGeneration(
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-            vllm_config.model_config.dtype,
-            vllm_config.cache_config.mamba_cache_dtype,
-            vllm_config.cache_config.mamba_ssm_cache_dtype,
-        )
+    ) -> tuple[torch.dtype, ...]:
+        return gdn_cache_dtypes(vllm_config.model_config.dtype)
 
     @classmethod
     def get_mamba_state_shape_from_config(
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+    ) -> tuple[tuple[int, ...], ...]:
         text_config = vllm_config.model_config.hf_text_config
-        effective_kernel_size = (
-            (text_config.linear_conv_kernel_dim - 1) * DUPLEXIO_NUM_CELLS + 1
-        )
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+        return gdn_cache_shapes(
             vllm_config.parallel_config.tensor_parallel_size,
             text_config.linear_num_key_heads,
             text_config.linear_num_value_heads,
             text_config.linear_key_head_dim,
             text_config.linear_value_head_dim,
-            effective_kernel_size,
-            0,
+            text_config.linear_conv_kernel_dim,
         )
 
     @classmethod
     def get_mamba_state_copy_func(
         cls,
-    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
-        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+    ) -> tuple[MambaStateCopyFunc, ...]:
+        return (get_conv_copy_spec,) + (get_temporal_copy_spec,) * 6
 
 
 def _decode_frame(
@@ -1348,7 +1296,51 @@ def _decode_frame(
     return waveform.view(1, 1, -1)
 
 
-def _text_sampling(info: Mapping[str, object]) -> TokenSamplingOptions:
+def text_suppression_ids(tokenizer: TokenizerLike, silence_token_id: int) -> tuple[list[int], list[int]]:
+    """Derive immutable vocabulary policy for the agent and tool heads."""
+    tool_ids = set(tokenizer.all_special_ids) | {silence_token_id}
+    for text in ("<|im_start|>", "<|im_end|>", "<think>", "</think>"):
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+        if len(encoded) == 1:
+            tool_ids.add(encoded[0])
+    agent_ids = tool_ids.copy()
+    for text in ("<tool_call>", "</tool_call>"):
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+        if len(encoded) == 1:
+            agent_ids.add(encoded[0])
+    return sorted(agent_ids), sorted(tool_ids)
+
+
+def frame_inputs(
+    text_ids: Tensor,
+    text_hidden: Tensor,
+    channel_embedding: Tensor,
+    user_hidden: Tensor,
+    agent_hidden: Tensor,
+    pad_token_id: int,
+    silence_token_id: int,
+    active_text_tokens: int,
+    audio_active: bool,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Assemble six-cell inputs and packed text ordinals without changing CPU state."""
+    text_hidden = text_hidden.masked_fill((text_ids == silence_token_id).unsqueeze(-1), 0)
+    embeddings = torch.cat(
+        (text_hidden + channel_embedding, user_hidden.unsqueeze(1), agent_hidden.unsqueeze(1)), dim=1,
+    ).flatten(0, 1)
+    text_active = (text_ids != pad_token_id) & (text_ids != silence_token_id)
+    audio_shape = (text_ids.shape[0], 2)
+    key_active = torch.cat(
+        (text_active, torch.full(audio_shape, audio_active, dtype=torch.bool, device=text_ids.device)), dim=1,
+    ).flatten()
+    ordinals = (text_active.flatten().to(torch.long).cumsum(0) + active_text_tokens).view_as(text_active)
+    text_ordinals = torch.cat(
+        (torch.where(text_active, ordinals, 0), torch.zeros(audio_shape, dtype=torch.long, device=text_ids.device)),
+        dim=1,
+    ).flatten()
+    return embeddings, key_active, text_ordinals
+
+
+def _text_sampling(info: Mapping[str, object], suppressed_token_ids: Tensor) -> TokenSamplingOptions:
     duplex = info.get("duplex")
     if not isinstance(duplex, Mapping):
         raise ValueError("DuplexIO frame is missing runtime metadata")
@@ -1356,8 +1348,7 @@ def _text_sampling(info: Mapping[str, object]) -> TokenSamplingOptions:
     if not isinstance(runtime, Mapping):
         raise ValueError("DuplexIO frame is missing runtime configuration")
     sampling = runtime.get("duplexio_text_sampling")
-    suppressed = runtime.get("duplexio_suppressed_token_ids")
-    if not isinstance(sampling, Mapping) or not isinstance(suppressed, list):
+    if not isinstance(sampling, Mapping):
         raise ValueError("DuplexIO frame is missing text sampling configuration")
     mode = sampling.get("mode")
     temperature = sampling.get("temperature")
@@ -1368,7 +1359,6 @@ def _text_sampling(info: Mapping[str, object]) -> TokenSamplingOptions:
         or not isinstance(temperature, (int, float))
         or not isinstance(top_k, int)
         or not isinstance(top_p, (int, float))
-        or not all(isinstance(token_id, int) for token_id in suppressed)
     ):
         raise ValueError("Invalid DuplexIO text sampling configuration")
     return TokenSamplingOptions(
@@ -1376,44 +1366,20 @@ def _text_sampling(info: Mapping[str, object]) -> TokenSamplingOptions:
         temperature=float(temperature),
         top_k=top_k,
         top_p=float(top_p),
-        suppressed_token_ids=tuple(suppressed),
+        suppressed_token_ids=suppressed_token_ids,
     )
 
 
 def _emit_temperatures(info: Mapping[str, object]) -> EmitSamplingTemperatures:
     duplex = info.get("duplex")
     runtime = duplex.get("runtime_config") if isinstance(duplex, Mapping) else None
-    temperatures = (
-        runtime.get("duplexio_emit_temperatures")
-        if isinstance(runtime, Mapping)
-        else None
-    )
+    temperatures = runtime.get("duplexio_emit_temperatures") if isinstance(runtime, Mapping) else None
     if not isinstance(temperatures, Mapping):
         raise ValueError("DuplexIO frame is missing emit temperatures")
     values = tuple(temperatures.get(name) for name in TARGET_STREAM_NAMES)
-    if not all(
-        isinstance(value, (int, float)) and value >= 0
-        for value in values
-    ):
+    if not all(isinstance(value, (int, float)) and value >= 0 for value in values):
         raise ValueError("Invalid DuplexIO emit temperatures")
     return EmitSamplingTemperatures(*(float(value) for value in values))
-
-
-def _agent_suppressed_token_ids(
-    info: Mapping[str, object],
-) -> tuple[int, ...]:
-    duplex = info.get("duplex")
-    runtime = duplex.get("runtime_config") if isinstance(duplex, Mapping) else None
-    suppressed = (
-        runtime.get("duplexio_agent_suppressed_token_ids")
-        if isinstance(runtime, Mapping)
-        else None
-    )
-    if not isinstance(suppressed, list) or not all(
-        isinstance(token_id, int) for token_id in suppressed
-    ):
-        raise ValueError("DuplexIO frame is missing agent token suppression")
-    return tuple(suppressed)
 
 
 def _sample_content_token_ids(
@@ -1421,34 +1387,14 @@ def _sample_content_token_ids(
     sampling: TokenSamplingOptions,
     *,
     generator: torch.Generator,
+    distribution: Callable[[Tensor, TokenSamplingOptions], tuple[Tensor, Tensor]] = content_distribution,
 ) -> Tensor:
-    if sampling.suppressed_token_ids:
-        logits = logits.clone()
-        token_ids = torch.tensor(
-            sampling.suppressed_token_ids,
-            device=logits.device,
-        )
-        logits.index_fill_(-1, token_ids, torch.finfo(logits.dtype).min)
     if sampling.mode in {"argmax", "max"}:
+        if sampling.suppressed_token_ids.numel():
+            logits = logits.clone()
+            logits.index_fill_(-1, sampling.suppressed_token_ids, torch.finfo(logits.dtype).min)
         return logits.argmax(dim=-1)
-
-    scaled = logits.float() / sampling.temperature
-    top_k = min(sampling.top_k, scaled.shape[-1])
-    top_values, top_indices = torch.topk(scaled, k=top_k, dim=-1)
-    if sampling.mode == "top_k":
-        probabilities = torch.softmax(top_values, dim=-1)
-    elif sampling.mode == "top_p":
-        sorted_probabilities = torch.softmax(top_values, dim=-1)
-        remove = sorted_probabilities.cumsum(dim=-1) > sampling.top_p
-        remove[..., 1:] = remove[..., :-1].clone()
-        remove[..., 0] = False
-        top_values = top_values.masked_fill(
-            remove,
-            torch.finfo(top_values.dtype).min,
-        )
-        probabilities = torch.softmax(top_values, dim=-1)
-    else:
-        raise ValueError(f"Unsupported DuplexIO sampling mode: {sampling.mode!r}")
+    top_indices, probabilities = distribution(logits, sampling)
     sampled = torch.multinomial(
         probabilities,
         num_samples=1,
@@ -1465,27 +1411,20 @@ def _sample_factorized_text_ids(
     sampling: TokenSamplingOptions,
     emit_temperature: float,
     generator: torch.Generator,
+    distribution: Callable[[Tensor, TokenSamplingOptions], tuple[Tensor, Tensor]] = content_distribution,
 ) -> Tensor:
     """Sample emit/silence independently from the conditional content ID."""
     emit = _sample_emit(
         emit_logits,
-        emit_temperature,
+        0.0 if sampling.mode in {"argmax", "max"} else emit_temperature,
         generator=generator,
     )
 
     content_ids = _sample_content_token_ids(
         logits,
-        TokenSamplingOptions(
-            mode=sampling.mode,
-            temperature=sampling.temperature,
-            top_k=sampling.top_k,
-            top_p=sampling.top_p,
-            suppressed_token_ids=(
-                *sampling.suppressed_token_ids,
-                silence_token_id,
-            ),
-        ),
+        sampling,
         generator=generator,
+        distribution=distribution,
     )
     return torch.where(
         emit,
@@ -1508,29 +1447,22 @@ def _sample_emit(
     ).bool()
 
 
-def _sample_tool_call_token_id(
+def sample_tool_token_id(
     logits: Tensor,
-    emit_logits: Tensor,
     *,
     constraint: ToolCallConstraintState | None,
-    silence_token_id: int,
+    emit: bool,
     sampling: TokenSamplingOptions,
-    emit_temperature: float,
     generator: torch.Generator,
-) -> tuple[Tensor, bool]:
+    distribution: Callable[[Tensor, TokenSamplingOptions], tuple[Tensor, Tensor]] = content_distribution,
+) -> Tensor | None:
+    """Sample an active grammar token; the batch owner accepts the CPU token ID."""
     if constraint is None or not constraint.enabled:
-        return logits.new_full((1,), silence_token_id, dtype=torch.long), False
+        return None
 
     if not constraint.active:
-        emit = constraint.force_next_call or bool(
-            _sample_emit(
-                emit_logits,
-                emit_temperature,
-                generator=generator,
-            ).item()
-        )
         if not emit:
-            return logits.new_full((1,), silence_token_id, dtype=torch.long), False
+            return None
         constraint.begin()
 
     constrained_logits = logits.clone()
@@ -1543,22 +1475,12 @@ def _sample_tool_call_token_id(
         bitmask,
         vocab_size=constrained_logits.shape[-1],
     )
-    token_id = _sample_content_token_ids(
+    return _sample_content_token_ids(
         constrained_logits,
-        TokenSamplingOptions(
-            mode=sampling.mode,
-            temperature=sampling.temperature,
-            top_k=sampling.top_k,
-            top_p=sampling.top_p,
-            suppressed_token_ids=(
-                *sampling.suppressed_token_ids,
-                silence_token_id,
-            ),
-        ),
+        sampling,
         generator=generator,
+        distribution=distribution,
     )
-    completed = constraint.accept(int(token_id.item()))
-    return token_id, completed
 
 
 def serialize_tool_call(
@@ -1583,11 +1505,7 @@ def serialize_tool_call(
 def _depth_sampling(info: Mapping[str, object]) -> tuple[float, int]:
     duplex = info.get("duplex")
     runtime = duplex.get("runtime_config") if isinstance(duplex, Mapping) else None
-    sampling = (
-        runtime.get("duplexio_depth_sampling")
-        if isinstance(runtime, Mapping)
-        else None
-    )
+    sampling = runtime.get("duplexio_depth_sampling") if isinstance(runtime, Mapping) else None
     if not isinstance(sampling, Mapping):
         raise ValueError("DuplexIO append is missing depth sampling configuration")
     temperature = sampling.get("temperature")
@@ -1598,6 +1516,10 @@ def _depth_sampling(info: Mapping[str, object]) -> tuple[float, int]:
 
 
 def _validate_vllm_runtime_contract(vllm_config: VllmConfig) -> None:
+    if vllm_config.quant_config is not None:
+        raise ValueError("DuplexIO requires unquantized backbone weights to preserve training's fused MLP math")
+    if vllm_config.model_config.head_dtype not in (None, vllm_config.model_config.dtype):
+        raise ValueError("DuplexIO vocabulary projection must retain the training model dtype")
     if vllm_config.parallel_config.pipeline_parallel_size != 1:
         raise ValueError("Native DuplexIO does not support pipeline parallelism")
     if vllm_config.speculative_config is not None:
@@ -1614,11 +1536,13 @@ def _validate_vllm_runtime_contract(vllm_config: VllmConfig) -> None:
     compilation = vllm_config.compilation_config
     if compilation.cudagraph_mode == CUDAGraphMode.FULL:
         if vllm_config.scheduler_config.max_num_seqs != 1:
-            raise ValueError("DuplexIO full CUDA graphs require max_num_seqs=1")
+            raise ValueError("Batched DuplexIO CUDA graphs require FULL_DECODE_ONLY")
         if compilation.cudagraph_capture_sizes != [DUPLEXIO_NUM_CELLS]:
-            raise ValueError(
-                "DuplexIO full CUDA graphs require the six-cell capture size"
-            )
+            raise ValueError("DuplexIO full CUDA graphs require the six-cell capture size")
+    elif compilation.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+        sizes = [DUPLEXIO_NUM_CELLS * count for count in range(1, vllm_config.scheduler_config.max_num_seqs + 1)]
+        if compilation.cudagraph_capture_sizes != sizes:
+            raise ValueError("DuplexIO decode graphs require one exact capture size per request count")
 
 
 def _fork_generator(generator: torch.Generator) -> torch.Generator:

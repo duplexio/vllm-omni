@@ -9,7 +9,7 @@ import xgrammar as xgr
 
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     TokenSamplingOptions,
-    _sample_tool_call_token_id,
+    sample_tool_token_id,
 )
 from vllm_omni.model_executor.models.duplexio.tool_calling import (
     ToolCallCapture,
@@ -49,7 +49,7 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream() -> None
         temperature=1.0,
         top_k=len(vocab),
         top_p=1.0,
-        suppressed_token_ids=(),
+        suppressed_token_ids=torch.tensor([0], dtype=torch.long),
     )
     generator = torch.Generator().manual_seed(0)
     generated = ""
@@ -57,17 +57,16 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream() -> None
     for frame in range(100):
         logits = torch.zeros(1, len(vocab))
         logits[0, 0] = 100
-        emit_logits = torch.tensor([10.0 if frame == 0 else -10.0])
-        token_id, complete = _sample_tool_call_token_id(
+        token_id = sample_tool_token_id(
             logits,
-            emit_logits,
             constraint=state,
-            silence_token_id=0,
+            emit=frame == 0,
             sampling=sampling,
-            emit_temperature=0.0,
             generator=generator,
         )
-        sampled_id = int(token_id.item())
+        assert token_id is not None
+        sampled_id = token_id.item()
+        complete = state.accept(sampled_id)
         assert sampled_id != 0
         generated += vocab[sampled_id]
         if complete:

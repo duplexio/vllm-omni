@@ -353,17 +353,16 @@ def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
 
     t_cpu = t.detach().to("cpu").contiguous()
     return AdditionalInformationEntry(
-        tensor_data=t_cpu.numpy().tobytes(),
+        tensor_data=t_cpu.reshape(-1).view(torch.uint8).numpy().tobytes(),
         tensor_shape=list(t_cpu.shape),
         tensor_dtype=_dtype_to_name(t_cpu.dtype),
     )
 
 
 def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
-    dt = np.dtype(entry.tensor_dtype or "float32")
-    arr = np.frombuffer(entry.tensor_data, dtype=dt)  # type: ignore[arg-type]
-    arr = arr.reshape(entry.tensor_shape)
-    return torch.from_numpy(arr.copy())
+    dtype = getattr(torch, entry.tensor_dtype)
+    data = np.frombuffer(entry.tensor_data, dtype=np.uint8).copy()
+    return torch.from_numpy(data).view(dtype).reshape(entry.tensor_shape)
 
 
 def serialize_payload(

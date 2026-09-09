@@ -29,10 +29,9 @@ from vllm_omni.model_executor.models.duplexio.row_semantics import (
 class DuplexIOKVLayout:
     """Physical slots owned by one admitted DuplexIO request.
 
-    The first region is a ring for the two audio cells in each frame. The
-    second region holds the four current text cells so inactive text still has
-    exact self-attention. The final region stores only active text cells and is
-    never reclaimed during the request.
+    The first region is a ring for active audio cells. The final region stores
+    active text cells and is never reclaimed during the request. Query-local
+    self-attention uses incoming K/V directly and needs no cache slots.
     """
 
     block_size: int
@@ -45,12 +44,9 @@ class DuplexIOKVLayout:
 
     @property
     def audio_ring_frames(self) -> int:
-        # The ring is keyed by audio position (a non-decreasing cumsum that
-        # advances only on frames carrying real audio). A query at audio
-        # position p sees audio positions p-window through p, inclusive, so
-        # window + 1 distinct positions must stay resident. Audio positions
-        # advance at most once per frame, so max_frames stays an upper bound.
-        return min(self.audio_window_frames + 1, self.max_frames)
+        # Training evicts whole 128-key (64-audio-frame) blocks. Retaining the
+        # masked block tail preserves its reduction alignment after eviction.
+        return min(self.audio_window_frames + 64, self.max_frames)
 
     @property
     def audio_slots(self) -> int:
@@ -61,12 +57,8 @@ class DuplexIOKVLayout:
         return DUPLEXIO_NUM_CELLS - DUPLEXIO_NUM_TEXT_CELLS
 
     @property
-    def transient_text_base(self) -> int:
-        return cdiv(self.audio_slots, self.block_size) * self.block_size
-
-    @property
     def persistent_text_base(self) -> int:
-        return self.transient_text_base + self.block_size
+        return cdiv(self.audio_slots, self.block_size) * self.block_size
 
     @property
     def max_persistent_text_tokens(self) -> int:
@@ -88,42 +80,12 @@ class DuplexIOKVLayout:
             self.max_persistent_text_tokens,
         )
 
-    def live_compact_pages(
-        self,
-        *,
-        live_audio_frames: int,
-        active_text_tokens: int,
-    ) -> tuple[int, ...]:
-        """Compact pages containing live audio, transient text, or active text."""
-        assert live_audio_frames >= 0
-        assert 0 <= active_text_tokens <= self.max_persistent_text_tokens
-
-        live_audio_slots = (
-            min(live_audio_frames, self.audio_ring_frames)
-            * self.num_audio_cells
-        )
-        audio_pages = range(cdiv(live_audio_slots, self.block_size))
-        transient_page = self.transient_text_base // self.block_size
-        live_persistent_tokens = min(
-            active_text_tokens + DUPLEXIO_NUM_TEXT_CELLS,
-            self.max_persistent_text_tokens,
-        )
-        persistent_page = self.persistent_text_base // self.block_size
-        persistent_pages = range(
-            persistent_page,
-            persistent_page + cdiv(live_persistent_tokens, self.block_size),
-        )
-        return (*audio_pages, transient_page, *persistent_pages)
 
     def audio_slot(self, audio_position: int, audio_cell: int) -> int:
         assert 0 <= audio_cell < self.num_audio_cells
         return (
             audio_position % self.audio_ring_frames
         ) * self.num_audio_cells + audio_cell
-
-    def transient_text_slot(self, text_cell: int) -> int:
-        assert 0 <= text_cell < DUPLEXIO_NUM_TEXT_CELLS
-        return self.transient_text_base + text_cell
 
     def persistent_text_slot(self, text_ordinal: int) -> int:
         assert 0 <= text_ordinal < self.max_persistent_text_tokens

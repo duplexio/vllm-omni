@@ -5,29 +5,29 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from itertools import islice
 from typing import Any, cast
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.nn.attention.flex_attention import BlockMask
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
@@ -41,23 +41,17 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
-from vllm.third_party.flash_linear_attention.ops import (
-    fused_post_conv_prep,
-    fused_sigmoid_gating_delta_rule_update,
-)
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
+    AttentionMetadata,
+    AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.flex_attention import (
     FlexAttentionBackend,
     FlexAttentionImpl,
-    FlexAttentionMetadata,
-    FlexAttentionMetadataBuilder,
-    create_block_mask_compiled,
-    physical_to_logical_mapping,
 )
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -75,11 +69,27 @@ from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
     DuplexIOKVLayout,
     make_duplexio_kv_cache_spec,
 )
+from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_function, fixed_linear
 from vllm_omni.model_executor.models.duplexio.row_semantics import (
     DUPLEXIO_NUM_CELLS,
     DUPLEXIO_NUM_TEXT_CELLS,
     expand_stream_conv_weight,
     mask_inactive_gdn_gates,
+)
+from vllm_omni.model_executor.models.duplexio.stream_attention import (
+    cached_rotary_pos_emb,
+    gated_attention_output,
+    gather_history,
+    history_and_self_attention,
+    history_block_mask,
+    packed_history_indices,
+)
+from vllm_omni.model_executor.models.duplexio.stream_conv import stream_causal_conv
+from vllm_omni.model_executor.models.duplexio.stream_gdn import (
+    append_gdn,
+    gdn_cache_dtypes,
+    gdn_cache_shapes,
+    prepare_gdn_inputs,
 )
 
 _METADATA_BYTES = 4
@@ -92,6 +102,65 @@ _K_AUDIO_POS_OFFSET = _K_ACTIVE_OFFSET + _METADATA_BYTES
 _CACHE_METADATA_SIZE = _K_AUDIO_POS_OFFSET + _METADATA_BYTES
 
 
+class DuplexIORotaryEmbedding(nn.Module):
+    """Cache phases from exported frequencies, never reconstruct their precision."""
+
+    def __init__(self, rotary_dim: int, max_positions: int, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.max_positions = max_positions
+        self.register_buffer("inverse_frequencies", torch.empty(rotary_dim // 2, dtype=torch.float32))
+        self.register_buffer("attention_scaling", torch.empty((), dtype=torch.float32))
+        self.register_buffer("cos_sin_cache", torch.empty(0, rotary_dim, dtype=dtype), persistent=False)
+
+    def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
+        loaded = AutoWeightsLoader(self).load_weights(weights)
+        if loaded != {"inverse_frequencies", "attention_scaling"}:
+            raise ValueError(f"Incomplete exported RoPE constants: {sorted(loaded)}")
+        positions = torch.arange(self.max_positions, device=self.inverse_frequencies.device, dtype=torch.float32)
+        phases = torch.outer(positions, self.inverse_frequencies)
+        self.cos_sin_cache = (
+            torch.cat((phases.cos(), phases.sin()), -1) * self.attention_scaling
+        ).to(self.cos_sin_cache.dtype)
+        return loaded
+
+
+class DuplexIORMSNorm(nn.Module):
+    """Use the training kernel and preserve its FP32 direct scales."""
+
+    def __init__(self, hidden_size: int, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
+        self.eps = eps
+
+    def forward(
+        self, hidden: Tensor, residual: Tensor | None = None,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        from quack import rmsnorm
+
+        return rmsnorm(hidden, self.weight, residual=residual, eps=self.eps, prenorm=residual is not None)
+
+
+class DuplexIOQwenMLP(Qwen3NextMLP):
+    """Keep vLLM's sharded weights but use training's fused SwiGLU math."""
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        from quack.mlp import mlp_func
+
+        output = mlp_func(
+            hidden,
+            self.gate_up_proj.weight,
+            self.down_proj.weight,
+            activation="swiglu",
+            recompute=False,
+            concat_layout=True,
+            tuned=False,
+        )
+        if self.down_proj.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output
+
+
+@torch.compile(dynamic=True, fullgraph=True)
 def _encode_uint32(values: Tensor, dtype: torch.dtype) -> Tensor:
     return torch.stack(
         (
@@ -104,6 +173,7 @@ def _encode_uint32(values: Tensor, dtype: torch.dtype) -> Tensor:
     ).to(dtype)
 
 
+@torch.compile(dynamic=True, fullgraph=True)
 def _decode_uint32(values: Tensor) -> Tensor:
     encoded = values.to(torch.long)
     return (
@@ -112,6 +182,17 @@ def _decode_uint32(values: Tensor) -> Tensor:
         | (encoded[..., 2] << 16)
         | (encoded[..., 3] << 24)
     )
+
+
+@torch.compile(dynamic=True, fullgraph=True)
+def owned_history_metadata(
+    cache: Tensor, block_table: Tensor, block_size: int, blocks_per_request: int,
+) -> tuple[Tensor, Tensor]:
+    """Decode only admitted requests' pages, in one fused indexed read."""
+    pages = block_table[:, :blocks_per_request].long()
+    physical = (pages[:, :, None] * block_size + torch.arange(block_size, device=cache.device)).flatten(1)
+    encoded = cache[physical, 0, -_CACHE_METADATA_SIZE:].view(*physical.shape, 6, _METADATA_BYTES)
+    return physical, _decode_uint32(encoded)
 
 
 def duplexio_compact_key_visible(
@@ -126,7 +207,7 @@ def duplexio_compact_key_visible(
     key_audio_positions: Tensor,
     layout: DuplexIOKVLayout,
 ) -> Tensor:
-    """Return exact visibility for keys stored in the compact physical layout."""
+    """Return prior-frame visibility; query-local self K/V bypass the cache."""
     same_request = query_epochs == key_epochs
     query_frames = torch.div(
         query_positions,
@@ -164,21 +245,7 @@ def duplexio_compact_key_visible(
         (compact_key_positions < layout.audio_slots)
         & (key_cells >= DUPLEXIO_NUM_TEXT_CELLS)
         & (compact_key_positions == expected_audio_slot)
-        & ((query_positions == key_positions) | cross_frame_visible)
-    )
-
-    transient_visible = (
-        (compact_key_positions >= layout.transient_text_base)
-        & (
-            compact_key_positions
-            < layout.transient_text_base + DUPLEXIO_NUM_TEXT_CELLS
-        )
-        & (key_cells < DUPLEXIO_NUM_TEXT_CELLS)
-        & (
-            compact_key_positions
-            == layout.transient_text_base + key_cells
-        )
-        & (query_positions == key_positions)
+        & cross_frame_visible
     )
 
     persistent_visible = (
@@ -191,23 +258,16 @@ def duplexio_compact_key_visible(
         )
         & cross_frame_visible
     )
-    return same_request & (
-        audio_visible | transient_visible | persistent_visible
-    )
+    return same_request & (audio_visible | persistent_visible)
 
 
-def duplexio_primary_compact_slots(
+def duplexio_audio_write_slots(
     positions: Tensor,
     audio_positions: Tensor,
+    key_active: Tensor,
     layout: DuplexIOKVLayout,
 ) -> Tensor:
-    """Map the six current frame cells to audio-ring or transient slots.
-
-    The audio ring is keyed by audio position, mirroring the training-side
-    eviction bound: window positions never decrease, so a ring of
-    ``audio_window_frames + 1`` distinct audio positions retains exactly the
-    keys still visible to any future query.
-    """
+    """Store only live audio; masked prefix cells must not overwrite history."""
     cells = torch.remainder(positions, DUPLEXIO_NUM_CELLS)
     audio_slots = (
         torch.remainder(audio_positions, layout.audio_ring_frames)
@@ -215,52 +275,12 @@ def duplexio_primary_compact_slots(
         + cells
         - DUPLEXIO_NUM_TEXT_CELLS
     )
-    return torch.where(
-        cells < DUPLEXIO_NUM_TEXT_CELLS,
-        layout.transient_text_base + cells,
-        audio_slots,
-    )
+    return audio_slots.masked_fill((cells < DUPLEXIO_NUM_TEXT_CELLS) | ~key_active, -1)
 
 
-def duplexio_primary_write_slots(
-    positions: Tensor,
-    audio_positions: Tensor,
-    key_active: Tensor,
-    request_indices: Tensor,
-    layout: DuplexIOKVLayout,
-) -> Tensor:
-    """Keep transient text writes only for each request's final scheduled
-    frame, and never write inactive audio keys.
-
-    Frames that carry no real audio (context prefill, system-token bursts)
-    do not advance audio time, so their audio cells share the ring slot of
-    the last live frame at the same audio position; writing those inactive
-    keys would clobber a live key that is still inside the window. They are
-    invisible everywhere, so they are simply not written.
-    """
-    slots = duplexio_primary_compact_slots(positions, audio_positions, layout)
-    frames = torch.div(positions, DUPLEXIO_NUM_CELLS, rounding_mode="floor")
-    final_frames = torch.full(
-        (request_indices.shape[0],),
-        -1,
-        dtype=frames.dtype,
-        device=frames.device,
-    )
-    final_frames.scatter_reduce_(
-        0,
-        request_indices,
-        frames,
-        reduce="amax",
-        include_self=True,
-    )
-    cells = torch.remainder(positions, DUPLEXIO_NUM_CELLS)
-    stale_text = (
-        cells < DUPLEXIO_NUM_TEXT_CELLS
-    ) & (frames != final_frames[request_indices])
-    inactive_audio = (cells >= DUPLEXIO_NUM_TEXT_CELLS) & ~key_active
-    return slots.masked_fill(stale_text | inactive_audio, -1)
 
 
+@torch.compile(dynamic=True, fullgraph=True)
 def _physical_slots(
     block_table: Tensor,
     request_indices: Tensor,
@@ -282,28 +302,25 @@ def _physical_slots(
     return physical_slots.masked_fill(~valid, -1)
 
 
-class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
-    """Build Flex metadata over DuplexIO's compact per-request address space."""
+@dataclass
+class DuplexIOAttentionMetadata(AttentionMetadata):
+    """Only the request layout needed by training-ordered paged attention."""
 
-    _cudagraph_support = AttentionCGSupport.NEVER
+    num_actual_tokens: int
+    num_query_batches: int
+    query_start_loc: Tensor
+    block_table: Tensor
+    doc_ids: Tensor
+    block_size: int
+    duplexio_layout: DuplexIOKVLayout
+    duplexio_full_graph: bool
+    duplexio_packed_capacity: int
 
-    @staticmethod
-    def _get_block_sizes(
-        attn_cfg,
-        supports_small_blocks: bool,
-        cache_block_size: int,
-    ) -> tuple[int, int]:
-        # Hybrid GDN/attention page alignment yields non-power-of-2 token
-        # pages (e.g. with the widened cache metadata); FlexAttention
-        # requires power-of-2 blocks. Default the kv block to the largest
-        # power of 2 dividing the page so flex blocks tile pages exactly.
-        if attn_cfg.flex_attn_kv_block_size is None and supports_small_blocks:
-            cache_block_size = cache_block_size & (-cache_block_size)
-        return FlexAttentionMetadataBuilder._get_block_sizes(
-            attn_cfg,
-            supports_small_blocks,
-            cache_block_size,
-        )
+
+class DuplexIOFlexAttentionMetadataBuilder(AttentionMetadataBuilder[DuplexIOAttentionMetadata]):
+    """Build request ownership, not the generic backend's unused cache-pool mask."""
+
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     @classmethod
     def get_cudagraph_support(
@@ -325,129 +342,48 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.layout = kv_cache_spec.layout
-        max_pages = self.layout.max_blocks
-        self.max_num_kv_indices = self.q_block_size * max_pages
-        self.max_num_rswa_kv_indices = max_pages + 1
-        self.compact_seq_lens = torch.empty(
-            vllm_config.scheduler_config.max_num_seqs,
-            dtype=torch.int32,
+        self.doc_ids = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            dtype=torch.long,
             device=device,
         )
         self.full_cudagraph_enabled = (
-            vllm_config.compilation_config.cudagraph_mode
-            == CUDAGraphMode.FULL
+            vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
-        blocks_per_page = (
-            self.layout.block_size + 2 * self.kv_block_size - 2
-        ) // self.kv_block_size
-        self.graph_block_offsets = torch.arange(
-            blocks_per_page,
-            dtype=torch.int32,
-            device=device,
-        )
-        self.graph_kv_indices = torch.full(
-            (1, 1, 1, blocks_per_page * self.layout.max_blocks + 1),
-            -1,
-            dtype=torch.int32,
-            device=device,
-        )
-        self.graph_kv_num_blocks = torch.zeros(
-            (1, 1, 1),
-            dtype=torch.int32,
-            device=device,
-        )
-
-    def build_graph_block_mask(
-        self,
-        metadata: FlexAttentionMetadata,
-    ) -> BlockMask:
-        block_mask = BlockMask(
-            seq_lengths=(
-                metadata.num_actual_tokens,
-                metadata.total_cache_tokens,
-            ),
-            kv_num_blocks=self.graph_kv_num_blocks,
-            kv_indices=self.graph_kv_indices,
-            full_kv_num_blocks=None,
-            full_kv_indices=None,
-            q_num_blocks=None,
-            q_indices=None,
-            full_q_num_blocks=None,
-            full_q_indices=None,
-            BLOCK_SIZE=(metadata.q_block_size, metadata.kv_block_size),
-            mask_mod=metadata.mask_mod,
-        )
-        setattr(metadata, "duplexio_graph_block_offsets", self.graph_block_offsets)
-        setattr(metadata, "duplexio_graph_block_mask", block_mask)
-        update_duplexio_graph_block_mask(
-            metadata,
-            tuple(range(self.layout.max_blocks)),
-        )
-        return block_mask
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> FlexAttentionMetadata:
-        decode_offset = common_attn_metadata.compute_num_computed_tokens()
-        compact_seq_lens = self.compact_seq_lens[
-            : common_attn_metadata.seq_lens.shape[0]
-        ]
-        compact_seq_lens.fill_(self.layout.max_compact_slots)
-        compact_metadata = common_attn_metadata.replace(
-            seq_lens=compact_seq_lens,
-            max_seq_len=self.layout.max_compact_slots,
-            causal=False,
+    ) -> DuplexIOAttentionMetadata:
+        del common_prefix_len, fast_build
+        common = common_attn_metadata
+        doc_ids = self.doc_ids[:common.num_actual_tokens]
+        torch.searchsorted(
+            common.query_start_loc[1:],
+            torch.arange(common.num_actual_tokens, device=self.device),
+            right=True,
+            out=doc_ids,
         )
-        metadata = super().build(
-            common_prefix_len,
-            compact_metadata,
-            fast_build=fast_build,
+        uniform_frames = (
+            common.max_query_len == DUPLEXIO_NUM_CELLS
+            and common.num_actual_tokens == DUPLEXIO_NUM_CELLS * common.num_reqs
         )
-        metadata.decode_offset.copy_(decode_offset)
-        setattr(metadata, "duplexio_layout", self.layout)
-        if (
-            self.full_cudagraph_enabled
-            and common_attn_metadata.num_reqs == 1
-            and metadata.num_actual_tokens == DUPLEXIO_NUM_CELLS
-        ):
-            metadata.block_mask = self.build_graph_block_mask(metadata)
-        return metadata
+        return DuplexIOAttentionMetadata(
+            num_actual_tokens=common.num_actual_tokens,
+            num_query_batches=common.num_reqs if uniform_frames else 1,
+            query_start_loc=common.query_start_loc,
+            block_table=common.block_table_tensor,
+            doc_ids=doc_ids,
+            block_size=self.layout.block_size,
+            duplexio_layout=self.layout,
+            duplexio_full_graph=self.full_cudagraph_enabled and uniform_frames,
+            duplexio_packed_capacity=(self.layout.max_compact_slots + 254) * common.num_reqs,
+        )
 
-
-def update_duplexio_graph_block_mask(
-    metadata: FlexAttentionMetadata,
-    compact_page_indices: tuple[int, ...],
-) -> None:
-    """Update the stable six-cell graph's live physical block list."""
-    block_mask = getattr(metadata, "duplexio_graph_block_mask", None)
-    if not isinstance(block_mask, BlockMask):
-        return
-    block_offsets = getattr(metadata, "duplexio_graph_block_offsets")
-    page_indices = metadata.block_table.new_tensor(compact_page_indices)
-    physical_pages = metadata.block_table[0].index_select(
-        0,
-        page_indices,
-    ).to(torch.int32)
-    page_starts = physical_pages * metadata.block_size
-    first_flex_blocks = page_starts // metadata.kv_block_size
-    candidate_blocks = first_flex_blocks[:, None] + block_offsets[None, :]
-    candidate_starts = candidate_blocks * metadata.kv_block_size
-    overlaps_page = (
-        candidate_starts < page_starts[:, None] + metadata.block_size
-    ) & (
-        candidate_starts + metadata.kv_block_size > page_starts[:, None]
-    )
-    flex_blocks = torch.unique(
-        candidate_blocks[overlaps_page],
-        sorted=True,
-    )
-    num_flex_blocks = flex_blocks.numel()
-    block_mask.kv_indices.fill_(-1)
-    block_mask.kv_indices[0, 0, 0, :num_flex_blocks].copy_(flex_blocks)
-    block_mask.kv_num_blocks.fill_(num_flex_blocks)
+    def use_cascade_attention(self, *args, **kwargs) -> bool:
+        return False
 
 
 def update_duplexio_attention_metadata(
@@ -455,7 +391,7 @@ def update_duplexio_attention_metadata(
     active_text_tokens: list[int],
     live_audio_frames: list[int],
 ) -> None:
-    """Expose each request's live compact address space to FlexAttention."""
+    """Bound packed history by live keys; graph-padding requests contribute zero."""
     pending = [attn_metadata]
     seen: set[int] = set()
     while pending:
@@ -466,56 +402,25 @@ def update_duplexio_attention_metadata(
         if isinstance(metadata, (list, tuple)):
             pending.extend(metadata)
             continue
-        if not isinstance(metadata, FlexAttentionMetadata):
+        if not isinstance(metadata, DuplexIOAttentionMetadata):
             continue
         if id(metadata) in seen:
             continue
         seen.add(id(metadata))
-        layout = getattr(metadata, "duplexio_layout", None)
-        if not isinstance(layout, DuplexIOKVLayout):
-            continue
-
-        num_reqs = metadata.seq_lens.shape[0]
+        layout = metadata.duplexio_layout
+        num_reqs = metadata.block_table.shape[0]
         retained_tokens = active_text_tokens[:num_reqs]
         retained_tokens.extend([0] * (num_reqs - len(retained_tokens)))
         retained_audio_frames = live_audio_frames[:num_reqs]
         retained_audio_frames.extend(
             [0] * (num_reqs - len(retained_audio_frames))
         )
-        compact_lengths = [
-            layout.live_compact_slots(retained)
-            for retained in retained_tokens
-        ]
-        lengths = metadata.seq_lens.new_tensor(compact_lengths)
-        metadata.seq_lens.copy_(lengths)
-        metadata.num_blocks_per_seq.copy_(
-            torch.div(
-                lengths + metadata.block_size - 1,
-                metadata.block_size,
-                rounding_mode="floor",
+        if not metadata.duplexio_full_graph:
+            metadata.duplexio_packed_capacity = sum(
+                count + DUPLEXIO_NUM_TEXT_CELLS
+                + min(frames, layout.audio_ring_frames) * layout.num_audio_cells + 254
+                for count, frames in zip(retained_tokens, retained_audio_frames, strict=True)
             )
-        )
-        inverse = physical_to_logical_mapping(
-            metadata.block_table,
-            lengths,
-            metadata.block_size,
-            metadata.physical_to_logical.shape[1],
-        )
-        metadata.physical_to_logical.copy_(inverse)
-        graph_block_mask = getattr(metadata, "duplexio_graph_block_mask", None)
-        if isinstance(graph_block_mask, BlockMask):
-            assert metadata.num_reqs == 1
-            compact_pages = layout.live_compact_pages(
-                live_audio_frames=retained_audio_frames[0],
-                active_text_tokens=retained_tokens[0],
-            )
-            update_duplexio_graph_block_mask(metadata, compact_pages)
-            metadata.block_mask = graph_block_mask
-        else:
-            # The normal multi-request path rebuilds a request-aware block mask
-            # in DuplexIOFlexAttentionImpl.forward. A single-request graph mask
-            # must never be reused for a batched metadata object.
-            metadata.block_mask = None
 
 
 class DuplexIOFlexAttentionImpl(FlexAttentionImpl):
@@ -528,251 +433,172 @@ class DuplexIOFlexAttentionImpl(FlexAttentionImpl):
         key: Tensor,
         value: Tensor,
         kv_cache: Tensor,
-        attn_metadata: FlexAttentionMetadata,
+        attn_metadata: DuplexIOAttentionMetadata,
         output: Tensor,
         output_scale: Tensor | None = None,
         output_block_scale: Tensor | None = None,
     ) -> Tensor:
-        if attn_metadata is not None:
-            num_actual_tokens = attn_metadata.num_actual_tokens
-            query = query[:num_actual_tokens]
-            key = key[:num_actual_tokens]
-            value = value[:num_actual_tokens]
-            doc_ids = attn_metadata.doc_ids
-            assert doc_ids is not None
-            layout = getattr(attn_metadata, "duplexio_layout", None)
-            assert isinstance(layout, DuplexIOKVLayout)
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError("DuplexIO attention does not support output quantization")
+        if attn_metadata is None:
+            return output.fill_(0)
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        query = query[:num_actual_tokens]
+        key = key[:num_actual_tokens]
+        value = value[:num_actual_tokens]
+        doc_ids = attn_metadata.doc_ids
+        layout = attn_metadata.duplexio_layout
 
-            key_positions = _decode_uint32(
-                key[
-                    :,
-                    0,
-                    self.head_size
-                    - _CACHE_METADATA_SIZE
-                    + _K_POSITION_OFFSET : self.head_size
-                    - _CACHE_METADATA_SIZE
-                    + _K_POSITION_OFFSET
-                    + _METADATA_BYTES,
-                ]
-            )
-            text_ordinals = _decode_uint32(
-                key[
-                    :,
-                    0,
-                    self.head_size
-                    - _CACHE_METADATA_SIZE
-                    + _K_TEXT_ORDINAL_OFFSET : self.head_size
-                    - _CACHE_METADATA_SIZE
-                    + _K_TEXT_ORDINAL_OFFSET
-                    + _METADATA_BYTES,
-                ]
-            )
-            token_key_active = _decode_uint32(
-                key[
-                    :,
-                    0,
-                    self.head_size
-                    - _CACHE_METADATA_SIZE
-                    + _K_ACTIVE_OFFSET : self.head_size
-                    - _CACHE_METADATA_SIZE
-                    + _K_ACTIVE_OFFSET
-                    + _METADATA_BYTES,
-                ]
-            ).bool()
-            # Query row i and key row i of an append are the same frame token,
-            # so the incoming key metadata doubles as the query audio position.
-            token_audio_positions = _decode_uint32(
-                key[
-                    :,
-                    0,
-                    self.head_size
-                    - _CACHE_METADATA_SIZE
-                    + _K_AUDIO_POS_OFFSET : self.head_size
-                    - _CACHE_METADATA_SIZE
-                    + _K_AUDIO_POS_OFFSET
-                    + _METADATA_BYTES,
-                ]
-            )
-            request_indices = doc_ids[:num_actual_tokens].to(torch.long)
-            primary_slots = _physical_slots(
-                attn_metadata.block_table,
-                request_indices,
-                duplexio_primary_write_slots(
-                    key_positions,
-                    token_audio_positions,
-                    token_key_active,
-                    request_indices,
-                    layout,
-                ),
-                attn_metadata.block_size,
-            )
-            super().do_kv_cache_update(
-                layer,
-                key,
-                value,
-                kv_cache,
-                primary_slots,
-            )
-
-            persistent_compact_slots = (
-                layout.persistent_text_base
-                + torch.clamp(text_ordinals, min=1)
-                - 1
-            )
-            persistent_slots = _physical_slots(
-                attn_metadata.block_table,
-                request_indices,
-                persistent_compact_slots,
-                attn_metadata.block_size,
-            )
-            persistent_slots = persistent_slots.masked_fill(
-                text_ordinals == 0,
-                -1,
-            )
-            super().do_kv_cache_update(
-                layer,
-                key,
-                value,
-                kv_cache,
-                persistent_slots,
-            )
-
-            key_cache = kv_cache.transpose(1, 2)[..., : self.head_size]
-            flat_key_cache = key_cache.reshape(
-                -1,
-                self.num_kv_heads,
-                self.head_size,
-            )
-            metadata_base = self.head_size - _CACHE_METADATA_SIZE
-            query_epochs = _decode_uint32(
-                query[
-                    :,
-                    0,
-                    metadata_base
-                    + _Q_EPOCH_OFFSET : metadata_base
-                    + _Q_EPOCH_OFFSET
-                    + _METADATA_BYTES,
-                ]
-            )
-            key_epochs = _decode_uint32(
-                flat_key_cache[
-                    :,
-                    0,
-                    metadata_base
-                    + _K_EPOCH_OFFSET : metadata_base
-                    + _K_EPOCH_OFFSET
-                    + _METADATA_BYTES,
-                ]
-            )
-            cached_key_positions = _decode_uint32(
-                flat_key_cache[
-                    :,
-                    0,
-                    metadata_base
-                    + _K_POSITION_OFFSET : metadata_base
-                    + _K_POSITION_OFFSET
-                    + _METADATA_BYTES,
-                ]
-            )
-            cached_text_ordinals = _decode_uint32(
-                flat_key_cache[
-                    :,
-                    0,
-                    metadata_base
-                    + _K_TEXT_ORDINAL_OFFSET : metadata_base
-                    + _K_TEXT_ORDINAL_OFFSET
-                    + _METADATA_BYTES,
-                ]
-            )
-            cached_key_active = _decode_uint32(
-                flat_key_cache[
-                    :,
-                    0,
-                    metadata_base
-                    + _K_ACTIVE_OFFSET : metadata_base
-                    + _K_ACTIVE_OFFSET
-                    + _METADATA_BYTES,
-                ]
-            ).bool()
-            cached_audio_positions = _decode_uint32(
-                flat_key_cache[
-                    :,
-                    0,
-                    metadata_base
-                    + _K_AUDIO_POS_OFFSET : metadata_base
-                    + _K_AUDIO_POS_OFFSET
-                    + _METADATA_BYTES,
-                ]
-            )
-
-            def mask_mod(
-                _batch: Tensor,
-                _head: Tensor,
-                query_index: Tensor,
-                physical_key_index: Tensor,
-            ) -> Tensor:
-                is_valid, logical_query, logical_key = (
-                    attn_metadata._convert_physical_to_logical(
-                        doc_ids,
-                        query_index,
-                        physical_key_index,
-                    )
-                )
-                visible = duplexio_compact_key_visible(
-                    logical_query,
-                    logical_key,
-                    query_epochs[query_index],
-                    key_epochs[physical_key_index],
-                    cached_key_positions[physical_key_index],
-                    cached_text_ordinals[physical_key_index],
-                    cached_key_active[physical_key_index],
-                    token_audio_positions[query_index],
-                    cached_audio_positions[physical_key_index],
-                    layout,
-                )
-                return is_valid & visible
-
-            self.mm_prefix_range = attn_metadata.mm_prefix_range
-            attn_metadata.sliding_window = self.sliding_window
-            layer_mask_mod = getattr(layer, "logical_mask_mod", None)
-            if layer_mask_mod is not None:
-                attn_metadata.logical_mask_mod = layer_mask_mod
-            layer_hint = getattr(layer, "block_sparsity_hint", None)
-            if layer_hint is not None:
-                attn_metadata.block_sparsity_hint = layer_hint
-            attn_metadata.mask_mod = mask_mod
-            graph_block_mask = getattr(
-                attn_metadata,
-                "duplexio_graph_block_mask",
-                None,
-            )
-            if isinstance(graph_block_mask, BlockMask):
-                graph_block_mask.mask_mod = mask_mod
-                attn_metadata.block_mask = graph_block_mask
-            else:
-                attn_metadata.block_mask = create_block_mask_compiled(
-                    mask_mod,
-                    None,
-                    None,
-                    attn_metadata.num_actual_tokens,
-                    attn_metadata.total_cache_tokens,
-                    device=attn_metadata.block_table.device,
-                    BLOCK_SIZE=(
-                        attn_metadata.q_block_size,
-                        attn_metadata.kv_block_size,
-                    ),
-                )
-        return super().forward(
+        key_positions = _decode_uint32(
+            key[
+                :,
+                0,
+                self.head_size
+                - _CACHE_METADATA_SIZE
+                + _K_POSITION_OFFSET : self.head_size
+                - _CACHE_METADATA_SIZE
+                + _K_POSITION_OFFSET
+                + _METADATA_BYTES,
+            ]
+        )
+        text_ordinals = _decode_uint32(
+            key[
+                :,
+                0,
+                self.head_size
+                - _CACHE_METADATA_SIZE
+                + _K_TEXT_ORDINAL_OFFSET : self.head_size
+                - _CACHE_METADATA_SIZE
+                + _K_TEXT_ORDINAL_OFFSET
+                + _METADATA_BYTES,
+            ]
+        )
+        token_key_active = _decode_uint32(
+            key[
+                :,
+                0,
+                self.head_size
+                - _CACHE_METADATA_SIZE
+                + _K_ACTIVE_OFFSET : self.head_size
+                - _CACHE_METADATA_SIZE
+                + _K_ACTIVE_OFFSET
+                + _METADATA_BYTES,
+            ]
+        ).bool()
+        # Query row i and key row i of an append are the same frame token,
+        # so the incoming key metadata doubles as the query audio position.
+        token_audio_positions = _decode_uint32(
+            key[
+                :,
+                0,
+                self.head_size
+                - _CACHE_METADATA_SIZE
+                + _K_AUDIO_POS_OFFSET : self.head_size
+                - _CACHE_METADATA_SIZE
+                + _K_AUDIO_POS_OFFSET
+                + _METADATA_BYTES,
+            ]
+        )
+        request_indices = doc_ids
+        primary_slots = _physical_slots(
+            attn_metadata.block_table,
+            request_indices,
+            duplexio_audio_write_slots(
+                key_positions,
+                token_audio_positions,
+                token_key_active,
+                layout,
+            ),
+            attn_metadata.block_size,
+        )
+        super().do_kv_cache_update(
             layer,
-            query,
             key,
             value,
             kv_cache,
-            attn_metadata,
-            output,
-            output_scale,
-            output_block_scale,
+            primary_slots,
         )
+
+        persistent_compact_slots = (
+            layout.persistent_text_base
+            + torch.clamp(text_ordinals, min=1)
+            - 1
+        )
+        persistent_slots = _physical_slots(
+            attn_metadata.block_table,
+            request_indices,
+            persistent_compact_slots,
+            attn_metadata.block_size,
+        )
+        persistent_slots = persistent_slots.masked_fill(
+            text_ordinals == 0,
+            -1,
+        )
+        super().do_kv_cache_update(
+            layer,
+            key,
+            value,
+            kv_cache,
+            persistent_slots,
+        )
+
+        key_cache = kv_cache.transpose(1, 2)[..., : self.head_size]
+        flat_key_cache = key_cache.reshape(
+            -1,
+            self.num_kv_heads,
+            self.head_size,
+        )
+        metadata_base = self.head_size - _CACHE_METADATA_SIZE
+        query_epochs = _decode_uint32(
+            query[
+                :,
+                0,
+                metadata_base
+                + _Q_EPOCH_OFFSET : metadata_base
+                + _Q_EPOCH_OFFSET
+                + _METADATA_BYTES,
+            ]
+        )
+        physical, cached_metadata = owned_history_metadata(
+            flat_key_cache, attn_metadata.block_table, layout.block_size, layout.max_blocks,
+        )
+
+        request_last = attn_metadata.query_start_loc[1:] - 1
+        indices, valid, key_owners, packed_positions, packed_audio_positions = packed_history_indices(
+            physical, query_epochs[request_last], token_audio_positions[request_last],
+            cached_metadata[..., 1], cached_metadata[..., 2],
+            cached_metadata[..., 5], cached_metadata[..., 4] != 0,
+            layout.max_model_len, layout.audio_window_frames,
+            attn_metadata.duplexio_packed_capacity,
+        )
+
+        batches = attn_metadata.num_query_batches
+        block_mask = history_block_mask(
+            request_indices.view(batches, -1),
+            (key_positions // DUPLEXIO_NUM_CELLS).view(batches, -1),
+            token_audio_positions.view(batches, -1),
+            key_owners, packed_positions // DUPLEXIO_NUM_CELLS, packed_audio_positions,
+            packed_positions % DUPLEXIO_NUM_CELLS, valid,
+            layout.audio_window_frames, (128, 128),
+        )
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        dim = self.head_size - _CACHE_METADATA_SIZE
+        key_tensor = gather_history(key_cache.reshape(-1, self.num_kv_heads, self.head_size), indices, valid, dim)
+        value_tensor = gather_history(value_cache.reshape(-1, self.num_kv_heads, self.head_size), indices, valid, dim)
+        # Uniform six-cell requests get independent query tiles. Expanded KV
+        # batches share the same packed storage; no keys are copied or padded.
+        merged = history_and_self_attention(
+            query[:, :, :dim].contiguous().view(batches, -1, self.num_heads, dim).transpose(1, 2),
+            key_tensor.expand(batches, -1, -1, -1),
+            value_tensor.expand(batches, -1, -1, -1),
+            key[:, :, :dim].contiguous().view(batches, -1, self.num_kv_heads, dim).transpose(1, 2),
+            value[:, :, :dim].contiguous().view(batches, -1, self.num_kv_heads, dim).transpose(1, 2),
+            torch.zeros(indices.shape[0], device=query.device, dtype=torch.float32),
+            block_mask=block_mask, scale=self.scale,
+        ).transpose(1, 2).reshape(-1, self.num_heads, dim)
+        output[:num_actual_tokens, :, :dim].copy_(merged)
+        output[:num_actual_tokens, :, dim:].zero_()
+        return output
 
 
 class DuplexIOFlexAttentionBackend(FlexAttentionBackend):
@@ -790,7 +616,7 @@ class DuplexIOFlexAttentionBackend(FlexAttentionBackend):
 
 
 class DuplexIOGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
-    """Declare full-graph support for the single-request DuplexIO schedule."""
+    """Retain graph input buffers independently for each six-cell batch size."""
 
     def __init__(
         self,
@@ -800,8 +626,7 @@ class DuplexIOGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self.full_graph_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
-        self.full_graph_metadata: GDNAttentionMetadata | None = None
+        self.full_graph_metadata: dict[int, GDNAttentionMetadata] = {}
 
     @classmethod
     def get_cudagraph_support(
@@ -811,23 +636,22 @@ class DuplexIOGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
     ) -> AttentionCGSupport:
         if vllm_config.scheduler_config.max_num_seqs == 1:
             return AttentionCGSupport.ALWAYS
-        return super().get_cudagraph_support(vllm_config, kv_cache_spec)
+        return AttentionCGSupport.UNIFORM_BATCH
 
     def is_full_graph_frame(
         self,
         metadata: CommonAttentionMetadata,
     ) -> bool:
         return (
-            metadata.num_reqs == 1
-            and metadata.num_actual_tokens == self.full_graph_tokens
+            metadata.max_query_len == DUPLEXIO_NUM_CELLS
+            and metadata.num_actual_tokens == DUPLEXIO_NUM_CELLS * metadata.num_reqs
         )
 
     def refresh_full_graph_metadata(
         self,
         common: CommonAttentionMetadata,
     ) -> GDNAttentionMetadata:
-        metadata = self.full_graph_metadata
-        assert metadata is not None
+        metadata = self.full_graph_metadata[common.num_reqs]
         state_indices = mamba_get_block_table_tensor(
             common.block_table_tensor,
             common.seq_lens,
@@ -868,7 +692,7 @@ class DuplexIOGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             non_spec_query_start_loc=query_start_loc,
             non_spec_state_indices_tensor=state_indices,
         )
-        self.full_graph_metadata = retained
+        self.full_graph_metadata[state_indices.shape[0]] = retained
         return retained
 
     def build(
@@ -880,7 +704,7 @@ class DuplexIOGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         if (
-            self.full_graph_metadata is not None
+            common_attn_metadata.num_reqs in self.full_graph_metadata
             and self.is_full_graph_frame(common_attn_metadata)
         ):
             return self.refresh_full_graph_metadata(common_attn_metadata)
@@ -904,7 +728,7 @@ class DuplexIOGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
 
 class DuplexIOGDNAttentionBackend(GDNAttentionBackend):
-    """GDN metadata backend specialized for DuplexIO's single request."""
+    """GDN metadata backend for complete six-cell appends."""
 
     @staticmethod
     def get_name() -> str:
@@ -979,16 +803,6 @@ class DuplexIOQwenAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            max_position=config.max_position_embeddings,
-            rope_parameters=config.rope_parameters,
-            dual_chunk_attention_config=getattr(
-                config,
-                "dual_chunk_attention_config",
-                None,
-            ),
-        )
         self.attn = DuplexIOPagedAttention(
             self.num_heads,
             self.cache_head_dim,
@@ -999,12 +813,13 @@ class DuplexIOQwenAttention(nn.Module):
             prefix=f"{prefix}.attn",
             attn_backend=DuplexIOFlexAttentionBackend,
         )
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = DuplexIORMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = DuplexIORMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
         positions: Tensor,
+        cos_sin_cache: Tensor,
         logical_positions: Tensor,
         hidden_states: Tensor,
         key_active: Tensor,
@@ -1012,7 +827,7 @@ class DuplexIOQwenAttention(nn.Module):
         text_ordinals: Tensor,
         audio_positions: Tensor,
     ) -> Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = fixed_linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
         if self.attn_output_gate:
             q_gate, key, value = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size],
@@ -1034,11 +849,13 @@ class DuplexIOQwenAttention(nn.Module):
 
         query = self.q_norm(
             query.view(-1, self.num_heads, self.head_dim)
-        ).reshape(-1, self.q_size)
+        )
         key = self.k_norm(
             key.view(-1, self.num_kv_heads, self.head_dim)
-        ).reshape(-1, self.kv_size)
-        query, key = self.rotary_emb(positions, query, key)
+        )
+        query, key = call_compiled_function(
+            cached_rotary_pos_emb, query, key, positions, cos_sin_cache
+        )
 
         epoch_bytes = _encode_uint32(request_epochs, query.dtype)
         query = torch.cat(
@@ -1089,8 +906,11 @@ class DuplexIOQwenAttention(nn.Module):
             self.cache_head_dim,
         )[..., : self.head_dim].reshape(-1, self.q_size)
         if gate is not None:
-            attended = attended * torch.sigmoid(gate)
-        return self.o_proj(attended)[0]
+            attended = call_compiled_function(gated_attention_output, attended, gate)
+        output = fixed_linear(attended, self.o_proj.weight)
+        if get_tensor_model_parallel_world_size() > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output
 
 
 class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
@@ -1108,9 +928,13 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             prefix=prefix,
             gqa_interleaved_layout=False,
         )
+        norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+        norm.weight = self.norm.weight
+        self.norm = norm
+        self.norm.compile(dynamic=True, fullgraph=True)
+        assert self.activation == "silu"
         self.full_cudagraph_enabled = (
-            vllm_config.compilation_config.cudagraph_mode
-            == CUDAGraphMode.FULL
+            vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
             and not vllm_config.model_config.enforce_eager
         )
         original_weight = cast(Tensor, self.conv1d.weight)
@@ -1138,22 +962,16 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         set_weight_attrs(expanded_weight, {"weight_loader": weight_loader})
         self.conv1d.weight = expanded_weight
 
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        return gdn_cache_dtypes(self.model_config.dtype)
+
     def get_state_shape(
         self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:  # ty: ignore[invalid-method-override]
-        # vLLM 0.26's base annotation says four shapes, but its calculator and
-        # cache-manager contract both return the convolution and temporal pair.
-        effective_kernel_size = (
-            (self.conv_kernel_size - 1) * DUPLEXIO_NUM_CELLS + 1
-        )
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
-            self.tp_size,
-            self.num_k_heads,
-            self.num_v_heads,
-            self.head_k_dim,
-            self.head_v_dim,
-            effective_kernel_size,
-            self.num_spec,
+    ) -> tuple[tuple[int, ...], ...]:
+        assert self.num_spec == 0
+        return gdn_cache_shapes(
+            self.tp_size, self.num_k_heads, self.num_v_heads,
+            self.head_k_dim, self.head_v_dim, self.conv_kernel_size,
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
@@ -1167,127 +985,13 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         conv_state: Tensor,
         state_indices: Tensor,
         query_start_loc: Tensor,
-        has_initial_state: Tensor | None,
+        has_initial_state: Tensor,
+        chunk_indices: Tensor,
     ) -> Tensor:
-        """Apply the expanded causal convolution and update its state cache.
-
-        vLLM's Triton causal-convolution kernel only supports the original
-        Qwen kernel widths. DuplexIO expands that kernel across six cells, so
-        the effective width is 19. This grouped PyTorch operation preserves
-        the same state contract for the expanded width.
-        """
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        return stream_causal_conv(
+            mixed_qkv, self.conv1d.weight, self.conv1d.bias, conv_state,
+            state_indices, query_start_loc, has_initial_state, chunk_indices,
         )
-        state_length = conv_weights.size(-1) - 1
-        request_count = query_start_loc.shape[0] - 1
-        if self.full_cudagraph_enabled and request_count == 1:
-            state_indices = state_indices[:1]
-            history = conv_state.index_select(0, state_indices)
-            if has_initial_state is not None:
-                history = history.masked_fill(
-                    ~has_initial_state[:1, None, None],
-                    0,
-                )
-            conv_input = torch.cat(
-                (history, mixed_qkv.transpose(0, 1).unsqueeze(0)),
-                dim=-1,
-            )
-            conv_output = F.conv1d(
-                conv_input,
-                conv_weights.unsqueeze(1),
-                bias=self.conv1d.bias,
-                groups=conv_weights.size(0),
-            )
-            if self.activation != "silu":
-                raise ValueError(
-                    "DuplexIO's native convolution path requires silu, "
-                    f"got {self.activation!r}"
-                )
-            conv_state[state_indices] = conv_input[:, :, -state_length:]
-            conv_output = conv_output.squeeze(0).transpose(0, 1).contiguous()
-            return F.silu(conv_output)
-
-        if request_count > 1:
-            query_lengths = query_start_loc[1:] - query_start_loc[:-1]
-            if bool(torch.all(query_lengths == query_lengths[0])):
-                query_length = mixed_qkv.shape[0] // request_count
-                assert mixed_qkv.shape[0] == request_count * query_length
-                history = conv_state.index_select(
-                    0,
-                    state_indices[:request_count],
-                )
-                if has_initial_state is not None:
-                    history = history.masked_fill(
-                        ~has_initial_state[:request_count, None, None],
-                        0,
-                    )
-                conv_input = torch.cat(
-                    (
-                        history,
-                        mixed_qkv.view(
-                            request_count,
-                            query_length,
-                            -1,
-                        ).transpose(1, 2),
-                    ),
-                    dim=-1,
-                )
-                conv_output = F.conv1d(
-                    conv_input,
-                    conv_weights.unsqueeze(1),
-                    bias=self.conv1d.bias,
-                    groups=conv_weights.size(0),
-                )
-                if self.activation != "silu":
-                    raise ValueError(
-                        "DuplexIO's native convolution path requires silu, "
-                        f"got {self.activation!r}"
-                    )
-                conv_state[state_indices[:request_count]] = conv_input[
-                    :, :, -state_length:
-                ]
-                return F.silu(
-                    conv_output.transpose(1, 2).contiguous().view_as(mixed_qkv)
-                )
-
-        output = torch.empty_like(mixed_qkv)
-
-        for request_index in range(query_start_loc.numel() - 1):
-            start = int(query_start_loc[request_index].item())
-            end = int(query_start_loc[request_index + 1].item())
-            if start == end:
-                continue
-
-            state_index = int(state_indices[request_index].item())
-            history = conv_state[state_index]
-            if (
-                has_initial_state is not None
-                and not bool(has_initial_state[request_index].item())
-            ):
-                history = torch.zeros_like(history)
-
-            conv_input = torch.cat(
-                (history, mixed_qkv[start:end].transpose(0, 1)),
-                dim=-1,
-            ).unsqueeze(0)
-            conv_output = F.conv1d(
-                conv_input,
-                conv_weights.unsqueeze(1),
-                bias=self.conv1d.bias,
-                groups=conv_weights.size(0),
-            )
-            if self.activation != "silu":
-                raise ValueError(
-                    "DuplexIO's native convolution path requires silu, "
-                    f"got {self.activation!r}"
-                )
-            output[start:end] = F.silu(
-                conv_output.squeeze(0).transpose(0, 1)
-            )
-            conv_state[state_index].copy_(conv_input[0, :, -state_length:])
-
-        return output
 
     def _forward_core(
         self,
@@ -1296,177 +1000,54 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         a: Tensor,
         core_attn_out: Tensor,
     ) -> None:
-        """Run GDN with DuplexIO's expanded convolution state."""
-        forward_context = get_forward_context()
-        attn_metadata_raw = forward_context.attn_metadata
-
-        if attn_metadata_raw is None:
-            self._warmup_prefill_kernels(mixed_qkv, 0)
-            return
-
-        assert isinstance(attn_metadata_raw, dict)
-        attn_metadata = attn_metadata_raw[self.prefix]
-        assert isinstance(attn_metadata, GDNAttentionMetadata)
-        if attn_metadata.spec_sequence_masks is not None:
-            raise RuntimeError(
-                "Native DuplexIO does not support speculative GDN execution"
-            )
-
-        non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
-        non_spec_state_indices_tensor = (
-            attn_metadata.non_spec_state_indices_tensor
-        )
-        assert non_spec_query_start_loc is not None
-        assert non_spec_state_indices_tensor is not None
-
-        self_kv_cache = self.kv_cache
-        conv_state = (
-            self_kv_cache[0]
-            if is_conv_state_dim_first()
-            else self_kv_cache[0].transpose(-1, -2)
-        )
-        ssm_state = self_kv_cache[1]
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
-        b = b[:num_actual_tokens]
-        a = a[:num_actual_tokens]
-
+        """Whole six-cell appends always use vLLM's prefill metadata."""
+        metadata = get_forward_context().attn_metadata
+        if metadata is None:
+            # vLLM profiles before allocating request caches. Exercise the real
+            # append with temporary state so its workspace is included as well.
+            tokens = mixed_qkv.shape[0]
+            boundaries = torch.tensor((0, tokens), device=mixed_qkv.device, dtype=torch.int32)
+            state_indices = torch.zeros(1, device=mixed_qkv.device, dtype=torch.int32)
+            has_initial_state = torch.zeros(1, device=mixed_qkv.device, dtype=torch.bool)
+            blocks = torch.arange((tokens + 63) // 64, device=mixed_qkv.device, dtype=torch.int32)
+            chunk_indices = torch.stack((torch.zeros_like(blocks), blocks), 1)
+            cache = tuple(torch.empty((1, *shape), device=mixed_qkv.device, dtype=dtype)
+                          for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype(), strict=True))
+        else:
+            assert isinstance(metadata, dict)
+            metadata = metadata[self.prefix]
+            assert isinstance(metadata, GDNAttentionMetadata)
+            assert metadata.spec_sequence_masks is None
+            assert metadata.num_decodes == 0
+            state_indices = metadata.prefill_state_indices
+            has_initial_state = metadata.prefill_has_initial_state
+            boundaries = metadata.prefill_query_start_loc
+            chunk_indices = metadata.chunk_indices
+            tokens = metadata.num_actual_tokens
+            cache = self.kv_cache
+        assert state_indices is not None and has_initial_state is not None
+        assert boundaries is not None and chunk_indices is not None
+        conv_state, recurrent_state = cache
+        if not is_conv_state_dim_first():
+            conv_state = conv_state.transpose(-1, -2)
         mixed_qkv = self.apply_stream_causal_conv(
-            mixed_qkv=mixed_qkv,
-            conv_state=conv_state,
-            state_indices=non_spec_state_indices_tensor,
-            query_start_loc=non_spec_query_start_loc,
-            has_initial_state=attn_metadata.has_initial_state,
+            mixed_qkv[:tokens], conv_state, state_indices, boundaries,
+            has_initial_state, chunk_indices,
         )
-
-        split_non_spec = (
-            attn_metadata.num_prefills > 0 and attn_metadata.num_decodes > 0
+        q, k, v, g, beta = prepare_gdn_inputs(
+            qkv=mixed_qkv,
+            a=a[:tokens],
+            b=b[:tokens],
+            a_log=self.A_log,
+            dt_bias=self.dt_bias,
+            key_heads=self.num_k_heads // self.tp_size,
+            key_dim=self.head_k_dim,
+            value_dim=self.head_v_dim,
         )
-        num_decode_tokens = attn_metadata.num_decode_tokens
-
-        if attn_metadata.num_prefills > 0:
-            if split_non_spec:
-                conv_output_prefill = mixed_qkv[num_decode_tokens:]
-                a_prefill = a[num_decode_tokens:]
-                b_prefill = b[num_decode_tokens:]
-            else:
-                conv_output_prefill = mixed_qkv
-                a_prefill = a
-                b_prefill = b
-
-            (
-                query_non_spec,
-                key_non_spec,
-                value_non_spec,
-                g_non_spec,
-                beta_non_spec,
-            ) = fused_post_conv_prep(
-                conv_output=conv_output_prefill,
-                a=a_prefill,
-                b=b_prefill,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                num_k_heads=self.num_k_heads // self.tp_size,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
-                apply_l2norm=True,
-                output_g_exp=False,
-            )
-            query_non_spec = query_non_spec.unsqueeze(0)
-            key_non_spec = key_non_spec.unsqueeze(0)
-            value_non_spec = value_non_spec.unsqueeze(0)
-            g_non_spec = g_non_spec.unsqueeze(0)
-            beta_non_spec = beta_non_spec.unsqueeze(0)
-        else:
-            query_non_spec, key_non_spec, value_non_spec = (
-                self.rearrange_mixed_qkv(mixed_qkv)
-            )
-            g_non_spec = None
-            beta_non_spec = None
-
-        if split_non_spec:
-            query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
-                mixed_qkv[:num_decode_tokens]
-            )
-            core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
-                A_log=self.A_log,
-                a=a[:num_decode_tokens],
-                b=b[:num_decode_tokens],
-                dt_bias=self.dt_bias,
-                q=query_decode,
-                k=key_decode,
-                v=value_decode,
-                initial_state=ssm_state,
-                inplace_final_state=True,
-                cu_seqlens=non_spec_query_start_loc[
-                    : attn_metadata.num_decodes + 1
-                ],
-                ssm_state_indices=non_spec_state_indices_tensor,
-                use_qk_l2norm_in_kernel=True,
-            )
-        else:
-            core_attn_out_decode = None
-
-        if attn_metadata.num_prefills > 0:
-            prefill_state_indices = attn_metadata.prefill_state_indices
-            prefill_has_initial_state = attn_metadata.prefill_has_initial_state
-            prefill_query_start_loc = attn_metadata.prefill_query_start_loc
-            chunk_indices = attn_metadata.chunk_indices
-            chunk_offsets = attn_metadata.chunk_offsets
-            assert prefill_state_indices is not None
-            assert prefill_has_initial_state is not None
-            assert prefill_query_start_loc is not None
-            assert chunk_indices is not None
-            assert chunk_offsets is not None
-
-            initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
-            core_attn_out_non_spec, last_recurrent_state = (
-                self.chunk_gated_delta_rule(
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    g=g_non_spec,
-                    beta=beta_non_spec,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    cu_seqlens=prefill_query_start_loc,
-                    chunk_indices=chunk_indices,
-                    chunk_offsets=chunk_offsets,
-                    use_qk_l2norm_in_kernel=False,
-                )
-            )
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(
-                ssm_state.dtype
-            )
-            if split_non_spec:
-                core_attn_out_non_spec = torch.cat(
-                    [core_attn_out_decode, core_attn_out_non_spec],
-                    dim=1,
-                )
-        elif attn_metadata.num_decodes > 0:
-            core_attn_out_non_spec, _ = (
-                fused_sigmoid_gating_delta_rule_update(
-                    A_log=self.A_log,
-                    a=a,
-                    b=b,
-                    dt_bias=self.dt_bias,
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[
-                        : attn_metadata.num_decodes + 1
-                    ],
-                    ssm_state_indices=non_spec_state_indices_tensor,
-                    use_qk_l2norm_in_kernel=True,
-                )
-            )
-        else:
-            return
-
-        core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+        core_attn_out[:tokens] = append_gdn(
+            q, k, v, g, beta, recurrent_state, state_indices,
+            boundaries, has_initial_state, chunk_indices,
+        )
 
     def forward_with_key_activity(
         self,
@@ -1474,8 +1055,8 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         key_active: Tensor,
     ) -> Tensor:
         num_tokens = hidden_states.shape[0]
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        projected_ba, _ = self.in_proj_ba(hidden_states)
+        mixed_qkvz = fixed_linear(hidden_states, self.in_proj_qkvz.weight, self.in_proj_qkvz.bias)
+        projected_ba = fixed_linear(hidden_states, self.in_proj_ba.weight, self.in_proj_ba.bias)
         beta_logits, decay_logits = self.split_ba(projected_ba)
         beta_logits = beta_logits.contiguous()
         decay_logits = decay_logits.contiguous()
@@ -1503,7 +1084,13 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             core_output,
             layer_name=_encode_layer_name(self.prefix),
         )
-        return self._output_projection(core_output, output_gate)
+        normalized = call_compiled_function(
+            self.norm, core_output.reshape(-1, self.head_v_dim), output_gate.reshape(-1, self.head_v_dim),
+        ).view(num_tokens, -1)
+        output = fixed_linear(normalized, self.out_proj.weight, self.out_proj.bias)
+        if self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output
 
 
 class DuplexIOQwenDecoderLayer(nn.Module):
@@ -1533,18 +1120,18 @@ class DuplexIOQwenDecoderLayer(nn.Module):
             )
         else:
             raise ValueError(f"Invalid Qwen3.5 layer type {layer_type!r}")
-        self.mlp = Qwen3NextMLP(
+        self.mlp = DuplexIOQwenMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=vllm_config.quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = DuplexIORMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = DuplexIORMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )
@@ -1562,17 +1149,18 @@ class DuplexIOQwenDecoderLayer(nn.Module):
         hidden_states: Tensor,
         residual: Tensor | None,
         positions: Tensor,
+        cos_sin_cache: Tensor,
         logical_positions: Tensor,
         key_active: Tensor,
         request_epochs: Tensor,
         text_ordinals: Tensor,
         audio_positions: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if residual is not None:
+            # Training rounds the previous MLP residual sum before the next norm.
+            hidden_states = hidden_states + residual
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn.forward_with_key_activity(
                 hidden_states,
@@ -1581,6 +1169,7 @@ class DuplexIOQwenDecoderLayer(nn.Module):
         else:
             hidden_states = self.self_attn(
                 positions,
+                cos_sin_cache,
                 logical_positions,
                 hidden_states,
                 key_active,
@@ -1628,6 +1217,11 @@ class DuplexIOQwenModel(nn.Module):
         config = vllm_config.model_config.hf_text_config
         self.config = config
         self.vocab_size = config.vocab_size
+        self.rotary_emb = DuplexIORotaryEmbedding(
+            int(config.head_dim * config.rope_parameters.get("partial_rotary_factor", 1.0)),
+            config.max_position_embeddings,
+            vllm_config.model_config.dtype,
+        )
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
@@ -1653,7 +1247,7 @@ class DuplexIOQwenModel(nn.Module):
             )
         )
         self.norm = (
-            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            DuplexIORMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             if get_pp_group().is_last_rank
             else PPMissingLayer()
         )
@@ -1683,6 +1277,7 @@ class DuplexIOQwenModel(nn.Module):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(
                 positions=positions,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 hidden_states=hidden_states,
                 residual=residual,
                 key_active=key_active,
@@ -1691,12 +1286,12 @@ class DuplexIOQwenModel(nn.Module):
                 text_ordinals=text_ordinals,
                 audio_positions=audio_positions,
             )
+        assert residual is not None
         if not get_pp_group().is_last_rank:
-            assert residual is not None
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
-        return self.norm(hidden_states, residual)[0]
+        return self.norm(hidden_states + residual)
 
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(
@@ -1716,8 +1311,6 @@ __all__ = [
     "DuplexIOQwenGatedDeltaNetAttention",
     "DuplexIOQwenModel",
     "duplexio_compact_key_visible",
-    "duplexio_primary_compact_slots",
-    "duplexio_primary_write_slots",
+    "duplexio_audio_write_slots",
     "update_duplexio_attention_metadata",
-    "update_duplexio_graph_block_mask",
 ]

@@ -11,6 +11,26 @@ import torch.nn as nn
 from torch import Tensor
 
 
+class ContinuousAudioRepresentation(nn.Module):
+    """Exported normalization of Pocket Mimi's continuous decoder latents."""
+
+    def __init__(self, embedding_dim: int) -> None:
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.register_buffer(
+            "embedding_mean", torch.zeros(embedding_dim, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "embedding_scale", torch.ones(embedding_dim, dtype=torch.float32)
+        )
+
+    def normalize(self, latent: Tensor) -> Tensor:
+        return (latent - self.embedding_mean) / self.embedding_scale
+
+    def denormalize(self, latent: Tensor) -> Tensor:
+        return latent * self.embedding_scale + self.embedding_mean
+
+
 class MimiEmbedding(nn.Module):
     """Sum one learned embedding table per delayed Mimi codebook."""
 

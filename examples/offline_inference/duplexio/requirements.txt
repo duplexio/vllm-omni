@@ -1,0 +1,8 @@
+# The streaming Nemotron encoder is newer than Transformers 5.15.
+transformers @ git+https://github.com/huggingface/transformers.git@b3d7e8c9d4e078a5e6c09a9d67e22dcadc2df4b8
+vllm==0.26.0
+pytest
+pytest-asyncio
+flash-linear-attention==0.5.2
+librosa>=0.11
+wandb

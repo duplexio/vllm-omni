@@ -154,7 +154,7 @@ def build_engine_core_request_from_tokens(
         prompt_embeds=prompt_embeds,
         resumable=resumable,
         additional_information=additional_info_payload,
-        model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
+        model_intermediate_buffer=serialize_additional_information(model_intermediate_buffer),
     )
 
 
@@ -909,7 +909,7 @@ class Orchestrator:
                         idle = False
                     else:
                         try:
-                            raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
+                            raw_outputs = pool.poll_llm_raw_output(replica_id)
                             if raw_outputs is None:
                                 continue
 

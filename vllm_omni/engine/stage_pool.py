@@ -1079,13 +1079,6 @@ class StagePool:
 
     # ---- Stage-local polling ----
 
-    async def _poll_stage_raw(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
-        """Pull raw EngineCoreOutputs from a stage replica without processing."""
-        outputs = await client.get_output_async()
-        if not outputs.outputs:
-            return None
-        return outputs
-
     async def process_llm_raw_outputs(
         self,
         replica_id: int,
@@ -1117,13 +1110,11 @@ class StagePool:
 
         return processed.request_outputs
 
-    async def poll_llm_raw_output(
+    def poll_llm_raw_output(
         self,
         replica_id: int,
-        *,
-        timeout_s: float = 0.001,
     ) -> EngineCoreOutputs | None:
-        """Poll raw EngineCore outputs from one LLM replica once."""
+        """Read one ready output; only the owning loop waits when all are idle."""
         if not self.is_replica_available(replica_id):
             return None
         raw_client = self.clients[replica_id]
@@ -1131,17 +1122,11 @@ class StagePool:
             return None
         client = cast(StagePoolLLMClient, raw_client)
         try:
-            return await asyncio.wait_for(
-                self._poll_stage_raw(client),
-                timeout=timeout_s,
-            )
-        except asyncio.TimeoutError:
-            return None
-        except asyncio.CancelledError:
-            raise
+            outputs = client.get_output_nowait()
+            return outputs if outputs is not None and outputs.outputs else None
         except Exception:
             logger.exception(
-                "[StagePool] _poll_stage_raw failed for stage-%s replica-%s",
+                "[StagePool] Output poll failed for stage-%s replica-%s",
                 self.stage_id,
                 replica_id,
             )

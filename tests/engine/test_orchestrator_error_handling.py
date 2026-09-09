@@ -73,9 +73,9 @@ def orchestrator_factory():
 
 
 class FakeDeadLLMStageClient(FakeStageClient):
-    """LLM stage client that raises EngineDeadError on get_output_async."""
+    """LLM stage client that raises EngineDeadError on get_output_nowait."""
 
-    async def get_output_async(self):
+    def get_output_nowait(self):
         raise EngineDeadError("Stage-0 engine core is dead")
 
 

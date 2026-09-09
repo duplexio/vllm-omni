@@ -20,7 +20,7 @@ def _write_checkpoint(tmp_path) -> None:
         json.dumps(
             {
                 "format": "duplexio_vllm",
-                "version": 3,
+                "version": 5,
                 "weight_files": ["model.safetensors"],
                 "voice_ids": ["alice"],
             }
