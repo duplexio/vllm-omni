@@ -88,7 +88,7 @@ async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
             max_session_rows=args.max_session_rows,
             max_calls=args.max_tool_calls,
         )
-    link = ActorLink(args.trainer, f"{socket.gethostname()}-gpu{device}")
+    link = ActorLink(args.trainer, f"{socket.gethostname()}-gpu{device}", str(args.inputs.resolve()))
     gate = RolloutGate(version=args.initial_version)
     sent = 0
     keys = TRAJECTORY_KEYS + (("predictor_hiddens",) if args.record_hiddens else ())

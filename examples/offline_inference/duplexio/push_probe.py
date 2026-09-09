@@ -109,7 +109,8 @@ def main() -> None:
     ) / 1024**3
     pool = RolloutPool(args.prepared, args.export)
     coordinator = Coordinator(port=args.port, expected_actors=args.actors,
-                              device=torch.device("cuda"), timeout_seconds=args.timeout)
+                              device=torch.device("cuda"), timeout_seconds=args.timeout,
+                              pool=str(args.prepared.resolve()))
     print(json.dumps({"endpoint": f"tcp://{coordinator.host}:{args.port}", "tensors": len(plan),
                       "payload_gib": payload_gib}), flush=True)
     deadline = time.monotonic() + args.timeout
