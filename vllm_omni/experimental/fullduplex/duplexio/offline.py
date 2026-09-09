@@ -263,7 +263,7 @@ async def rollout_conversation(
         recorded_frames = min(frame_count, user_end + 1 + first_turn.margin_frames)
     else:
         recorded_frames = frame_count
-    expected_segments = prefix_segments  # counted as segments are submitted
+    submitted_segments = 0  # every append yields exactly one output
     live_rows_submitted = 0
     submit_done = asyncio.Event()
     live_final_submitted = False
@@ -283,11 +283,11 @@ async def rollout_conversation(
     last_tool_sequence = 0  # the engine re-reports a call every frame until the next one
 
     async def append(payload: dict[str, Any], *, final: bool = False) -> None:
-        nonlocal expected_segments
+        nonlocal submitted_segments
         await pending.acquire()
         await gate.open.wait()
         gate.submitted()
-        expected_segments += 1
+        submitted_segments += 1
         await engine.append_duplex_input_async(
             session_id,
             mode="append_audio_chunk",
@@ -418,17 +418,26 @@ async def rollout_conversation(
         # has returned, so poll briefly and only fail when segments are outstanding.
         while (
             not submit_done.is_set()
-            or completed < expected_segments
+            or completed < submitted_segments
             or any(not task.done() for task in tool_tasks)
         ):
             outputs = await engine.collect_duplex_data_plane_outputs_async(
                 duplex_resource_request_id(fence, "stage0"), timeout=5.0,
             )
             if not outputs:
-                if completed < expected_segments:
+                if completed < submitted_segments:
                     idle_since = idle_since or time.monotonic()
                     if time.monotonic() - idle_since > 120.0:
-                        raise TimeoutError("Timed out waiting for a queued input segment")
+                        raise TimeoutError(
+                            f"Timed out waiting for a queued input segment: session={session_id} "
+                            f"completed={completed}/{submitted_segments} live_submitted={live_rows_submitted} "
+                            f"live_completed={live_completed} recorded={recorded_frames} "
+                            f"max_live={max_live_rows} last_agent_row={last_agent_row} "
+                            f"submit_done={submit_done.is_set()} final_submitted={live_final_submitted} "
+                            f"tool_tasks={sum(not task.done() for task in tool_tasks)} "
+                            f"gate_open={gate.open.is_set()} prefix_segments={prefix_segments} "
+                            f"answered={answered_calls}"
+                        )
                 continue
             idle_since = None
             for output in outputs:
@@ -467,6 +476,7 @@ async def rollout_conversation(
         "runtime_config": runtime,
         "metadata": conversation.metadata,
         "recorded_frames": recorded_frames,
+        "submitted_segments": submitted_segments,
         "elapsed_seconds": time.perf_counter() - started,
         "prefill_seconds": prefill_finished - started,
         "decode_seconds": decode_finished - prefill_finished,
