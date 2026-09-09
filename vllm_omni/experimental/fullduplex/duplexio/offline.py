@@ -369,7 +369,7 @@ async def rollout_conversation(
 
     async def answer(call: dict[str, Any]) -> None:
         assert tools is not None
-        nonlocal expected_segments, tool_rows_budget, answered_calls
+        nonlocal tool_rows_budget, answered_calls
         if answered_calls >= tools.max_calls:
             return
         answered_calls += 1
@@ -392,7 +392,6 @@ async def rollout_conversation(
         tool_rows_budget -= len(token_ids)
         for offset in range(0, len(token_ids), SYSTEM_INPUT_CHUNK_FRAMES):
             chunk = token_ids[offset : offset + SYSTEM_INPUT_CHUNK_FRAMES]
-            expected_segments += 1
             await append(
                 {
                     "type": "audio",
@@ -413,6 +412,7 @@ async def rollout_conversation(
         nonlocal last_tool_sequence, last_agent_row
         await first_submitted.wait()
         completed = 0
+        live_completed = 0  # segments that consumed a live row (prefill and tool results do not)
         idle_since: float | None = None
         # Tool tasks may still be waiting on their LLM after every queued segment
         # has returned, so poll briefly and only fail when segments are outstanding.
@@ -440,11 +440,11 @@ async def rollout_conversation(
                     prefill_finished = time.perf_counter()
                 gate.collected()
                 pending.release()
-                if first_turn is not None and output.multimodal_output["agent_audio_token_ids"].numel():
+                if output.multimodal_output["agent_audio_token_ids"].numel():
+                    live_completed += 1
                     agent_token = int(output.multimodal_output["agent_token_id"].reshape(-1)[0])
-                    if agent_token != first_turn.silence_token_id:
-                        # Predictions follow the consumed live rows one to one.
-                        last_agent_row = max(last_agent_row, completed - prefix_segments - 1)
+                    if first_turn is not None and agent_token != first_turn.silence_token_id:
+                        last_agent_row = live_completed - 1
                 if tools is not None:
                     for call in decode_tool_calls(output.multimodal_output.get("tool_call_json")):
                         if call["sequence"] <= last_tool_sequence:
