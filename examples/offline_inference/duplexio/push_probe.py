@@ -60,6 +60,21 @@ def replay_metrics(model, pool: RolloutPool, trajectory, version: int) -> dict[s
     return {"current_version": stats(current), "older_versions": stats(~current)}
 
 
+def load_training_checkpoint(config_path: Path, checkpoint: Path):
+    """Build the training model and load one FSDP checkpoint, as export does."""
+    import torch.distributed.checkpoint as dcp
+    from duplexio.config import load_config
+    from duplexio.models.duplexio import DuplexIOModel
+
+    model_config = load_config(str(config_path)).model.model_copy(deep=True)
+    model_config.gradient_checkpointing = False
+    model = DuplexIOModel.load(model_config).eval()
+    state = {"model": model.state_dict()}
+    dcp.load(state, checkpoint_id=str(checkpoint / "pytorch_model_fsdp_0"), no_dist=True)
+    model.load_state_dict(state["model"], strict=True)
+    return model
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("export", type=Path, help="Native export the actors started from")
@@ -69,17 +84,22 @@ def main() -> None:
     parser.add_argument("--actors", type=int, default=1)
     parser.add_argument("--trajectories", type=int, default=3, help="Trajectories fully under the pushed version")
     parser.add_argument("--noise", type=float, default=0.02, help="Relative perturbation of every trainable tensor")
+    parser.add_argument("--checkpoint", type=Path, help="Push this FSDP training checkpoint instead of the export's weights")
+    parser.add_argument("--config", type=Path, help="Training config matching --checkpoint")
     parser.add_argument("--timeout", type=float, default=1200.0)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True)
 
-    model = load_reference(args.export).cuda().eval()
+    if args.checkpoint is not None:
+        model = load_training_checkpoint(args.config, args.checkpoint).cuda().eval()
+    else:
+        model = load_reference(args.export).cuda().eval()
     model.user_asr.requires_grad_(False)
     model.audio_codec.requires_grad_(False)
     generator = torch.Generator(device="cuda").manual_seed(0)
     with torch.no_grad():
         for param in model.parameters():
-            if param.requires_grad:
+            if param.requires_grad and args.noise > 0:
                 spread = param.float().std() if param.numel() > 1 else param.float().abs().mean()
                 scale = args.noise * spread.clamp_min(1e-6)
                 param.add_((torch.randn(param.shape, generator=generator, device="cuda") * scale).to(param.dtype))
