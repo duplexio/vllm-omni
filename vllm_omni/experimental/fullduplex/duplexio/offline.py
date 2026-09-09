@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 import hashlib
 import time
 from typing import TYPE_CHECKING, Any
@@ -13,12 +14,27 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch import Tensor
 
+from vllm_omni.experimental.fullduplex.duplexio.tool_simulator import ToolSimulator, decode_tool_calls
 from vllm_omni.experimental.fullduplex.duplexio.trajectory import TrajectoryRecorder
 from vllm_omni.experimental.fullduplex.engine.contracts import duplex_resource_request_id
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+
     from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+SYSTEM_INPUT_CHUNK_FRAMES = 128
+
+
+@dataclass
+class ToolParticipant:
+    """Answers the student's tool calls mid-session with simulated results."""
+
+    simulator: ToolSimulator
+    tokenizer: PreTrainedTokenizerBase
+    silence_token_id: int
+    pad_token_id: int
 
 
 class PreparedConversation(BaseModel):
@@ -97,12 +113,16 @@ async def rollout_conversation(
     sampling_config: dict[str, Any],
     seed: int,
     gate: RolloutGate,
+    tools: ToolParticipant | None = None,
 ) -> dict[str, Any]:
     """Run one full prefix followed by causal inputs; never inject agent targets.
 
     The final prefix predicts output zero. Each live input consumes that output
     as feedback and predicts the next output. Thus N live inputs yield N+1
     predictions. Replay stores this contract explicitly, including the last one.
+    With a tool participant, each completed tool call is answered by a
+    simulated result injected as a system-input burst while user audio keeps
+    streaming, exactly as the realtime adapter would.
     """
     session_id = f"opd-{conversation.conversation_id}-{seed}"
     fence = DuplexFence(session_id)
@@ -134,6 +154,10 @@ async def rollout_conversation(
     prefix_frames = len(conversation.system_token_ids)
     prefix_segments = (prefix_frames + 255) // 256
     frame_count = conversation.user_features.shape[0]
+    expected_segments = prefix_segments + frame_count
+    live_final_submitted = False
+    tool_history: list[dict[str, Any]] = []
+    tool_tasks: set[asyncio.Task[None]] = set()
 
     async def append(payload: dict[str, Any], *, final: bool = False) -> None:
         await pending.acquire()
@@ -167,7 +191,13 @@ async def rollout_conversation(
                     "decode_audio": False,
                 }
             )
+        nonlocal live_final_submitted
         for frame, user_token in enumerate(conversation.user_token_ids.tolist()):
+            final = frame + 1 == frame_count
+            if final:
+                # Late tool results cannot follow the final live frame.
+                await asyncio.gather(*tool_tasks)
+                live_final_submitted = True
             await append(
                 {
                     "format": "duplexio_features",
@@ -175,13 +205,56 @@ async def rollout_conversation(
                     "user_token_id": user_token,
                     "decode_audio": False,
                 },
-                final=frame + 1 == frame_count,
+                final=final,
+            )
+
+    def transcript() -> str:
+        assert tools is not None
+        text_ids = torch.cat([segment["text_ids"] for segment in recorder.segments])
+        lines = []
+        for column, speaker in ((1, "user"), (2, "assistant")):
+            ids = text_ids[:, column]
+            ids = ids[(ids != tools.silence_token_id) & (ids != tools.pad_token_id)]
+            if ids.numel():
+                lines.append(f"{speaker}: {tools.tokenizer.decode(ids.tolist())}")
+        return "\n".join(lines)
+
+    async def answer(call: dict[str, Any]) -> None:
+        assert tools is not None
+        nonlocal expected_segments
+        result = await tools.simulator.execute(
+            call,
+            tools=conversation.tools,
+            assistant_system_prompt=str(conversation.metadata.get("teacher_system", "")),
+            transcript=transcript(),
+            history=tool_history,
+        )
+        if live_final_submitted:
+            return
+        token_ids = tools.tokenizer.encode(f"<tool_response>\n{result}\n</tool_response>", add_special_tokens=False)
+        for offset in range(0, len(token_ids), SYSTEM_INPUT_CHUNK_FRAMES):
+            chunk = token_ids[offset : offset + SYSTEM_INPUT_CHUNK_FRAMES]
+            expected_segments += 1
+            await append(
+                {
+                    "type": "audio",
+                    "audio": "",
+                    "format": "pcm_f32le",
+                    "sample_rate_hz": 24000,
+                    "frame_size": 1920,
+                    "frame_count": len(chunk),
+                    "valid_samples": len(chunk) * 1920,
+                    "duplexio_system_input": True,
+                    "duplexio_system_input_final": offset + len(chunk) == len(token_ids),
+                    "duplexio_system_token_ids": chunk,
+                    "decode_audio": False,
+                }
             )
 
     async def collect() -> tuple[float, float]:
         await first_submitted.wait()
         completed = 0
-        while completed < prefix_segments + frame_count:
+        while completed < expected_segments or any(not task.done() for task in tool_tasks):
             outputs = await engine.collect_duplex_data_plane_outputs_async(
                 duplex_resource_request_id(fence, "stage0"), timeout=120.0,
             )
@@ -196,6 +269,11 @@ async def rollout_conversation(
                     prefill_finished = time.perf_counter()
                 gate.collected()
                 pending.release()
+                if tools is not None:
+                    for call in decode_tool_calls(output.multimodal_output.get("tool_call_json")):
+                        task = asyncio.create_task(answer(call))
+                        tool_tasks.add(task)
+                        task.add_done_callback(tool_tasks.discard)
         return prefill_finished, time.perf_counter()
 
     try:
@@ -229,6 +307,7 @@ async def rollout_conversations(
     sink: TrajectorySink,
     gate: RolloutGate,
     passes: int | None = 1,
+    tools: ToolParticipant | None = None,
 ) -> None:
     """Continuously refill independent sessions; no cross-conversation barrier.
 
@@ -257,6 +336,7 @@ async def rollout_conversations(
                 sampling_config=sampling_config,
                 seed=conversation_seed(seed + 1_000_003 * pass_index, conversation.conversation_id),
                 gate=gate,
+                tools=tools,
             )
             await sink(index, trace)
 
