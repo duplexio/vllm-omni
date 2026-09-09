@@ -45,6 +45,7 @@ class ToolParticipant:
     max_session_rows: int = 4096
     max_calls: int = 8
     max_result_tokens: int = 400
+    reserved_rows: int = 512  # session rows kept for tool results
 
 
 class PreparedConversation(BaseModel):
@@ -74,6 +75,36 @@ class PreparedConversation(BaseModel):
         if (tokens < 0).any() or any(token < 0 for token in self.system_token_ids):
             raise ValueError("Input token IDs must be nonnegative")
         return self
+
+
+@dataclass
+class FirstTurnPolicy:
+    """Roll out the user's first turn only, then let the agent finish.
+
+    After the first user utterance (plus `margin_frames`) the actor streams the
+    pool's encoded silence and stops once the agent has emitted nothing for
+    `stop_after_silence_frames` with no tool call pending, or after
+    `max_response_frames`. Recorded user turns beyond the first would answer the
+    dataset's agent, not the student's, so they are never played.
+    """
+
+    silence_features: Tensor  # (frames, ASR dim) fp32, cycled
+    silence_token_id: int
+    pad_token_id: int
+    turn_gap_frames: int = 12
+    margin_frames: int = 12
+    stop_after_silence_frames: int = 37
+    max_response_frames: int = 750
+    min_response_frames: int = 125  # give a silent agent this long to start speaking
+
+
+def first_utterance_end(user_token_ids: Tensor, silence_token_id: int, pad_token_id: int, gap_frames: int) -> int:
+    """Row of the last token of the first user utterance (the whole recording if none)."""
+    rows = ((user_token_ids != silence_token_id) & (user_token_ids != pad_token_id)).nonzero().flatten()
+    if rows.numel() == 0:
+        return int(user_token_ids.numel()) - 1
+    breaks = (rows[1:] - rows[:-1] > gap_frames).nonzero().flatten()
+    return int(rows[int(breaks[0])] if breaks.numel() else rows[-1])
 
 
 @dataclass(frozen=True)
@@ -183,6 +214,7 @@ async def rollout_conversation(
     seed: int,
     gate: RolloutGate,
     tools: ToolParticipant | None = None,
+    first_turn: FirstTurnPolicy | None = None,
 ) -> dict[str, Any]:
     """Run one full prefix followed by causal inputs; never inject agent targets.
 
@@ -223,20 +255,39 @@ async def rollout_conversation(
     prefix_frames = len(conversation.system_token_ids)
     prefix_segments = (prefix_frames + 255) // 256
     frame_count = conversation.user_features.shape[0]
-    expected_segments = prefix_segments + frame_count
+    if first_turn is not None:
+        user_end = first_utterance_end(
+            conversation.user_token_ids, first_turn.silence_token_id, first_turn.pad_token_id,
+            first_turn.turn_gap_frames,
+        )
+        recorded_frames = min(frame_count, user_end + 1 + first_turn.margin_frames)
+    else:
+        recorded_frames = frame_count
+    expected_segments = prefix_segments  # counted as segments are submitted
+    live_rows_submitted = 0
+    submit_done = asyncio.Event()
     live_final_submitted = False
+    last_agent_row = -1  # live row index of the last emitted agent token
     tool_history: list[dict[str, Any]] = []
     tool_tasks: set[asyncio.Task[None]] = set()
     # One row of slack: the engine appends the sampled scheduler token, so a
     # request filled exactly to max_model_len fails its length assertion.
-    tool_rows_budget = (tools.max_session_rows - 1 - prefix_frames - frame_count) if tools else 0
+    max_live_rows = frame_count
+    tool_rows_budget = 0
+    if tools is not None:
+        tool_rows_budget = min(tools.reserved_rows, tools.max_session_rows - 1 - prefix_frames - recorded_frames)
+        max_live_rows = tools.max_session_rows - 1 - prefix_frames - tool_rows_budget
+    if first_turn is not None:
+        max_live_rows = min(max_live_rows, recorded_frames + first_turn.max_response_frames)
     answered_calls = 0
     last_tool_sequence = 0  # the engine re-reports a call every frame until the next one
 
     async def append(payload: dict[str, Any], *, final: bool = False) -> None:
+        nonlocal expected_segments
         await pending.acquire()
         await gate.open.wait()
         gate.submitted()
+        expected_segments += 1
         await engine.append_duplex_input_async(
             session_id,
             mode="append_audio_chunk",
@@ -265,22 +316,45 @@ async def rollout_conversation(
                     "decode_audio": False,
                 }
             )
-        nonlocal live_final_submitted
-        for frame, user_token in enumerate(conversation.user_token_ids.tolist()):
-            final = frame + 1 == frame_count
+        nonlocal live_final_submitted, live_rows_submitted
+
+        async def live(features: Tensor, user_token: int, *, final: bool) -> None:
+            nonlocal live_final_submitted, live_rows_submitted
             if final:
                 # Late tool results cannot follow the final live frame.
                 await asyncio.gather(*tool_tasks)
                 live_final_submitted = True
+            live_rows_submitted += 1
             await append(
-                {
-                    "format": "duplexio_features",
-                    "features": conversation.user_features[frame : frame + 1],
-                    "user_token_id": user_token,
-                    "decode_audio": False,
-                },
+                {"format": "duplexio_features", "features": features, "user_token_id": user_token,
+                 "decode_audio": False},
                 final=final,
             )
+
+        user_tokens = conversation.user_token_ids.tolist()
+        for frame in range(recorded_frames):
+            final = first_turn is None and frame + 1 == recorded_frames
+            await live(conversation.user_features[frame : frame + 1], user_tokens[frame], final=final)
+        if first_turn is not None:
+            silence = first_turn.silence_features
+            while True:
+                response_rows = live_rows_submitted - recorded_frames
+                quiet_rows = live_rows_submitted - 1 - max(last_agent_row, recorded_frames - 1)
+                tool_pending = any(not task.done() for task in tool_tasks)
+                finished = (
+                    response_rows >= first_turn.min_response_frames
+                    and quiet_rows >= first_turn.stop_after_silence_frames
+                    and not tool_pending
+                )
+                final = finished or live_rows_submitted + 1 >= max_live_rows
+                await live(
+                    silence[live_rows_submitted % silence.shape[0]].unsqueeze(0),
+                    first_turn.silence_token_id,
+                    final=final,
+                )
+                if final:
+                    break
+        submit_done.set()
 
     def transcript() -> str:
         assert tools is not None
@@ -336,13 +410,17 @@ async def rollout_conversation(
             )
 
     async def collect() -> tuple[float, float]:
-        nonlocal last_tool_sequence
+        nonlocal last_tool_sequence, last_agent_row
         await first_submitted.wait()
         completed = 0
         idle_since: float | None = None
         # Tool tasks may still be waiting on their LLM after every queued segment
         # has returned, so poll briefly and only fail when segments are outstanding.
-        while completed < expected_segments or any(not task.done() for task in tool_tasks):
+        while (
+            not submit_done.is_set()
+            or completed < expected_segments
+            or any(not task.done() for task in tool_tasks)
+        ):
             outputs = await engine.collect_duplex_data_plane_outputs_async(
                 duplex_resource_request_id(fence, "stage0"), timeout=5.0,
             )
@@ -362,6 +440,11 @@ async def rollout_conversation(
                     prefill_finished = time.perf_counter()
                 gate.collected()
                 pending.release()
+                if first_turn is not None and output.multimodal_output["agent_audio_token_ids"].numel():
+                    agent_token = int(output.multimodal_output["agent_token_id"].reshape(-1)[0])
+                    if agent_token != first_turn.silence_token_id:
+                        # Predictions follow the consumed live rows one to one.
+                        last_agent_row = max(last_agent_row, completed - prefix_segments - 1)
                 if tools is not None:
                     for call in decode_tool_calls(output.multimodal_output.get("tool_call_json")):
                         if call["sequence"] <= last_tool_sequence:
@@ -383,6 +466,7 @@ async def rollout_conversation(
         "conversation_id": conversation.conversation_id,
         "runtime_config": runtime,
         "metadata": conversation.metadata,
+        "recorded_frames": recorded_frames,
         "elapsed_seconds": time.perf_counter() - started,
         "prefill_seconds": prefill_finished - started,
         "decode_seconds": decode_finished - prefill_finished,
@@ -405,6 +489,7 @@ async def rollout_conversations(
     passes: int | None = 1,
     tools: ToolParticipant | None = None,
     load: Callable[[Any], PreparedConversation] | None = None,
+    first_turn: FirstTurnPolicy | None = None,
 ) -> None:
     """Continuously refill independent sessions; no cross-conversation barrier.
 
@@ -436,6 +521,7 @@ async def rollout_conversations(
                 seed=conversation_seed(seed + 1_000_003 * pass_index, conversation.conversation_id),
                 gate=gate,
                 tools=tools,
+                first_turn=first_turn,
             )
             await sink(index, trace)
 

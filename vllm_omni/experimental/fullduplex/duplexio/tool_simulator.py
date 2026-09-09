@@ -78,12 +78,16 @@ class ToolSimulator:
         api_key: str | None = None,
         timeout: float = 60.0,
         max_tokens: int = 1024,
+        disable_thinking: bool = False,
     ) -> None:
+        """`disable_thinking` passes Qwen's chat-template switch for locally served
+        reasoning models, so results come back as plain JSON."""
         self.model = model
         self.max_tokens = max_tokens
+        self.extra_body = {"chat_template_kwargs": {"enable_thinking": False}} if disable_thinking else {}
         self.client = AsyncOpenAI(
             base_url=base_url,
-            api_key=api_key or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+            api_key=api_key or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY") or "local",
             timeout=timeout,
         )
 
@@ -119,6 +123,7 @@ class ToolSimulator:
             try:
                 response = await self.client.chat.completions.create(
                     model=self.model, messages=messages, max_tokens=self.max_tokens, temperature=0.3,
+                    extra_body=self.extra_body,
                 )
                 content = (response.choices[0].message.content or "").strip()
             except Exception as error:  # network or provider failure: the tool errors

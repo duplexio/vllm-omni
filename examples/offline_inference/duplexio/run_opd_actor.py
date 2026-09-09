@@ -22,6 +22,7 @@ from duplexio.opd_link import JOIN_GROUP, JOINED, PREPARE_UPDATE, READY, SHUTDOW
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.experimental.fullduplex.duplexio.offline import (
+    FirstTurnPolicy,
     RolloutGate,
     ToolParticipant,
     load_pool_shard,
@@ -81,12 +82,23 @@ async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
 
         tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, local_files_only=True)
         tools = ToolParticipant(
-            ToolSimulator(args.tool_model, base_url=args.tool_base_url),
+            ToolSimulator(args.tool_model, base_url=args.tool_base_url, disable_thinking=args.tool_disable_thinking),
             tokenizer,
             silence_token_id=config.silence_token_id,
             pad_token_id=config.pad_token_id,
             max_session_rows=args.max_session_rows,
             max_calls=args.max_tool_calls,
+        )
+    first_turn = None
+    if not args.full_conversation:
+        from safetensors.torch import load_file
+
+        first_turn = FirstTurnPolicy(
+            silence_features=load_file(args.inputs / "silence_features.safetensors")["user_features"].float(),
+            silence_token_id=config.silence_token_id,
+            pad_token_id=config.pad_token_id,
+            stop_after_silence_frames=round(args.stop_after_silence_seconds * config.frame_rate),
+            max_response_frames=round(args.max_response_seconds * config.frame_rate),
         )
     link = ActorLink(args.trainer, f"{socket.gethostname()}-gpu{device}", str(args.inputs.resolve()))
     gate = RolloutGate(version=args.initial_version)
@@ -114,6 +126,7 @@ async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
             passes=None,
             tools=tools,
             load=partial(prepared_from_pool, args.inputs, max_rows=args.max_session_rows),
+            first_turn=first_turn,
         )
     )
     try:
@@ -169,8 +182,16 @@ def main() -> None:
     parser.add_argument("--record-hiddens", action="store_true", help="Also stream predictor states (parity probes only)")
     parser.add_argument("--deploy-config", default="vllm_omni/deploy/duplexio_opd_h100_32.yaml")
     parser.add_argument("--tool-model", help="Answer tool calls with this OpenAI-compatible model; omit to leave calls unanswered")
-    parser.add_argument("--tool-base-url", default="https://openrouter.ai/api/v1")
+    parser.add_argument("--tool-base-url", default="https://openrouter.ai/api/v1",
+                        help="OpenAI-compatible endpoint; a local `vllm serve` works, e.g. http://localhost:8001/v1")
+    parser.add_argument("--tool-disable-thinking", action="store_true",
+                        help="Pass enable_thinking=false to the tool model's chat template (local Qwen3.5)")
     parser.add_argument("--max-session-rows", type=int, default=4096, help="Engine max_model_len / 6 cells")
+    parser.add_argument("--full-conversation", action="store_true",
+                        help="Play the whole recorded user channel instead of the first turn plus the agent's reply")
+    parser.add_argument("--stop-after-silence-seconds", type=float, default=3.0,
+                        help="First-turn mode: end the session after this much agent silence with no call pending")
+    parser.add_argument("--max-response-seconds", type=float, default=60.0)
     parser.add_argument("--max-tool-calls", type=int, default=8, help="Answered calls per conversation")
     args = parser.parse_args()
     if len(set(args.devices)) != len(args.devices) or min(args.devices) < 0:
