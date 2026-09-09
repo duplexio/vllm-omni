@@ -65,7 +65,7 @@ async def rpc(engine: AsyncOmni, method: str, args: tuple[Any, ...], timeout: fl
 async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
     device = args.devices[actor_index]
     config = DuplexIOConfig.from_pretrained(args.checkpoint, local_files_only=True)
-    conversations = load_pool_shard(args.inputs, actor_index, len(args.devices))
+    conversations = load_pool_shard(args.inputs, actor_index, len(args.devices), max_rows=args.max_session_rows)
     if not conversations:
         raise ValueError("Each rollout actor needs at least one conversation")
     engine = AsyncOmni(

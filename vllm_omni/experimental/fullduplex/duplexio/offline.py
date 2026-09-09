@@ -85,14 +85,26 @@ class PoolConversation:
     frames: int
 
 
-def load_pool_shard(pool_dir: Path, shard: int, shards: int) -> list[PoolConversation]:
-    """Return this actor's slice of the pool index, sorted by conversation ID."""
+def load_pool_shard(
+    pool_dir: Path, shard: int, shards: int, *, max_rows: int, reserved_rows: int = 512, min_live_rows: int = 125,
+) -> list[PoolConversation]:
+    """Return this actor's slice of the pool index, sorted by conversation ID.
+
+    Conversations whose prompt leaves fewer than `min_live_rows` (10 s) of audio
+    within the session budget are left out; the count is printed once.
+    """
     index = json.loads((pool_dir / "index.json").read_text())
-    entries = sorted(
-        (PoolConversation(c["conversation_id"], c["file_stem"], c["frames"]) for c in index["conversations"]),
-        key=lambda entry: entry.conversation_id,
-    )
-    return entries[shard::shards]
+    usable, dropped = [], 0
+    for c in index["conversations"]:
+        if c["prefix_frames"] + min_live_rows + reserved_rows > max_rows:
+            dropped += 1
+            continue
+        usable.append(PoolConversation(c["conversation_id"], c["file_stem"], c["frames"]))
+    if dropped and shard == 0:
+        print(json.dumps({"pool": str(pool_dir), "conversations": len(index["conversations"]),
+                          "dropped_for_prompt_length": dropped, "max_rows": max_rows}), flush=True)
+    usable.sort(key=lambda entry: entry.conversation_id)
+    return usable[shard::shards]
 
 
 def prepared_from_pool(
