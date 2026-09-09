@@ -110,7 +110,8 @@ async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
         link.send_trajectory(
             trace["conversation_id"],
             {key: trace[key] for key in keys}
-            | {"elapsed_seconds": trace["elapsed_seconds"], "seed": trace["runtime_config"]["duplexio_sampling_seed"]},
+            | {"elapsed_seconds": trace["elapsed_seconds"], "seed": trace["runtime_config"]["duplexio_sampling_seed"],
+               "recorded_frames": trace["recorded_frames"]},
         )
         sent += 1
 
