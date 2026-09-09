@@ -86,6 +86,8 @@ async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
             tokenizer,
             silence_token_id=config.silence_token_id,
             pad_token_id=config.pad_token_id,
+            max_session_rows=args.max_session_rows,
+            max_calls=args.max_tool_calls,
         )
     link = ActorLink(args.trainer, f"{socket.gethostname()}-gpu{device}")
     gate = RolloutGate(version=args.initial_version)
@@ -168,6 +170,8 @@ def main() -> None:
     parser.add_argument("--deploy-config", default="vllm_omni/deploy/duplexio_opd_h100.yaml")
     parser.add_argument("--tool-model", help="Answer tool calls with this OpenAI-compatible model; omit to leave calls unanswered")
     parser.add_argument("--tool-base-url", default="https://openrouter.ai/api/v1")
+    parser.add_argument("--max-session-rows", type=int, default=4096, help="Engine max_model_len / 6 cells")
+    parser.add_argument("--max-tool-calls", type=int, default=8, help="Answered calls per conversation")
     args = parser.parse_args()
     if len(set(args.devices)) != len(args.devices) or min(args.devices) < 0:
         parser.error("Devices must be distinct nonnegative GPU indices")

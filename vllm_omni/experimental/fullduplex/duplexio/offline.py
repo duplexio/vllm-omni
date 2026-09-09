@@ -7,6 +7,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import hashlib
+import json
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -29,12 +30,20 @@ SYSTEM_INPUT_CHUNK_FRAMES = 128
 
 @dataclass
 class ToolParticipant:
-    """Answers the student's tool calls mid-session with simulated results."""
+    """Answers the student's tool calls mid-session with simulated results.
+
+    `max_session_rows` is the engine's request budget in frame rows
+    (max_model_len / 6 cells); results that would not fit, or arrive after
+    `max_calls` answered calls, are dropped and the call stays unanswered.
+    """
 
     simulator: ToolSimulator
     tokenizer: PreTrainedTokenizerBase
     silence_token_id: int
     pad_token_id: int
+    max_session_rows: int = 4096
+    max_calls: int = 8
+    max_result_tokens: int = 400
 
 
 class PreparedConversation(BaseModel):
@@ -158,6 +167,8 @@ async def rollout_conversation(
     live_final_submitted = False
     tool_history: list[dict[str, Any]] = []
     tool_tasks: set[asyncio.Task[None]] = set()
+    tool_rows_budget = (tools.max_session_rows - prefix_frames - frame_count) if tools else 0
+    answered_calls = 0
 
     async def append(payload: dict[str, Any], *, final: bool = False) -> None:
         await pending.acquire()
@@ -221,7 +232,10 @@ async def rollout_conversation(
 
     async def answer(call: dict[str, Any]) -> None:
         assert tools is not None
-        nonlocal expected_segments
+        nonlocal expected_segments, tool_rows_budget, answered_calls
+        if answered_calls >= tools.max_calls:
+            return
+        answered_calls += 1
         result = await tools.simulator.execute(
             call,
             tools=conversation.tools,
@@ -229,9 +243,16 @@ async def rollout_conversation(
             transcript=transcript(),
             history=tool_history,
         )
-        if live_final_submitted:
-            return
         token_ids = tools.tokenizer.encode(f"<tool_response>\n{result}\n</tool_response>", add_special_tokens=False)
+        if len(token_ids) > tools.max_result_tokens:
+            result = json.dumps({"error": "tool result too long for the session"})
+            token_ids = tools.tokenizer.encode(f"<tool_response>\n{result}\n</tool_response>", add_special_tokens=False)
+        fits = len(token_ids) <= tool_rows_budget
+        print(json.dumps({"session": session_id, "tool": call["name"], "result_tokens": len(token_ids),
+                          "injected": fits and not live_final_submitted}), flush=True)
+        if live_final_submitted or not fits:
+            return
+        tool_rows_budget -= len(token_ids)
         for offset in range(0, len(token_ids), SYSTEM_INPUT_CHUNK_FRAMES):
             chunk = token_ids[offset : offset + SYSTEM_INPUT_CHUNK_FRAMES]
             expected_segments += 1
