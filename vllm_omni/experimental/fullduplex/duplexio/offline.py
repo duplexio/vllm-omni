@@ -227,7 +227,9 @@ async def rollout_conversation(
     live_final_submitted = False
     tool_history: list[dict[str, Any]] = []
     tool_tasks: set[asyncio.Task[None]] = set()
-    tool_rows_budget = (tools.max_session_rows - prefix_frames - frame_count) if tools else 0
+    # One row of slack: the engine appends the sampled scheduler token, so a
+    # request filled exactly to max_model_len fails its length assertion.
+    tool_rows_budget = (tools.max_session_rows - 1 - prefix_frames - frame_count) if tools else 0
     answered_calls = 0
     last_tool_sequence = 0  # the engine re-reports a call every frame until the next one
 
