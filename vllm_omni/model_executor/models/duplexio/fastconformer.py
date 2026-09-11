@@ -19,12 +19,15 @@ NUM_LOOKAHEAD_TOKENS = 0
 WORD_START = "\u2581"
 # A word is normally released when the next one starts, but the last word before
 # a pause has no successor — and is the one the agent needs to take its turn, so
-# silence ends it instead. The threshold has to clear the longest silence *inside*
-# a word: measured on a trajectory turn, gaps between a word's own pieces reach 6
-# frames (trailing punctuation is the worst case), so 8 frames (640 ms) releases
-# whole words only, and still lands inside the delay range training samples for
-# this stream.
-WORD_END_SILENCE_FRAMES = 8
+# silence ends it instead. Measured over 6881 aligned words (300 Emilia clips):
+# waiting longer splits fewer words across two releases, which matters because a
+# split re-encodes as Qwen ids the backbone never saw for that word (1.5% of
+# words at 4 frames, 3.9% at 3, 18.5% at 1), but it also delays the whole stream.
+# Training placed a word at word_end + first-piece emission latency (p50 3
+# frames, support ≤13); a streaming decoder cannot beat last-piece + this wait,
+# which is p50 8 / p90 12 frames here — inside that support, where 8 frames
+# (p50 12 / p90 16) left half the words past anything training showed.
+WORD_END_SILENCE_FRAMES = 4
 
 
 @dataclass
