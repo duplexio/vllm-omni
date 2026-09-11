@@ -69,7 +69,6 @@ def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
         frames_seen=100_000,
         audio_position=99_000,
         active_text_tokens=250_000,
-        cache_epoch=91,
     )
 
     fork = state.fork()

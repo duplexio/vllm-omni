@@ -2,13 +2,49 @@
 
 Semantic equality is required at the **recorded-feature boundary**; small measured
 numerical differences are accepted. Earlier exact-equality results below predate
-the recurrent-decode simplification. OPD optimizer updates remain
+the recurrent-decode simplification and the paged full-attention simplification
+(2026-09-10), which reduces full attention to one paged FlexAttention call per
+layer plus a query-local diagonal merge and no longer rounds like training's
+dense matmul. OPD optimizer updates remain
 disabled. This does not certify raw-audio encoding, other compiler stacks,
 tensor parallelism, or the complete rollout/teacher/learner update loop.
 
 Both worktrees contain uncommitted integration changes. The checks use the
 actual DuplexIO training code on main (base commit
 `751cf4f24d9c4f7df3b1271f8f4364bda1c679bc`), not the former isolated prototype.
+
+## Paged full attention, 2026-09-10
+
+Full attention is now one paged FlexAttention call per layer over the native
+cache, plus a query-local diagonal merged with the softmax normalizer. The
+fork-local attention path is gone: the hand-written self/history merge module,
+the runner hook, cache epochs, the K-vector position tail, four model-forward
+arguments and four graph buffers were deleted (28 files, 1,062 insertions,
+2,003 deletions). Sessions address the cache themselves — audio in a ring at
+`frame % audio_ring_frames`, text appended one slot per emitted cell — so
+vLLM's own block tables, batching and CUDA graphs run unmodified.
+
+Three real-input trajectories (882 predictions) gave mean conditional agent KL
+0.00029-0.00036, maximum KL 0.00217-0.00369, top-1 agreement 0.979-0.986 and
+worst emitted-token log-probability difference 0.077-0.099 across repeated runs.
+The pre-refactor path on the same conversations measured mean 0.00032, maximum
+0.00402, top-1 0.993 and 0.114; its first prediction was exact, this one is not.
+Packed replay of the same trajectories gives relative L2 0.0133-0.0149 per
+conversation. Bit-exactness with training's dense matmul was given up
+deliberately; these differences are accepted, and no long-context OPD stability
+claim is made. Cached prefill/decode still matches packed training exactly for
+the recurrent layers.
+
+Throughput is unchanged. Alternating passes on one eight-H100 node with the
+256-conversation fixture, three warmed rounds each, measured 2,469/2,497/2,508
+and 2,517/2,538/2,526 live frames/s before versus 2,433/2,470/2,468 and
+2,488/2,500/2,496 after: 1.1% lower, within the spread between nodes. The
+compact scan bound still assumes four emitted text slots per frame where
+sessions emit roughly one, which is the remaining page-scan headroom; tightening
+it would reinstate the per-request slot state this change removed. The GPU suite
+passes 211 tests with 2 skips.
+
+Logs: `/dcai/users/thuand/duplexio-vllm-simplify-20260910/run_503325/`.
 
 ## Recurrent decode, 2026-09-08
 

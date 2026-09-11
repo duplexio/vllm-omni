@@ -8,6 +8,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
 
+import torch
+from torch import Tensor
 from typing_extensions import Self
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.utils.math_utils import cdiv
@@ -61,6 +63,10 @@ class DuplexIOKVLayout:
         return cdiv(self.audio_slots, self.block_size) * self.block_size
 
     @property
+    def text_base_page(self) -> int:
+        return self.persistent_text_base // self.block_size
+
+    @property
     def max_persistent_text_tokens(self) -> int:
         return self.max_frames * DUPLEXIO_NUM_TEXT_CELLS
 
@@ -72,15 +78,6 @@ class DuplexIOKVLayout:
     def max_blocks(self) -> int:
         return cdiv(self.max_compact_slots, self.block_size)
 
-    def live_compact_slots(self, active_text_tokens: int) -> int:
-        """Slots Flex must scan for the accepted text plus one frame."""
-        assert 0 <= active_text_tokens <= self.max_persistent_text_tokens
-        return self.persistent_text_base + min(
-            active_text_tokens + DUPLEXIO_NUM_TEXT_CELLS,
-            self.max_persistent_text_tokens,
-        )
-
-
     def audio_slot(self, audio_position: int, audio_cell: int) -> int:
         assert 0 <= audio_cell < self.num_audio_cells
         return (
@@ -90,6 +87,111 @@ class DuplexIOKVLayout:
     def persistent_text_slot(self, text_ordinal: int) -> int:
         assert 0 <= text_ordinal < self.max_persistent_text_tokens
         return self.persistent_text_base + text_ordinal
+
+
+class DuplexIOFrameMetadata:
+    """Per-token cache addressing for one model step.
+
+    A cell's slot decides its position, so nothing has to be stored alongside
+    the key: an audio slot is the ring residue of its frame, a text slot is
+    dense in emission order. One instance is shared by every full-attention
+    layer, which keeps the addressing and the attention mask in one place.
+
+    Buffers are sized for the largest batch and keep stable addresses for
+    CUDA-graph replay. Whatever the current batch does not cover stays inert,
+    so padded graph tokens neither write a slot nor see a key.
+    """
+
+    def __init__(
+        self,
+        layout: DuplexIOKVLayout,
+        max_tokens: int,
+        device: torch.device,
+    ) -> None:
+        self.layout = layout
+        self.cell = torch.arange(max_tokens, device=device) % DUPLEXIO_NUM_CELLS
+        self.key_active = torch.ones(max_tokens, dtype=torch.bool, device=device)
+        self.text_ordinal = torch.zeros(max_tokens, dtype=torch.int32, device=device)
+        self.text_last = torch.zeros(max_tokens, dtype=torch.int32, device=device)
+        self.audio_first = torch.ones(max_tokens, dtype=torch.int32, device=device)
+        self.audio_last = torch.full((max_tokens,), -1, dtype=torch.int32, device=device)
+        self.filled = 0
+
+    def update(
+        self,
+        *,
+        key_active: Tensor,
+        text_ordinal: Tensor,
+        text_last: Tensor,
+        audio_first: Tensor,
+        audio_last: Tensor,
+    ) -> None:
+        """Install this step's cells, one row of each tensor per token."""
+        tokens = key_active.shape[0]
+        if tokens < self.filled:
+            self.reset(tokens, self.filled)
+        self.filled = tokens
+        self.key_active[:tokens].copy_(key_active)
+        self.text_ordinal[:tokens].copy_(text_ordinal)
+        self.text_last[:tokens].copy_(text_last)
+        self.audio_first[:tokens].copy_(audio_first)
+        self.audio_last[:tokens].copy_(audio_last)
+
+    def reset(self, start: int = 0, end: int | None = None) -> None:
+        """Make tokens inert: no slot to write, no key in the window."""
+        region = slice(start, end)
+        self.key_active[region] = True
+        self.text_ordinal[region] = 0
+        self.text_last[region] = 0
+        self.audio_first[region] = 1
+        self.audio_last[region] = -1
+        self.filled = min(self.filled, start)
+
+    def write_slots(self, tokens: int) -> Tensor:
+        """Compact slot per cell, -1 for cells that must not enter the cache.
+
+        Audio cells land on their own frame, one past the last frame they see.
+        Text cells land on their emission ordinal; an unemitted cell has ordinal
+        zero and is skipped.
+        """
+        layout = self.layout
+        cell = self.cell[:tokens]
+        audio_last = self.audio_last[:tokens]
+        text_ordinal = self.text_ordinal[:tokens]
+        is_audio = cell >= DUPLEXIO_NUM_TEXT_CELLS
+        audio_slot = (
+            torch.remainder(audio_last + 1, layout.audio_ring_frames) * layout.num_audio_cells
+            + cell
+            - DUPLEXIO_NUM_TEXT_CELLS
+        )
+        stored = torch.where(
+            is_audio,
+            self.key_active[:tokens] & (audio_last >= 0),
+            text_ordinal > 0,
+        )
+        text_slot = layout.persistent_text_base + text_ordinal - 1
+        return torch.where(is_audio, audio_slot, text_slot).masked_fill(~stored, -1)
+
+    def visible(self, batch: Tensor, head: Tensor, query: Tensor, key: Tensor) -> Tensor:
+        """Return whether a query cell sees a compact slot of a prior row.
+
+        Its own cell is merged separately, so no same-row key is visible here.
+        An audio slot's frame is the most recent one with its ring residue; slots
+        that were never written, or that the window has passed, derive a frame
+        below the query's first visible frame.
+        """
+        del batch, head
+        layout = self.layout
+        audio_last = self.audio_last[query]
+        frame = audio_last - torch.remainder(
+            audio_last - torch.div(key, layout.num_audio_cells, rounding_mode="floor"),
+            layout.audio_ring_frames,
+        )
+        audio = (key < layout.audio_slots) & (frame >= self.audio_first[query])
+        text = (key >= layout.persistent_text_base) & (
+            key - layout.persistent_text_base < self.text_last[query]
+        )
+        return audio | text
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -217,8 +319,11 @@ def make_duplexio_kv_cache_spec(
         raise ValueError("DuplexIO FlexAttention does not support quantized KV cache")
     if max_model_len < DUPLEXIO_NUM_CELLS:
         raise ValueError("DuplexIO max_model_len must fit at least one frame")
-    if max_model_len > 2**32:
-        raise ValueError("DuplexIO max_model_len exceeds its uint32 cache metadata")
+    if base.block_size & (base.block_size - 1):
+        raise ValueError(
+            "DuplexIO paged FlexAttention needs a power-of-two KV block size; "
+            f"got {base.block_size}. Pin `block_size` in the deployment config."
+        )
     if audio_window_frames < 0:
         raise ValueError("DuplexIO audio attention window must be non-negative")
     return DuplexIOKVCacheSpec(
@@ -239,6 +344,7 @@ def make_duplexio_kv_cache_spec(
 
 
 __all__ = [
+    "DuplexIOFrameMetadata",
     "DuplexIOKVCacheManager",
     "DuplexIOKVCacheSpec",
     "DuplexIOKVLayout",

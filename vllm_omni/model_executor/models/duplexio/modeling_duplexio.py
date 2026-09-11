@@ -71,12 +71,10 @@ from vllm_omni.model_executor.models.duplexio.pocket_mimi import (
 )
 from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
     DuplexIOQwenModel,
-    update_duplexio_attention_metadata,
 )
 from vllm_omni.model_executor.models.duplexio.row_semantics import (
     DUPLEXIO_NUM_CELLS,
     duplexio_frame_positions,
-    duplexio_logical_positions,
 )
 from vllm_omni.model_executor.models.duplexio.stream_gdn import gdn_cache_dtypes, gdn_cache_shapes
 from vllm_omni.model_executor.models.duplexio.text_sampling import TokenSamplingOptions, content_distribution
@@ -122,7 +120,11 @@ class DuplexIORequestState:
     audio_position: int = 0
     active_text_tokens: int = 0
     tool_call_sequence: int = 0
-    cache_epoch: int = 0
+    # Transcript tokens the RNN-T has produced but the user stream has not
+    # emitted yet, and whether any word has been emitted (all but the first
+    # word of an utterance carries a leading space, as in training).
+    user_text_pending: tuple[int, ...] = ()
+    user_text_started: bool = False
 
     def fork(self) -> DuplexIORequestState:
         """Commit an append only after its model step succeeds."""
@@ -248,37 +250,16 @@ class DuplexIOForConditionalGeneration(
         )
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("duplexio", "key_active"),
-            ("duplexio", "request_epochs"),
             ("duplexio", "text_ordinals"),
-            ("duplexio", "audio_positions"),
+            ("duplexio", "text_last"),
+            ("duplexio", "audio_first"),
+            ("duplexio", "audio_last"),
             ("duplexio", "user_token_id"),
             ("duplexio_replay", "text_ids"),
             ("duplexio_replay", "user_features"),
             ("duplexio_replay", "agent_audio"),
             ("duplexio_replay", "audio_mask"),
         }
-        graph_device = vllm_config.device_config.device
-        graph_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        self.register_buffer(
-            "graph_key_active",
-            torch.ones(graph_tokens, dtype=torch.bool, device=graph_device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "graph_request_epochs",
-            torch.zeros(graph_tokens, dtype=torch.long, device=graph_device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "graph_text_ordinals",
-            torch.zeros(graph_tokens, dtype=torch.long, device=graph_device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "graph_audio_positions",
-            torch.zeros(graph_tokens, dtype=torch.long, device=graph_device),
-            persistent=False,
-        )
         self.pad_token_id = config.pad_token_id
         self.silence_token_id = config.silence_token_id
         if self.pad_token_id is None or self.silence_token_id is None:
@@ -288,6 +269,9 @@ class DuplexIOForConditionalGeneration(
             vllm_config=vllm_config,
             prefix=f"{prefix}.llm" if prefix else "llm",
         )
+        # Cell addressing for the backbone's cache, filled once per step and
+        # read by every full-attention layer.
+        self.frame = self.llm.base_model.model.frame
         hidden_size = self.text_config.hidden_size
         adapter_hidden_size = config.audio_adapter_config.get("hidden_size") or hidden_size
         speaker_dim = config.speaker_lda_dim or config.speaker_embed_dim
@@ -383,9 +367,9 @@ class DuplexIOForConditionalGeneration(
             revision=vllm_config.model_config.revision,
         )
         self._forced_next_token_ids: list[int] | None = None
-        self._next_cache_epoch = 1
-        tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
-        agent_suppressed, tool_suppressed = text_suppression_ids(tokenizer, self.silence_token_id)
+        # Also encodes the streaming RNN-T's user words for the user text stream.
+        self.tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
+        agent_suppressed, tool_suppressed = text_suppression_ids(self.tokenizer, self.silence_token_id)
         self.register_buffer(
             "agent_suppressed_token_ids",
             torch.tensor(agent_suppressed, dtype=torch.long, device=self.llm.channel_emb.device),
@@ -396,63 +380,29 @@ class DuplexIOForConditionalGeneration(
             torch.tensor(tool_suppressed, dtype=torch.long, device=self.llm.channel_emb.device),
             persistent=False,
         )
-        self.tool_call_compiler = ToolCallConstraintCompiler(tokenizer, self.text_config.vocab_size)
+        self.tool_call_compiler = ToolCallConstraintCompiler(self.tokenizer, self.text_config.vocab_size)
         self.set_custom_preprocess(self.preprocess)
         self.set_custom_postprocess(self.postprocess)
 
     def embed_input_ids(self, input_ids: Tensor) -> Tensor:
         return self.llm.base_model.model.embed_input_ids(input_ids)
 
-    def update_attention_metadata(
-        self,
-        attn_metadata: object,
-        request_infos: list[dict[str, Any]],
-    ) -> None:
-        """Expose accepted audio and active-text counts to Flex metadata."""
-        active_text_tokens = []
-        live_audio_frames = []
-        for info in request_infos:
-            state = info.get("duplexio_model_state")
-            accepted_text_tokens = state.active_text_tokens if isinstance(state, DuplexIORequestState) else 0
-            accepted_audio_positions = state.audio_position if isinstance(state, DuplexIORequestState) else 0
-            duplex = info.get("duplex")
-            frame_count = duplex.get("frame_count", 1) if isinstance(duplex, Mapping) else 1
-            assert isinstance(frame_count, int) and frame_count > 0
-            is_text_only = isinstance(duplex, Mapping) and (
-                bool(duplex.get("duplexio_prefill", False)) or bool(duplex.get("duplexio_system_input", False))
-            )
-            active_text_tokens.append(accepted_text_tokens + (frame_count - 1) * len(TEXT_STREAM_NAMES))
-            # The audio ring is keyed by audio position; text-only frames do
-            # not advance audio time and therefore add no live ring entries.
-            live_audio_frames.append(accepted_audio_positions + (0 if is_text_only else frame_count))
-        update_duplexio_attention_metadata(
-            attn_metadata,
-            active_text_tokens,
-            live_audio_frames,
-        )
-
     def update_graph_inputs(
         self,
         request_infos: list[dict[str, Any]],
     ) -> None:
-        """Copy current preprocessed metadata into stable CUDA-graph inputs."""
+        """Install this step's cell addressing at stable device addresses."""
         if not request_infos:
-            self.graph_key_active.fill_(True)
-            self.graph_request_epochs.zero_()
-            self.graph_text_ordinals.zero_()
-            self.graph_audio_positions.zero_()
+            self.frame.reset()
             return
-
         duplex_infos = [info["duplexio"] for info in request_infos]
-        key_active = torch.cat([info["key_active"] for info in duplex_infos])
-        request_epochs = torch.cat([info["request_epochs"] for info in duplex_infos])
-        text_ordinals = torch.cat([info["text_ordinals"] for info in duplex_infos])
-        audio_positions = torch.cat([info["audio_positions"] for info in duplex_infos])
-        token_count = key_active.shape[0]
-        self.graph_key_active[:token_count].copy_(key_active)
-        self.graph_request_epochs[:token_count].copy_(request_epochs)
-        self.graph_text_ordinals[:token_count].copy_(text_ordinals)
-        self.graph_audio_positions[:token_count].copy_(audio_positions)
+        self.frame.update(
+            key_active=torch.cat([info["key_active"] for info in duplex_infos]),
+            text_ordinal=torch.cat([info["text_ordinals"] for info in duplex_infos]),
+            text_last=torch.cat([info["text_last"] for info in duplex_infos]),
+            audio_first=torch.cat([info["audio_first"] for info in duplex_infos]),
+            audio_last=torch.cat([info["audio_last"] for info in duplex_infos]),
+        )
 
     def supports_cudagraph_replay(
         self,
@@ -512,6 +462,21 @@ class DuplexIOForConditionalGeneration(
         if agent_requests:
             for index, request in enumerate(agent_requests):
                 request["embed"]["agent_hidden"] = agent_hidden[index : index + 1]
+
+    def user_text_token_ids(self, words: tuple[str, ...], started: bool) -> tuple[int, ...]:
+        """Encode finished user words the way training's transcript stream does.
+
+        Training assigns Qwen ids to the whole transcript by character overlap,
+        so every word but the utterance's first carries its leading space, which
+        the words already do — the first word of all just drops it.
+        """
+        text = "".join(words)
+        return tuple(
+            self.tokenizer.encode(
+                text if started else text.lstrip(),
+                add_special_tokens=False,
+            )
+        )
 
     @torch.inference_mode()
     def preprocess(
@@ -609,14 +574,12 @@ class DuplexIOForConditionalGeneration(
                 if prefill_final == remaining:
                     raise ValueError("DuplexIO final-prefill flag disagrees with remaining system tokens")
         else:
-            # The input owner supplies user tokens on their actual arrival frame.
-            # There is no learned DuplexIO user emit head in version four.
-            text_ids[:, USER_CELL] = duplex["user_token_id"]
             user_features = (
                 info["embed"]["speech_feat"]
                 if prepared_features
                 else None
             )
+            user_words: tuple[str, ...] = ()
             if user_features is None:
                 waveform = _decode_frame(duplex["payload"], input_ids.device, torch.float32)
                 if waveform.shape[-1] != self.config.frame_size:
@@ -630,7 +593,29 @@ class DuplexIOForConditionalGeneration(
                 )
                 encoded, state.user_asr = self.user_asr.encode_audio_chunk(waveform, asr_state)
                 state.user_asr.resample_tail = tail
+                user_words, state.user_asr.rnnt = self.user_asr.decode_words(
+                    encoded,
+                    state.user_asr.rnnt,
+                )
                 user_features = encoded[0]
+            # An input owner that has its own transcript supplies user tokens on
+            # their actual arrival frame. A live websocket session has none, so
+            # the streaming RNN-T fills the stream the way training does: word
+            # tokens, one per frame, a few frames behind the speech itself.
+            user_token_id = duplex["user_token_id"]
+            if user_token_id is None:
+                if user_words:
+                    state.user_text_pending += self.user_text_token_ids(
+                        user_words,
+                        state.user_text_started,
+                    )
+                    state.user_text_started = True
+                if state.user_text_pending:
+                    user_token_id = state.user_text_pending[0]
+                    state.user_text_pending = state.user_text_pending[1:]
+            text_ids[:, USER_CELL] = (
+                self.silence_token_id if user_token_id is None else user_token_id
+            )
             agent_codes = state.agent_audio_codes.unsqueeze(0)
         with torch.autocast(
             device_type=input_ids.device.type,
@@ -651,9 +636,10 @@ class DuplexIOForConditionalGeneration(
         text_hidden = self.llm.base_model.model.embed_input_ids(text_ids.flatten()).view(
             frame_count, len(TEXT_STREAM_NAMES), -1
         )
-        embeddings, key_active, text_ordinals = self.frame_inputs(
+        embeddings, key_active, text_ordinals, text_last, audio_first, audio_last = self.frame_inputs(
             text_ids, text_hidden, self.llm.channel_emb, user_hidden, agent_hidden,
             self.pad_token_id, self.silence_token_id, state.active_text_tokens,
+            state.audio_position, self.config.audio_attention_window_frames,
             not is_prefill and not is_system_input,
         )
         state.active_text_tokens += active_text_count
@@ -680,19 +666,10 @@ class DuplexIOForConditionalGeneration(
                 "duplexio": {
                     "key_active": key_active,
                     "user_token_id": text_ids[-1, USER_CELL],
-                    "request_epochs": torch.full(
-                        (frame_count * DUPLEXIO_NUM_CELLS,),
-                        state.cache_epoch,
-                        dtype=torch.long,
-                        device=input_ids.device,
-                    ),
                     "text_ordinals": text_ordinals,
-                    "audio_positions": torch.full(
-                        (frame_count * DUPLEXIO_NUM_CELLS,),
-                        state.audio_position,
-                        dtype=torch.long,
-                        device=input_ids.device,
-                    ),
+                    "text_last": text_last,
+                    "audio_first": audio_first,
+                    "audio_last": audio_last,
                 },
             },
         )
@@ -711,30 +688,11 @@ class DuplexIOForConditionalGeneration(
         del input_ids, request_token_spans, request_sample_eligible, kwargs
         if inputs_embeds is None:
             raise ValueError("Native DuplexIO requires precomputed frame embeddings")
-        token_count = inputs_embeds.shape[0]
-        if self.full_cudagraph_enabled or not model_intermediate_buffer:
-            key_active = self.graph_key_active[:token_count]
-            request_epochs = self.graph_request_epochs[:token_count]
-            text_ordinals = self.graph_text_ordinals[:token_count]
-            audio_positions = self.graph_audio_positions[:token_count]
-        else:
-            infos = model_intermediate_buffer or []
-            duplex_infos = [info["duplexio"] for info in infos]
-            # Session-side appends may build these on CPU; the engine runs on
-            # the accelerator.
-            device = inputs_embeds.device
-            key_active = torch.cat([info["key_active"] for info in duplex_infos]).to(device)
-            request_epochs = torch.cat([info["request_epochs"] for info in duplex_infos]).to(device)
-            text_ordinals = torch.cat([info["text_ordinals"] for info in duplex_infos]).to(device)
-            audio_positions = torch.cat([info["audio_positions"] for info in duplex_infos]).to(device)
+        del model_intermediate_buffer
         with torch.profiler.record_function("duplexio.backbone"):
             return self.llm.base_model.model(
                 positions=duplexio_frame_positions(positions),
-                logical_positions=duplexio_logical_positions(positions),
-                key_active=key_active,
-                request_epochs=request_epochs,
-                text_ordinals=text_ordinals,
-                audio_positions=audio_positions,
+                key_active=self.frame.key_active[: inputs_embeds.shape[0]],
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
             )
@@ -1198,10 +1156,6 @@ class DuplexIOForConditionalGeneration(
             raise ValueError("duplexio_tools must be a list of tool definitions")
         if not isinstance(tool_choice, Mapping):
             raise ValueError("duplexio_tool_choice must be an object")
-        cache_epoch = self._next_cache_epoch
-        if cache_epoch >= 2**32:
-            raise RuntimeError("DuplexIO cache epoch space is exhausted")
-        self._next_cache_epoch += 1
         speaker_embedding = pool[embedding_index].to(
             device=device,
             dtype=self.llm.channel_emb.dtype,
@@ -1232,7 +1186,6 @@ class DuplexIOForConditionalGeneration(
                 cast(list[Mapping[str, Any]], tools),
                 tool_choice,
             ),
-            cache_epoch=cache_epoch,
         )
 
     def initial_agent_audio(self, frames: int) -> Tensor:
@@ -1320,24 +1273,55 @@ def frame_inputs(
     pad_token_id: int,
     silence_token_id: int,
     active_text_tokens: int,
+    audio_position: int,
+    audio_window_frames: int,
     audio_active: bool,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Assemble six-cell inputs and packed text ordinals without changing CPU state."""
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Assemble six-cell inputs and cache addressing without changing CPU state.
+
+    Besides the flattened embeddings this returns one entry per cell: whether the
+    cell contributes a key, its 1-based text emission ordinal (0 when it emits
+    nothing), how many text keys strictly earlier rows emitted, and the inclusive
+    range of audio frames the cell may attend. Audio frames are numbered from
+    one in audio time, which only advances on frames carrying real audio, so a
+    text-only append leaves the range frozen and writes no audio key.
+    """
+    frames, device = text_ids.shape[0], text_ids.device
     text_hidden = text_hidden.masked_fill((text_ids == silence_token_id).unsqueeze(-1), 0)
     embeddings = torch.cat(
         (text_hidden + channel_embedding, user_hidden.unsqueeze(1), agent_hidden.unsqueeze(1)), dim=1,
     ).flatten(0, 1)
     text_active = (text_ids != pad_token_id) & (text_ids != silence_token_id)
-    audio_shape = (text_ids.shape[0], 2)
+    audio_shape = (frames, 2)
     key_active = torch.cat(
-        (text_active, torch.full(audio_shape, audio_active, dtype=torch.bool, device=text_ids.device)), dim=1,
+        (text_active, torch.full(audio_shape, audio_active, dtype=torch.bool, device=device)), dim=1,
     ).flatten()
-    ordinals = (text_active.flatten().to(torch.long).cumsum(0) + active_text_tokens).view_as(text_active)
+    ordinals = (
+        text_active.flatten().cumsum(0, dtype=torch.int32) + active_text_tokens
+    ).view_as(text_active)
     text_ordinals = torch.cat(
-        (torch.where(text_active, ordinals, 0), torch.zeros(audio_shape, dtype=torch.long, device=text_ids.device)),
+        (torch.where(text_active, ordinals, 0), torch.zeros(audio_shape, dtype=torch.int32, device=device)),
         dim=1,
     ).flatten()
-    return embeddings, key_active, text_ordinals
+    # A row sees the text its predecessors emitted, never its own siblings'.
+    row_emitted = text_active.sum(1, dtype=torch.int32)
+    text_last = row_emitted.cumsum(0) - row_emitted + active_text_tokens
+    rows = torch.arange(frames, dtype=torch.int32, device=device)
+    audio_last = audio_position + (rows if audio_active else torch.zeros_like(rows))
+    audio_first = (audio_last + int(audio_active) - audio_window_frames).clamp_min(1)
+
+    def per_cell(values: Tensor) -> Tensor:
+        """Give every cell of a row the row's value."""
+        return values[:, None].expand(-1, DUPLEXIO_NUM_CELLS).flatten()
+
+    return (
+        embeddings,
+        key_active,
+        text_ordinals,
+        per_cell(text_last),
+        per_cell(audio_first),
+        per_cell(audio_last),
+    )
 
 
 def _text_sampling(info: Mapping[str, object], suppressed_token_ids: Tensor) -> TokenSamplingOptions:

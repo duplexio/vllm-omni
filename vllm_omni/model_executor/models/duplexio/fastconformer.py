@@ -15,6 +15,16 @@ from torchaudio import functional as AF
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1_280
 NUM_LOOKAHEAD_TOKENS = 0
+# The RNN-T's sub-word vocabulary marks the first piece of every word.
+WORD_START = "\u2581"
+# A word is normally released when the next one starts, but the last word before
+# a pause has no successor — and is the one the agent needs to take its turn, so
+# silence ends it instead. The threshold has to clear the longest silence *inside*
+# a word: measured on a trajectory turn, gaps between a word's own pieces reach 6
+# frames (trailing punctuation is the worst case), so 8 frames (640 ms) releases
+# whole words only, and still lands inside the delay range training samples for
+# this stream.
+WORD_END_SILENCE_FRAMES = 8
 
 
 @dataclass
@@ -26,12 +36,28 @@ class FastConformerStreamState:
 
 
 @dataclass
+class RNNTGreedyState:
+    """Resumable greedy RNN-T decode state for one live utterance."""
+
+    # Prediction-network LSTM state, and its output for the emitted prefix.
+    hidden: Tensor | None = None
+    cell: Tensor | None = None
+    prediction: Tensor | None = None
+    # Sub-word ids of the word still being spoken. A word is released only once
+    # the next one starts, so text the model has already seen never changes.
+    word_token_ids: tuple[int, ...] = ()
+    # Encoder frames since the last emitted sub-word.
+    silent_frames: int = 0
+
+
+@dataclass
 class FastConformerAudioStreamState:
     """Raw-audio frontend and encoder state for one live utterance."""
 
     encoder: FastConformerStreamState = field(
         default_factory=FastConformerStreamState,
     )
+    rnnt: RNNTGreedyState = field(default_factory=RNNTGreedyState)
     audio_buffer: Tensor | None = None
     buffer_start_sample: int = 0
     next_mel_frame: int = 0
@@ -274,10 +300,97 @@ class FastConformerRNNT(nn.Module):
             states,
             FastConformerAudioStreamState(
                 encoder=encoder_state,
+                rnnt=state.rnnt,
                 audio_buffer=audio_buffer,
                 buffer_start_sample=buffer_start,
                 next_mel_frame=next_mel_frame,
             ),
+        )
+
+    def prediction_step(
+        self,
+        token_id: int,
+        hidden: Tensor | None,
+        cell: Tensor | None,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Advance the prediction network by one emitted token."""
+        decoder = self.model.decoder
+        embeddings = decoder.embedding(
+            torch.tensor([[token_id]], dtype=torch.long, device=device)
+        )
+        output, (hidden, cell) = decoder.lstm(
+            embeddings, None if hidden is None else (hidden, cell)
+        )
+        return decoder.decoder_projector(output), hidden, cell
+
+    @torch.inference_mode()
+    def decode_words(
+        self, encoded: Tensor, state: RNNTGreedyState
+    ) -> tuple[tuple[str, ...], RNNTGreedyState]:
+        """Greedily transcribe encoder states, returning the words that finished.
+
+        Each returned word carries the leading space its ``▁`` piece stands for,
+        and a group that continues an already released word (punctuation after a
+        pause) carries none, so the caller concatenates them as-is.
+
+        The native greedy schedule: a blank advances one encoder frame, a symbol
+        stays on the frame and advances the prediction network, and
+        ``max_symbols_per_step`` symbols force an advance. Unlike ``generate``,
+        which consumes a whole utterance, the LSTM state lives in ``state`` so a
+        live session resumes on its next 80 ms append.
+        """
+        # The joint head consumes projected encoder states, while the
+        # conversational model embeds the unprojected ones that
+        # encode_audio_chunk returns; projecting again here keeps the transcript
+        # decode independent of the feature path for one small matmul a frame.
+        projected = self.model.encoder_projector(encoded)
+        tokenizer = self.processor.tokenizer
+        hidden, cell, prediction = state.hidden, state.cell, state.prediction
+        word_token_ids = state.word_token_ids
+        if prediction is None:
+            # generate() seeds the prediction network with a single blank step.
+            prediction, hidden, cell = self.prediction_step(
+                self.blank_token_id, hidden, cell, encoded.device
+            )
+        def release(token_ids: tuple[int, ...]) -> str:
+            lead = (
+                " "
+                if tokenizer.convert_ids_to_tokens(token_ids[0]).startswith(WORD_START)
+                else ""
+            )
+            return lead + tokenizer.decode(list(token_ids))
+
+        words: list[str] = []
+        silent_frames = state.silent_frames
+        for index in range(projected.shape[1]):
+            frame = projected[:, index : index + 1, None, :]
+            emitted = False
+            for _ in range(self.model.max_symbols_per_step):
+                logits = self.model.joint(
+                    encoder_hidden_states=frame,
+                    decoder_hidden_states=prediction[:, None],
+                )
+                token_id = int(logits.flatten().argmax())
+                if token_id == self.blank_token_id:
+                    break
+                starts_word = tokenizer.convert_ids_to_tokens(token_id).startswith(
+                    WORD_START
+                )
+                if starts_word and word_token_ids:
+                    words.append(release(word_token_ids))
+                    word_token_ids = ()
+                prediction, hidden, cell = self.prediction_step(
+                    token_id, hidden, cell, encoded.device
+                )
+                word_token_ids += (token_id,)
+                emitted = True
+            silent_frames = 0 if emitted else silent_frames + 1
+            if word_token_ids and silent_frames >= WORD_END_SILENCE_FRAMES:
+                words.append(release(word_token_ids))
+                word_token_ids = ()
+        return tuple(words), RNNTGreedyState(
+            hidden, cell, prediction, word_token_ids, silent_frames
         )
 
     @torch.inference_mode()
@@ -296,6 +409,9 @@ class FastConformerRNNT(nn.Module):
             max_new_tokens=max_new_tokens,
             streamer=streamer,
             return_dict_in_generate=True,
+            # The export carries no generation config; the prediction network
+            # starts from blank, exactly as decode_words seeds it.
+            decoder_start_token_id=self.blank_token_id,
         )
         return self.processor.batch_decode(
             generated.sequences, skip_special_tokens=True

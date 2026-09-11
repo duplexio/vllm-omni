@@ -20,8 +20,10 @@ def test_compiled_frame_inputs_preserve_layout() -> None:
         user = torch.randn(frames, 128, device="cuda", dtype=torch.bfloat16)
         agent = torch.randn_like(user)
         for start in (0, 1, 9, 1057):
-            expected = frame_inputs(ids, text, channels, user, agent, 0, 1, start, live)
-            actual = compiled(ids, text, channels, user, agent, 0, 1, start, live)
+            # Audio time is frozen on a text-only append, which `live` selects.
+            arguments = (ids, text, channels, user, agent, 0, 1, start, start // 4, 3, live)
+            expected = frame_inputs(*arguments)
+            actual = compiled(*arguments)
             for output, reference in zip(actual, expected, strict=True):
                 torch.testing.assert_close(output, reference, rtol=0, atol=0)
             ordinals = []

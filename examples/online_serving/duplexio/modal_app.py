@@ -13,17 +13,22 @@ from pathlib import Path
 
 import modal
 
-# Staging variant (DUPLEXIO_MODAL_STAGING=1): separate app + web labels,
-# experimenting with memory snapshots of a genuinely SLEPT engine. The live
-# app is completely unaffected unless the env var is set at deploy time.
-STAGING = os.environ.get("DUPLEXIO_MODAL_STAGING") == "1"
-APP_NAME = "duplexio-vllm-omni-staging" if STAGING else "duplexio-vllm-omni"
+# A variant name deploys a parallel app under suffixed web labels
+# (DUPLEXIO_MODAL_VARIANT=paged serves https://duplexio--demo-paged.modal.run).
+# The live demo is unaffected unless the variable is unset at deploy time.
+VARIANT = os.environ.get("DUPLEXIO_MODAL_VARIANT", "")
+SUFFIX = f"-{VARIANT}" if VARIANT else ""
+# Every image that imports this module has to agree with the deploying client on
+# the variant: web labels and the frontend's backend URL are recomputed from it
+# when a container imports the module.
+VARIANT_ENV = {"DUPLEXIO_MODAL_VARIANT": VARIANT} if VARIANT else {}
+APP_NAME = f"duplexio-vllm-omni{SUFFIX}"
 MODEL_VOLUME_NAME = "duplexio-vllm-models"
-MODEL_NAME = "duplexio-489780-checkpoint-1-vllm-v3"
+MODEL_NAME = "duplexio-opd-warm23k-vllm-v5"
 MODEL_PATH = Path("/models") / MODEL_NAME
-# Default voice for prewarm + demo; must exist in the checkpoint voice
-# pool (v3 ships the VoxCeleb id100xx set; id10014 is the eval voice).
-VOICE = "id10014"
+# Default voice for prewarm + demo; must exist in the checkpoint voice pool
+# (VoxCeleb id100xx set plus the two custom voices, boxlyx and maya).
+VOICE = "69f67cf0ae15b9e491cd6b21"
 APP_ROOT = Path("/app/vllm-omni")
 FRONTEND_ROOT = Path("/app/realtime_web")
 DEPLOY_CONFIG_NAME = "duplexio.yaml"
@@ -38,38 +43,104 @@ AUTH_PASSWORD_HASH_ENV = "DEMO_PASSWORD_HASH"
 BACKEND_AUTH_SECRET_NAME = "duplexio-demo-backend-auth"
 BACKEND_KEY_ENV = "DUPLEXIO_BACKEND_MODAL_KEY"
 BACKEND_SECRET_ENV = "DUPLEXIO_BACKEND_MODAL_SECRET"
-MODEL_WEB_LABEL = "model-snapshot-staging" if STAGING else "model-snapshot"
-DEMO_WEB_LABEL = "demo-staging" if STAGING else "demo"
+MODEL_WEB_LABEL = f"model-snapshot{SUFFIX}"
+DEMO_WEB_LABEL = f"demo{SUFFIX}"
 BACKEND_WEBSOCKET_URL = f"wss://duplexio--{MODEL_WEB_LABEL}.modal.run"
 BACKEND_HEALTH_URL = f"https://duplexio--{MODEL_WEB_LABEL}.modal.run/healthz"
 
 repo_root = Path(__file__).resolve().parents[3] if modal.is_local() else APP_ROOT
-model_image = modal.Image.from_dockerfile(
-    repo_root / "docker" / "Dockerfile.cuda",
-    context_dir=repo_root,
-    build_args={"BASE_IMAGE": "vllm/vllm-openai:v0.26.0"},
-    ignore=[
-        ".venv",
-        "wandb",
-        "examples/online_serving/duplexio/modal_app.py",
-        "**/__pycache__",
-        "**/.pytest_cache",
-    ],
-).env(
-    {
-        "PYTHONPATH": str(APP_ROOT),
-        # TCP connections do not survive snapshot restore (the container IP
-        # changes), so the NCCL monitor thread's periodic flight-recorder
-        # dump-flag poll spams "Broken pipe" against the dead rank-0
-        # TCPStore forever. The monitor thread always runs regardless of
-        # ENABLE_MONITORING=0 (that only disables its kill action, verified
-        # on a restored container); DUMP_ON_TIMEOUT=0 stops the TCPStore
-        # polling. World-size-1 inference only loses the flight recorder.
-        "TORCH_NCCL_ENABLE_MONITORING": "0",
-        "TORCH_NCCL_DUMP_ON_TIMEOUT": "0",
-        "TORCH_NCCL_PROPAGATE_ERROR": "0",
-        **({"DUPLEXIO_MODAL_STAGING": "1"} if STAGING else {}),
-    }
+
+
+def vllm_wheel() -> Path:
+    """Locate the cluster-built vLLM wheel named by DUPLEXIO_VLLM_WHEEL."""
+    setting = os.environ.get("DUPLEXIO_VLLM_WHEEL")
+    if not setting:
+        raise RuntimeError(
+            "Set DUPLEXIO_VLLM_WHEEL to the vLLM wheel built against the "
+            "training compiler stack (duplexio-modal-demo/wheel.sbatch)."
+        )
+    wheel = Path(setting)
+    if not wheel.is_file():
+        raise RuntimeError(f"DUPLEXIO_VLLM_WHEEL is not a file: {wheel}")
+    return wheel
+
+
+# Serving must run the compiler stack training parity was measured on: torch
+# 2.13+cu130 (older torch has no flex-attention AuxRequest), vLLM built from
+# upstream 568afb3a1, and the quack/FLA kernels the model calls directly. vLLM
+# arrives as a wheel because compiling it on a Modal builder takes hours.
+# uv reads the version from the wheel's filename, so the copy keeps its name.
+# Only a local deploy builds the image, so the container-side value is unused.
+VLLM_WHEEL_PATH = f"/wheels/{vllm_wheel().name}" if modal.is_local() else "/wheels"
+model_image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.13"
+    )
+    .apt_install("git", "ninja-build")
+    .uv_pip_install(
+        "torch==2.13.0",
+        "torchvision==0.28.0",
+        "torchaudio==2.11.0",
+        extra_index_url="https://download.pytorch.org/whl/cu130",
+    )
+    .add_local_file(
+        vllm_wheel() if modal.is_local() else VLLM_WHEEL_PATH,
+        VLLM_WHEEL_PATH,
+        copy=True,
+    )
+    .uv_pip_install(VLLM_WHEEL_PATH)
+    .add_local_dir(
+        repo_root,
+        str(APP_ROOT),
+        copy=True,
+        # Serving needs the source tree only. The working copy also holds many
+        # gigabytes of local artifacts (exports, run logs, captured tensors)
+        # that would otherwise be uploaded into every image layer.
+        ignore=[
+            ".venv",
+            "wandb",
+            "checkpoints",
+            "logs",
+            "probe_dumps",
+            "rollout_layers_v9",
+            "**/*.pt",
+            "**/__pycache__",
+            "**/.pytest_cache",
+        ],
+    )
+    # Installed from inside the image so the requirements file resolves relative
+    # to itself, and so vllm-omni's own pins cannot move torch. common.txt, not
+    # cuda.txt: the cuda extras (fa3-fwd, onnxruntime) serve the diffusion and
+    # other-model paths, and are absent from the validated training venv.
+    .run_commands(
+        f"python -m pip install --no-cache-dir -r {APP_ROOT}/requirements/common.txt",
+    )
+    # Last, so the kernel and transformers pins win over any resolution above.
+    .uv_pip_install(
+        "nvidia-cutlass-dsl==4.6.0.dev0",
+        "quack-kernels==0.5.3",
+        "flash-linear-attention==0.5.1",
+        "fla-core==0.5.1",
+        "transformers @ git+https://github.com/huggingface/transformers.git"
+        "@b3d7e8c9d4e078a5e6c09a9d67e22dcadc2df4b8",
+        pre=True,
+    )
+    .env(
+        {
+            "PYTHONPATH": str(APP_ROOT),
+            # TCP connections do not survive snapshot restore (the container IP
+            # changes), so the NCCL monitor thread's periodic flight-recorder
+            # dump-flag poll spams "Broken pipe" against the dead rank-0
+            # TCPStore forever. The monitor thread always runs regardless of
+            # ENABLE_MONITORING=0 (that only disables its kill action, verified
+            # on a restored container); DUMP_ON_TIMEOUT=0 stops the TCPStore
+            # polling. World-size-1 inference only loses the flight recorder.
+            "TORCH_NCCL_ENABLE_MONITORING": "0",
+            "TORCH_NCCL_DUMP_ON_TIMEOUT": "0",
+            "TORCH_NCCL_PROPAGATE_ERROR": "0",
+            **VARIANT_ENV,
+        }
+    )
 )
 frontend_image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -84,7 +155,7 @@ frontend_image = (
         remote_path=str(FRONTEND_ROOT),
         copy=True,
     )
-    .env({"PYTHONPATH": "/app"})
+    .env({"PYTHONPATH": "/app", **VARIANT_ENV})
 )
 model_volume = modal.Volume.from_name(MODEL_VOLUME_NAME, create_if_missing=True)
 app = modal.App(APP_NAME)
@@ -115,7 +186,12 @@ def wait_for_backend(process: subprocess.Popen[bytes]) -> None:
 
 def backend_command(*, enable_sleep_mode: bool) -> list[str]:
     command = [
-        "vllm-omni",
+        # Run the CLI as a module off PYTHONPATH, exactly as the cluster does:
+        # vllm-omni is not pip-installed here, so there is no console script and
+        # no second source of truth for which tree serves.
+        sys.executable,
+        "-m",
+        "vllm_omni.entrypoints.cli.main",
         "serve",
         str(MODEL_PATH),
         "--omni",
@@ -284,7 +360,7 @@ def check_model_present() -> None:
     # live app's garbled restores coincided with workers logging "Sleep
     # Mode DISABLED" (snapshot of a fully LIVE engine). The flag plumbing
     # is code-identical 58c2721..HEAD and engages on the cluster via this
-    # exact CLI, so staging first re-tests the proven design end-to-end.
+    # exact CLI.
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
@@ -299,7 +375,7 @@ class SnapshotModelServer:
             "/v1/omni/sleep",
             {"stage_ids": SNAPSHOT_STAGE_IDS, "level": 1},
         )
-        print("[staging] engine slept (weights offloaded); snapshotting")
+        print("[snapshot] engine slept (weights offloaded); snapshotting")
 
     @modal.enter(snap=False)
     def wake(self) -> None:
@@ -310,15 +386,15 @@ class SnapshotModelServer:
         )
         wait_for_backend(self.backend)
         print(
-            f"[staging] engine woke in {time.monotonic() - wake_started:.1f}s"
+            f"[snapshot] engine woke in {time.monotonic() - wake_started:.1f}s"
         )
 
     @modal.exit()
     def stop(self) -> None:
         stop_backend(self.backend)
 
-    # Staging is non-production: no proxy auth so the remote
-    # agent-speech gate can drive it directly.
+    # No proxy auth: the remote agent-speech gate drives this
+    # backend directly.
     @modal.asgi_app(label=MODEL_WEB_LABEL, requires_proxy_auth=False)
     def web(self) -> object:
         return build_model_app(self.backend)

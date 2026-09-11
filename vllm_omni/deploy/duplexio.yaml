@@ -14,28 +14,32 @@ stages:
   - stage_id: 0
     devices: "0"
     max_num_seqs: 1
-    # Six scheduler positions represent one 80 ms DuplexIO frame. Keep the
-    # complete cache layout while bounding each prefill/profile forward.
-    max_model_len: 24576
+    # Six scheduler positions represent one 80 ms DuplexIO frame, so this is the
+    # session length: 12288 frames is 16 minutes of conversation (24576 tokens —
+    # 5.5 minutes — killed live sessions with vLLM's fatal "Sampled token IDs
+    # exceed the max model length"). Audio keys past the model's 4096-frame
+    # window are recycled through the bounded ring, so only the persistent text
+    # cells grow with this: 12288 frames * 4 text cells * 32 KiB/token is 1.6 GB
+    # of the reserved KV cache.
+    max_model_len: 73728
     max_num_batched_tokens: 4096
+    # FlexAttention tiles pages, so the page must be a power of two. Without
+    # this the hybrid cache would derive 528 tokens per page from the mamba
+    # state size. 1024 spans the same slots in fewer, larger pages.
+    block_size: 1024
     # Reserve activation headroom for the session's tool-aware system prefill.
     # The remaining KV cache still exceeds one maximum-length session.
     gpu_memory_utilization: 0.7
     enforce_eager: false
     async_scheduling: false
     compilation_config:
-      mode: 3
-      cudagraph_mode: FULL
+      # mode 0: capture CUDA graphs without an inductor pass. The model calls
+      # quack GEMMs through a torch.compiler.disable()d boundary, which a
+      # fullgraph dynamo trace rejects; this is also the mode the rollout
+      # actors are measured in (duplexio_opd_h100*.yaml).
+      mode: 0
       # With max_num_seqs=1, every live append is one uniform six-cell frame.
       # Larger system/tool prefills run eagerly outside this graph.
+      cudagraph_mode: FULL_DECODE_ONLY
       cudagraph_capture_sizes: [6]
-      compile_sizes: ["cudagraph_capture_sizes"]
       cudagraph_copy_inputs: true
-    engine_extras:
-      attention_config:
-        # The hybrid cache page is not a power of two, but FlexAttention
-        # kernel tiles must be. Leave flex_attn_kv_block_size unset: the
-        # DuplexIO metadata builder defaults it to the largest power of two
-        # dividing the physical page so flex blocks tile pages exactly.
-        flex_attn_block_m: 16
-        flex_attn_block_n: 16

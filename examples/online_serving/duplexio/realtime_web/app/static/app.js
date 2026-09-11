@@ -180,6 +180,12 @@
     textTopP.value = text.top_p ?? '';
     audioTemperature.value = audio.temperature ?? '';
     audioTopK.value = audio.top_k ?? '';
+    // A continuous flow-map checkpoint samples audio at the temperature baked
+    // into it, so it reports no audio defaults: hide the knobs the backend
+    // would ignore.
+    for (const input of [audioTemperature, audioTopK]) {
+      input.closest('label').hidden = sampling.audio === undefined;
+    }
     userEmitTemperature.value = emit.user ?? '';
     agentEmitTemperature.value = Number.isInteger(emit.agent)
       ? emit.agent.toFixed(1)
@@ -614,6 +620,20 @@
         sampleRate: { ideal: inputRate },
       },
     });
+    for (const track of mediaStream.getAudioTracks()) {
+      // A device change, an OS suspend, or another app taking the input ends
+      // the track ("MediaStreamTrack ended due to a capture failure"). Without
+      // this the meter just goes flat and a deaf browser looks like a deaf
+      // model, so say it out loud and stop the session.
+      track.addEventListener('ended', () => {
+        log('microphone capture failed (track ended) — check the input device');
+        detailElement.textContent = 'Microphone stopped';
+        setStatus('Microphone lost', 'error');
+        stopSession();
+      });
+      track.addEventListener('mute', () => log('microphone muted by the system'));
+      track.addEventListener('unmute', () => log('microphone resumed'));
+    }
     try {
       captureContext = new AudioContextClass({ sampleRate: inputRate });
     } catch (_error) {

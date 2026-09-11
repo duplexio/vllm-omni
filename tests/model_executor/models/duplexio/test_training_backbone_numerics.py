@@ -89,21 +89,39 @@ def test_mlp_native_matches_training_without_runtime_tuning(rows: int) -> None:
 
 
 @torch.inference_mode()
-def test_self_attention_merge_matches_training_with_cache_metadata_strides() -> None:
+def test_self_attention_merge_matches_training_within_bf16_rounding() -> None:
     from duplexio.modules.stream_attention import merge_self_attention as training_merge
 
     from vllm_omni.model_executor.models.duplexio.stream_attention import merge_self_attention
 
     torch.manual_seed(716)
-    tensors = [
-        torch.randn(1, 4416, heads, 280, device="cuda", dtype=torch.bfloat16)[..., :256].transpose(1, 2)
-        for heads in (16, 4, 4, 16)
-    ]
-    lse = torch.randn(1, 16, 4416, device="cuda")
-    expected = training_merge(*(tensor.contiguous() for tensor in tensors), lse, 256**-0.5)
+    tokens, dim = 4416, 256
+    query = torch.randn(tokens, 16, dim, device="cuda", dtype=torch.bfloat16)
+    self_key = torch.randn(tokens, 4, dim, device="cuda", dtype=torch.bfloat16)
+    self_value = torch.randn_like(self_key)
+    # Flex hands the history back transposed, so keep it non-contiguous here too.
+    history = torch.randn(1, 16, tokens, dim, device="cuda", dtype=torch.bfloat16)[0].transpose(0, 1)
+    lse = torch.randn(tokens, 16, device="cuda")
+    expected = training_merge(
+        query.transpose(0, 1)[None].contiguous(),
+        self_key.transpose(0, 1)[None].contiguous(),
+        self_value.transpose(0, 1)[None].contiguous(),
+        history.transpose(0, 1)[None].contiguous(),
+        lse.transpose(0, 1)[None].contiguous(),
+        dim**-0.5,
+    )[0].transpose(0, 1)
     for length in (1536, 6):
-        actual = merge_self_attention(*(tensor[:, :, :length] for tensor in tensors), lse[:, :, :length], 256**-0.5)
-        torch.testing.assert_close(actual, expected[:, :, :length], rtol=0, atol=0)
+        actual = merge_self_attention(
+            query[:length],
+            self_key[:length],
+            self_value[:length],
+            history[:length],
+            lse[:length],
+            dim**-0.5,
+        )
+        # Same algebra, different kernel. One bf16 mantissa step is 4e-3
+        # relative, and differently ordered rounding lands up to two apart.
+        torch.testing.assert_close(actual, expected[:length], rtol=1e-2, atol=1e-2)
 
 
 @torch.inference_mode()

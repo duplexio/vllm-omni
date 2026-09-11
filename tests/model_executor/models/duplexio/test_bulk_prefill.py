@@ -43,6 +43,8 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
     model.silence_token_id = 2
     model.full_cudagraph_enabled = False
     model.frame_inputs = frame_inputs
+    # Audio cells see a two-frame window here, so eviction shows up in the test.
+    model.config = SimpleNamespace(audio_attention_window_frames=2)
     model.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(dtype=torch.float32)
     )
@@ -73,7 +75,6 @@ def request_state(model: DuplexIOForConditionalGeneration) -> DuplexIORequestSta
         depth_speaker_conditioning=None,
         system_token_ids=(3, 4, 5),
         sampling_generator=torch.Generator().manual_seed(9),
-        cache_epoch=7,
     )
 
 
@@ -129,9 +130,10 @@ def test_text_only_bulk_and_serial_frames_are_identical(system: bool) -> None:
         key: []
         for key in (
             "key_active",
-            "request_epochs",
             "text_ordinals",
-            "audio_positions",
+            "text_last",
+            "audio_first",
+            "audio_last",
         )
     }
     for index, token in enumerate(tokens):

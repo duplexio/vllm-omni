@@ -25,6 +25,10 @@ from vllm_omni.model_executor.models.duplexio.depth_sampler import (
     DepthAutoregressiveSampler,
     DepthSamplerConfig,
 )
+from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
+    DuplexIOFrameMetadata,
+    DuplexIOKVLayout,
+)
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
     TokenSamplingOptions,
@@ -40,8 +44,6 @@ from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
     DuplexIOGDNAttentionMetadataBuilder,
     DuplexIOQwenGatedDeltaNetAttention,
     DuplexIOQwenModel,
-    _decode_uint32,
-    _encode_uint32,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -100,14 +102,6 @@ def _config() -> DuplexIOConfig:
     )
 
 
-def test_duplexio_uint32_metadata_round_trip() -> None:
-    values = torch.tensor([0, 1, 255, 256, 65_535, 2**32 - 1])
-
-    encoded = _encode_uint32(values, torch.bfloat16)
-
-    torch.testing.assert_close(_decode_uint32(encoded), values)
-
-
 def test_duplexio_config_round_trips_nested_text_config() -> None:
     config = _config()
     restored = DuplexIOConfig.from_dict(config.to_dict())
@@ -144,68 +138,44 @@ def test_duplexio_text_config_uses_one_dimensional_rope() -> None:
 
 
 
-def test_duplexio_copies_current_metadata_into_stable_graph_buffers() -> None:
+def test_duplexio_installs_cell_addressing_at_stable_buffers() -> None:
     model = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
     nn.Module.__init__(model)
-    model.register_buffer(
-        "graph_key_active",
-        torch.ones(6, dtype=torch.bool),
-        persistent=False,
+    layout = DuplexIOKVLayout(block_size=16, audio_window_frames=2, max_model_len=120)
+    model.frame = DuplexIOFrameMetadata(layout, 12, torch.device("cpu"))
+    frame = model.frame
+    buffers = (
+        frame.key_active,
+        frame.text_ordinal,
+        frame.text_last,
+        frame.audio_first,
+        frame.audio_last,
     )
-    model.register_buffer(
-        "graph_request_epochs",
-        torch.zeros(6, dtype=torch.long),
-        persistent=False,
-    )
-    model.register_buffer(
-        "graph_text_ordinals",
-        torch.zeros(6, dtype=torch.long),
-        persistent=False,
-    )
-    model.register_buffer(
-        "graph_audio_positions",
-        torch.zeros(6, dtype=torch.long),
-        persistent=False,
-    )
-    pointers = (
-        model.graph_key_active.data_ptr(),
-        model.graph_request_epochs.data_ptr(),
-        model.graph_text_ordinals.data_ptr(),
-        model.graph_audio_positions.data_ptr(),
-    )
+    pointers = tuple(buffer.data_ptr() for buffer in buffers)
     info = {
         "duplexio": {
-            "key_active": torch.tensor([True, False, True, True, False, True]),
-            "request_epochs": torch.arange(6),
-            "text_ordinals": torch.arange(6) + 10,
-            "audio_positions": torch.full((6,), 23),
+            "key_active": torch.tensor([True, False, False, False, True, True]),
+            "text_ordinals": torch.tensor([7, 0, 0, 0, 0, 0], dtype=torch.int32),
+            "text_last": torch.full((6,), 6, dtype=torch.int32),
+            "audio_first": torch.full((6,), 1, dtype=torch.int32),
+            "audio_last": torch.full((6,), 4, dtype=torch.int32),
         }
     }
 
-    model.update_graph_inputs([info])
+    model.update_graph_inputs([info, info])
 
-    torch.testing.assert_close(
-        model.graph_key_active,
-        info["duplexio"]["key_active"],
-    )
-    torch.testing.assert_close(
-        model.graph_request_epochs,
-        info["duplexio"]["request_epochs"],
-    )
-    torch.testing.assert_close(
-        model.graph_text_ordinals,
-        info["duplexio"]["text_ordinals"],
-    )
-    torch.testing.assert_close(
-        model.graph_audio_positions,
-        info["duplexio"]["audio_positions"],
-    )
-    assert pointers == (
-        model.graph_key_active.data_ptr(),
-        model.graph_request_epochs.data_ptr(),
-        model.graph_text_ordinals.data_ptr(),
-        model.graph_audio_positions.data_ptr(),
-    )
+    for name, buffer in zip(info["duplexio"], buffers, strict=True):
+        expected = info["duplexio"][name]
+        torch.testing.assert_close(buffer[:12], torch.cat((expected, expected)))
+
+    # An empty step must leave nothing addressable behind.
+    model.update_graph_inputs([])
+
+    assert torch.equal(frame.write_slots(12), torch.full((12,), -1))
+    assert not frame.visible(
+        None, None, torch.arange(12)[:, None], torch.arange(layout.max_compact_slots)
+    ).any()
+    assert pointers == tuple(buffer.data_ptr() for buffer in buffers)
 
 
 def test_duplexio_graph_replays_only_live_frames() -> None:
@@ -301,25 +271,25 @@ def test_duplexio_qwen_backbone_uses_vllm_compile_boundary() -> None:
     assert TorchCompileWithNoGuardsWrapper in DuplexIOQwenModel.__bases__
 
 
-@pytest.mark.parametrize(
-    ("builder", "multiple_request_support"),
-    [
-        (DuplexIOFlexAttentionMetadataBuilder, AttentionCGSupport.UNIFORM_BATCH),
-        (
-            DuplexIOGDNAttentionMetadataBuilder,
-            AttentionCGSupport.UNIFORM_BATCH,
-        ),
-    ],
-)
-def test_duplexio_cudagraph_supports_uniform_six_cell_batches(
-    builder: type,
-    multiple_request_support: AttentionCGSupport,
-) -> None:
+def test_duplexio_cudagraph_supports_uniform_six_cell_batches() -> None:
     single = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=1))
     multiple = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=2))
 
-    assert builder.get_cudagraph_support(single, None) is AttentionCGSupport.ALWAYS
-    assert builder.get_cudagraph_support(multiple, None) is multiple_request_support
+    # Paged attention masks by slot address, so any batch shape replays; the GDN
+    # recurrence still needs one graph per batch size.
+    for config in (single, multiple):
+        assert (
+            DuplexIOFlexAttentionMetadataBuilder.get_cudagraph_support(config, None)
+            is AttentionCGSupport.ALWAYS
+        )
+    assert (
+        DuplexIOGDNAttentionMetadataBuilder.get_cudagraph_support(single, None)
+        is AttentionCGSupport.ALWAYS
+    )
+    assert (
+        DuplexIOGDNAttentionMetadataBuilder.get_cudagraph_support(multiple, None)
+        is AttentionCGSupport.UNIFORM_BATCH
+    )
 
 
 def test_duplexio_gdn_uses_frame_graph_backend() -> None:

@@ -16,13 +16,13 @@ stages:
     max_num_seqs: 8
     max_model_len: 24576
     max_num_batched_tokens: 24576
+    # FlexAttention tiles pages, so the page must be a power of two. Without
+    # this the hybrid cache would derive 528 tokens per page from the mamba
+    # state size. 1024 spans the same slots in fewer, larger pages.
+    block_size: 1024
     gpu_memory_utilization: 0.8
     enforce_eager: true
     async_scheduling: false
     compilation_config:
       mode: 0
       cudagraph_mode: NONE
-    engine_extras:
-      attention_config:
-        flex_attn_block_m: 16
-        flex_attn_block_n: 16

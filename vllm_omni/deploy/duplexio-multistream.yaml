@@ -1,9 +1,7 @@
 # Native two-stream DuplexIO deployment.
 #
-# DuplexIO's compact FlexAttention cache is request-aware, but its stable FULL
-# CUDA graph mask is intentionally limited to one request. This profile keeps
-# torch compilation enabled and runs the batched Flex/GDN path without FULL
-# graph replay so two sessions can share one replica safely.
+# A local development profile for two sessions on one replica, running the
+# batched Flex/GDN path without graph replay so a step is easy to inspect.
 pipeline: duplexio
 async_chunk: false
 session_mode: duplex
@@ -22,13 +20,15 @@ stages:
     # Reserve one bounded compact cache layout per admitted session.
     max_model_len: 24576
     max_num_batched_tokens: 4096
+    # FlexAttention tiles pages, so the page must be a power of two. Without
+    # this the hybrid cache would derive 528 tokens per page from the mamba
+    # state size. 1024 spans the same slots in fewer, larger pages.
+    block_size: 1024
     gpu_memory_utilization: 0.7
     enforce_eager: false
     async_scheduling: false
     compilation_config:
-      mode: 3
+      # A fullgraph dynamo trace rejects the model's torch.compiler.disable()d
+      # quack GEMMs, so compilation stops at graph capture (here: none).
+      mode: 0
       cudagraph_mode: NONE
-    engine_extras:
-      attention_config:
-        flex_attn_block_m: 16
-        flex_attn_block_n: 16

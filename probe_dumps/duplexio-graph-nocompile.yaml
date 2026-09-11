@@ -18,6 +18,10 @@ stages:
     # complete cache layout while bounding each prefill/profile forward.
     max_model_len: 24576
     max_num_batched_tokens: 4096
+    # FlexAttention tiles pages, so the page must be a power of two. Without
+    # this the hybrid cache would derive 528 tokens per page from the mamba
+    # state size. 1024 spans the same slots in fewer, larger pages.
+    block_size: 1024
     # Reserve activation headroom for the session's tool-aware system prefill.
     # The remaining KV cache still exceeds one maximum-length session.
     gpu_memory_utilization: 0.7
@@ -30,11 +34,3 @@ stages:
       # Larger system/tool prefills run eagerly outside this graph.
       cudagraph_capture_sizes: [6]
       cudagraph_copy_inputs: true
-    engine_extras:
-      attention_config:
-        # The hybrid cache page is not a power of two, but FlexAttention
-        # kernel tiles must be. Leave flex_attn_kv_block_size unset: the
-        # DuplexIO metadata builder defaults it to the largest power of two
-        # dividing the physical page so flex blocks tile pages exactly.
-        flex_attn_block_m: 16
-        flex_attn_block_n: 16

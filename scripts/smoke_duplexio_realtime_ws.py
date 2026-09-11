@@ -82,6 +82,25 @@ def normalized_words(text: str) -> list[str]:
     return cleaned.split()
 
 
+def user_audio_frames(path: Path) -> list[np.ndarray]:
+    """Split a 24 kHz wav's first channel into browser-sized input frames.
+
+    A trajectory wav carries the user on channel one and the agent on channel
+    two, so the first channel is the side a real speaker would send.
+    """
+    import wave
+
+    with wave.open(str(path)) as handle:
+        rate = handle.getframerate()
+        channels = handle.getnchannels()
+        if rate != SAMPLE_RATE or handle.getsampwidth() != 2:
+            fail(f"user audio must be 16-bit {SAMPLE_RATE} Hz, got {handle.getsampwidth() * 8}-bit {rate} Hz")
+        pcm = np.frombuffer(handle.readframes(handle.getnframes()), dtype="<i2")
+    samples = pcm.reshape(-1, channels)[:, 0].astype(np.float32) / 32768.0
+    frame_count = len(samples) // FRAME_SIZE
+    return list(samples[: frame_count * FRAME_SIZE].reshape(frame_count, FRAME_SIZE))
+
+
 def browser_decode(chunks: list[dict]) -> tuple[np.ndarray, int]:
     """Reassemble audio deltas exactly like the web client's app.js."""
     pcm_parts: list[np.ndarray] = []
@@ -112,6 +131,7 @@ async def run_client(args: argparse.Namespace) -> None:
     connect_started = time.monotonic()
     audio_chunks: list[dict] = []
     transcript_parts: list[str] = []
+    user_transcript_parts: list[str] = []
     event_counts: dict[str, int] = {}
     session_ready = asyncio.Event()
     done = asyncio.Event()
@@ -139,6 +159,8 @@ async def run_client(args: argparse.Namespace) -> None:
                         audio_chunks.append(event)
                     elif event_type == "response.audio_transcript.delta":
                         transcript_parts.append(event.get("delta") or "")
+                    elif event_type == "conversation.item.input_audio_transcription.delta":
+                        user_transcript_parts.append(event.get("delta") or "")
             except websockets.ConnectionClosed:
                 done.set()
 
@@ -163,14 +185,21 @@ async def run_client(args: argparse.Namespace) -> None:
         # sending audio; frames sent earlier reach a not-yet-duplex session.
         await asyncio.wait_for(session_ready.wait(), timeout=120.0)
         print("[ws] session ready")
-        # Stream silent f32 frames at the browser cadence (80 ms).
+        # Stream f32 frames at the browser cadence (80 ms): the user's speech
+        # if given, then silence for the rest of the session.
         silent = base64.b64encode(bytes(FRAME_SIZE * 4)).decode()
-        frames = int(args.seconds / 0.08)
+        speech = [
+            base64.b64encode(frame.astype("<f4").tobytes()).decode()
+            for frame in (
+                user_audio_frames(Path(args.user_audio)) if args.user_audio else []
+            )
+        ]
+        frames = max(int(args.seconds / 0.08), len(speech))
         start = time.monotonic()
         for index in range(frames):
             await ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
-                "audio": silent,
+                "audio": speech[index] if index < len(speech) else silent,
                 "format": "pcm_f32le",
                 "sample_rate_hz": SAMPLE_RATE,
             }))
@@ -187,24 +216,30 @@ async def run_client(args: argparse.Namespace) -> None:
         reader_task.cancel()
 
     transcript = "".join(transcript_parts).strip()
+    user_transcript = "".join(user_transcript_parts).strip()
     print(f"[ws] event counts: {event_counts}")
+    if args.user_audio:
+        print(f"[ws] user transcript (streaming RNN-T): {user_transcript!r}")
     print(f"[ws] audio.delta chunks: {len(audio_chunks)}")
     print(f"[ws] transcript deltas: {transcript!r}")
     if not audio_chunks:
         fail("no response.audio.delta events received")
     if not transcript:
         fail("no response.audio_transcript.delta text received")
+    if args.user_audio and not user_transcript:
+        fail("user speech produced no input_audio_transcription deltas")
 
     waveform, rate = browser_decode(audio_chunks)
     duration = len(waveform) / rate
     print(f"[ws] reassembled audio: {len(waveform)} samples @ {rate} Hz "
           f"= {duration:.2f}s over {len(audio_chunks)} chunks")
     # Duplicated/overlapping chunks would inflate duration well beyond the
-    # session length; the session streams args.seconds of frames total.
-    if duration > args.seconds + 3.0:
+    # session length; the session streams `frames` input frames total.
+    session_span = frames * 0.08
+    if duration > session_span + 3.0:
         fail(
             f"reassembled audio ({duration:.1f}s) exceeds the session span "
-            f"({args.seconds:.1f}s): duplicated or overlapping chunks"
+            f"({session_span:.1f}s): duplicated or overlapping chunks"
         )
     if not np.isfinite(waveform).all():
         fail("reassembled audio contains non-finite samples")
@@ -254,6 +289,12 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--voice", default=None)
     parser.add_argument("--seconds", type=float, default=15.0)
+    parser.add_argument(
+        "--user-audio",
+        default=None,
+        help="Wav of user speech to stream instead of silence (16-bit 24 kHz; "
+        "channel one is used). Also checks that the session transcribes it.",
+    )
     parser.add_argument("--port", type=int, default=8099)
     parser.add_argument(
         "--url",

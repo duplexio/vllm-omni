@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from itertools import islice
 from typing import Any, cast
 
@@ -13,7 +13,7 @@ import torch
 from torch import Tensor, nn
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -41,17 +41,18 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
-    AttentionMetadata,
-    AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.flex_attention import (
     FlexAttentionBackend,
     FlexAttentionImpl,
+    FlexAttentionMetadata,
+    FlexAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -61,10 +62,8 @@ from vllm.v1.attention.backends.gdn_attn import (
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheSpec
 
-from vllm_omni.model_executor.models.duplexio.attention_semantics import (
-    key_visible,
-)
 from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
+    DuplexIOFrameMetadata,
     DuplexIOKVCacheSpec,
     DuplexIOKVLayout,
     make_duplexio_kv_cache_spec,
@@ -79,10 +78,8 @@ from vllm_omni.model_executor.models.duplexio.row_semantics import (
 from vllm_omni.model_executor.models.duplexio.stream_attention import (
     cached_rotary_pos_emb,
     gated_attention_output,
-    gather_history,
-    history_and_self_attention,
-    history_block_mask,
-    packed_history_indices,
+    merge_self_attention,
+    paged_history_attention,
 )
 from vllm_omni.model_executor.models.duplexio.stream_conv import stream_causal_conv
 from vllm_omni.model_executor.models.duplexio.stream_gdn import (
@@ -92,14 +89,13 @@ from vllm_omni.model_executor.models.duplexio.stream_gdn import (
     prepare_gdn_inputs,
 )
 
-_METADATA_BYTES = 4
-_Q_EPOCH_OFFSET = 0
-_K_EPOCH_OFFSET = _Q_EPOCH_OFFSET + _METADATA_BYTES
-_K_POSITION_OFFSET = _K_EPOCH_OFFSET + _METADATA_BYTES
-_K_TEXT_ORDINAL_OFFSET = _K_POSITION_OFFSET + _METADATA_BYTES
-_K_ACTIVE_OFFSET = _K_TEXT_ORDINAL_OFFSET + _METADATA_BYTES
-_K_AUDIO_POS_OFFSET = _K_ACTIVE_OFFSET + _METADATA_BYTES
-_CACHE_METADATA_SIZE = _K_AUDIO_POS_OFFSET + _METADATA_BYTES
+# Flex tiles the 1024-key cache pages; 16x64 keeps the six-cell query tile and
+# the masked-out ring pages cheap.
+KERNEL_OPTIONS: dict[str, int | bool] = {
+    "FORCE_USE_FLEX_ATTENTION": True,
+    "BLOCK_M": 16,
+    "BLOCK_N": 64,
+}
 
 
 class DuplexIORotaryEmbedding(nn.Module):
@@ -161,132 +157,53 @@ class DuplexIOQwenMLP(Qwen3NextMLP):
 
 
 @torch.compile(dynamic=True, fullgraph=True)
-def _encode_uint32(values: Tensor, dtype: torch.dtype) -> Tensor:
-    return torch.stack(
-        (
-            values & 0xFF,
-            (values >> 8) & 0xFF,
-            (values >> 16) & 0xFF,
-            (values >> 24) & 0xFF,
-        ),
-        dim=-1,
-    ).to(dtype)
-
-
-@torch.compile(dynamic=True, fullgraph=True)
-def _decode_uint32(values: Tensor) -> Tensor:
-    encoded = values.to(torch.long)
-    return (
-        encoded[..., 0]
-        | (encoded[..., 1] << 8)
-        | (encoded[..., 2] << 16)
-        | (encoded[..., 3] << 24)
-    )
-
-
-@torch.compile(dynamic=True, fullgraph=True)
-def owned_history_metadata(
-    cache: Tensor, block_table: Tensor, block_size: int, blocks_per_request: int,
-) -> tuple[Tensor, Tensor]:
-    """Decode only admitted requests' pages, in one fused indexed read."""
-    pages = block_table[:, :blocks_per_request].long()
-    physical = (pages[:, :, None] * block_size + torch.arange(block_size, device=cache.device)).flatten(1)
-    encoded = cache[physical, 0, -_CACHE_METADATA_SIZE:].view(*physical.shape, 6, _METADATA_BYTES)
-    return physical, _decode_uint32(encoded)
-
-
-def duplexio_compact_key_visible(
-    query_positions: Tensor,
-    compact_key_positions: Tensor,
-    query_epochs: Tensor,
-    key_epochs: Tensor,
-    key_positions: Tensor,
-    text_ordinals: Tensor,
-    key_active: Tensor,
-    query_audio_positions: Tensor,
-    key_audio_positions: Tensor,
+def step_page_bounds(
+    seq_lens: Tensor,
+    block_table: Tensor,
+    page_ids: Tensor,
+    compact_seq_lens: Tensor,
+    touched_block_table: Tensor,
     layout: DuplexIOKVLayout,
-) -> Tensor:
-    """Return prior-frame visibility; query-local self K/V bypass the cache."""
-    same_request = query_epochs == key_epochs
-    query_frames = torch.div(
-        query_positions,
-        DUPLEXIO_NUM_CELLS,
-        rounding_mode="floor",
-    )
-    key_frames = torch.div(
-        key_positions,
-        DUPLEXIO_NUM_CELLS,
-        rounding_mode="floor",
-    )
-    key_cells = torch.remainder(key_positions, DUPLEXIO_NUM_CELLS)
+) -> None:
+    """Write this step's compact sequence bound and its page table.
 
-    # Cross-frame visibility follows the training predicate: strict row
-    # causality, active keys only, and the audio-time window (text keys are
-    # never windowed; frozen-audio-time frames do not consume window budget).
-    cross_frame_visible = key_visible(
-        query_frames,
-        key_frames,
-        query_audio_positions,
-        key_audio_positions,
-        key_cells,
-        key_active,
-        layout.audio_window_frames,
-        False,
+    A frame owns four text slots at most, and only emitted cells claim one, so
+    the bound over-scans into masked-out pages that the emitted count - unknown
+    until preprocessing runs - would tighten.
+
+    Pages the step can neither read nor write are blanked, which reads as "skip
+    me" wherever a page list is built: a session's audio ring starts at the
+    bottom of the compact space and its text region at a fixed base far above
+    it, so scanning up to the bound alone would cover a wide band of pages that
+    are never written. Both outputs keep their address for CUDA-graph replay.
+    """
+    rows = torch.div(seq_lens, DUPLEXIO_NUM_CELLS, rounding_mode="floor")
+    text_slots = rows * DUPLEXIO_NUM_TEXT_CELLS
+    audio_slots = rows.clamp(max=layout.audio_ring_frames) * layout.num_audio_cells
+    text_pages = cdiv(text_slots, layout.block_size)[:, None]
+    base = layout.text_base_page
+    touched = (page_ids < cdiv(audio_slots, layout.block_size)[:, None]) | (
+        (page_ids >= base) & (page_ids - base < text_pages)
     )
-
-    audio_cell = key_cells - DUPLEXIO_NUM_TEXT_CELLS
-    expected_audio_slot = (
-        torch.remainder(key_audio_positions, layout.audio_ring_frames)
-        * layout.num_audio_cells
-        + audio_cell
+    compact_seq_lens.copy_(
+        (layout.persistent_text_base + text_slots).clamp(max=layout.max_compact_slots)
     )
-    audio_visible = (
-        (compact_key_positions < layout.audio_slots)
-        & (key_cells >= DUPLEXIO_NUM_TEXT_CELLS)
-        & (compact_key_positions == expected_audio_slot)
-        & cross_frame_visible
-    )
-
-    persistent_visible = (
-        (compact_key_positions >= layout.persistent_text_base)
-        & (key_cells < DUPLEXIO_NUM_TEXT_CELLS)
-        & (text_ordinals > 0)
-        & (
-            compact_key_positions
-            == layout.persistent_text_base + text_ordinals - 1
-        )
-        & cross_frame_visible
-    )
-    return same_request & (audio_visible | persistent_visible)
-
-
-def duplexio_audio_write_slots(
-    positions: Tensor,
-    audio_positions: Tensor,
-    key_active: Tensor,
-    layout: DuplexIOKVLayout,
-) -> Tensor:
-    """Store only live audio; masked prefix cells must not overwrite history."""
-    cells = torch.remainder(positions, DUPLEXIO_NUM_CELLS)
-    audio_slots = (
-        torch.remainder(audio_positions, layout.audio_ring_frames)
-        * layout.num_audio_cells
-        + cells
-        - DUPLEXIO_NUM_TEXT_CELLS
-    )
-    return audio_slots.masked_fill((cells < DUPLEXIO_NUM_TEXT_CELLS) | ~key_active, -1)
-
-
+    touched_block_table.copy_(block_table * touched)
 
 
 @torch.compile(dynamic=True, fullgraph=True)
-def _physical_slots(
+def physical_slots(
     block_table: Tensor,
     request_indices: Tensor,
     compact_slots: Tensor,
     block_size: int,
 ) -> Tensor:
+    """Resolve compact slots through the page table, -1 where there is no slot.
+
+    The table is the touched-page table the mask was built from: a step writes
+    the ring position and the text ordinals it also reads, so its pages are
+    listed there.
+    """
     valid = compact_slots >= 0
     compact_slots = compact_slots.clamp_min(0)
     compact_blocks = torch.div(
@@ -302,36 +219,15 @@ def _physical_slots(
     return physical_slots.masked_fill(~valid, -1)
 
 
-@dataclass
-class DuplexIOAttentionMetadata(AttentionMetadata):
-    """Only the request layout needed by training-ordered paged attention."""
+class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
+    """Point upstream's paged FlexAttention at DuplexIO's compact slot space.
 
-    num_actual_tokens: int
-    num_query_batches: int
-    query_start_loc: Tensor
-    block_table: Tensor
-    doc_ids: Tensor
-    block_size: int
-    duplexio_layout: DuplexIOKVLayout
-    duplexio_full_graph: bool
-    duplexio_packed_capacity: int
-
-
-class DuplexIOFlexAttentionMetadataBuilder(AttentionMetadataBuilder[DuplexIOAttentionMetadata]):
-    """Build request ownership, not the generic backend's unused cache-pool mask."""
-
-    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
-
-    @classmethod
-    def get_cudagraph_support(
-        cls,
-        vllm_config: VllmConfig,
-        kv_cache_spec: AttentionSpec,
-    ) -> AttentionCGSupport:
-        del kv_cache_spec
-        if vllm_config.scheduler_config.max_num_seqs == 1:
-            return AttentionCGSupport.ALWAYS
-        return cls._cudagraph_support
+    Slots are addressed by role - an audio ring, then a persistent text region -
+    so the only backend-visible differences are the sequence bound (how many
+    pages a step scans) and the mask (row causality plus the audio window,
+    instead of token causality). Persistent index buffers, the direct block-mask
+    build and CUDA-graph support are all upstream's.
+    """
 
     def __init__(
         self,
@@ -341,90 +237,80 @@ class DuplexIOFlexAttentionMetadataBuilder(AttentionMetadataBuilder[DuplexIOAtte
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        if not self.direct_build:
+            raise ValueError(
+                "DuplexIO needs FlexAttention's direct block-mask build, which "
+                f"requires the kv block size ({self.kv_block_size}) to equal the "
+                f"cache block size ({self.block_size})"
+            )
         self.layout = kv_cache_spec.layout
-        self.doc_ids = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            dtype=torch.long,
+        layers = get_layers_from_vllm_config(vllm_config, Attention, self.layer_names)
+        frame = next(iter(layers.values())).frame
+        if frame.layout != self.layout:
+            raise ValueError(
+                f"DuplexIO cache layout {self.layout} does not match the layout "
+                f"{frame.layout} the model was built with"
+            )
+        # Every full-attention layer shares one frame, so one mask serves them all.
+        self.duplexio_mask = self._maybe_get_custom_mask_mod(layers)
+        self.max_num_kv_indices = self.q_block_size * self.layout.max_blocks
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self.compact_seq_lens = torch.empty(max_num_seqs, dtype=torch.int32, device=device)
+        # Written every step and read inside CUDA graphs, so the address is kept.
+        self.touched_block_table = torch.empty(
+            max_num_seqs,
+            self.layout.max_blocks,
+            dtype=torch.int32,
             device=device,
         )
-        self.full_cudagraph_enabled = (
-            vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
-        )
+        self.page_ids = torch.arange(self.layout.max_blocks, dtype=torch.int32, device=device)
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> FlexAttentionMetadata:
+        # The compact bound is a constant, so capture needs no sequence maximum
+        # and never syncs on one.
+        return self.build(0, common_attn_metadata)
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> DuplexIOAttentionMetadata:
-        del common_prefix_len, fast_build
+    ) -> FlexAttentionMetadata:
         common = common_attn_metadata
-        doc_ids = self.doc_ids[:common.num_actual_tokens]
-        torch.searchsorted(
-            common.query_start_loc[1:],
-            torch.arange(common.num_actual_tokens, device=self.device),
-            right=True,
-            out=doc_ids,
+        layout = self.layout
+        requests = common.seq_lens.shape[0]
+        seq_lens = self.compact_seq_lens[:requests]
+        block_table = self.touched_block_table[:requests]
+        step_page_bounds(
+            common.seq_lens,
+            common.block_table_tensor,
+            self.page_ids,
+            seq_lens,
+            block_table,
+            layout,
         )
-        uniform_frames = (
-            common.max_query_len == DUPLEXIO_NUM_CELLS
-            and common.num_actual_tokens == DUPLEXIO_NUM_CELLS * common.num_reqs
+        metadata = super().build(
+            common_prefix_len,
+            common.replace(
+                causal=False,
+                seq_lens=seq_lens,
+                max_seq_len=layout.max_compact_slots,
+                block_table_tensor=block_table,
+            ),
+            fast_build,
         )
-        return DuplexIOAttentionMetadata(
-            num_actual_tokens=common.num_actual_tokens,
-            num_query_batches=common.num_reqs if uniform_frames else 1,
-            query_start_loc=common.query_start_loc,
-            block_table=common.block_table_tensor,
-            doc_ids=doc_ids,
-            block_size=self.layout.block_size,
-            duplexio_layout=self.layout,
-            duplexio_full_graph=self.full_cudagraph_enabled and uniform_frames,
-            duplexio_packed_capacity=(self.layout.max_compact_slots + 254) * common.num_reqs,
-        )
-
-    def use_cascade_attention(self, *args, **kwargs) -> bool:
-        return False
-
-
-def update_duplexio_attention_metadata(
-    attn_metadata: object,
-    active_text_tokens: list[int],
-    live_audio_frames: list[int],
-) -> None:
-    """Bound packed history by live keys; graph-padding requests contribute zero."""
-    pending = [attn_metadata]
-    seen: set[int] = set()
-    while pending:
-        metadata = pending.pop()
-        if isinstance(metadata, dict):
-            pending.extend(metadata.values())
-            continue
-        if isinstance(metadata, (list, tuple)):
-            pending.extend(metadata)
-            continue
-        if not isinstance(metadata, DuplexIOAttentionMetadata):
-            continue
-        if id(metadata) in seen:
-            continue
-        seen.add(id(metadata))
-        layout = metadata.duplexio_layout
-        num_reqs = metadata.block_table.shape[0]
-        retained_tokens = active_text_tokens[:num_reqs]
-        retained_tokens.extend([0] * (num_reqs - len(retained_tokens)))
-        retained_audio_frames = live_audio_frames[:num_reqs]
-        retained_audio_frames.extend(
-            [0] * (num_reqs - len(retained_audio_frames))
-        )
-        if not metadata.duplexio_full_graph:
-            metadata.duplexio_packed_capacity = sum(
-                count + DUPLEXIO_NUM_TEXT_CELLS
-                + min(frames, layout.audio_ring_frames) * layout.num_audio_cells + 254
-                for count, frames in zip(retained_tokens, retained_audio_frames, strict=True)
-            )
+        # The paged mask closure reads both at kernel launch, so the block mask
+        # super().build() already produced picks them up. Starting every query's
+        # logical index at its batch offset makes it index this step's cells.
+        metadata.logical_mask_mod = self.duplexio_mask
+        metadata.decode_offset.copy_(common.query_start_loc[: seq_lens.shape[0]])
+        return metadata
 
 
 class DuplexIOFlexAttentionImpl(FlexAttentionImpl):
-    """FlexAttention with bounded, role-aware paged-KV writes."""
+    """Paged FlexAttention over role-addressed slots, plus the query diagonal."""
 
     def forward(
         self,
@@ -433,7 +319,7 @@ class DuplexIOFlexAttentionImpl(FlexAttentionImpl):
         key: Tensor,
         value: Tensor,
         kv_cache: Tensor,
-        attn_metadata: DuplexIOAttentionMetadata,
+        attn_metadata: FlexAttentionMetadata,
         output: Tensor,
         output_scale: Tensor | None = None,
         output_block_scale: Tensor | None = None,
@@ -442,162 +328,38 @@ class DuplexIOFlexAttentionImpl(FlexAttentionImpl):
             raise NotImplementedError("DuplexIO attention does not support output quantization")
         if attn_metadata is None:
             return output.fill_(0)
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        query = query[:num_actual_tokens]
-        key = key[:num_actual_tokens]
-        value = value[:num_actual_tokens]
-        doc_ids = attn_metadata.doc_ids
-        layout = attn_metadata.duplexio_layout
-
-        key_positions = _decode_uint32(
-            key[
-                :,
-                0,
-                self.head_size
-                - _CACHE_METADATA_SIZE
-                + _K_POSITION_OFFSET : self.head_size
-                - _CACHE_METADATA_SIZE
-                + _K_POSITION_OFFSET
-                + _METADATA_BYTES,
-            ]
-        )
-        text_ordinals = _decode_uint32(
-            key[
-                :,
-                0,
-                self.head_size
-                - _CACHE_METADATA_SIZE
-                + _K_TEXT_ORDINAL_OFFSET : self.head_size
-                - _CACHE_METADATA_SIZE
-                + _K_TEXT_ORDINAL_OFFSET
-                + _METADATA_BYTES,
-            ]
-        )
-        token_key_active = _decode_uint32(
-            key[
-                :,
-                0,
-                self.head_size
-                - _CACHE_METADATA_SIZE
-                + _K_ACTIVE_OFFSET : self.head_size
-                - _CACHE_METADATA_SIZE
-                + _K_ACTIVE_OFFSET
-                + _METADATA_BYTES,
-            ]
-        ).bool()
-        # Query row i and key row i of an append are the same frame token,
-        # so the incoming key metadata doubles as the query audio position.
-        token_audio_positions = _decode_uint32(
-            key[
-                :,
-                0,
-                self.head_size
-                - _CACHE_METADATA_SIZE
-                + _K_AUDIO_POS_OFFSET : self.head_size
-                - _CACHE_METADATA_SIZE
-                + _K_AUDIO_POS_OFFSET
-                + _METADATA_BYTES,
-            ]
-        )
-        request_indices = doc_ids
-        primary_slots = _physical_slots(
-            attn_metadata.block_table,
-            request_indices,
-            duplexio_audio_write_slots(
-                key_positions,
-                token_audio_positions,
-                token_key_active,
-                layout,
+        tokens = attn_metadata.num_actual_tokens
+        query, key, value = query[:tokens], key[:tokens], value[:tokens]
+        frame = layer.frame
+        assert attn_metadata.doc_ids is not None
+        self.do_kv_cache_update(
+            layer,
+            key,
+            value,
+            kv_cache,
+            physical_slots(
+                attn_metadata.block_table,
+                attn_metadata.doc_ids[:tokens],
+                frame.write_slots(tokens),
+                attn_metadata.block_size,
             ),
-            attn_metadata.block_size,
-        )
-        super().do_kv_cache_update(
-            layer,
-            key,
-            value,
-            kv_cache,
-            primary_slots,
         )
 
-        persistent_compact_slots = (
-            layout.persistent_text_base
-            + torch.clamp(text_ordinals, min=1)
-            - 1
+        # A cell's own K/V is not in the cache yet, so history and diagonal are
+        # reduced separately and merged with the softmax normalizer.
+        keys, values = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        history, lse = paged_history_attention(
+            query,
+            keys.view(-1, self.num_kv_heads, self.head_size),
+            values.view(-1, self.num_kv_heads, self.head_size),
+            attn_metadata.block_mask,
+            self.scale,
+            self.num_kv_heads != self.num_heads,
+            KERNEL_OPTIONS,
         )
-        persistent_slots = _physical_slots(
-            attn_metadata.block_table,
-            request_indices,
-            persistent_compact_slots,
-            attn_metadata.block_size,
+        output[:tokens].copy_(
+            merge_self_attention(query, key, value, history, lse, self.scale)
         )
-        persistent_slots = persistent_slots.masked_fill(
-            text_ordinals == 0,
-            -1,
-        )
-        super().do_kv_cache_update(
-            layer,
-            key,
-            value,
-            kv_cache,
-            persistent_slots,
-        )
-
-        key_cache = kv_cache.transpose(1, 2)[..., : self.head_size]
-        flat_key_cache = key_cache.reshape(
-            -1,
-            self.num_kv_heads,
-            self.head_size,
-        )
-        metadata_base = self.head_size - _CACHE_METADATA_SIZE
-        query_epochs = _decode_uint32(
-            query[
-                :,
-                0,
-                metadata_base
-                + _Q_EPOCH_OFFSET : metadata_base
-                + _Q_EPOCH_OFFSET
-                + _METADATA_BYTES,
-            ]
-        )
-        physical, cached_metadata = owned_history_metadata(
-            flat_key_cache, attn_metadata.block_table, layout.block_size, layout.max_blocks,
-        )
-
-        request_last = attn_metadata.query_start_loc[1:] - 1
-        indices, valid, key_owners, packed_positions, packed_audio_positions = packed_history_indices(
-            physical, query_epochs[request_last], token_audio_positions[request_last],
-            cached_metadata[..., 1], cached_metadata[..., 2],
-            cached_metadata[..., 5], cached_metadata[..., 4] != 0,
-            layout.max_model_len, layout.audio_window_frames,
-            attn_metadata.duplexio_packed_capacity,
-        )
-
-        batches = attn_metadata.num_query_batches
-        block_mask = history_block_mask(
-            request_indices.view(batches, -1),
-            (key_positions // DUPLEXIO_NUM_CELLS).view(batches, -1),
-            token_audio_positions.view(batches, -1),
-            key_owners, packed_positions // DUPLEXIO_NUM_CELLS, packed_audio_positions,
-            packed_positions % DUPLEXIO_NUM_CELLS, valid,
-            layout.audio_window_frames, (128, 128),
-        )
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        dim = self.head_size - _CACHE_METADATA_SIZE
-        key_tensor = gather_history(key_cache.reshape(-1, self.num_kv_heads, self.head_size), indices, valid, dim)
-        value_tensor = gather_history(value_cache.reshape(-1, self.num_kv_heads, self.head_size), indices, valid, dim)
-        # Uniform six-cell requests get independent query tiles. Expanded KV
-        # batches share the same packed storage; no keys are copied or padded.
-        merged = history_and_self_attention(
-            query[:, :, :dim].contiguous().view(batches, -1, self.num_heads, dim).transpose(1, 2),
-            key_tensor.expand(batches, -1, -1, -1),
-            value_tensor.expand(batches, -1, -1, -1),
-            key[:, :, :dim].contiguous().view(batches, -1, self.num_kv_heads, dim).transpose(1, 2),
-            value[:, :, :dim].contiguous().view(batches, -1, self.num_kv_heads, dim).transpose(1, 2),
-            torch.zeros(indices.shape[0], device=query.device, dtype=torch.float32),
-            block_mask=block_mask, scale=self.scale,
-        ).transpose(1, 2).reshape(-1, self.num_heads, dim)
-        output[:num_actual_tokens, :, :dim].copy_(merged)
-        output[:num_actual_tokens, :, dim:].zero_()
         return output
 
 
@@ -762,6 +524,7 @@ class DuplexIOQwenAttention(nn.Module):
         config: Any,
         *,
         vllm_config: VllmConfig,
+        frame: DuplexIOFrameMetadata,
         prefix: str,
     ) -> None:
         super().__init__()
@@ -782,7 +545,6 @@ class DuplexIOQwenAttention(nn.Module):
         self.head_dim = config.head_dim or (
             self.hidden_size // self.total_num_heads
         )
-        self.cache_head_dim = self.head_dim + _CACHE_METADATA_SIZE
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
@@ -805,7 +567,7 @@ class DuplexIOQwenAttention(nn.Module):
         )
         self.attn = DuplexIOPagedAttention(
             self.num_heads,
-            self.cache_head_dim,
+            self.head_dim,
             self.head_dim**-0.5,
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
@@ -813,6 +575,10 @@ class DuplexIOQwenAttention(nn.Module):
             prefix=f"{prefix}.attn",
             attn_backend=DuplexIOFlexAttentionBackend,
         )
+        # The impl addresses cache slots from the frame, and the metadata builder
+        # finds this step's mask on the layer the way upstream Flex expects.
+        self.attn.frame = frame
+        self.attn.logical_mask_mod = frame.visible
         self.q_norm = DuplexIORMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = DuplexIORMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
@@ -820,12 +586,7 @@ class DuplexIOQwenAttention(nn.Module):
         self,
         positions: Tensor,
         cos_sin_cache: Tensor,
-        logical_positions: Tensor,
         hidden_states: Tensor,
-        key_active: Tensor,
-        request_epochs: Tensor,
-        text_ordinals: Tensor,
-        audio_positions: Tensor,
     ) -> Tensor:
         qkv = fixed_linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
         if self.attn_output_gate:
@@ -856,55 +617,11 @@ class DuplexIOQwenAttention(nn.Module):
         query, key = call_compiled_function(
             cached_rotary_pos_emb, query, key, positions, cos_sin_cache
         )
-
-        epoch_bytes = _encode_uint32(request_epochs, query.dtype)
-        query = torch.cat(
-            (
-                query.view(-1, self.num_heads, self.head_dim),
-                epoch_bytes[:, None, :].expand(-1, self.num_heads, -1),
-                query.new_zeros(
-                    query.shape[0],
-                    self.num_heads,
-                    _CACHE_METADATA_SIZE - _METADATA_BYTES,
-                ),
-            ),
-            dim=-1,
+        attended = self.attn(
+            query,
+            key,
+            value.view(-1, self.num_kv_heads, self.head_dim),
         )
-        key_metadata = torch.cat(
-            (
-                key.new_zeros(key.shape[0], _METADATA_BYTES),
-                _encode_uint32(request_epochs, key.dtype),
-                _encode_uint32(logical_positions, key.dtype),
-                _encode_uint32(text_ordinals, key.dtype),
-                _encode_uint32(key_active.to(torch.long), key.dtype),
-                _encode_uint32(audio_positions, key.dtype),
-            ),
-            dim=-1,
-        )
-        key = torch.cat(
-            (
-                key.view(-1, self.num_kv_heads, self.head_dim),
-                key_metadata[:, None, :].expand(-1, self.num_kv_heads, -1),
-            ),
-            dim=-1,
-        )
-        value = torch.cat(
-            (
-                value.view(-1, self.num_kv_heads, self.head_dim),
-                value.new_zeros(
-                    value.shape[0],
-                    self.num_kv_heads,
-                    _CACHE_METADATA_SIZE,
-                ),
-            ),
-            dim=-1,
-        )
-        attended = self.attn(query, key, value)
-        attended = attended.view(
-            -1,
-            self.num_heads,
-            self.cache_head_dim,
-        )[..., : self.head_dim].reshape(-1, self.q_size)
         if gate is not None:
             attended = call_compiled_function(gated_attention_output, attended, gate)
         output = fixed_linear(attended, self.o_proj.weight)
@@ -1096,7 +813,13 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 class DuplexIOQwenDecoderLayer(nn.Module):
     """Dense Qwen3.5 decoder layer with explicit DuplexIO metadata flow."""
 
-    def __init__(self, vllm_config: VllmConfig, layer_type: str, prefix: str) -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        layer_type: str,
+        frame: DuplexIOFrameMetadata,
+        prefix: str,
+    ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_text_config
         if config.model_type != "qwen3_5_text":
@@ -1116,6 +839,7 @@ class DuplexIOQwenDecoderLayer(nn.Module):
             self.self_attn = DuplexIOQwenAttention(
                 config,
                 vllm_config=vllm_config,
+                frame=frame,
                 prefix=f"{prefix}.self_attn",
             )
         else:
@@ -1150,11 +874,7 @@ class DuplexIOQwenDecoderLayer(nn.Module):
         residual: Tensor | None,
         positions: Tensor,
         cos_sin_cache: Tensor,
-        logical_positions: Tensor,
         key_active: Tensor,
-        request_epochs: Tensor,
-        text_ordinals: Tensor,
-        audio_positions: Tensor,
     ) -> tuple[Tensor, Tensor]:
         if residual is not None:
             # Training rounds the previous MLP residual sum before the next norm.
@@ -1170,12 +890,7 @@ class DuplexIOQwenDecoderLayer(nn.Module):
             hidden_states = self.self_attn(
                 positions,
                 cos_sin_cache,
-                logical_positions,
                 hidden_states,
-                key_active,
-                request_epochs,
-                text_ordinals,
-                audio_positions,
             )
         if self.layer_scale:
             hidden_states = hidden_states * (
@@ -1196,11 +911,7 @@ class DuplexIOQwenDecoderLayer(nn.Module):
 @support_torch_compile(
     dynamic_arg_dims={
         "positions": 0,
-        "logical_positions": 0,
         "key_active": 0,
-        "request_epochs": 0,
-        "text_ordinals": 0,
-        "audio_positions": 0,
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
     }
@@ -1226,12 +937,24 @@ class DuplexIOQwenModel(nn.Module):
             self.vocab_size,
             config.hidden_size,
         )
+        # One frame of cell addressing, shared by every full-attention layer and
+        # filled by the runner before each step.
+        self.frame = DuplexIOFrameMetadata(
+            DuplexIOKVLayout(
+                block_size=vllm_config.cache_config.block_size,
+                audio_window_frames=vllm_config.model_config.hf_config.audio_attention_window_frames,
+                max_model_len=vllm_config.model_config.max_model_len,
+            ),
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.device_config.device,
+        )
 
         def get_layer(prefix: str) -> DuplexIOQwenDecoderLayer:
             layer_index = extract_layer_index(prefix)
             return DuplexIOQwenDecoderLayer(
                 vllm_config,
                 config.layer_types[layer_index],
+                self.frame,
                 prefix,
             )
 
@@ -1258,11 +981,7 @@ class DuplexIOQwenModel(nn.Module):
     def forward(
         self,
         positions: Tensor,
-        logical_positions: Tensor,
         key_active: Tensor,
-        request_epochs: Tensor,
-        text_ordinals: Tensor,
-        audio_positions: Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: Tensor | None = None,
     ) -> Tensor | IntermediateTensors:
@@ -1281,10 +1000,6 @@ class DuplexIOQwenModel(nn.Module):
                 hidden_states=hidden_states,
                 residual=residual,
                 key_active=key_active,
-                logical_positions=logical_positions,
-                request_epochs=request_epochs,
-                text_ordinals=text_ordinals,
-                audio_positions=audio_positions,
             )
         assert residual is not None
         if not get_pp_group().is_last_rank:
@@ -1310,7 +1025,4 @@ __all__ = [
     "DuplexIOQwenDecoderLayer",
     "DuplexIOQwenGatedDeltaNetAttention",
     "DuplexIOQwenModel",
-    "duplexio_compact_key_visible",
-    "duplexio_audio_write_slots",
-    "update_duplexio_attention_metadata",
 ]

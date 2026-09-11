@@ -129,6 +129,38 @@ def test_sampling_defaults_apply_serving_temperatures(tmp_path: Path) -> None:
     }
 
 
+def test_sampling_defaults_omit_audio_for_continuous_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """A flow-map audio head takes no client sampling overrides."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "audio_representation": "continuous",
+                "rollout_sampling_config": {
+                    "mode": "top_p",
+                    "temperature": 0.6,
+                    "top_k": 20,
+                    "top_p": 0.95,
+                },
+                "flowmap_config": {"sampling_temperature": 0.3},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert server.load_sampling_defaults(config_path) == {
+        "text": {
+            "mode": "top_p",
+            "temperature": 0.6,
+            "top_k": 20,
+            "top_p": 0.95,
+        },
+        "emit": {"user": 0.0, "agent": 1.0, "tool_call": 1.0},
+    }
+
+
 @pytest.mark.parametrize(
     ("healthy", "status_code", "body"),
     [(True, 200, "ok"), (False, 503, "unhealthy")],

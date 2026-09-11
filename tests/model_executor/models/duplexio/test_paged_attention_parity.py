@@ -1,209 +1,380 @@
-"""The actual paged backend must preserve every query's diagonal attention."""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""The paged backend must reproduce dense DuplexIO attention over live sessions."""
 
+from collections.abc import Sequence
+from itertools import accumulate
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import Tensor, nn
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.flex_attention import FlexAttentionMetadata
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from vllm_omni.model_executor.models.duplexio.kv_reclamation import DuplexIOKVLayout
-from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
-    DuplexIOAttentionMetadata,
-    DuplexIOFlexAttentionImpl,
-    _encode_uint32,
+from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
+    DuplexIOFrameMetadata,
+    DuplexIOKVCacheSpec,
+    DuplexIOKVLayout,
+    make_duplexio_kv_cache_spec,
 )
-from vllm_omni.model_executor.models.duplexio.row_semantics import duplexio_attention_visible
-from vllm_omni.model_executor.models.duplexio.stream_attention import gather_history, packed_history_indices
+from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
+    DuplexIOFlexAttentionImpl,
+    DuplexIOFlexAttentionMetadataBuilder,
+    DuplexIOPagedAttention,
+    step_page_bounds,
+)
+from vllm_omni.model_executor.models.duplexio.row_semantics import (
+    DUPLEXIO_NUM_CELLS,
+    DUPLEXIO_NUM_TEXT_CELLS,
+    duplexio_attention_visible,
+)
+
+WINDOW = 2
+# FlexAttention tiles a page with BLOCK_N, so a page cannot be smaller than it.
+BLOCK_SIZE = 64
+NUM_AUDIO_CELLS = DUPLEXIO_NUM_CELLS - DUPLEXIO_NUM_TEXT_CELLS
+FRAME_FIELDS = ("key_active", "text_ordinal", "text_last", "audio_first", "audio_last")
+# Paged attention reduces the history in page order and merges the diagonal
+# afterwards, so it does not round like a dense matmul. Bit-exactness with
+# training was traded for that simpler reduction.
+TOLERANCE = {torch.float32: 2e-5, torch.bfloat16: 3e-2}
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("rows", [1, 129, 257])
-def test_history_gather_preserves_values_and_zeros_poisoned_padding(dtype: torch.dtype, rows: int) -> None:
-    torch.manual_seed(17)
-    storage = torch.full((512, 4, 560), torch.nan, device="cuda", dtype=dtype)
-    cache = storage[..., :280]
-    indices = torch.randperm(512, device="cuda")[:rows]
-    valid = torch.arange(rows, device="cuda") % 3 != 0
-    cache[indices[valid]] = torch.randn((valid.sum().item(), 4, 280), device="cuda", dtype=dtype)
-    expected = torch.where(valid[:, None, None], cache[indices, :, :256], 0)
-    torch.testing.assert_close(gather_history(cache, indices, valid, 256), expected.transpose(0, 1)[None], atol=0, rtol=0)
+def cells(values: Tensor) -> Tensor:
+    """Give every cell of a row the row's value."""
+    return values[:, None].expand(-1, DUPLEXIO_NUM_CELLS).flatten()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_history_packing_ignores_unowned_cache_metadata() -> None:
-    layout = DuplexIOKVLayout(block_size=16, audio_window_frames=2, max_model_len=120)
-    blocks = torch.tensor([[2, 4, 6, 8, 10, 12, 14, 16]], device="cuda", dtype=torch.int32)
-    length = 18 * 16
-    positions = torch.full((length,), -100000, device="cuda", dtype=torch.long)
-    epochs = torch.zeros_like(positions)
-    audio = torch.zeros_like(positions)
-    active = torch.zeros(length, device="cuda", dtype=torch.bool)
-    compact = layout.persistent_text_base + torch.arange(3, device="cuda")
-    physical = blocks[0, compact // 16].long() * 16 + compact % 16
-    positions[physical] = torch.tensor([0, 6, 12], device="cuda")
-    epochs[physical] = 7
-    active[physical] = True
-    owned = (blocks.long()[:, :, None] * 16 + torch.arange(16, device="cuda")).flatten(1)
-    indices, valid, owners, _, _ = packed_history_indices(
-        owned,
-        torch.tensor([7], device="cuda"),
-        torch.tensor([0], device="cuda"),
-        epochs[owned],
-        positions[owned],
-        audio[owned],
-        active[owned],
-        120,
-        2,
-        256,
+def session_fields(audio_active: Tensor, text_active: Tensor) -> dict[str, Tensor]:
+    """Per-token frame fields for a whole session, as ``frame_inputs`` derives them.
+
+    ``audio_active`` is (rows,) and ``text_active`` (rows, 4). A row without
+    active audio is a token burst - a spliced tool result - which keeps the audio
+    clock frozen and therefore consumes no window budget.
+    """
+    rows = audio_active.shape[0]
+    audio_position = audio_active.cumsum(0, dtype=torch.int32)
+    emitted = text_active.int().flatten().cumsum(0, dtype=torch.int32).view(rows, -1)
+    audio_padding = torch.zeros(rows, NUM_AUDIO_CELLS, dtype=torch.int32)
+    return {
+        "key_active": torch.cat(
+            (text_active, audio_active[:, None].expand(-1, NUM_AUDIO_CELLS)), 1
+        ).flatten(),
+        "text_ordinal": torch.cat(
+            (torch.where(text_active, emitted, 0), audio_padding), 1
+        ).flatten(),
+        "text_last": cells(
+            torch.cat((torch.zeros(1, dtype=torch.int32), emitted[:-1, -1]))
+        ),
+        "audio_first": cells((audio_position - WINDOW).clamp_min(1)),
+        "audio_last": cells(audio_position - audio_active.int()),
+        # Audio time, for the dense reference: not a cache-addressing field.
+        "audio_position": cells(audio_position),
+    }
+
+
+def batched(source: Sequence[Tensor], live: list[int], used: list[Tensor]) -> Tensor:
+    """Concatenate each live session's slice of a per-session tensor."""
+    return torch.cat(
+        [source[request][rows] for request, rows in zip(live, used, strict=True)]
     )
-    torch.testing.assert_close(indices[valid], physical, rtol=0, atol=0)
-    assert not owners[valid].count_nonzero()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_history_packing_preserves_request_order_epochs_and_audio_retention() -> None:
-    block_size = 784
-    blocks = torch.tensor([[7, 2, 11, 17], [5, 19, 23, 1], [13, 4, 29, 9]], device="cuda", dtype=torch.int32)
-    slots = 32 * block_size
-    positions = torch.full((slots,), 2**32 - 1, device="cuda", dtype=torch.long)
-    epochs = torch.zeros_like(positions)
-    audio = torch.zeros_like(positions)
-    active = torch.ones(slots, device="cuda", dtype=torch.bool)
-    expected_indices = []
-    expected_owners = []
-    for owner, first_page in enumerate((7, 5, 13)):
-        physical = first_page * block_size + torch.arange(8, device="cuda")
-        positions[physical] = torch.tensor([0, 7, 14, 424, 419, 388, 21, 28], device="cuda")
-        epochs[physical] = 17 + owner
-        epochs[physical[6]] = 0
-        active[physical[7]] = False
-        audio[physical] = torch.tensor([0, 0, 0, 70, 69, 64, 0, 0], device="cuda")
-        expected_indices.append(physical[torch.tensor([0, 1, 2, 4, 3], device="cuda")])
-        expected_owners.append(torch.full((5,), owner, device="cuda", dtype=torch.long))
-    owned = (blocks.long()[:, :, None] * block_size + torch.arange(block_size, device="cuda")).flatten(1)
-    indices, valid, owners, _, _ = packed_history_indices(
-        owned, torch.tensor([17, 18, 19], device="cuda"),
-        torch.full((3,), 150, device="cuda", dtype=torch.long),
-        epochs[owned], positions[owned], audio[owned], active[owned], 24576, 64, 777,
+def dense_attention(
+    query: Tensor, key: Tensor, value: Tensor, fields: dict[str, Tensor], scale: float
+) -> Tensor:
+    """Reduce the exact visibility relation in fp32 over every session token."""
+    positions = torch.arange(query.shape[0], device=query.device)
+    visible = duplexio_attention_visible(
+        positions[:, None],
+        positions[None],
+        fields["audio_position"][:, None],
+        fields["audio_position"][None],
+        fields["key_active"][None],
+        audio_attention_window_frames=WINDOW,
     )
-    torch.testing.assert_close(indices[valid], torch.cat(expected_indices), rtol=0, atol=0)
-    torch.testing.assert_close(owners[valid], torch.cat(expected_owners), rtol=0, atol=0)
-    starts = torch.tensor([0, 128, 256, 384, 512, 640], device="cuda")
-    assert valid[starts].all()
+    groups = query.shape[1] // key.shape[1]
+    keys = key.float().repeat_interleave(groups, 1)
+    values = value.float().repeat_interleave(groups, 1)
+    scores = torch.einsum("thd,shd->hts", query.float(), keys) * scale
+    return torch.einsum(
+        "hts,shd->thd", scores.masked_fill(~visible, -torch.inf).softmax(-1), values
+    )
+
+
+def paged_backend(
+    spec: DuplexIOKVCacheSpec,
+    frame: DuplexIOFrameMetadata,
+    heads: int,
+    max_seqs: int,
+    pages: int,
+) -> tuple[nn.Module, DuplexIOFlexAttentionMetadataBuilder, DuplexIOFlexAttentionImpl]:
+    """Wire the real builder and impl to one attention layer's frame metadata."""
+    device = frame.cell.device
+    layer = object.__new__(DuplexIOPagedAttention)
+    nn.Module.__init__(layer)
+    layer._k_scale = torch.ones((), device=device)
+    layer._v_scale = torch.ones((), device=device)
+    layer.frame = frame
+    layer.logical_mask_mod = frame.visible
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_num_attention_heads=lambda _: heads,
+            get_num_kv_heads=lambda _: spec.num_kv_heads,
+            get_head_size=lambda: spec.head_size,
+            max_model_len=spec.max_model_len,
+            rswa_window=None,
+        ),
+        parallel_config=None,
+        cache_config=SimpleNamespace(num_gpu_blocks=pages),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=max_seqs, max_num_batched_tokens=frame.cell.shape[0]
+        ),
+        attention_config=SimpleNamespace(
+            flex_attn_q_block_size=None,
+            flex_attn_kv_block_size=None,
+            flex_attn_block_m=None,
+            flex_attn_block_n=None,
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True),
+            static_forward_context={"attn": layer},
+        ),
+    )
+    builder = DuplexIOFlexAttentionMetadataBuilder(spec, ["attn"], vllm_config, device)
+    impl = DuplexIOFlexAttentionImpl(
+        heads,
+        spec.head_size,
+        spec.head_size**-0.5,
+        spec.num_kv_heads,
+        None,
+        None,
+        "auto",
+    )
+    return layer, builder, impl
+
+
+def step_metadata(
+    builder: DuplexIOFlexAttentionMetadataBuilder,
+    sizes: list[int],
+    seq_lens: list[int],
+    block_table: Tensor,
+) -> FlexAttentionMetadata:
+    device = block_table.device
+    starts = torch.tensor([0, *accumulate(sizes)], dtype=torch.int32)
+    return builder.build(
+        0,
+        CommonAttentionMetadata(
+            query_start_loc=starts.to(device),
+            query_start_loc_cpu=starts,
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+            num_reqs=len(sizes),
+            num_actual_tokens=sum(sizes),
+            max_query_len=max(sizes),
+            max_seq_len=max(seq_lens),
+            block_table_tensor=block_table,
+            slot_mapping=torch.zeros(sum(sizes), dtype=torch.long, device=device),
+        ),
+    )
+
+
+def session_activity(rows: int, prefix: int, request: int) -> tuple[Tensor, Tensor]:
+    """Text-only prefix, then live audio rows with a mid-session token burst."""
+    row = torch.arange(rows)
+    audio_active = (row >= prefix) & ((row < 12 + request) | (row >= 15 + request))
+    text_active = torch.stack(
+        (
+            row < prefix,
+            torch.zeros(rows, dtype=torch.bool),
+            audio_active & (row % 5 == request),
+            ~audio_active & (row >= prefix),
+        ),
+        dim=1,
+    )
+    return audio_active, text_active
+
+
+def run_session(
+    prefixes: list[int],
+    rows: int,
+    dtype: torch.dtype,
+    dim: int,
+    heads: int,
+    kv_heads: int,
+) -> None:
+    """Replay ``len(prefixes)`` sessions through the paged backend, step by step."""
+    torch.manual_seed(731)
+    device = torch.device("cuda")
+    requests = len(prefixes)
+    spec = make_duplexio_kv_cache_spec(
+        FullAttentionSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=kv_heads,
+            head_size=dim,
+            head_size_v=dim,
+            dtype=dtype,
+        ),
+        audio_window_frames=WINDOW,
+        max_model_len=rows * DUPLEXIO_NUM_CELLS,
+    )
+    layout = spec.layout
+    tokens = rows * DUPLEXIO_NUM_CELLS
+    query = torch.randn(requests, tokens, heads, dim, device=device, dtype=dtype)
+    key = torch.randn(requests, tokens, kv_heads, dim, device=device, dtype=dtype)
+    value = torch.randn_like(key)
+    fields = [
+        {
+            name: field.to(device)
+            for name, field in session_fields(
+                *session_activity(rows, prefix, request)
+            ).items()
+        }
+        for request, prefix in enumerate(prefixes)
+    ]
+    expected = [
+        dense_attention(query[i], key[i], value[i], fields[i], dim**-0.5)
+        for i in range(requests)
+    ]
+
+    pages = layout.max_blocks * requests
+    frame = DuplexIOFrameMetadata(
+        layout, sum(prefixes) * DUPLEXIO_NUM_CELLS, device
+    )
+    layer, builder, impl = paged_backend(spec, frame, heads, requests, pages + 1)
+    # Page 0 belongs to no request: a page outside the block table must never be
+    # read. vLLM zeroes the pages it does hand out, which is what keeps
+    # masked-out slots from poisoning the reduction.
+    cache = torch.zeros(
+        pages + 1, BLOCK_SIZE, kv_heads, 2 * dim, device=device, dtype=dtype
+    ).transpose(1, 2)
+    cache[0].fill_(torch.nan)
+    block_table = (torch.randperm(pages, device=device, dtype=torch.int32) + 1).view(
+        requests, layout.max_blocks
+    )
+
+    # Every session prefills its text-only prefix in the first step, then walks
+    # one row per step until it runs out of rows.
+    live = list(range(requests))
+    consumed = [0] * requests
+    steps = list(prefixes)
+    while live:
+        used = [
+            torch.arange(
+                consumed[request] * DUPLEXIO_NUM_CELLS,
+                (consumed[request] + step) * DUPLEXIO_NUM_CELLS,
+                device=device,
+            )
+            for request, step in zip(live, steps, strict=True)
+        ]
+
+        frame.update(
+            **{
+                name: batched([field[name] for field in fields], live, used)
+                for name in FRAME_FIELDS
+            }
+        )
+        sizes = [step * DUPLEXIO_NUM_CELLS for step in steps]
+        metadata = step_metadata(
+            builder,
+            sizes,
+            [
+                (consumed[request] + step) * DUPLEXIO_NUM_CELLS
+                for request, step in zip(live, steps, strict=True)
+            ],
+            block_table[live],
+        )
+        batch = batched(query, live, used)
+        output = impl.forward(
+            layer,
+            batch,
+            batched(key, live, used),
+            batched(value, live, used),
+            cache,
+            metadata,
+            torch.empty_like(batch),
+        )
+        for request, rows_used, part in zip(
+            live, used, output.split(sizes), strict=True
+        ):
+            torch.testing.assert_close(
+                part.float(),
+                expected[request][rows_used],
+                atol=TOLERANCE[dtype],
+                rtol=TOLERANCE[dtype],
+            )
+
+        for request, step in zip(live, steps, strict=True):
+            consumed[request] += step
+        live = [request for request in live if consumed[request] < rows]
+        steps = [1] * len(live)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged cache")
 @pytest.mark.parametrize(
-    "frames,live_audio,system_prefix",
-    [
-        (1, False, True),
-        (3, False, True),
-        (1, True, True),
-        (160, False, True),
-        (3, True, False),
-    ],
+    "dtype,dim,heads,kv_heads,rows",
+    (
+        (torch.float32, 16, 4, 2, 24),
+        # The ring holds `window + 64` frames, so only a long session wraps it
+        # and forces the mask to reject a slot the window has passed.
+        (torch.bfloat16, 256, 16, 4, 72),
+    ),
 )
-@pytest.mark.parametrize("dtype,dim", ((torch.float32, 16), (torch.bfloat16, 128), (torch.bfloat16, 256)))
 @torch.inference_mode()
-def test_attention_matches_dense_including_inactive_self(
-    frames: int,
-    live_audio: bool,
-    system_prefix: bool,
-    dtype: torch.dtype,
-    dim: int,
+def test_paged_session_matches_dense_attention(
+    dtype: torch.dtype, dim: int, heads: int, kv_heads: int, rows: int
 ) -> None:
-    torch.manual_seed(731)
-    device = torch.device("cuda")
-    query_heads, kv_heads = (16, 4) if dim == 256 else (4, 2)
-    tokens = frames * 6
-    layout = DuplexIOKVLayout(block_size=16, audio_window_frames=2, max_model_len=(frames + 12) * 6)
-    positions = torch.arange(tokens, device=device)
-    active = (positions % 6 == 0) & system_prefix
-    if live_audio:
-        active |= positions % 6 >= 4
-    audio_pos = positions // 6 + 1 if live_audio else torch.zeros_like(positions)
-    epochs = torch.full_like(positions, 19)
-    ordinals = torch.where((positions % 6 == 0) & system_prefix, positions // 6 + 1, 0)
-    query = torch.randn(tokens, query_heads, dim, device=device, dtype=dtype)
-    key = torch.randn(tokens, kv_heads, dim, device=device, dtype=dtype)
-    value = torch.randn_like(key)
-    q_metadata = torch.cat((_encode_uint32(epochs, query.dtype), query.new_zeros(tokens, 20)), -1)
-    k_metadata = torch.cat(
-        (
-            key.new_zeros(tokens, 4),
-            *[_encode_uint32(x, key.dtype) for x in (epochs, positions, ordinals, active.long(), audio_pos)],
-        ),
-        -1,
-    )
-    augmented_query = torch.cat((query, q_metadata[:, None].expand(-1, query_heads, -1)), -1)
-    augmented_key = torch.cat((key, k_metadata[:, None].expand(-1, kv_heads, -1)), -1)
-    augmented_value = torch.cat((value, value.new_zeros(tokens, kv_heads, 24)), -1)
-    cache = query.new_zeros(layout.max_blocks + 1, 16, kv_heads, 2 * (dim + 24)).transpose(1, 2)
-    cache[0].fill_(torch.nan)
-    boundaries = torch.tensor([0, tokens], device=device, dtype=torch.int32)
-    block_ids = torch.arange(1, layout.max_blocks + 1, device=device, dtype=torch.int32)[None]
-    metadata = DuplexIOAttentionMetadata(
-        num_actual_tokens=tokens,
-        num_query_batches=1,
-        query_start_loc=boundaries,
-        block_table=block_ids,
-        block_size=16,
-        doc_ids=torch.zeros(tokens, device=device, dtype=torch.long),
-        duplexio_layout=layout,
-        duplexio_full_graph=False,
-        duplexio_packed_capacity=layout.max_compact_slots + 254,
-    )
-    backend = DuplexIOFlexAttentionImpl(query_heads, dim + 24, dim**-0.5, kv_heads, None, None, "auto")
-    scales = SimpleNamespace(_k_scale=torch.ones((), device=device), _v_scale=torch.ones((), device=device))
-    output = backend.forward(
-        scales, augmented_query, augmented_key, augmented_value, cache, metadata, torch.empty_like(augmented_query)
-    )[..., :dim]
-    visible = duplexio_attention_visible(
-        positions[:, None],
-        positions[None],
-        audio_pos[:, None],
-        audio_pos[None],
-        active[None],
-        audio_attention_window_frames=2,
-    )
-    if dtype == torch.bfloat16:
-        pytest.importorskip("duplexio")
-        from duplexio.models.duplexio import history_block_mask
-        from duplexio.modules.stream_attention import (
-            aligned_kv_indices,
-            history_and_self_attention,
-        )
+    run_session([3], rows, dtype, dim, heads, kv_heads)
 
-        indices, valid = aligned_kv_indices((positions % 6 >= 4).long(), active, 2, 128)
-        block = history_block_mask(
-            torch.zeros_like(positions),
-            positions // 6,
-            audio_pos,
-            torch.zeros_like(indices),
-            positions[indices] // 6,
-            audio_pos[indices],
-            positions[indices] % 6,
-            valid,
-            2,
-            (128, 128),
-        )
-        expected = (
-            history_and_self_attention(
-                query.transpose(0, 1).unsqueeze(0),
-                key[indices].transpose(0, 1).unsqueeze(0),
-                value[indices].transpose(0, 1).unsqueeze(0),
-                key.transpose(0, 1).unsqueeze(0),
-                value.transpose(0, 1).unsqueeze(0),
-                torch.zeros(indices.numel(), device=device),
-                block_mask=block,
-                scale=dim**-0.5,
-            )
-            .squeeze(0)
-            .transpose(0, 1)
-        )
-        torch.testing.assert_close(output, expected, atol=0, rtol=0)
-        return
-    scores = torch.einsum("thd,shd->hts", query, key.repeat_interleave(2, 1)) * dim**-0.5
-    probabilities = scores.masked_fill(~visible, -torch.inf).softmax(-1)
-    expected = torch.einsum("hts,shd->thd", probabilities, value.repeat_interleave(2, 1))
-    torch.testing.assert_close(output, expected, atol=2e-5, rtol=2e-5)
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged cache")
+@torch.inference_mode()
+def test_batched_sessions_stay_isolated_in_a_shuffled_block_table() -> None:
+    run_session([3, 5, 4], 20, torch.bfloat16, 128, 8, 2)
+
+
+def test_only_pages_a_step_can_touch_are_listed() -> None:
+    """The scan must follow the session, not the layout bound.
+
+    A long-session layout leaves a wide band of never-written pages between the
+    audio ring and the text base, and scanning one costs as much as scanning
+    live keys.
+    """
+    rows = 30
+    layout = DuplexIOKVLayout(
+        block_size=BLOCK_SIZE,
+        audio_window_frames=WINDOW,
+        max_model_len=600 * DUPLEXIO_NUM_CELLS,
+    )
+    text_base = layout.text_base_page
+    seq_lens = torch.tensor([rows * DUPLEXIO_NUM_CELLS])
+    block_table = torch.arange(1, layout.max_blocks + 1, dtype=torch.int32)[None]
+    compact = torch.zeros(1, dtype=torch.int32)
+    listed = torch.zeros_like(block_table)
+
+    step_page_bounds(
+        seq_lens,
+        block_table,
+        torch.arange(layout.max_blocks, dtype=torch.int32),
+        compact,
+        listed,
+        layout,
+    )
+
+    audio_pages = -(-rows * NUM_AUDIO_CELLS // BLOCK_SIZE)
+    text_pages = -(-rows * DUPLEXIO_NUM_TEXT_CELLS // BLOCK_SIZE)
+    expected = {*range(audio_pages), *range(text_base, text_base + text_pages)}
+    assert {page for page, entry in enumerate(listed[0].tolist()) if entry} == expected
+    assert len(expected) < layout.max_blocks
+    assert int(compact) == layout.persistent_text_base + rows * DUPLEXIO_NUM_TEXT_CELLS
+
+    # Whatever the row writes has to be among the pages the step listed.
+    frame = DuplexIOFrameMetadata(layout, DUPLEXIO_NUM_CELLS, torch.device("cpu"))
+    fields = session_fields(*session_activity(rows, 3, 0))
+    frame.update(
+        **{name: fields[name][-DUPLEXIO_NUM_CELLS:] for name in FRAME_FIELDS}
+    )
+    written = frame.write_slots(DUPLEXIO_NUM_CELLS)
+    assert (written >= 0).any()
+    assert {int(slot) // BLOCK_SIZE for slot in written[written >= 0]} <= expected
