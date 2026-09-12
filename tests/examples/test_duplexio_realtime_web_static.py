@@ -96,13 +96,19 @@ def test_frontend_includes_delayed_local_demo_tools() -> None:
     assert "source: 'local demo'" in app
 
 
-def test_frontend_can_select_a_model_voice() -> None:
+def test_frontend_sends_a_voice_reference_clip() -> None:
     index = (APP_ROOT / "index.html").read_text(encoding="utf-8")
     app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
 
+    # A voice is audio this page supplies: pick a sample or upload one, resample
+    # it to the model's rate, and send it as the session's reference audio.
     assert '<select id="model-voice"' in index
-    assert "voiceSelect.value = config.voice" in app
-    assert "voice: voiceSelect.value" in app
+    assert '<input id="voice-upload" type="file"' in index
+    assert "config.sampleClips" in app
+    assert "OfflineAudioContext" in app
+    assert "ref_audio_data: referenceAudio" in app
+    assert "ref_audio_format: 'pcm_f32le'" in app
+    assert "voice: voiceSelect.value" not in app
 
 
 def test_frontend_sends_sampling_parameters_before_session_start() -> None:

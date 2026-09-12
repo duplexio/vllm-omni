@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import secrets
 from collections.abc import Callable, Mapping
@@ -33,9 +35,6 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
 )
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     ServingRuntimeConfigError,
-)
-from vllm_omni.model_executor.models.duplexio.checkpoint import (
-    resolve_checkpoint_directory,
 )
 from vllm_omni.model_executor.models.duplexio.tool_calling import (
     tool_call_grammar,
@@ -204,19 +203,10 @@ class DuplexIOServingRuntimeAdapter:
         _validate_full_duplex_mode(config)
         start_role = _start_role(config.extra_body)
         hf_config = getattr(model_config, "hf_config", model_config)
-        voice_ids, manifest_default = _load_voice_manifest(model_config)
-        configured_default = getattr(hf_config, "default_voice", None)
-        voice = config.voice or configured_default or manifest_default
-        if voice is None:
-            raise DuplexIOClientRuntimeConfigError(
-                "DuplexIO requires a named exported voice for speaker conditioning",
-                code="voice_required",
-            )
-        if voice is not None and voice not in voice_ids:
-            raise DuplexIOClientRuntimeConfigError(
-                f"Unknown DuplexIO voice {voice!r}",
-                code="voice_not_found",
-            )
+        voice_prompt, voice_prompt_frames = _voice_prompt_from_session(
+            config,
+            hf_config,
+        )
 
         depth = getattr(hf_config, "depth_transformer_config", {})
         if not isinstance(depth, Mapping):
@@ -321,9 +311,8 @@ class DuplexIOServingRuntimeAdapter:
                 for token in (*system_token_ids, *initial_prefix_ids)
             ],
             "duplexio_start_role": start_role,
-            "duplexio_voice": voice,
-            "duplexio_voice_ids": list(voice_ids),
-            "duplexio_voice_clip_index": 0,
+            "duplexio_voice_prompt_audio": voice_prompt,
+            "duplexio_voice_prompt_frames": voice_prompt_frames,
             "duplexio_scheduler_token_id": scheduler_token_id,
             "duplexio_sampling_seed": (
                 client_sampling.seed
@@ -356,9 +345,31 @@ class DuplexIOServingRuntimeAdapter:
         turn_id = getattr(session, "turn_id", None)
         if not isinstance(turn_id, int):
             raise RuntimeError("DuplexIO session is missing an integer turn_id")
-        if not system_token_ids:
-            return ()
+        prompt_frames = runtime_config.get("duplexio_voice_prompt_frames")
+        if not isinstance(prompt_frames, int) or prompt_frames < 1:
+            raise RuntimeError(
+                "DuplexIO session runtime_config has no pinned voice-prompt frames"
+            )
         payloads = []
+        # The pinned voice prompt comes first: the reference the agent's voice is
+        # cloned from precedes the instructions it is supposed to speak.
+        for offset in range(0, prompt_frames, PREFILL_CHUNK_FRAMES):
+            frame_count = min(PREFILL_CHUNK_FRAMES, prompt_frames - offset)
+            payloads.append({
+                "type": "audio",
+                "audio": "",
+                "format": "pcm_f32le",
+                "sample_rate_hz": DUPLEXIO_SAMPLE_RATE,
+                "frame_size": DUPLEXIO_FRAME_SIZE,
+                "frame_count": frame_count,
+                "valid_samples": frame_count * DUPLEXIO_FRAME_SIZE,
+                "force_listen": False,
+                "is_speech": False,
+                "duplex_turn_id": turn_id,
+                "duplexio_voice_prompt": True,
+            })
+        if not system_token_ids:
+            return tuple(payloads)
         for offset in range(0, len(system_token_ids), PREFILL_CHUNK_FRAMES):
             frame_count = min(
                 PREFILL_CHUNK_FRAMES,
@@ -476,25 +487,21 @@ class DuplexIOServingRuntimeAdapter:
                     "DuplexIO cannot change start_role after a session is created",
                     code="start_role_update_unsupported",
                 )
-        if (
-            config.voice is not None
-            and config.voice != current.get("duplexio_voice")
+        # The voice is pinned reference audio, already in the cache's pinned
+        # region: it cannot be swapped without starting a new session.
+        reference = config.extra_body.get("ref_audio_data")
+        if reference is not None and reference != current.get(
+            "duplexio_voice_prompt_audio"
         ):
             raise DuplexIOClientRuntimeConfigError(
-                "DuplexIO cannot change voice after a session is created",
+                "DuplexIO cannot change the reference audio after a session is "
+                "created",
                 code="voice_update_unsupported",
             )
-        voice = config.voice or current.get("duplexio_voice")
-        if not isinstance(voice, str) or not voice:
+        if config.voice is not None:
             raise DuplexIOClientRuntimeConfigError(
-                "DuplexIO requires a named exported voice for speaker conditioning",
-                code="voice_required",
-            )
-        voice_ids = current.get("duplexio_voice_ids")
-        if not isinstance(voice_ids, list) or voice not in voice_ids:
-            raise DuplexIOClientRuntimeConfigError(
-                f"Unknown DuplexIO voice {voice!r}",
-                code="voice_not_found",
+                "DuplexIO has no named voices; supply ref_audio_data instead",
+                code="voice_update_unsupported",
             )
 
     @staticmethod
@@ -632,25 +639,68 @@ def render_tool_system_prompt(
     return "\n".join(system_blocks)
 
 
-def _load_voice_manifest(model_config: object) -> tuple[tuple[str, ...], str | None]:
-    model_path = getattr(model_config, "model", None)
-    if not isinstance(model_path, str) or not model_path:
-        return (), None
-    revision = getattr(model_config, "revision", None)
-    root = resolve_checkpoint_directory(model_path, revision=revision)
-    path = root / "voices.json"
-    if not path.is_file():
-        return (), None
-    value = json.loads(path.read_text())
-    voices = value.get("voices") if isinstance(value, dict) else None
-    if not isinstance(voices, dict) or any(not isinstance(name, str) for name in voices):
-        raise ValueError(f"Invalid DuplexIO voice manifest: {path}")
-    default = value.get("default_voice")
-    if default is not None and not isinstance(default, str):
-        raise ValueError(f"Invalid DuplexIO default voice in {path}")
-    if default is not None and default not in voices:
-        raise ValueError(f"DuplexIO default voice is not present in {path}")
-    return tuple(sorted(voices)), default
+def _voice_prompt_from_session(
+    config: DuplexSessionConfig,
+    hf_config: object,
+) -> tuple[str, int]:
+    """Return the session's reference audio and how many frames it pins.
+
+    A voice is audio, not a name: the caller supplies the clip the agent's voice
+    is cloned from, the same way this repo's other native-duplex models take
+    ``ref_audio_data``. The bytes stay base64 here and are decoded once at the
+    model boundary, so a ten-second clip never becomes a quarter-million-element
+    Python list on the way.
+    """
+    extra_body = config.extra_body
+    for rejected in ("ref_audio_path", "tts_ref_audio_path"):
+        if rejected in extra_body or getattr(config, rejected, None):
+            raise DuplexIOClientRuntimeConfigError(
+                f"DuplexIO does not accept {rejected}; resolve ref_audio in "
+                "serving first",
+                code="ref_audio_path_rejected",
+            )
+    audio_data = extra_body.get("ref_audio_data")
+    if not isinstance(audio_data, str) or not audio_data:
+        raise DuplexIOClientRuntimeConfigError(
+            "DuplexIO requires ref_audio_data: base64 pcm_f32le reference audio "
+            "for the agent's voice",
+            code="ref_audio_required",
+        )
+    audio_format = extra_body.get("ref_audio_format", "pcm_f32le")
+    if audio_format != "pcm_f32le":
+        raise DuplexIOClientRuntimeConfigError(
+            f"Unsupported DuplexIO ref_audio_format: {audio_format!r}",
+            code="ref_audio_format_unsupported",
+        )
+    sample_rate = extra_body.get("ref_audio_sample_rate", DUPLEXIO_SAMPLE_RATE)
+    if sample_rate != DUPLEXIO_SAMPLE_RATE:
+        raise DuplexIOClientRuntimeConfigError(
+            f"DuplexIO reference audio must be {DUPLEXIO_SAMPLE_RATE} Hz mono, "
+            f"got {sample_rate!r}",
+            code="ref_audio_sample_rate",
+        )
+    try:
+        raw = base64.b64decode(audio_data, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise DuplexIOClientRuntimeConfigError(
+            "Invalid DuplexIO ref_audio_data",
+            code="ref_audio_invalid",
+        ) from error
+    if len(raw) % 4:
+        raise DuplexIOClientRuntimeConfigError(
+            "DuplexIO ref_audio_data is not whole 32-bit samples",
+            code="ref_audio_invalid",
+        )
+    max_frames = getattr(hf_config, "voice_prompt_max_frames", 0)
+    if not isinstance(max_frames, int) or max_frames < 1:
+        raise ValueError("DuplexIO checkpoint declares no pinned prompt room")
+    frames = min(len(raw) // (4 * DUPLEXIO_FRAME_SIZE), max_frames)
+    if frames < 1:
+        raise DuplexIOClientRuntimeConfigError(
+            "DuplexIO reference audio is shorter than one 80 ms frame",
+            code="ref_audio_too_short",
+        )
+    return audio_data, frames
 
 
 def _validate_full_duplex_mode(config: DuplexSessionConfig) -> None:

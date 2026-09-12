@@ -51,32 +51,33 @@ class BackendConnection:
         return None
 
 
-def test_voice_options_follow_checkpoint_tensor_numbers(tmp_path: Path) -> None:
-    manifest_path = tmp_path / "voices.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "voices": {
-                    "custom": {"tensor": "voice.332"},
-                    "first": {"tensor": "voice.0"},
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
+def test_sample_clips_are_listed_for_the_upload_control(tmp_path: Path) -> None:
+    (tmp_path / "bravo_voice.wav").write_bytes(b"RIFF")
+    (tmp_path / "alpha_voice.flac").write_bytes(b"fLaC")
+    (tmp_path / "notes.txt").write_text("not audio", encoding="utf-8")
 
-    assert server.load_voice_options(manifest_path) == [
-        {"id": "first", "label": "Voice 1 — first"},
-        {"id": "custom", "label": "Voice 333 — custom"},
+    assert server.list_sample_clips(tmp_path) == [
+        {
+            "id": "alpha_voice.flac",
+            "label": "alpha voice",
+            "url": "/voices/alpha_voice.flac",
+        },
+        {
+            "id": "bravo_voice.wav",
+            "label": "bravo voice",
+            "url": "/voices/bravo_voice.wav",
+        },
     ]
+    # A deployment may ship none: the page still uploads a clip.
+    assert server.list_sample_clips(None) == []
 
 
-def test_index_exposes_voice_options_and_default() -> None:
+def test_index_exposes_sample_clips() -> None:
     app = server.build_app(
         ws_backend="ws://127.0.0.1:8099",
         model="checkpoint",
-        voice="custom",
-        voices=[{"id": "custom", "label": "Voice 333 — custom"}],
+        sample_clips=[{"id": "alice.wav", "label": "alice", "url": "/voices/alice.wav"}],
+        sample_clip_dir=None,
         sampling={
             "text": {
                 "mode": "top_p",
@@ -92,8 +93,8 @@ def test_index_exposes_voice_options_and_default() -> None:
     index = TestClient(app).get("/")
 
     assert index.status_code == 200
-    assert '"voice": "custom"' in index.text
-    assert '"label": "Voice 333 \\u2014 custom"' in index.text
+    assert '"sampleClips"' in index.text
+    assert '"url": "/voices/alice.wav"' in index.text
     assert '"sampling": {"text": {"mode": "top_p"' in index.text
 
 
@@ -173,8 +174,8 @@ def test_healthz_reports_backend_health(
     app = server.build_app(
         ws_backend="ws://127.0.0.1:8099",
         model="checkpoint",
-        voice="custom",
-        voices=[{"id": "custom", "label": "Voice 333 — custom"}],
+        sample_clips=[{"id": "alice.wav", "label": "alice", "url": "/voices/alice.wav"}],
+        sample_clip_dir=None,
         sampling={},
         health_check=lambda: healthy,
     )
@@ -202,8 +203,8 @@ def test_access_password_protects_page_and_websocket(monkeypatch: pytest.MonkeyP
     app = server.build_app(
         ws_backend="ws://127.0.0.1:8099",
         model="checkpoint",
-        voice="custom",
-        voices=[{"id": "custom", "label": "Voice 333 — custom"}],
+        sample_clips=[{"id": "alice.wav", "label": "alice", "url": "/voices/alice.wav"}],
+        sample_clip_dir=None,
         sampling={},
         password_hash="test-verifier",
         backend_headers={
@@ -272,8 +273,8 @@ def test_healthz_remains_public_when_access_password_is_set() -> None:
     app = server.build_app(
         ws_backend="ws://127.0.0.1:8099",
         model="checkpoint",
-        voice="custom",
-        voices=[{"id": "custom", "label": "Voice 333 — custom"}],
+        sample_clips=[{"id": "alice.wav", "label": "alice", "url": "/voices/alice.wav"}],
+        sample_clip_dir=None,
         sampling={},
         password_hash="test-verifier",
     )
@@ -289,8 +290,10 @@ def test_session_cookie_survives_frontend_restart(monkeypatch: pytest.MonkeyPatc
     app_args = {
         "ws_backend": "wss://backend.example",
         "model": "checkpoint",
-        "voice": "custom",
-        "voices": [{"id": "custom", "label": "Voice 333 — custom"}],
+        "sample_clips": [
+            {"id": "alice.wav", "label": "alice", "url": "/voices/alice.wav"}
+        ],
+        "sample_clip_dir": None,
         "sampling": {},
         "password_hash": "test-verifier",
     }

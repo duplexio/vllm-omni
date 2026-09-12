@@ -45,7 +45,6 @@ class DuplexIOConfig(PretrainedConfig):
         initial_agent_prefix: str = INITIAL_AGENT_PREFIX,
         initial_user_prefix: str = INITIAL_USER_PREFIX,
         voice_prompt_max_frames: int = 125,
-        default_voice: str | None = None,
         audio_adapter_config: dict[str, Any] | None = None,
         quantized_audio_config: dict[str, Any] | None = None,
         depth_transformer_config: dict[str, Any] | None = None,
@@ -76,7 +75,6 @@ class DuplexIOConfig(PretrainedConfig):
         self.initial_agent_prefix = initial_agent_prefix
         self.initial_user_prefix = initial_user_prefix
         self.voice_prompt_max_frames = voice_prompt_max_frames
-        self.default_voice = default_voice
         self.audio_adapter_config = dict(audio_adapter_config or {})
         self.quantized_audio_config = dict(quantized_audio_config or {})
         self.depth_transformer_config = dict(depth_transformer_config or {})

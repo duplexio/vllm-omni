@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import struct
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +22,14 @@ from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSessionConfi
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+REFERENCE_FRAMES = 3
+
+
+def reference_audio(frames: int = REFERENCE_FRAMES) -> str:
+    """Base64 pcm_f32le reference audio: the voice, as the client supplies it."""
+    samples = [0.25] * (frames * 1_920)
+    return base64.b64encode(struct.pack(f"<{len(samples)}f", *samples)).decode()
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -30,24 +40,16 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
         ("agent", [7, 8]),
     ],
 )
-async def test_serving_config_selects_exported_default_voice(
+async def test_serving_config_pins_the_client_reference_audio(
     tmp_path,
     monkeypatch,
     start_role: str | None,
     expected_prefix_ids: list[int],
 ) -> None:
-    (tmp_path / "voices.json").write_text(
-        json.dumps(
-            {
-                "default_voice": "voice-b",
-                "voices": {"voice-b": {}, "voice-a": {}},
-            }
-        )
-    )
     model_config = SimpleNamespace(
         model=str(tmp_path),
         hf_config=SimpleNamespace(
-            default_voice="voice-b",
+            voice_prompt_max_frames=125,
             default_system_prompt="system",
             initial_agent_prefix="<|im_start|>assistant\n",
             initial_user_prefix="<|im_start|>user\n",
@@ -87,7 +89,10 @@ async def test_serving_config_selects_exported_default_voice(
         lambda config: tokenizer,
     )
 
-    extra_body: dict[str, object] = {"full_duplex": True}
+    extra_body: dict[str, object] = {
+        "full_duplex": True,
+        "ref_audio_data": reference_audio(),
+    }
     if start_role is not None:
         extra_body["start_role"] = start_role
     adapter = DuplexIOServingRuntimeAdapter(lambda *_args: None)
@@ -99,8 +104,8 @@ async def test_serving_config_selects_exported_default_voice(
         model_config=model_config,
     )
 
-    assert runtime["duplexio_voice"] == "voice-b"
-    assert runtime["duplexio_voice_ids"] == ["voice-a", "voice-b"]
+    assert runtime["duplexio_voice_prompt_audio"] == reference_audio()
+    assert runtime["duplexio_voice_prompt_frames"] == REFERENCE_FRAMES
     assert runtime["duplexio_scheduler_token_id"] == 11
     assert isinstance(runtime["duplexio_sampling_seed"], int)
     assert runtime["duplexio_system_token_ids"] == [
@@ -129,28 +134,64 @@ async def test_serving_config_selects_exported_default_voice(
 
 
 @pytest.mark.asyncio
-async def test_serving_config_rejects_unknown_voice(tmp_path) -> None:
-    (tmp_path / "voices.json").write_text(
-        json.dumps({"default_voice": "voice-a", "voices": {"voice-a": {}}})
-    )
+async def test_serving_config_requires_reference_audio(tmp_path) -> None:
     model_config = SimpleNamespace(
         model=str(tmp_path),
-        hf_config=SimpleNamespace(default_voice="voice-a", pad_token_id=0),
+        hf_config=SimpleNamespace(voice_prompt_max_frames=125, pad_token_id=0),
     )
     config = DuplexSessionConfig(
         modalities=["audio"],
-        voice="missing",
         extra_body={"full_duplex": True},
     )
 
     with pytest.raises(DuplexIOClientRuntimeConfigError) as exc_info:
         adapter = DuplexIOServingRuntimeAdapter(lambda *_args: None)
-        await adapter.prepare_runtime_config(
-            config,
-            model_config=model_config,
-        )
+        await adapter.prepare_runtime_config(config, model_config=model_config)
 
-    assert exc_info.value.code == "voice_not_found"
+    assert exc_info.value.code == "ref_audio_required"
+
+
+@pytest.mark.asyncio
+async def test_serving_config_rejects_a_server_side_reference_path(tmp_path) -> None:
+    model_config = SimpleNamespace(
+        model=str(tmp_path),
+        hf_config=SimpleNamespace(voice_prompt_max_frames=125, pad_token_id=0),
+    )
+    config = DuplexSessionConfig(
+        modalities=["audio"],
+        extra_body={"full_duplex": True, "ref_audio_path": "/srv/voices/a.wav"},
+    )
+
+    with pytest.raises(DuplexIOClientRuntimeConfigError) as exc_info:
+        adapter = DuplexIOServingRuntimeAdapter(lambda *_args: None)
+        await adapter.prepare_runtime_config(config, model_config=model_config)
+
+    assert exc_info.value.code == "ref_audio_path_rejected"
+
+
+@pytest.mark.asyncio
+async def test_serving_config_rejects_reference_audio_below_one_frame(
+    tmp_path,
+) -> None:
+    model_config = SimpleNamespace(
+        model=str(tmp_path),
+        hf_config=SimpleNamespace(voice_prompt_max_frames=125, pad_token_id=0),
+    )
+    config = DuplexSessionConfig(
+        modalities=["audio"],
+        extra_body={
+            "full_duplex": True,
+            "ref_audio_data": base64.b64encode(
+                struct.pack("<4f", *[0.1] * 4)
+            ).decode(),
+        },
+    )
+
+    with pytest.raises(DuplexIOClientRuntimeConfigError) as exc_info:
+        adapter = DuplexIOServingRuntimeAdapter(lambda *_args: None)
+        await adapter.prepare_runtime_config(config, model_config=model_config)
+
+    assert exc_info.value.code == "ref_audio_too_short"
 
 
 @pytest.mark.asyncio
@@ -158,13 +199,10 @@ async def test_serving_config_applies_client_sampling_parameters(
     tmp_path,
     monkeypatch,
 ) -> None:
-    (tmp_path / "voices.json").write_text(
-        json.dumps({"default_voice": "voice-a", "voices": {"voice-a": {}}})
-    )
     model_config = SimpleNamespace(
         model=str(tmp_path),
         hf_config=SimpleNamespace(
-            default_voice="voice-a",
+            voice_prompt_max_frames=125,
             default_system_prompt="system",
             initial_agent_prefix="agent",
             initial_user_prefix="user",
@@ -199,6 +237,7 @@ async def test_serving_config_applies_client_sampling_parameters(
             modalities=["text", "audio"],
             extra_body={
                 "full_duplex": True,
+                "ref_audio_data": reference_audio(),
                 "duplexio_sampling": {
                     "seed": 1234,
                     "text": {
@@ -246,32 +285,6 @@ def test_serving_config_rejects_invalid_client_sampling() -> None:
     assert exc_info.value.code == "invalid_sampling"
 
 
-@pytest.mark.asyncio
-async def test_serving_config_rejects_invalid_manifest_default(tmp_path) -> None:
-    (tmp_path / "voices.json").write_text(
-        json.dumps(
-            {
-                "default_voice": "missing",
-                "voices": {"voice-a": {}},
-            }
-        )
-    )
-    model_config = SimpleNamespace(
-        model=str(tmp_path),
-        hf_config=SimpleNamespace(default_voice=None, pad_token_id=0),
-    )
-
-    with pytest.raises(ValueError, match="default voice"):
-        adapter = DuplexIOServingRuntimeAdapter(lambda *_args: None)
-        await adapter.prepare_runtime_config(
-            DuplexSessionConfig(
-                modalities=["audio"],
-                extra_body={"full_duplex": True},
-            ),
-            model_config=model_config,
-        )
-
-
 def test_duplexio_capabilities_use_native_scheduler_data_plane() -> None:
     capabilities = DuplexIOServingRuntimeAdapter.capabilities(max_sessions=2)
 
@@ -284,41 +297,55 @@ def test_duplexio_capabilities_use_native_scheduler_data_plane() -> None:
     assert capabilities.chunk_period_ms == 80
 
 
-def test_duplexio_initial_payloads_seed_the_full_silent_prompt() -> None:
+def test_duplexio_initial_payloads_pin_the_voice_then_seed_the_prompt() -> None:
     adapter = DuplexIOServingRuntimeAdapter(lambda *_args: None)
     payloads = adapter.initial_data_plane_payloads(
         SimpleNamespace(
-            runtime_config={"duplexio_system_token_ids": [1, 2, 3]},
+            runtime_config={
+                "duplexio_system_token_ids": [1, 2, 3],
+                "duplexio_voice_prompt_frames": 2,
+            },
             turn_id=4,
         )
     )
 
-    assert len(payloads) == 1
-    payload = payloads[0]
-    assert payload["audio"] == ""
-    assert payload["frame_size"] == DUPLEXIO_FRAME_SIZE
-    assert payload["frame_count"] == 3
-    assert payload["valid_samples"] == 3 * DUPLEXIO_FRAME_SIZE
-    assert payload["duplexio_prefill_final"] is True
-    assert payload["duplex_turn_id"] == 4
+    assert len(payloads) == 2
+    prompt, prefill = payloads
+    # The reference the voice is cloned from precedes the instructions.
+    assert prompt["duplexio_voice_prompt"] is True
+    assert prompt["frame_count"] == 2
+    assert "duplexio_prefill" not in prompt
+    assert prefill["audio"] == ""
+    assert prefill["frame_size"] == DUPLEXIO_FRAME_SIZE
+    assert prefill["frame_count"] == 3
+    assert prefill["valid_samples"] == 3 * DUPLEXIO_FRAME_SIZE
+    assert prefill["duplexio_prefill_final"] is True
+    assert prefill["duplex_turn_id"] == 4
 
 
 def test_duplexio_initial_payloads_chunk_long_system_prompts() -> None:
     adapter = DuplexIOServingRuntimeAdapter(lambda *_args: None)
     payloads = adapter.initial_data_plane_payloads(
         SimpleNamespace(
-            runtime_config={"duplexio_system_token_ids": list(range(260))},
+            runtime_config={
+                "duplexio_system_token_ids": list(range(260)),
+                # A long prompt chunks like the text does.
+                "duplexio_voice_prompt_frames": 130,
+            },
             turn_id=4,
         )
     )
 
-    assert [payload["frame_count"] for payload in payloads] == [128, 128, 4]
-    assert [payload["duplexio_prefill_final"] for payload in payloads] == [
+    prompt = [payload for payload in payloads if payload.get("duplexio_voice_prompt")]
+    prefill = [payload for payload in payloads if payload.get("duplexio_prefill")]
+    assert [payload["frame_count"] for payload in prompt] == [128, 2]
+    assert [payload["frame_count"] for payload in prefill] == [128, 128, 4]
+    assert [payload["duplexio_prefill_final"] for payload in prefill] == [
         False,
         False,
         True,
     ]
-    assert sum(payload["valid_samples"] for payload in payloads) == (
+    assert sum(payload["valid_samples"] for payload in prefill) == (
         260 * DUPLEXIO_FRAME_SIZE
     )
 
@@ -471,28 +498,3 @@ async def test_duplexio_requires_full_duplex_mode(tmp_path) -> None:
         )
 
     assert exc_info.value.code == "full_duplex_required"
-
-
-@pytest.mark.asyncio
-async def test_duplexio_requires_voice_for_text_projection(
-    tmp_path,
-) -> None:
-    (tmp_path / "voices.json").write_text(
-        json.dumps({"default_voice": None, "voices": {"voice-a": {}}})
-    )
-    model_config = SimpleNamespace(
-        model=str(tmp_path),
-        hf_config=SimpleNamespace(default_voice=None, pad_token_id=0),
-    )
-
-    with pytest.raises(DuplexIOClientRuntimeConfigError) as exc_info:
-        adapter = DuplexIOServingRuntimeAdapter(lambda *_args: None)
-        await adapter.prepare_runtime_config(
-            DuplexSessionConfig(
-                modalities=["text"],
-                extra_body={"full_duplex": True},
-            ),
-            model_config=model_config,
-        )
-
-    assert exc_info.value.code == "voice_required"

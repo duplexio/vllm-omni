@@ -86,6 +86,7 @@ def build_duplexio_data_plane_prompt(
         "duplexio_system_input_final",
         False,
     )
+    duplexio_voice_prompt = payload.get("duplexio_voice_prompt", False)
     if not all(
         isinstance(value, bool)
         for value in (
@@ -93,6 +94,7 @@ def build_duplexio_data_plane_prompt(
             duplexio_prefill_final,
             duplexio_system_input,
             duplexio_system_input_final,
+            duplexio_voice_prompt,
         )
     ):
         raise ValueError("DuplexIO text-input flags must be boolean when present")
@@ -102,6 +104,10 @@ def build_duplexio_data_plane_prompt(
         raise ValueError("DuplexIO system_input_final requires duplexio_system_input")
     if duplexio_prefill and duplexio_system_input:
         raise ValueError("DuplexIO prefill and system input are mutually exclusive")
+    if duplexio_voice_prompt and (duplexio_prefill or duplexio_system_input):
+        raise ValueError(
+            "DuplexIO voice prompt is its own burst, ahead of any text input"
+        )
     duplexio_system_token_ids = payload.get("duplexio_system_token_ids")
     if duplexio_system_input and (
         not isinstance(duplexio_system_token_ids, list)
@@ -143,6 +149,7 @@ def build_duplexio_data_plane_prompt(
                 "duplexio_prefill_final": duplexio_prefill_final,
                 "duplexio_system_input": duplexio_system_input,
                 "duplexio_system_input_final": duplexio_system_input_final,
+                "duplexio_voice_prompt": duplexio_voice_prompt,
                 "duplexio_system_token_ids": duplexio_system_token_ids,
                 "user_token_id": payload.get("user_token_id"),
                 "decode_audio": payload.get("decode_audio", True),

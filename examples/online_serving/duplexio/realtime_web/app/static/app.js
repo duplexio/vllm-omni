@@ -12,6 +12,10 @@
   const muteButton = document.getElementById('mute');
   const recordButton = document.getElementById('record');
   const voiceSelect = document.getElementById('model-voice');
+  const voiceUpload = document.getElementById('voice-upload');
+  // The voice is reference audio this page sends, not a name the checkpoint
+  // knows: whatever clip is chosen is resampled here and pinned by the server.
+  let referenceAudio = null;
   const samplingPicker = document.getElementById('sampling-picker');
   const textSamplingMode = document.getElementById('text-sampling-mode');
   const textTemperature = document.getElementById('text-temperature');
@@ -139,11 +143,60 @@
   }
 
   function populateVoices() {
-    const voices = Array.isArray(config.voices) ? config.voices : [];
-    const options = voices.map((voice) => new Option(voice.label, voice.id));
-    voiceSelect.replaceChildren(...options);
-    voiceSelect.value = config.voice;
+    const clips = Array.isArray(config.sampleClips) ? config.sampleClips : [];
+    const options = clips.map((clip) => new Option(clip.label, clip.url));
+    voiceSelect.replaceChildren(
+      new Option(clips.length ? 'Sample clips…' : 'Upload a clip', ''),
+      ...options,
+    );
   }
+
+  async function referenceAudioFromBuffer(buffer) {
+    // The model wants mono at its own rate, so decode and resample here rather
+    // than teach serving another format.
+    const rate = config.inputSampleRate;
+    const context = new OfflineAudioContext(1, Math.ceil(buffer.duration * rate), rate);
+    const source = context.createBufferSource();
+    source.buffer = buffer;
+    source.connect(context.destination);
+    source.start();
+    const mono = (await context.startRendering()).getChannelData(0);
+    const bytes = new Uint8Array(new Float32Array(mono).buffer);
+    let binary = '';
+    for (let index = 0; index < bytes.length; index += 1) {
+      binary += String.fromCharCode(bytes[index]);
+    }
+    return btoa(binary);
+  }
+
+  async function loadReferenceAudio(source) {
+    const context = new AudioContext();
+    try {
+      const bytes = source instanceof Blob
+        ? await source.arrayBuffer()
+        : await (await fetch(source)).arrayBuffer();
+      const buffer = await context.decodeAudioData(bytes);
+      referenceAudio = await referenceAudioFromBuffer(buffer);
+      detailElement.textContent = `Voice reference ready (${buffer.duration.toFixed(1)} s)`;
+    } finally {
+      await context.close();
+    }
+  }
+
+  voiceSelect.addEventListener('change', () => {
+    if (voiceSelect.value) loadReferenceAudio(voiceSelect.value).catch((error) => {
+      detailElement.textContent = `Could not read that clip: ${error.message}`;
+    });
+  });
+
+  voiceUpload.addEventListener('change', () => {
+    const [file] = voiceUpload.files;
+    if (!file) return;
+    voiceSelect.value = '';
+    loadReferenceAudio(file).catch((error) => {
+      detailElement.textContent = `Could not read that clip: ${error.message}`;
+    });
+  });
 
   function populateTools() {
     const options = tools.map((tool) => {
@@ -695,7 +748,6 @@
           session: {
             model: config.model,
             modalities: ['audio', 'text'],
-            voice: voiceSelect.value,
             response_format: 'pcm',
             tools: sessionTools,
             tool_choice: sessionTools.length ? 'auto' : 'none',
@@ -703,6 +755,9 @@
               full_duplex: true,
               auto_response: true,
               start_role: 'agent',
+              ref_audio_data: referenceAudio,
+              ref_audio_format: 'pcm_f32le',
+              ref_audio_sample_rate: config.inputSampleRate,
               duplexio_sampling: sessionSampling,
             },
           },
@@ -852,6 +907,7 @@
     muteButton.textContent = 'Mute';
     muteButton.disabled = true;
     voiceSelect.disabled = false;
+    voiceUpload.disabled = false;
     samplingPicker.disabled = false;
     toolPicker.disabled = false;
     updateRecordingButton();
@@ -861,9 +917,15 @@
 
   async function startSession() {
     if (running) return;
+    if (!referenceAudio) {
+      setStatus('Offline', 'error');
+      detailElement.textContent = 'Choose or upload a voice clip first';
+      return;
+    }
     startButton.disabled = true;
     recordButton.disabled = true;
     voiceSelect.disabled = true;
+    voiceUpload.disabled = true;
     samplingPicker.disabled = true;
     toolPicker.disabled = true;
     setStatus('Starting');

@@ -43,7 +43,6 @@ from vllm_omni.model_executor.models.duplexio.audio_representation import (
     MimiEmbedding,
 )
 from vllm_omni.model_executor.models.duplexio.checkpoint import (
-    load_voice_clips,
     resolve_checkpoint_directory,
 )
 from vllm_omni.model_executor.models.duplexio.configuration_duplexio import (
@@ -351,12 +350,6 @@ class DuplexIOForConditionalGeneration(
         self.tool_call_emit_head = nn.Linear(DUPLEXIO_NUM_CELLS * hidden_size, 1)
         self.logits_processor = DuplexIOLogitsProcessor(self.text_config.vocab_size)
         self.make_empty_intermediate_tensors = self.llm.base_model.model.make_empty_intermediate_tensors
-        self._voice_clips = load_voice_clips(
-            vllm_config.model_config.model,
-            sample_rate=config.sample_rate,
-            default_voice=config.default_voice,
-            revision=vllm_config.model_config.revision,
-        )
         self._forced_next_token_ids: list[int] | None = None
         # Also encodes the streaming RNN-T's user words for the user text stream.
         self.tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
@@ -1211,13 +1204,15 @@ class DuplexIOForConditionalGeneration(
         runtime_config: Mapping[str, object],
         device: torch.device,
     ) -> DuplexIORequestState:
-        voice = runtime_config.get("duplexio_voice")
-        if not isinstance(voice, str) or voice not in self._voice_clips:
-            raise ValueError(f"DuplexIO request selected unknown voice {voice!r}")
-        clips = self._voice_clips[voice]
-        clip_index = runtime_config.get("duplexio_voice_clip_index", 0)
-        if not isinstance(clip_index, int) or not 0 <= clip_index < len(clips):
-            raise ValueError(f"Voice clip index {clip_index!r} is invalid for {voice!r}")
+        # A voice is reference audio the caller supplies. Serving validates the
+        # format and rate; the bytes stay base64 until here so a ten-second clip
+        # never crosses the boundary as a quarter-million-element list.
+        reference = runtime_config.get("duplexio_voice_prompt_audio")
+        if not isinstance(reference, str) or not reference:
+            raise ValueError(
+                "DuplexIO requires duplexio_voice_prompt_audio: base64 pcm_f32le "
+                "reference audio the agent's voice is cloned from"
+            )
         system_tokens = runtime_config.get("duplexio_system_token_ids", ())
         if not isinstance(system_tokens, (list, tuple)) or not all(isinstance(token, int) for token in system_tokens):
             raise ValueError("duplexio_system_token_ids must be integer token IDs")
@@ -1236,26 +1231,28 @@ class DuplexIOForConditionalGeneration(
         if not isinstance(tool_choice, Mapping):
             raise ValueError("duplexio_tool_choice must be an object")
         # A clip longer than the pinned region is truncated from the start, which
-        # keeps the speech onset its reference window was chosen around; a shorter
-        # one is pinned as-is, because padded silence teaches nothing about a voice.
+        # keeps its speech onset; a shorter one is pinned as-is, because padded
+        # silence teaches nothing about a voice.
         frame_size = self.config.frame_size
+        raw = base64.b64decode(reference, validate=True)
+        if not raw or len(raw) % 4:
+            raise ValueError("DuplexIO voice prompt is not whole 32-bit samples")
+        samples = torch.frombuffer(bytearray(raw), dtype=torch.float32).to(device)
         prompt_frames = min(
-            clips[clip_index].shape[0] // frame_size,
+            samples.shape[0] // frame_size,
             self.config.voice_prompt_max_frames,
         )
         if prompt_frames == 0:
             raise ValueError(
-                f"DuplexIO voice clip {clip_index} of {voice!r} is shorter than one frame"
+                "DuplexIO voice prompt is shorter than one frame "
+                f"({samples.shape[0]} samples at {self.config.sample_rate} Hz)"
             )
         continuous = isinstance(self.audio_codec, PocketMimi)
         agent_delay = (
             None if continuous else self.audio_representation.new_state(device=device)
         )
         voice_prompt = self.encode_voice_prompt(
-            clips[clip_index][: prompt_frames * frame_size].to(
-                device=device,
-                dtype=torch.float32,
-            ),
+            samples[: prompt_frames * frame_size],
             agent_delay,
         )
         return DuplexIORequestState(

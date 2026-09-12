@@ -59,32 +59,22 @@ def join_ws_url(base: str, path: str, query: str) -> str:
     return base.rstrip("/") + path + (("?" + query) if query else "")
 
 
-def load_voice_options(manifest_path: Path) -> list[dict[str, str]]:
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    voices = manifest.get("voices") if isinstance(manifest, Mapping) else None
-    if not isinstance(voices, Mapping) or not voices:
-        raise ValueError(f"Invalid DuplexIO voice manifest: {manifest_path}")
+def list_sample_clips(directory: Path | None) -> list[dict[str, str]]:
+    """Offer the sample reference clips a browser can pick instead of uploading.
 
-    numbered_voices: list[tuple[int, dict[str, str]]] = []
-    for voice_id, entry in voices.items():
-        if not isinstance(voice_id, str) or not isinstance(entry, Mapping):
-            raise ValueError(f"Invalid DuplexIO voice manifest: {manifest_path}")
-        tensor_name = entry.get("tensor")
-        match = re.fullmatch(r"voice\.(\d+)", tensor_name) if isinstance(tensor_name, str) else None
-        if match is None:
-            raise ValueError(f"Invalid DuplexIO voice tensor for {voice_id!r}")
-        voice_number = int(match.group(1)) + 1
-        numbered_voices.append(
-            (
-                voice_number,
-                {
-                    "id": voice_id,
-                    "label": f"Voice {voice_number} — {voice_id}",
-                },
-            )
-        )
-    numbered_voices.sort(key=lambda item: item[0])
-    return [option for _, option in numbered_voices]
+    A voice is audio the client sends, so these are only convenience assets: the
+    page reads whichever clip is chosen, resamples it, and puts it in the session
+    as reference audio. No clips is a valid deployment — the page still uploads.
+    """
+    if directory is None:
+        return []
+    if not directory.is_dir():
+        raise ValueError(f"DuplexIO sample clip directory not found: {directory}")
+    return [
+        {"id": path.name, "label": path.stem.replace("_", " "), "url": f"/voices/{path.name}"}
+        for path in sorted(directory.iterdir())
+        if path.suffix.lower() in {".wav", ".flac", ".mp3", ".ogg"}
+    ]
 
 
 def load_sampling_defaults(config_path: Path) -> dict[str, object]:
@@ -160,8 +150,8 @@ def build_app(
     *,
     ws_backend: str,
     model: str,
-    voice: str,
-    voices: list[dict[str, str]],
+    sample_clips: list[dict[str, str]],
+    sample_clip_dir: Path | None,
     sampling: dict[str, object],
     tools: list[dict[str, object]] | None = None,
     health_check: Callable[[], bool] | None = None,
@@ -216,8 +206,7 @@ def build_app(
         config = json.dumps(
             {
                 "model": model,
-                "voice": voice,
-                "voices": voices,
+                "sampleClips": sample_clips,
                 "sampling": sampling,
                 "inputSampleRate": INPUT_SAMPLE_RATE,
                 "realtimePath": "v1/realtime",
@@ -332,6 +321,12 @@ def build_app(
                 await websocket.close(code=1011)
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    if sample_clip_dir is not None:
+        app.mount(
+            "/voices",
+            StaticFiles(directory=str(sample_clip_dir)),
+            name="voices",
+        )
     return app
 
 
@@ -341,8 +336,12 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=7862)
     parser.add_argument("--ws-backend", default="ws://127.0.0.1:8099")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--voice", required=True)
-    parser.add_argument("--voice-manifest", type=Path, required=True)
+    parser.add_argument(
+        "--sample-clips",
+        type=Path,
+        default=None,
+        help="Directory of reference clips the page offers beside its upload control.",
+    )
     parser.add_argument(
         "--tools",
         type=Path,
@@ -354,18 +353,16 @@ def main() -> None:
     tools = json.loads(args.tools.read_text(encoding="utf-8"))
     if not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools):
         parser.error("--tools must contain a JSON list of tool definitions")
-    voices = load_voice_options(args.voice_manifest)
+    sample_clips = list_sample_clips(args.sample_clips)
     sampling = load_sampling_defaults(Path(args.model) / "config.json")
-    if args.voice not in {voice["id"] for voice in voices}:
-        parser.error(f"--voice {args.voice!r} is not present in --voice-manifest")
 
     logging.basicConfig(level=logging.INFO)
     uvicorn.run(
         build_app(
             ws_backend=args.ws_backend,
             model=args.model,
-            voice=args.voice,
-            voices=voices,
+            sample_clips=sample_clips,
+            sample_clip_dir=args.sample_clips,
             sampling=sampling,
             tools=tools,
         ),
