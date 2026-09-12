@@ -27,12 +27,15 @@ def test_duplexio_attention_visibility_matches_row_contract() -> None:
     key_active = torch.ones_like(key, dtype=torch.bool)
     key_active[:, 1] = False
 
+    key_pinned = torch.zeros_like(key, dtype=torch.bool)
+
     visible = duplexio_attention_visible(
         query,
         key,
         audio_positions[:, None],
         audio_positions[None, :],
         key_active,
+        key_pinned,
         audio_attention_window_frames=2,
     )
 
@@ -121,3 +124,40 @@ def test_cell_and_frame_positions_share_one_rope_position_per_row() -> None:
         duplexio_cell_ids(positions),
         torch.arange(DUPLEXIO_NUM_CELLS).repeat(3),
     )
+
+
+def test_pinned_voice_prompt_cells_outlive_the_audio_window() -> None:
+    # Two frames of audio a full window apart: frame 0's audio cells expire for
+    # frame 1's query, unless they are the pinned voice prompt.
+    positions = torch.arange(2 * DUPLEXIO_NUM_CELLS)
+    audio_positions = torch.tensor([1, 9]).repeat_interleave(DUPLEXIO_NUM_CELLS)
+    query = positions[:, None]
+    key = positions[None, :]
+    key_active = torch.ones_like(key, dtype=torch.bool)
+    audio_cells = (positions % DUPLEXIO_NUM_CELLS) >= 4
+    last_row = positions >= DUPLEXIO_NUM_CELLS
+
+    expired = duplexio_attention_visible(
+        query,
+        key,
+        audio_positions[:, None],
+        audio_positions[None, :],
+        key_active,
+        torch.zeros_like(key, dtype=torch.bool),
+        audio_attention_window_frames=2,
+    )
+    pinned = duplexio_attention_visible(
+        query,
+        key,
+        audio_positions[:, None],
+        audio_positions[None, :],
+        key_active,
+        (audio_cells & ~last_row)[None, :].expand_as(key),
+        audio_attention_window_frames=2,
+    )
+
+    first_row_audio = (audio_cells & ~last_row)[None, :].expand_as(expired)
+    assert not expired[last_row][:, (audio_cells & ~last_row)].any()
+    assert pinned[last_row][:, (audio_cells & ~last_row)].all()
+    # Nothing else moves: the two relations differ only on those keys.
+    torch.testing.assert_close(pinned & ~first_row_audio, expired & ~first_row_audio)

@@ -13,7 +13,14 @@ def test_compiled_frame_inputs_preserve_layout() -> None:
     compiled = torch.compile(
         frame_inputs, fullgraph=True, dynamic=True, options={"emulate_precision_casts": True},
     )
-    for frames, live in ((1, True), (7, False), (7, True), (1, False)):
+    for frames, live, prompt in (
+        (1, True, False),
+        (7, False, False),
+        (7, True, False),
+        (1, False, False),
+        # A pinned voice-prompt burst: not live, but its audio cells are keys.
+        (4, False, True),
+    ):
         ids = torch.randint(0, 8, (frames, 4), device="cuda")
         text = torch.randn(frames, 4, 128, device="cuda", dtype=torch.bfloat16)
         channels = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
@@ -21,7 +28,10 @@ def test_compiled_frame_inputs_preserve_layout() -> None:
         agent = torch.randn_like(user)
         for start in (0, 1, 9, 1057):
             # Audio time is frozen on a text-only append, which `live` selects.
-            arguments = (ids, text, channels, user, agent, 0, 1, start, start // 4, 3, live)
+            arguments = (
+                ids, text, channels, user, agent, 0, 1, start, start // 4, 3, live,
+                0, prompt,
+            )
             expected = frame_inputs(*arguments)
             actual = compiled(*arguments)
             for output, reference in zip(actual, expected, strict=True):
@@ -34,4 +44,16 @@ def test_compiled_frame_inputs_preserve_layout() -> None:
                     ordinals.append(counter if token not in (0, 1) else 0)
                 ordinals.extend((0, 0))
             assert actual[2].tolist() == ordinals
-            assert actual[1].view(frames, 6)[:, 4:].eq(live).all()
+            assert actual[1].view(frames, 6)[:, 4:].eq(live or prompt).all()
+            prompt_ordinal = actual[6].view(frames, 6)
+            assert not prompt_ordinal[:, :4].any()
+            expected_ordinals = (
+                torch.arange(1, frames + 1, device="cuda", dtype=torch.int32)
+                if prompt
+                else torch.zeros(frames, device="cuda", dtype=torch.int32)
+            )
+            assert prompt_ordinal[:, 4:].eq(expected_ordinals[:, None]).all()
+            # A prompt row sees only the prompt frames before it.
+            assert actual[7].view(frames, 6).eq(
+                (expected_ordinals - 1 if prompt else expected_ordinals)[:, None]
+            ).all()

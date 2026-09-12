@@ -29,6 +29,7 @@ def key_in_window(
     q_window_pos: Tensor,
     k_window_pos: Tensor,
     k_cell_ids: Tensor,
+    k_pinned: Tensor,
     window_frames: int,
     window_all_keys: bool,
 ) -> Tensor:
@@ -44,6 +45,11 @@ def key_in_window(
     cache evicts by cell count, so a positional window keeps cached and batch
     forwards identical).
 
+    Pinned voice-prompt keys are exempt: they are the reference the agent's
+    voice is cloned from and must outlive any window. Freezing their audio clock
+    is not enough on its own, because a frozen key still falls out of the
+    distance test once the conversation runs past it.
+
     It doubles as the eviction keep-predicate: window positions never
     decrease, so a key outside the window of position ``p`` is invisible to
     every query at ``p`` or later.
@@ -51,7 +57,7 @@ def key_in_window(
     in_window = (q_window_pos - k_window_pos) <= window_frames
     if window_all_keys:
         return in_window
-    return (k_cell_ids < NUM_STREAMS) | in_window
+    return (k_cell_ids < NUM_STREAMS) | k_pinned | in_window
 
 
 def key_visible(
@@ -61,6 +67,7 @@ def key_visible(
     k_window_pos: Tensor,
     k_cell_ids: Tensor,
     k_active: Tensor,
+    k_pinned: Tensor,
     window_frames: int,
     window_all_keys: bool,
 ) -> Tensor:
@@ -76,6 +83,7 @@ def key_visible(
             q_window_pos,
             k_window_pos,
             k_cell_ids,
+            k_pinned,
             window_frames,
             window_all_keys,
         )

@@ -8,7 +8,7 @@ import torch
 from safetensors.torch import save_file
 
 from vllm_omni.model_executor.models.duplexio.checkpoint import (
-    load_voice_pools,
+    load_voice_clips,
     resolve_checkpoint_directory,
     validate_export_manifest,
 )
@@ -30,26 +30,42 @@ def _write_checkpoint(tmp_path) -> None:
         json.dumps(
             {
                 "default_voice": "alice",
+                "sample_rate": 24_000,
                 "voices": {
-                    "alice": {"tensor": "voice.0", "num_embeddings": 2}
+                    "alice": {"tensors": ["voice.0.0", "voice.0.1"]}
                 },
             }
         )
     )
-    save_file({"voice.0": torch.ones(2, 3)}, tmp_path / "voices.safetensors")
+    save_file(
+        {"voice.0.0": torch.ones(4_800), "voice.0.1": torch.full((2_400,), 0.5)},
+        tmp_path / "voices.safetensors",
+    )
 
 
-def test_checkpoint_contract_loads_exact_voice_pool(tmp_path) -> None:
+def test_checkpoint_contract_loads_every_voice_clip(tmp_path) -> None:
     _write_checkpoint(tmp_path)
 
-    pools = load_voice_pools(
+    clips = load_voice_clips(
         str(tmp_path),
-        speaker_embed_dim=3,
+        sample_rate=24_000,
         default_voice="alice",
     )
 
-    assert set(pools) == {"alice"}
-    torch.testing.assert_close(pools["alice"], torch.ones(2, 3))
+    assert set(clips) == {"alice"}
+    assert [clip.shape for clip in clips["alice"]] == [(4_800,), (2_400,)]
+    torch.testing.assert_close(clips["alice"][0], torch.ones(4_800))
+
+
+def test_checkpoint_contract_rejects_a_bundle_at_another_rate(tmp_path) -> None:
+    _write_checkpoint(tmp_path)
+
+    with pytest.raises(ValueError, match="voice bundle is at"):
+        load_voice_clips(
+            str(tmp_path),
+            sample_rate=16_000,
+            default_voice=None,
+        )
 
 
 def test_checkpoint_contract_rejects_missing_weight_file(tmp_path) -> None:
@@ -67,9 +83,9 @@ def test_checkpoint_contract_rejects_voice_manifest_disagreement(tmp_path) -> No
     (tmp_path / "duplexio_export.json").write_text(json.dumps(manifest))
 
     with pytest.raises(ValueError, match="voice artifact disagree"):
-        load_voice_pools(
+        load_voice_clips(
             str(tmp_path),
-            speaker_embed_dim=3,
+            sample_rate=24_000,
             default_voice=None,
         )
 

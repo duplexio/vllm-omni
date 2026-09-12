@@ -36,12 +36,16 @@ def install_row(
     emitted_before: int,
     audio_frame: int,
     audio_active: bool = True,
+    prompt_ordinal: int = 0,
+    prompt_before: int = 0,
 ) -> None:
-    """Install one live row, mirroring what ``frame_inputs`` computes for it.
+    """Install one row, mirroring what ``frame_inputs`` computes for it.
 
     ``audio_frame`` is the one-based audio-time position the row's own audio
     occupies (or, for a frozen row, the last position already recorded) and
     ``emitted_before`` how many text cells the session emitted before the row.
+    A pinned voice-prompt row sets ``prompt_ordinal`` to its one-based place in
+    the prompt; ``prompt_before`` is how many prompt frames precede the row.
     """
     ordinals = torch.where(
         text_active,
@@ -50,7 +54,9 @@ def install_row(
     )
     window = frame.layout.audio_window_frames
     frame.update(
-        key_active=torch.cat((text_active, torch.full((2,), audio_active))),
+        key_active=torch.cat(
+            (text_active, torch.full((2,), audio_active or prompt_ordinal > 0))
+        ),
         text_ordinal=torch.cat((ordinals, torch.zeros(2, dtype=torch.int32))),
         text_last=torch.full((DUPLEXIO_NUM_CELLS,), emitted_before, dtype=torch.int32),
         audio_first=torch.full(
@@ -60,6 +66,15 @@ def install_row(
             (DUPLEXIO_NUM_CELLS,),
             audio_frame - 1 if audio_active else audio_frame,
             dtype=torch.int32,
+        ),
+        prompt_ordinal=torch.cat(
+            (
+                torch.zeros(DUPLEXIO_NUM_TEXT_CELLS, dtype=torch.int32),
+                torch.full((2,), prompt_ordinal, dtype=torch.int32),
+            )
+        ),
+        prompt_last=torch.full(
+            (DUPLEXIO_NUM_CELLS,), prompt_before, dtype=torch.int32
         ),
     )
 
@@ -71,6 +86,7 @@ def test_compact_cache_attention_matches_logical_rows_across_audio_eviction() ->
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=2,
+        voice_prompt_frames=1,
         max_model_len=5 * DUPLEXIO_NUM_CELLS,
     )
     frame = frame_metadata(layout)
@@ -121,6 +137,7 @@ def test_compact_cache_attention_matches_logical_rows_across_audio_eviction() ->
                 torch.tensor(audio_frame),
                 torch.tensor(logical_audio),
                 torch.tensor(logical_active),
+                torch.zeros(len(logical_active), dtype=torch.bool),
                 audio_attention_window_frames=layout.audio_window_frames,
             )
             logical_scores = query @ all_keys[logical_visible].T
@@ -138,6 +155,7 @@ def test_audio_ring_reuses_a_bounded_set_of_slots() -> None:
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=8,
+        voice_prompt_frames=1,
         max_model_len=600_000,
     )
     rows = 500
@@ -150,6 +168,8 @@ def test_audio_ring_reuses_a_bounded_set_of_slots() -> None:
         text_last=torch.zeros(tokens, dtype=torch.int32),
         audio_first=torch.ones(tokens, dtype=torch.int32),
         audio_last=torch.div(cells, DUPLEXIO_NUM_CELLS, rounding_mode="floor").int(),
+        prompt_ordinal=torch.zeros(tokens, dtype=torch.int32),
+        prompt_last=torch.zeros(tokens, dtype=torch.int32),
     )
 
     written = frame.write_slots(tokens)
@@ -164,6 +184,7 @@ def test_frozen_audio_rows_write_emitted_text_but_no_audio() -> None:
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=8,
+        voice_prompt_frames=1,
         max_model_len=60,
     )
     frame = frame_metadata(layout)
@@ -189,6 +210,7 @@ def test_live_row_writes_its_own_audio_frame_into_the_ring() -> None:
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=8,
+        voice_prompt_frames=1,
         max_model_len=60,
     )
     frame = frame_metadata(layout)
@@ -208,6 +230,7 @@ def test_padded_graph_tokens_neither_write_nor_see_a_slot() -> None:
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=2,
+        voice_prompt_frames=1,
         max_model_len=60,
     )
     frame = frame_metadata(layout, rows=2)
@@ -260,6 +283,7 @@ def test_cache_manager_reserves_once_and_releases_every_block_on_teardown() -> N
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=8,
+        voice_prompt_frames=1,
         max_model_len=600,
     )
     pool = _BlockPool()
@@ -313,7 +337,9 @@ def test_cache_spec_registers_native_manager_and_preserves_page_contract() -> No
         dtype=torch.bfloat16,
     )
 
-    spec = make_duplexio_kv_cache_spec(base, audio_window_frames=8, max_model_len=600)
+    spec = make_duplexio_kv_cache_spec(
+        base, audio_window_frames=8, voice_prompt_frames=1, max_model_len=600
+    )
 
     assert KVCacheSpecRegistry.get_manager_class(spec) is DuplexIOKVCacheManager
     assert spec.page_size_bytes == base.page_size_bytes
@@ -331,4 +357,86 @@ def test_cache_spec_rejects_pages_flex_cannot_tile() -> None:
     )
 
     with pytest.raises(ValueError, match="power-of-two"):
-        make_duplexio_kv_cache_spec(base, audio_window_frames=8, max_model_len=600)
+        make_duplexio_kv_cache_spec(
+            base, audio_window_frames=8, voice_prompt_frames=1, max_model_len=600
+        )
+
+
+def test_pinned_prompt_rows_land_outside_the_ring_and_never_expire() -> None:
+    # One audio frame of window, two pinned prompt frames ahead of the session.
+    layout = DuplexIOKVLayout(
+        block_size=16,
+        audio_window_frames=1,
+        voice_prompt_frames=2,
+        max_model_len=8 * DUPLEXIO_NUM_CELLS,
+    )
+    frame = frame_metadata(layout)
+    silent = torch.zeros(DUPLEXIO_NUM_TEXT_CELLS, dtype=torch.bool)
+
+    prompt_slots = []
+    for ordinal in (1, 2):
+        install_row(
+            frame,
+            text_active=silent,
+            emitted_before=0,
+            audio_frame=0,
+            audio_active=False,
+            prompt_ordinal=ordinal,
+            prompt_before=ordinal - 1,
+        )
+        written = frame.write_slots(DUPLEXIO_NUM_CELLS)
+        prompt_slots.append(written[DUPLEXIO_NUM_TEXT_CELLS:].tolist())
+
+    # Prompt frames are dense in their own region: neither collides with the
+    # ring, whose slots start at zero, nor with each other.
+    assert prompt_slots == [
+        [layout.prompt_base, layout.prompt_base + 1],
+        [layout.prompt_base + 2, layout.prompt_base + 3],
+    ]
+    assert layout.audio_slots <= layout.prompt_base
+    assert layout.prompt_base + layout.prompt_slots <= layout.persistent_text_base
+
+    # A live row far past the window still sees both pinned frames, while its own
+    # ring history has expired.
+    install_row(
+        frame,
+        text_active=silent,
+        emitted_before=0,
+        audio_frame=40,
+        prompt_before=2,
+    )
+    keys = torch.arange(layout.max_compact_slots)
+    query = torch.zeros_like(keys)
+    visible = frame.visible(query, query, query, keys)
+
+    pinned = torch.zeros_like(visible)
+    pinned[layout.prompt_base : layout.prompt_base + layout.prompt_slots] = True
+    assert visible[pinned].all()
+    # Nothing was emitted, so no text slot is visible; ring slots are governed by
+    # the window and covered by the eviction tests above.
+    assert not visible[layout.persistent_text_base :].any()
+
+
+def test_a_pinned_frame_does_not_see_itself_through_the_cache() -> None:
+    layout = DuplexIOKVLayout(
+        block_size=16,
+        audio_window_frames=1,
+        voice_prompt_frames=2,
+        max_model_len=8 * DUPLEXIO_NUM_CELLS,
+    )
+    frame = frame_metadata(layout)
+    install_row(
+        frame,
+        text_active=torch.zeros(DUPLEXIO_NUM_TEXT_CELLS, dtype=torch.bool),
+        emitted_before=0,
+        audio_frame=0,
+        audio_active=False,
+        prompt_ordinal=1,
+        prompt_before=0,
+    )
+    keys = torch.arange(layout.max_compact_slots)
+    query = torch.zeros_like(keys)
+
+    # Its own cells are merged from the incoming K/V, so the cache must not
+    # report them: nothing is visible before the first prompt frame is behind us.
+    assert not frame.visible(query, query, query, keys).any()

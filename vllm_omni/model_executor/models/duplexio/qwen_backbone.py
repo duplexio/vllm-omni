@@ -513,6 +513,7 @@ class DuplexIOPagedAttention(Attention):
         return make_duplexio_kv_cache_spec(
             base,
             audio_window_frames=config.audio_attention_window_frames,
+            voice_prompt_frames=config.voice_prompt_max_frames,
             max_model_len=vllm_config.model_config.max_model_len,
         )
 
@@ -944,6 +945,7 @@ class DuplexIOQwenModel(nn.Module):
             DuplexIOKVLayout(
                 block_size=vllm_config.cache_config.block_size,
                 audio_window_frames=vllm_config.model_config.hf_config.audio_attention_window_frames,
+                voice_prompt_frames=vllm_config.model_config.hf_config.voice_prompt_max_frames,
                 max_model_len=vllm_config.model_config.max_model_len,
             ),
             vllm_config.scheduler_config.max_num_batched_tokens,

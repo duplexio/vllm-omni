@@ -25,13 +25,12 @@ class DuplexIOConfig(PretrainedConfig):
         *,
         text_config: dict[str, Any] | PretrainedConfig | None = None,
         audio_codec_config: dict[str, Any] | None = None,
-        duplexio_export_version: int = 5,
+        duplexio_export_version: int = 6,
         user_asr_config: dict[str, Any] | None = None,
         user_asr_streaming_config: dict[str, Any] | None = None,
         audio_representation: str = "continuous",
         continuous_audio_config: dict[str, Any] | None = None,
         flowmap_config: dict[str, Any] | None = None,
-        speaker_lda_dim: int | None = None,
         emit_head_input: str = "full_frame",
         audio_conditioning: str = "agent_audio_cell",
         stream_names: list[str] | None = None,
@@ -45,7 +44,7 @@ class DuplexIOConfig(PretrainedConfig):
         default_system_prompt: str = "",
         initial_agent_prefix: str = INITIAL_AGENT_PREFIX,
         initial_user_prefix: str = INITIAL_USER_PREFIX,
-        speaker_embed_dim: int = 2_048,
+        voice_prompt_max_frames: int = 125,
         default_voice: str | None = None,
         audio_adapter_config: dict[str, Any] | None = None,
         quantized_audio_config: dict[str, Any] | None = None,
@@ -62,7 +61,6 @@ class DuplexIOConfig(PretrainedConfig):
         self.audio_representation = audio_representation
         self.continuous_audio_config = dict(continuous_audio_config or {})
         self.flowmap_config = dict(flowmap_config or {})
-        self.speaker_lda_dim = speaker_lda_dim
         self.emit_head_input = emit_head_input
         self.audio_conditioning = audio_conditioning
         self.duplexio_export_version = duplexio_export_version
@@ -77,7 +75,7 @@ class DuplexIOConfig(PretrainedConfig):
         self.default_system_prompt = default_system_prompt
         self.initial_agent_prefix = initial_agent_prefix
         self.initial_user_prefix = initial_user_prefix
-        self.speaker_embed_dim = speaker_embed_dim
+        self.voice_prompt_max_frames = voice_prompt_max_frames
         self.default_voice = default_voice
         self.audio_adapter_config = dict(audio_adapter_config or {})
         self.quantized_audio_config = dict(quantized_audio_config or {})
@@ -103,7 +101,7 @@ class DuplexIOConfig(PretrainedConfig):
         return self.text_config
 
     def _validate_duplexio_contract(self) -> None:
-        if self.duplexio_export_version != 5:
+        if self.duplexio_export_version != 6:
             raise ValueError(
                 f"Unsupported DuplexIO export version: {self.duplexio_export_version}"
             )
@@ -148,12 +146,9 @@ class DuplexIOConfig(PretrainedConfig):
             "frame_samples": 1_280,
         }:
             raise ValueError("DuplexIO requires 80 ms, zero-lookahead streaming ASR")
-        if (
-            self.speaker_lda_dim is not None
-            and not 0 < self.speaker_lda_dim <= self.speaker_embed_dim
-        ):
+        if self.voice_prompt_max_frames < 1:
             raise ValueError(
-                "DuplexIO speaker LDA dimension is outside the raw embedding"
+                "DuplexIO needs room for at least one pinned voice-prompt frame"
             )
         adapter_hidden_size = self.audio_adapter_config.get("hidden_size")
         if adapter_hidden_size is not None and (
@@ -218,10 +213,11 @@ class DuplexIOConfig(PretrainedConfig):
             raise ValueError("Native DuplexIO requires one acoustic delay frame")
         if (
             self.depth_transformer_config.get("implementation")
-            != "duplexio_speaker_adaptive_depth_v1"
+            != "duplexio_depth_v2"
         ):
             raise ValueError(
-                "Native DuplexIO requires the speaker-conditioned depth checkpoint"
+                "Native DuplexIO requires the unconditioned depth checkpoint; the "
+                "agent's voice comes from the pinned prompt, not a speaker vector"
             )
         depth_dim = self.depth_transformer_config.get("dim")
         depth_layers = self.depth_transformer_config.get("num_layers")
@@ -292,8 +288,6 @@ class DuplexIOConfig(PretrainedConfig):
             raise ValueError("DuplexIO rollout sampling top_p must be in (0, 1]")
         if self.audio_attention_window_frames < 1:
             raise ValueError("DuplexIO audio attention window must be positive")
-        if self.speaker_embed_dim < 1:
-            raise ValueError("DuplexIO speaker_embed_dim must be positive")
 
         text_config = self.text_config
         if text_config.model_type != "qwen3_5_text":

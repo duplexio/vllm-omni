@@ -31,13 +31,16 @@ from vllm_omni.model_executor.models.duplexio.row_semantics import (
 class DuplexIOKVLayout:
     """Physical slots owned by one admitted DuplexIO request.
 
-    The first region is a ring for active audio cells. The final region stores
-    active text cells and is never reclaimed during the request. Query-local
+    The first region is a ring for active audio cells. The second holds the
+    pinned voice prompt, which is audio that no window expires, so it cannot
+    live in a ring indexed by audio time. The final region stores active text
+    cells. Neither of the last two is reclaimed during the request. Query-local
     self-attention uses incoming K/V directly and needs no cache slots.
     """
 
     block_size: int
     audio_window_frames: int
+    voice_prompt_frames: int
     max_model_len: int
 
     @property
@@ -59,8 +62,19 @@ class DuplexIOKVLayout:
         return DUPLEXIO_NUM_CELLS - DUPLEXIO_NUM_TEXT_CELLS
 
     @property
-    def persistent_text_base(self) -> int:
+    def prompt_base(self) -> int:
         return cdiv(self.audio_slots, self.block_size) * self.block_size
+
+    @property
+    def prompt_slots(self) -> int:
+        return self.voice_prompt_frames * self.num_audio_cells
+
+    @property
+    def persistent_text_base(self) -> int:
+        return (
+            cdiv(self.prompt_base + self.prompt_slots, self.block_size)
+            * self.block_size
+        )
 
     @property
     def text_base_page(self) -> int:
@@ -83,6 +97,12 @@ class DuplexIOKVLayout:
         return (
             audio_position % self.audio_ring_frames
         ) * self.num_audio_cells + audio_cell
+
+    def prompt_slot(self, prompt_frame: int, audio_cell: int) -> int:
+        """Pinned prompt frames are dense: they are written once and never move."""
+        assert 0 <= audio_cell < self.num_audio_cells
+        assert 0 <= prompt_frame < self.voice_prompt_frames
+        return self.prompt_base + prompt_frame * self.num_audio_cells + audio_cell
 
     def persistent_text_slot(self, text_ordinal: int) -> int:
         assert 0 <= text_ordinal < self.max_persistent_text_tokens
@@ -115,6 +135,8 @@ class DuplexIOFrameMetadata:
         self.text_last = torch.zeros(max_tokens, dtype=torch.int32, device=device)
         self.audio_first = torch.ones(max_tokens, dtype=torch.int32, device=device)
         self.audio_last = torch.full((max_tokens,), -1, dtype=torch.int32, device=device)
+        self.prompt_ordinal = torch.zeros(max_tokens, dtype=torch.int32, device=device)
+        self.prompt_last = torch.zeros(max_tokens, dtype=torch.int32, device=device)
         self.filled = 0
 
     def update(
@@ -125,6 +147,8 @@ class DuplexIOFrameMetadata:
         text_last: Tensor,
         audio_first: Tensor,
         audio_last: Tensor,
+        prompt_ordinal: Tensor,
+        prompt_last: Tensor,
     ) -> None:
         """Install this step's cells, one row of each tensor per token."""
         tokens = key_active.shape[0]
@@ -136,6 +160,8 @@ class DuplexIOFrameMetadata:
         self.text_last[:tokens].copy_(text_last)
         self.audio_first[:tokens].copy_(audio_first)
         self.audio_last[:tokens].copy_(audio_last)
+        self.prompt_ordinal[:tokens].copy_(prompt_ordinal)
+        self.prompt_last[:tokens].copy_(prompt_last)
 
     def reset(self, start: int = 0, end: int | None = None) -> None:
         """Make tokens inert: no slot to write, no key in the window."""
@@ -145,32 +171,49 @@ class DuplexIOFrameMetadata:
         self.text_last[region] = 0
         self.audio_first[region] = 1
         self.audio_last[region] = -1
+        self.prompt_ordinal[region] = 0
+        self.prompt_last[region] = 0
         self.filled = min(self.filled, start)
 
     def write_slots(self, tokens: int) -> Tensor:
         """Compact slot per cell, -1 for cells that must not enter the cache.
 
-        Audio cells land on their own frame, one past the last frame they see.
-        Text cells land on their emission ordinal; an unemitted cell has ordinal
-        zero and is skipped.
+        Live audio cells land on their own frame, one past the last frame they
+        see. Pinned voice-prompt cells land densely in their own region, because
+        a ring indexed by audio time would expire them. Text cells land on their
+        emission ordinal; an unemitted cell has ordinal zero and is skipped.
         """
         layout = self.layout
         cell = self.cell[:tokens]
         audio_last = self.audio_last[:tokens]
         text_ordinal = self.text_ordinal[:tokens]
+        prompt_ordinal = self.prompt_ordinal[:tokens]
         is_audio = cell >= DUPLEXIO_NUM_TEXT_CELLS
+        is_prompt = is_audio & (prompt_ordinal > 0)
+        audio_cell = cell - DUPLEXIO_NUM_TEXT_CELLS
         audio_slot = (
             torch.remainder(audio_last + 1, layout.audio_ring_frames) * layout.num_audio_cells
-            + cell
-            - DUPLEXIO_NUM_TEXT_CELLS
+            + audio_cell
+        )
+        prompt_slot = (
+            layout.prompt_base
+            + (prompt_ordinal - 1) * layout.num_audio_cells
+            + audio_cell
         )
         stored = torch.where(
             is_audio,
-            self.key_active[:tokens] & (audio_last >= 0),
+            self.key_active[:tokens] & ((audio_last >= 0) | (prompt_ordinal > 0)),
             text_ordinal > 0,
         )
         text_slot = layout.persistent_text_base + text_ordinal - 1
-        return torch.where(is_audio, audio_slot, text_slot).masked_fill(~stored, -1)
+        return (
+            torch.where(
+                is_audio,
+                torch.where(is_prompt, prompt_slot, audio_slot),
+                text_slot,
+            )
+            .masked_fill(~stored, -1)
+        )
 
     def visible(self, batch: Tensor, head: Tensor, query: Tensor, key: Tensor) -> Tensor:
         """Return whether a query cell sees a compact slot of a prior row.
@@ -178,7 +221,8 @@ class DuplexIOFrameMetadata:
         Its own cell is merged separately, so no same-row key is visible here.
         An audio slot's frame is the most recent one with its ring residue; slots
         that were never written, or that the window has passed, derive a frame
-        below the query's first visible frame.
+        below the query's first visible frame. Pinned prompt slots carry no
+        window: every row after the one that wrote them sees them.
         """
         del batch, head
         layout = self.layout
@@ -188,10 +232,20 @@ class DuplexIOFrameMetadata:
             layout.audio_ring_frames,
         )
         audio = (key < layout.audio_slots) & (frame >= self.audio_first[query])
+        prompt_frame = torch.div(
+            key - layout.prompt_base,
+            layout.num_audio_cells,
+            rounding_mode="floor",
+        )
+        prompt = (
+            (key >= layout.prompt_base)
+            & (key < layout.prompt_base + layout.prompt_slots)
+            & (prompt_frame < self.prompt_last[query])
+        )
         text = (key >= layout.persistent_text_base) & (
             key - layout.persistent_text_base < self.text_last[query]
         )
-        return audio | text
+        return audio | prompt | text
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -199,6 +253,7 @@ class DuplexIOKVCacheSpec(FullAttentionSpec):
     """Full-attention pages using DuplexIO's role-aware physical layout."""
 
     audio_window_frames: int
+    voice_prompt_frames: int
     max_model_len: int
 
     @property
@@ -206,6 +261,7 @@ class DuplexIOKVCacheSpec(FullAttentionSpec):
         return DuplexIOKVLayout(
             block_size=self.block_size,
             audio_window_frames=self.audio_window_frames,
+            voice_prompt_frames=self.voice_prompt_frames,
             max_model_len=self.max_model_len,
         )
 
@@ -312,6 +368,7 @@ def make_duplexio_kv_cache_spec(
     base: FullAttentionSpec,
     *,
     audio_window_frames: int,
+    voice_prompt_frames: int,
     max_model_len: int,
 ) -> DuplexIOKVCacheSpec:
     """Convert an Attention-produced full spec to DuplexIO's compact spec."""
@@ -326,6 +383,10 @@ def make_duplexio_kv_cache_spec(
         )
     if audio_window_frames < 0:
         raise ValueError("DuplexIO audio attention window must be non-negative")
+    if voice_prompt_frames < 1:
+        raise ValueError(
+            "DuplexIO needs room for at least one pinned voice-prompt frame"
+        )
     return DuplexIOKVCacheSpec(
         block_size=base.block_size,
         num_kv_heads=base.num_kv_heads,
@@ -339,6 +400,7 @@ def make_duplexio_kv_cache_spec(
         attention_chunk_size=base.attention_chunk_size,
         non_causal=base.non_causal,
         audio_window_frames=audio_window_frames,
+        voice_prompt_frames=voice_prompt_frames,
         max_model_len=max_model_len,
     )
 

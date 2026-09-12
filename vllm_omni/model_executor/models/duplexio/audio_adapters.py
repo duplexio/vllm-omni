@@ -13,8 +13,8 @@ from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_func
 
 
 @torch.compile(dynamic=True, fullgraph=True)
-def audio_adapter_hidden(gate_up: Tensor, modulation: Tensor | None) -> Tensor:
-    """Keep gate, normalization and speaker rounding identical in train/decode."""
+def audio_adapter_hidden(gate_up: Tensor) -> Tensor:
+    """Keep gate and normalization identical in train/decode."""
     gate, value = gate_up.chunk(2, dim=-1)
     hidden = F.silu(gate) * value
     # Normalize in FP32 with a row-local reduction independent of batch size.
@@ -26,14 +26,15 @@ def audio_adapter_hidden(gate_up: Tensor, modulation: Tensor | None) -> Tensor:
         hidden = rmsnorm(hidden, eps=eps)
     else:
         hidden = F.rms_norm(hidden, (hidden.shape[-1],), eps=eps)
-    if modulation is not None:
-        scale, shift = modulation.chunk(2, dim=-1)
-        hidden = hidden * (1 + scale) + shift
     return hidden
 
 
 class AudioInputAdapter(nn.Module):
-    """Map one frame of user-audio features into Qwen."""
+    """Map one frame of audio features into Qwen.
+
+    Both audio cells use it: the agent's voice comes from the pinned prompt in
+    its own cell, so nothing is injected here.
+    """
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int) -> None:
         super().__init__()
@@ -42,34 +43,6 @@ class AudioInputAdapter(nn.Module):
 
     def forward(self, audio_features: Tensor) -> Tensor:
         hidden = call_compiled_function(
-            audio_adapter_hidden, self.gate_up_proj(audio_features), None
-        )
-        return self.output_proj(hidden)
-
-
-class AgentAudioInputAdapter(nn.Module):
-    """Inject speaker-conditioned agent audio into Qwen."""
-
-    def __init__(
-        self,
-        input_dim: int,
-        speaker_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-    ) -> None:
-        super().__init__()
-        self.gate_up_proj = nn.Linear(input_dim, 2 * hidden_dim, bias=False)
-        self.speaker_modulation = nn.Linear(speaker_dim, 2 * hidden_dim, bias=False)
-        self.output_proj = nn.Linear(hidden_dim, output_dim, bias=False)
-
-    def forward(
-        self,
-        audio_features: Tensor,
-        speaker_embeddings: Tensor,
-    ) -> Tensor:
-        hidden = call_compiled_function(
-            audio_adapter_hidden,
-            self.gate_up_proj(audio_features),
-            self.speaker_modulation(speaker_embeddings),
+            audio_adapter_hidden, self.gate_up_proj(audio_features)
         )
         return self.output_proj(hidden)

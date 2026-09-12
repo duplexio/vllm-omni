@@ -18,31 +18,36 @@ WINDOW = 2
 # 4 are token-only bursts, so audio time freezes at 3 while frames advance:
 # frame:      0  1  2  3  4  5
 # audio time: 1  2  3  3  3  4
-# Each row: (q_frame, k_frame, q_audio, k_audio, k_cell, k_active,
+# Each row: (q_frame, k_frame, q_audio, k_audio, k_cell, k_active, k_pinned,
 #            in_window, visible). Queries sit at frame 5 (audio 4) unless the
 # case needs another vantage point.
 TRUTH_TABLE = [
     # Text keys are never windowed, however far back they are.
-    (5, 0, 4, 1, 0, True, True, True),
-    (5, 0, 4, 1, 3, True, True, True),
+    (5, 0, 4, 1, 0, True, False, True, True),
+    (5, 0, 4, 1, 3, True, False, True, True),
     # Inactive keys stay in window (text) but are never cross-frame visible.
-    (5, 0, 4, 1, 2, False, True, False),
+    (5, 0, 4, 1, 2, False, False, True, False),
     # Audio key inside the window.
-    (5, 4, 4, 3, 4, True, True, True),
+    (5, 4, 4, 3, 4, True, False, True, True),
     # Boundary: audio key exactly at window distance is still visible.
-    (5, 1, 4, 2, 5, True, True, True),
+    (5, 1, 4, 2, 5, True, False, True, True),
     # One past the window: evicted for every future query.
-    (5, 0, 4, 1, 4, True, False, False),
+    (5, 0, 4, 1, 4, True, False, False, False),
+    # The same key pinned as the voice prompt: no window expires it.
+    (5, 0, 4, 1, 4, True, True, True, True),
+    # Pinning does not make an inactive or same-frame key visible.
+    (5, 0, 4, 1, 4, False, True, True, False),
+    (5, 5, 4, 4, 4, True, True, True, False),
     # Burst case: frame distance 3 exceeds the window, but the frozen audio
     # time keeps the key visible (audio distance 1).
-    (5, 2, 4, 3, 4, True, True, True),
+    (5, 2, 4, 3, 4, True, False, True, True),
     # Same for a query on a burst frame itself (frame 4, audio 3 vs frame 1,
     # audio 2): frame distance 3, audio distance 1.
-    (4, 1, 3, 2, 5, True, True, True),
+    (4, 1, 3, 2, 5, True, False, True, True),
     # Same-frame keys are never cross-frame visible (self visibility is the
     # caller's q_idx == kv_idx term), though they are inside the window.
-    (5, 5, 4, 4, 4, True, True, False),
-    (5, 5, 4, 4, 1, True, True, False),
+    (5, 5, 4, 4, 4, True, False, True, False),
+    (5, 5, 4, 4, 1, True, False, True, False),
 ]
 
 
@@ -55,6 +60,7 @@ def test_vendored_predicates_match_literal_truth_table() -> None:
             k_audio,
             k_cell,
             k_active,
+            k_pinned,
             in_window,
             visible,
         ) = case
@@ -63,6 +69,7 @@ def test_vendored_predicates_match_literal_truth_table() -> None:
                 torch.tensor(q_audio),
                 torch.tensor(k_audio),
                 torch.tensor(k_cell),
+                torch.tensor(k_pinned),
                 WINDOW,
                 False,
             )
@@ -75,6 +82,7 @@ def test_vendored_predicates_match_literal_truth_table() -> None:
                 torch.tensor(k_audio),
                 torch.tensor(k_cell),
                 torch.tensor(k_active),
+                torch.tensor(k_pinned),
                 WINDOW,
                 False,
             )
@@ -88,6 +96,7 @@ def test_window_all_keys_windows_text_keys_too() -> None:
             torch.tensor(5),
             torch.tensor(1),
             torch.tensor(0),
+            torch.tensor(False),
             WINDOW,
             True,
         )
@@ -97,6 +106,18 @@ def test_window_all_keys_windows_text_keys_too() -> None:
             torch.tensor(5),
             torch.tensor(3),
             torch.tensor(0),
+            torch.tensor(False),
+            WINDOW,
+            True,
+        )
+    )
+    # The adapter has no pinned cells, so pinning cannot widen its window.
+    assert not bool(
+        key_in_window(
+            torch.tensor(5),
+            torch.tensor(1),
+            torch.tensor(0),
+            torch.tensor(True),
             WINDOW,
             True,
         )
@@ -118,43 +139,47 @@ def test_vendored_predicates_match_training_repo() -> None:
     q_audio = k_audio + torch.randint(-2, 8, size, generator=generator)
     k_cell = torch.randint(0, 6, size, generator=generator)
     k_active = torch.rand(size, generator=generator) < 0.7
+    k_pinned = torch.rand(size, generator=generator) < 0.2
+    # Training has one window semantics — the backbone's — so only that variant
+    # is comparable; `window_all_keys` is this repo's adapter-only addition.
     for window_frames in (0, 1, 3, 4_096):
-        for window_all_keys in (False, True):
-            torch.testing.assert_close(
-                key_in_window(
-                    q_audio,
-                    k_audio,
-                    k_cell,
-                    window_frames,
-                    window_all_keys,
-                ),
-                training_in_window(
-                    q_audio,
-                    k_audio,
-                    k_cell,
-                    window_frames,
-                    window_all_keys,
-                ),
-            )
-            torch.testing.assert_close(
-                key_visible(
-                    q_frame,
-                    k_frame,
-                    q_audio,
-                    k_audio,
-                    k_cell,
-                    k_active,
-                    window_frames,
-                    window_all_keys,
-                ),
-                training_visible(
-                    q_frame,
-                    k_frame,
-                    q_audio,
-                    k_audio,
-                    k_cell,
-                    k_active,
-                    window_frames,
-                    window_all_keys,
-                ),
-            )
+        torch.testing.assert_close(
+            key_in_window(
+                q_audio,
+                k_audio,
+                k_cell,
+                k_pinned,
+                window_frames,
+                False,
+            ),
+            training_in_window(
+                q_audio,
+                k_audio,
+                k_cell,
+                k_pinned,
+                window_frames,
+            ),
+        )
+        torch.testing.assert_close(
+            key_visible(
+                q_frame,
+                k_frame,
+                q_audio,
+                k_audio,
+                k_cell,
+                k_active,
+                k_pinned,
+                window_frames,
+                False,
+            ),
+            training_visible(
+                q_frame,
+                k_frame,
+                q_audio,
+                k_audio,
+                k_cell,
+                k_active,
+                k_pinned,
+                window_frames,
+            ),
+        )

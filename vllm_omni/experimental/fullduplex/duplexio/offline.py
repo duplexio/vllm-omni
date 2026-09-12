@@ -57,7 +57,7 @@ class PreparedConversation(BaseModel):
     user_features: Tensor
     user_token_ids: Tensor
     voice: str
-    voice_embedding_index: int = Field(default=0, ge=0)
+    voice_clip_index: int = Field(default=0, ge=0)
     tools: list[dict[str, Any]]
     metadata: dict[str, Any]
 
@@ -160,7 +160,7 @@ def prepared_from_pool(
         user_features=tensors["user_features"][:live_limit].float(),
         user_token_ids=tensors["user_token_ids"][:live_limit],
         voice=info["voice"],
-        voice_embedding_index=info["voice_embedding_index"],
+        voice_clip_index=info["voice_clip_index"],
         tools=info["tools"],
         metadata={**info["metadata"], "teacher_system": info["teacher_system"]},
     )
@@ -231,7 +231,7 @@ async def rollout_conversation(
         **sampling_config,
         "duplexio_system_token_ids": conversation.system_token_ids,
         "duplexio_voice": conversation.voice,
-        "duplexio_voice_embedding_index": conversation.voice_embedding_index,
+        "duplexio_voice_clip_index": conversation.voice_clip_index,
         "duplexio_tools": conversation.tools,
         "duplexio_tool_choice": {"mode": "auto" if conversation.tools else "none"},
         "duplexio_sampling_seed": seed,

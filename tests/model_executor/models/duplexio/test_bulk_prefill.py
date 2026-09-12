@@ -8,7 +8,6 @@ import torch
 from torch import Tensor, nn
 
 from vllm_omni.model_executor.models.duplexio.audio_adapters import (
-    AgentAudioInputAdapter,
     AudioInputAdapter,
 )
 from vllm_omni.model_executor.models.duplexio.audio_representation import (
@@ -55,7 +54,7 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
     )
     model.agent_audio_embedding = MimiEmbedding(3, 64, 5)
     model.user_audio_input_adapter = AudioInputAdapter(8, 7, 11)
-    model.agent_audio_input_adapter = AgentAudioInputAdapter(5, 3, 7, 11)
+    model.agent_audio_input_adapter = AudioInputAdapter(5, 7, 11)
     model.user_asr = SimpleNamespace(output_dim=8)
     model.llm = SimpleNamespace(
         base_model=SimpleNamespace(model=TextEmbedding(11)),
@@ -71,8 +70,8 @@ def request_state(model: DuplexIOForConditionalGeneration) -> DuplexIORequestSta
         user_asr=FastConformerAudioStreamState(),
         agent_delay=model.audio_representation.new_state(device=torch.device("cpu")),
         output_mimi=MimiStreamingState(),
-        speaker_embedding=torch.randn(3),
-        depth_speaker_conditioning=None,
+        # Two pinned prompt frames of encoded agent-audio rows.
+        voice_prompt=torch.zeros(2, 3, dtype=torch.long),
         system_token_ids=(3, 4, 5),
         sampling_generator=torch.Generator().manual_seed(9),
     )
@@ -188,8 +187,7 @@ def test_cached_live_frame_inserts_user_token_and_generated_agent_feedback() -> 
     torch.testing.assert_close(
         embeddings[5:6],
         model.agent_audio_input_adapter(
-            model.agent_audio_embedding(state.agent_audio_codes[None]),
-            state.speaker_embedding[None],
+            model.agent_audio_embedding(state.agent_audio_codes[None])
         ),
     )
     assert update["duplexio_working_state"].audio_position == 1

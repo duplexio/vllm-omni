@@ -1,6 +1,6 @@
 # Copyright (c) Kyutai, all rights reserved.
 # This source code is licensed under MoshiLicense.txt in this directory.
-"""Inference implementation of DuplexIO's speaker-conditioned depth sampler."""
+"""Inference implementation of DuplexIO's depth sampler."""
 
 from __future__ import annotations
 
@@ -38,45 +38,6 @@ class ScaledEmbedding(nn.Embedding):
         if self.output_projection is not None:
             hidden = self.output_projection(hidden)
         return hidden
-
-
-@dataclass(frozen=True)
-class AdaptiveLayerNormConditioning:
-    shift: Tensor
-    scale: Tensor
-
-
-@dataclass(frozen=True)
-class DepthSpeakerConditioning:
-    """Speaker-dependent depth tensors that remain constant for a session."""
-
-    attention: tuple[AdaptiveLayerNormConditioning, ...]
-    feedforward: tuple[AdaptiveLayerNormConditioning, ...]
-
-
-class SpeakerAdaptiveLayerNorm(nn.Module):
-    """LayerNorm modulated by the selected voice embedding."""
-
-    def __init__(self, dim: int, speaker_dim: int) -> None:
-        super().__init__()
-        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
-        self.modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(speaker_dim, 2 * dim),
-        )
-
-    def prepare(self, speaker: Tensor) -> AdaptiveLayerNormConditioning:
-        shift, scale = self.modulation(speaker).chunk(2, dim=-1)
-        return AdaptiveLayerNormConditioning(shift=shift, scale=scale)
-
-    def forward(
-        self,
-        hidden: Tensor,
-        conditioning: AdaptiveLayerNormConditioning,
-    ) -> Tensor:
-        return self.norm(hidden) * (
-            1 + conditioning.scale.unsqueeze(1)
-        ) + conditioning.shift.unsqueeze(1)
 
 
 class GatedMLP(nn.Module):
@@ -169,12 +130,11 @@ class DepthTransformerLayer(nn.Module):
         num_heads: int,
         feedforward_dim: int,
         num_codebooks: int,
-        speaker_dim: int,
     ) -> None:
         super().__init__()
-        self.attention_norm = SpeakerAdaptiveLayerNorm(dim, speaker_dim)
+        self.attention_norm = nn.LayerNorm(dim)
         self.attention = DepthAttention(dim, num_heads, num_codebooks)
-        self.feedforward_norm = SpeakerAdaptiveLayerNorm(dim, speaker_dim)
+        self.feedforward_norm = nn.LayerNorm(dim)
         self.feedforward = DepthFeedForward(
             dim,
             feedforward_dim,
@@ -184,23 +144,17 @@ class DepthTransformerLayer(nn.Module):
     def step(
         self,
         hidden: Tensor,
-        attention_conditioning: AdaptiveLayerNormConditioning,
-        feedforward_conditioning: AdaptiveLayerNormConditioning,
         codebook: int,
         cache: AttentionCache,
     ) -> tuple[Tensor, AttentionCache]:
         update, cache = self.attention.step(
-            self.attention_norm(hidden, attention_conditioning),
+            self.attention_norm(hidden),
             codebook,
             cache,
         )
         hidden = hidden + update
         return (
-            hidden
-            + self.feedforward.step(
-                self.feedforward_norm(hidden, feedforward_conditioning),
-                codebook,
-            ),
+            hidden + self.feedforward.step(self.feedforward_norm(hidden), codebook),
             cache,
         )
 
@@ -213,7 +167,6 @@ class DepthTransformer(nn.Module):
         num_heads: int,
         feedforward_dim: int,
         num_codebooks: int,
-        speaker_dim: int,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
@@ -223,7 +176,6 @@ class DepthTransformer(nn.Module):
                     num_heads,
                     feedforward_dim,
                     num_codebooks,
-                    speaker_dim,
                 )
                 for _ in range(num_layers)
             ]
@@ -232,25 +184,12 @@ class DepthTransformer(nn.Module):
     def step(
         self,
         hidden: Tensor,
-        speaker_conditioning: DepthSpeakerConditioning,
         codebook: int,
         caches: tuple[AttentionCache, ...],
     ) -> tuple[Tensor, tuple[AttentionCache, ...]]:
         next_caches = []
-        for layer, cache, attention, feedforward in zip(
-            self.layers,
-            caches,
-            speaker_conditioning.attention,
-            speaker_conditioning.feedforward,
-            strict=True,
-        ):
-            hidden, cache = layer.step(
-                hidden,
-                attention,
-                feedforward,
-                codebook,
-                cache,
-            )
+        for layer, cache in zip(self.layers, caches, strict=True):
+            hidden, cache = layer.step(hidden, codebook, cache)
             next_caches.append(cache)
         return hidden, tuple(next_caches)
 
@@ -258,7 +197,6 @@ class DepthTransformer(nn.Module):
 @dataclass(frozen=True)
 class DepthSamplerConfig:
     conditioning_dim: int
-    speaker_embedding_dim: int
     text_vocab_size: int
     codebook_size: int = 2_048
     num_codebooks: int = 8
@@ -273,7 +211,7 @@ class DepthSamplerConfig:
 
 
 class DepthAutoregressiveSampler(nn.Module):
-    """Generate one delayed Mimi column from text, voice, and backbone state."""
+    """Generate one delayed Mimi column from text and backbone state."""
 
     def __init__(self, config: DepthSamplerConfig) -> None:
         super().__init__()
@@ -283,11 +221,6 @@ class DepthAutoregressiveSampler(nn.Module):
                 nn.Linear(config.conditioning_dim, config.dim, bias=False)
                 for _ in range(config.num_codebooks)
             ]
-        )
-        self.speaker_projection = nn.Linear(
-            config.speaker_embedding_dim,
-            config.dim,
-            bias=False,
         )
         self.previous_codebook_embeddings = nn.ModuleList(
             [
@@ -310,7 +243,6 @@ class DepthAutoregressiveSampler(nn.Module):
             config.num_heads,
             config.feedforward_dim,
             config.num_codebooks,
-            config.dim,
         )
         self.heads = nn.ModuleList(
             [
@@ -320,29 +252,10 @@ class DepthAutoregressiveSampler(nn.Module):
         )
 
     @torch.no_grad()
-    def prepare_speaker(
-        self,
-        speaker_embeddings: Tensor,
-    ) -> DepthSpeakerConditioning:
-        """Compute speaker-dependent depth normalization once per session."""
-        speaker = self.speaker_projection(speaker_embeddings)
-        return DepthSpeakerConditioning(
-            attention=tuple(
-                layer.attention_norm.prepare(speaker)
-                for layer in self.transformer.layers
-            ),
-            feedforward=tuple(
-                layer.feedforward_norm.prepare(speaker)
-                for layer in self.transformer.layers
-            ),
-        )
-
-    @torch.no_grad()
     def sample(
         self,
         conditioning: Tensor,
         text_tokens: Tensor,
-        speaker_conditioning: DepthSpeakerConditioning,
         *,
         temperature: float | None = None,
         top_k: int | None = None,
@@ -372,7 +285,6 @@ class DepthAutoregressiveSampler(nn.Module):
             hidden = token + self.conditioning_projections[codebook](conditioning)
             hidden, caches = self.transformer.step(
                 hidden.unsqueeze(1),
-                speaker_conditioning,
                 codebook,
                 caches,
             )
@@ -400,5 +312,4 @@ class DepthAutoregressiveSampler(nn.Module):
 __all__ = [
     "DepthAutoregressiveSampler",
     "DepthSamplerConfig",
-    "DepthSpeakerConditioning",
 ]

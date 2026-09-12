@@ -3,7 +3,7 @@
 import torch
 from torch import Tensor, nn
 
-from vllm_omni.model_executor.models.duplexio.audio_adapters import AgentAudioInputAdapter, AudioInputAdapter
+from vllm_omni.model_executor.models.duplexio.audio_adapters import AudioInputAdapter
 
 
 class AudioInputGraph:
@@ -17,18 +17,16 @@ class AudioInputGraph:
         self,
         user_adapter: AudioInputAdapter,
         agent_embedding: nn.Module,
-        agent_adapter: AgentAudioInputAdapter,
+        agent_adapter: AudioInputAdapter,
         features: Tensor,
         codes: Tensor,
-        speakers: Tensor,
         dtype: torch.dtype,
     ) -> None:
         self.features = features.clone()
         self.codes = codes.clone()
-        self.speakers = speakers.clone()
 
         def project() -> tuple[Tensor, Tensor]:
-            return user_adapter(self.features), agent_adapter(agent_embedding(self.codes), self.speakers)
+            return user_adapter(self.features), agent_adapter(agent_embedding(self.codes))
 
         stream = torch.cuda.Stream(device=features.device)
         stream.wait_stream(torch.cuda.current_stream())
@@ -45,9 +43,8 @@ class AudioInputGraph:
         ):
             self.user_hidden, self.agent_hidden = project()
 
-    def __call__(self, features: Tensor, codes: Tensor, speakers: Tensor) -> tuple[Tensor, Tensor]:
+    def __call__(self, features: Tensor, codes: Tensor) -> tuple[Tensor, Tensor]:
         self.features.copy_(features)
         self.codes.copy_(codes)
-        self.speakers.copy_(speakers)
         self.graph.replay()
         return self.user_hidden, self.agent_hidden

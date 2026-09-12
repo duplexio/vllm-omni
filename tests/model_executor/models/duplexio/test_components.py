@@ -11,7 +11,6 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend, GDNAttentionMetadata
 
 from vllm_omni.model_executor.models.duplexio.audio_adapters import (
-    AgentAudioInputAdapter,
     AudioInputAdapter,
 )
 from vllm_omni.model_executor.models.duplexio.audio_representation import (
@@ -86,7 +85,7 @@ def _config() -> DuplexIOConfig:
             "acoustic_delay_frames": 1,
         },
         depth_transformer_config={
-            "implementation": "duplexio_speaker_adaptive_depth_v1",
+            "implementation": "duplexio_depth_v2",
             "low_rank_embeddings": 8,
             "dim": 32,
             "num_layers": 2,
@@ -109,9 +108,7 @@ def test_duplexio_config_round_trips_nested_text_config() -> None:
     assert restored.get_text_config().model_type == "qwen3_5_text"
     assert restored.get_text_config().hidden_size == 32
     assert restored.quantized_audio_config["num_codebooks"] == 8
-    assert restored.depth_transformer_config["implementation"] == (
-        "duplexio_speaker_adaptive_depth_v1"
-    )
+    assert restored.depth_transformer_config["implementation"] == "duplexio_depth_v2"
     assert restored.audio_adapter_config == {"hidden_size": 16}
     assert restored.initial_agent_prefix == "<|im_start|>assistant\n"
     assert restored.initial_user_prefix == "<|im_start|>user\n"
@@ -141,7 +138,12 @@ def test_duplexio_text_config_uses_one_dimensional_rope() -> None:
 def test_duplexio_installs_cell_addressing_at_stable_buffers() -> None:
     model = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
     nn.Module.__init__(model)
-    layout = DuplexIOKVLayout(block_size=16, audio_window_frames=2, max_model_len=120)
+    layout = DuplexIOKVLayout(
+        block_size=16,
+        audio_window_frames=2,
+        voice_prompt_frames=1,
+        max_model_len=120,
+    )
     model.frame = DuplexIOFrameMetadata(layout, 12, torch.device("cpu"))
     frame = model.frame
     buffers = (
@@ -150,6 +152,8 @@ def test_duplexio_installs_cell_addressing_at_stable_buffers() -> None:
         frame.text_last,
         frame.audio_first,
         frame.audio_last,
+        frame.prompt_ordinal,
+        frame.prompt_last,
     )
     pointers = tuple(buffer.data_ptr() for buffer in buffers)
     info = {
@@ -159,6 +163,8 @@ def test_duplexio_installs_cell_addressing_at_stable_buffers() -> None:
             "text_last": torch.full((6,), 6, dtype=torch.int32),
             "audio_first": torch.full((6,), 1, dtype=torch.int32),
             "audio_last": torch.full((6,), 4, dtype=torch.int32),
+            "prompt_ordinal": torch.zeros(6, dtype=torch.int32),
+            "prompt_last": torch.zeros(6, dtype=torch.int32),
         }
     }
 
@@ -222,7 +228,7 @@ def test_duplexio_config_rejects_old_depth_checkpoint() -> None:
         "implementation": "moshi_original_depformer",
     }
 
-    with pytest.raises(ValueError, match="speaker-conditioned"):
+    with pytest.raises(ValueError, match="unconditioned depth checkpoint"):
         DuplexIOConfig.from_dict(config)
 
 
@@ -398,14 +404,14 @@ def test_gdn_graph_buffers_are_independent_per_batch_size() -> None:
 
 def test_mlp_adapters_return_backbone_inputs_without_a_skip() -> None:
     torch.manual_seed(0)
+    # One adapter serves both audio cells; the agent's voice arrives as the
+    # pinned prompt in its own cell, not as a conditioning vector here.
     user = AudioInputAdapter(5, 7, 11)
-    agent_in = AgentAudioInputAdapter(5, 3, 7, 11)
+    agent_in = AudioInputAdapter(5, 7, 11)
     audio = torch.randn(4, 5)
-    speakers = torch.randn(2, 3)
-    request_indices = torch.tensor([0, 0, 1, 1])
 
     user_hidden = user(audio)
-    agent_hidden = agent_in(audio, speakers[request_indices])
+    agent_hidden = agent_in(audio)
 
     assert user_hidden.shape == (4, 11)
     assert agent_hidden.shape == (4, 11)
@@ -463,12 +469,11 @@ def test_mimi_embedding_keeps_checkpoint_module_layout() -> None:
     assert embedding(torch.tensor([[1, 2, 3]])).shape == (1, 5)
 
 
-def test_speaker_depth_sampling_is_deterministic_at_top_k_one() -> None:
+def test_depth_sampling_is_deterministic_at_top_k_one() -> None:
     torch.manual_seed(1)
     model = DepthAutoregressiveSampler(
         DepthSamplerConfig(
             conditioning_dim=5,
-            speaker_embedding_dim=6,
             text_vocab_size=11,
             codebook_size=7,
             num_codebooks=3,
@@ -482,11 +487,9 @@ def test_speaker_depth_sampling_is_deterministic_at_top_k_one() -> None:
     ).eval()
     conditioning = torch.randn(2, 5)
     text_tokens = torch.tensor([2, 4])
-    speakers = torch.randn(2, 6)
 
-    speaker_conditioning = model.prepare_speaker(speakers)
-    first = model.sample(conditioning, text_tokens, speaker_conditioning)
-    second = model.sample(conditioning, text_tokens, speaker_conditioning)
+    first = model.sample(conditioning, text_tokens)
+    second = model.sample(conditioning, text_tokens)
 
     torch.testing.assert_close(first, second)
 
@@ -497,7 +500,6 @@ def test_depth_sampler_runs_with_native_bfloat16_parameters() -> None:
         DepthAutoregressiveSampler(
             DepthSamplerConfig(
                 conditioning_dim=5,
-                speaker_embedding_dim=6,
                 text_vocab_size=11,
                 codebook_size=7,
                 num_codebooks=3,
@@ -514,19 +516,12 @@ def test_depth_sampler_runs_with_native_bfloat16_parameters() -> None:
     )
     conditioning = torch.randn(2, 5, dtype=torch.bfloat16)
     text_tokens = torch.tensor([2, 4])
-    speakers = torch.randn(2, 6, dtype=torch.bfloat16)
 
-    speaker_conditioning = model.prepare_speaker(speakers)
-    sampled = model.sample(
-        conditioning,
-        text_tokens,
-        speaker_conditioning,
-    )
+    sampled = model.sample(conditioning, text_tokens)
 
     assert sampled.shape == (2, 3)
     assert all(
-        layer.shift.dtype == torch.bfloat16 and layer.scale.dtype == torch.bfloat16
-        for layer in speaker_conditioning.attention + speaker_conditioning.feedforward
+        parameter.dtype == torch.bfloat16 for parameter in model.parameters()
     )
 
 
@@ -598,41 +593,10 @@ def test_vocabulary_suppression_is_model_owned_and_sampling_temperature_stays_dy
     assert first.suppressed_token_ids is second.suppressed_token_ids is suppressed
 
 
-def test_speaker_depth_conditioning_changes_adaptive_normalization() -> None:
-    torch.manual_seed(2)
-    model = DepthAutoregressiveSampler(
-        DepthSamplerConfig(
-            conditioning_dim=5,
-            speaker_embedding_dim=6,
-            text_vocab_size=11,
-            codebook_size=7,
-            num_codebooks=3,
-            low_rank_embeddings=2,
-            dim=8,
-            num_layers=2,
-            num_heads=2,
-            feedforward_dim=12,
-            sampling_top_k=1,
-        )
-    ).eval()
-    hidden = torch.randn(2, 1, 8)
-    speakers = torch.randn(2, 6)
-    speaker_states = model.speaker_projection(speakers)
-    norm = model.transformer.layers[0].attention_norm
-    first_conditioning = norm.prepare(speaker_states)
-    second_conditioning = norm.prepare(speaker_states.flip(0))
-
-    first = norm(hidden, first_conditioning)
-    second = norm(hidden, second_conditioning)
-
-    assert not torch.allclose(first, second)
-
-
 def test_depth_sampler_uses_current_checkpoint_module_names() -> None:
     model = DepthAutoregressiveSampler(
         DepthSamplerConfig(
             conditioning_dim=5,
-            speaker_embedding_dim=6,
             text_vocab_size=11,
             codebook_size=7,
             num_codebooks=3,
@@ -646,10 +610,10 @@ def test_depth_sampler_uses_current_checkpoint_module_names() -> None:
     keys = set(model.state_dict())
 
     assert "conditioning_projections.0.weight" in keys
-    assert "speaker_projection.weight" in keys
     assert "previous_codebook_embeddings.0.output_projection.weight" in keys
     assert "text_embedding.output_projection.weight" in keys
     assert "transformer.layers.0.attention.input_projections.0.weight" in keys
     assert "transformer.layers.0.feedforward.layers.0.input.weight" in keys
-    assert "transformer.layers.0.attention_norm.modulation.1.weight" in keys
+    assert "transformer.layers.0.attention_norm.weight" in keys
+    assert not any("modulation" in key for key in keys)
     assert "heads.0.weight" in keys

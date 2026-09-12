@@ -45,7 +45,7 @@ class PreparedRole(BaseModel):
 
     system_token_ids: list[int] = Field(min_length=1)
     voice: str = Field(min_length=1)
-    voice_embedding_index: int = Field(default=0, ge=0)
+    voice_clip_index: int = Field(default=0, ge=0)
     tools: list[dict[str, Any]] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -80,7 +80,7 @@ def _role_runtime(
         **sampling_config,
         "duplexio_system_token_ids": role.system_token_ids,
         "duplexio_voice": role.voice,
-        "duplexio_voice_embedding_index": role.voice_embedding_index,
+        "duplexio_voice_clip_index": role.voice_clip_index,
         "duplexio_tools": role.tools,
         "duplexio_tool_choice": {"mode": "auto" if role.tools else "none"},
         "duplexio_sampling_seed": seed,

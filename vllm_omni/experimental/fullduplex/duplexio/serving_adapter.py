@@ -116,7 +116,7 @@ class DuplexIOServingRuntimeAdapter:
             "duplexio_sampling_seed",
             "duplexio_start_role",
             "duplexio_voice_ids",
-            "duplexio_voice_embedding_index",
+            "duplexio_voice_clip_index",
             "duplexio_depth_sampling",
             "duplexio_emit_temperatures",
             "duplexio_text_sampling",
@@ -323,7 +323,7 @@ class DuplexIOServingRuntimeAdapter:
             "duplexio_start_role": start_role,
             "duplexio_voice": voice,
             "duplexio_voice_ids": list(voice_ids),
-            "duplexio_voice_embedding_index": 0,
+            "duplexio_voice_clip_index": 0,
             "duplexio_scheduler_token_id": scheduler_token_id,
             "duplexio_sampling_seed": (
                 client_sampling.seed

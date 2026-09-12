@@ -35,7 +35,15 @@ WINDOW = 2
 # FlexAttention tiles a page with BLOCK_N, so a page cannot be smaller than it.
 BLOCK_SIZE = 64
 NUM_AUDIO_CELLS = DUPLEXIO_NUM_CELLS - DUPLEXIO_NUM_TEXT_CELLS
-FRAME_FIELDS = ("key_active", "text_ordinal", "text_last", "audio_first", "audio_last")
+FRAME_FIELDS = (
+    "key_active",
+    "text_ordinal",
+    "text_last",
+    "audio_first",
+    "audio_last",
+    "prompt_ordinal",
+    "prompt_last",
+)
 # Paged attention reduces the history in page order and merges the diagonal
 # afterwards, so it does not round like a dense matmul. Bit-exactness with
 # training was traded for that simpler reduction.
@@ -70,6 +78,9 @@ def session_fields(audio_active: Tensor, text_active: Tensor) -> dict[str, Tenso
         ),
         "audio_first": cells((audio_position - WINDOW).clamp_min(1)),
         "audio_last": cells(audio_position - audio_active.int()),
+        # This session pins no voice prompt; the pinned region stays empty.
+        "prompt_ordinal": torch.zeros(rows * DUPLEXIO_NUM_CELLS, dtype=torch.int32),
+        "prompt_last": torch.zeros(rows * DUPLEXIO_NUM_CELLS, dtype=torch.int32),
         # Audio time, for the dense reference: not a cache-addressing field.
         "audio_position": cells(audio_position),
     }
@@ -93,6 +104,7 @@ def dense_attention(
         fields["audio_position"][:, None],
         fields["audio_position"][None],
         fields["key_active"][None],
+        torch.zeros_like(fields["key_active"][None], dtype=torch.bool),
         audio_attention_window_frames=WINDOW,
     )
     groups = query.shape[1] // key.shape[1]
@@ -217,6 +229,7 @@ def run_session(
             dtype=dtype,
         ),
         audio_window_frames=WINDOW,
+        voice_prompt_frames=1,
         max_model_len=rows * DUPLEXIO_NUM_CELLS,
     )
     layout = spec.layout
@@ -345,6 +358,7 @@ def test_only_pages_a_step_can_touch_are_listed() -> None:
     layout = DuplexIOKVLayout(
         block_size=BLOCK_SIZE,
         audio_window_frames=WINDOW,
+        voice_prompt_frames=1,
         max_model_len=600 * DUPLEXIO_NUM_CELLS,
     )
     text_base = layout.text_base_page

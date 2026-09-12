@@ -9,9 +9,6 @@ import torch
 from vllm_omni.model_executor.models.duplexio.audio_representation import (
     DelayedMimiState,
 )
-from vllm_omni.model_executor.models.duplexio.depth_sampler import (
-    DepthSpeakerConditioning,
-)
 from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FastConformerAudioStreamState,
 )
@@ -59,11 +56,7 @@ def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
             encoder_transformer=MimiTransformerState.empty(2),
             decoder_transformer=MimiTransformerState.empty(2),
         ),
-        speaker_embedding=torch.zeros(512),
-        depth_speaker_conditioning=DepthSpeakerConditioning(
-            attention=(),
-            feedforward=(),
-        ),
+        voice_prompt=torch.zeros(1_920),
         system_token_ids=(1, 2, 3),
         sampling_generator=generator,
         frames_seen=100_000,
@@ -79,10 +72,10 @@ def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
     assert fork.text_input_ids.shape == (4,)
     assert fork.agent_audio_codes.shape == (8,)
     assert fork.agent_delay.previous_acoustic_codes.shape == (7,)
-    assert fork.speaker_embedding.shape == (512,)
+    # The pinned prompt is immutable for the session, so a fork shares it.
+    assert fork.voice_prompt is state.voice_prompt
     assert fork.output_mimi is not state.output_mimi
     assert (
         fork.output_mimi.decoder_transformer
         is not state.output_mimi.decoder_transformer
     )
-    assert fork.depth_speaker_conditioning is state.depth_speaker_conditioning

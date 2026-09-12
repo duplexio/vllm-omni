@@ -21,6 +21,7 @@ def duplexio_attention_visible(
     query_audio_positions: Tensor,
     key_audio_positions: Tensor,
     key_active: Tensor,
+    key_pinned: Tensor,
     *,
     audio_attention_window_frames: int,
 ) -> Tensor:
@@ -29,7 +30,8 @@ def duplexio_attention_visible(
     Positions are logical vLLM token positions, with six consecutive cells per
     frame. A query sees itself and active keys from prior frames. Audio keys
     additionally expire once the AUDIO-TIME distance (not the frame distance)
-    exceeds ``audio_attention_window_frames``.
+    exceeds ``audio_attention_window_frames``, unless they are pinned
+    voice-prompt cells, which no window expires.
     """
     query_frames = torch.div(
         query_positions,
@@ -49,6 +51,7 @@ def duplexio_attention_visible(
         key_audio_positions,
         key_cells,
         key_active,
+        key_pinned,
         audio_attention_window_frames,
         False,
     ) | (query_positions == key_positions)

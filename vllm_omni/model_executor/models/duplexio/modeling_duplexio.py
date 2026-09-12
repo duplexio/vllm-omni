@@ -33,7 +33,6 @@ from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.duplexio.audio_adapters import (
-    AgentAudioInputAdapter,
     AudioInputAdapter,
 )
 from vllm_omni.model_executor.models.duplexio.audio_input_graph import AudioInputGraph
@@ -44,7 +43,7 @@ from vllm_omni.model_executor.models.duplexio.audio_representation import (
     MimiEmbedding,
 )
 from vllm_omni.model_executor.models.duplexio.checkpoint import (
-    load_voice_pools,
+    load_voice_clips,
     resolve_checkpoint_directory,
 )
 from vllm_omni.model_executor.models.duplexio.configuration_duplexio import (
@@ -53,7 +52,6 @@ from vllm_omni.model_executor.models.duplexio.configuration_duplexio import (
 from vllm_omni.model_executor.models.duplexio.depth_sampler import (
     DepthAutoregressiveSampler,
     DepthSamplerConfig,
-    DepthSpeakerConditioning,
 )
 from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FastConformerAudioStreamState,
@@ -74,6 +72,7 @@ from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
 )
 from vllm_omni.model_executor.models.duplexio.row_semantics import (
     DUPLEXIO_NUM_CELLS,
+    DUPLEXIO_NUM_TEXT_CELLS,
     duplexio_frame_positions,
 )
 from vllm_omni.model_executor.models.duplexio.stream_gdn import gdn_cache_dtypes, gdn_cache_shapes
@@ -118,8 +117,11 @@ class DuplexIORequestState:
     user_asr: FastConformerAudioStreamState
     output_mimi: ContinuousMimiState | MimiStreamingState
     agent_delay: DelayedMimiState | None
-    speaker_embedding: Tensor
-    depth_speaker_conditioning: DepthSpeakerConditioning | None
+    # The pinned voice prompt, already encoded into agent-audio input rows
+    # ``(frames, dim)``: reference audio for the agent's voice. It is written into
+    # the cache's pinned region once, and `prompt_frames_written` says how many of
+    # its frames the session has installed.
+    voice_prompt: Tensor
     system_token_ids: tuple[int, ...]
     sampling_generator: torch.Generator
     tool_call_constraint: ToolCallConstraintState | None = None
@@ -128,6 +130,7 @@ class DuplexIORequestState:
     audio_position: int = 0
     active_text_tokens: int = 0
     tool_call_sequence: int = 0
+    prompt_frames_written: int = 0
     # Transcript tokens the RNN-T has produced but the user stream has not
     # emitted yet, and whether any word has been emitted (all but the first
     # word of an utterance carries a leading space, as in training).
@@ -262,6 +265,8 @@ class DuplexIOForConditionalGeneration(
             ("duplexio", "text_last"),
             ("duplexio", "audio_first"),
             ("duplexio", "audio_last"),
+            ("duplexio", "prompt_ordinal"),
+            ("duplexio", "prompt_last"),
             ("duplexio", "user_token_id"),
             ("duplexio_replay", "text_ids"),
             ("duplexio_replay", "user_features"),
@@ -282,31 +287,11 @@ class DuplexIOForConditionalGeneration(
         self.frame = self.llm.base_model.model.frame
         hidden_size = self.text_config.hidden_size
         adapter_hidden_size = config.audio_adapter_config.get("hidden_size") or hidden_size
-        speaker_dim = config.speaker_lda_dim or config.speaker_embed_dim
         root = resolve_checkpoint_directory(
             vllm_config.model_config.model,
             revision=vllm_config.model_config.revision,
         )
         self.user_asr = FastConformerRNNT.from_export(config.user_asr_config, root)
-        if config.speaker_lda_dim is None:
-            self.register_buffer("speaker_lda_projection", None)
-            self.register_buffer("speaker_lda_mean", None)
-        else:
-            self.register_buffer(
-                "speaker_lda_projection",
-                torch.empty(
-                    speaker_dim,
-                    config.speaker_embed_dim,
-                    dtype=torch.float32,
-                ),
-            )
-            self.register_buffer(
-                "speaker_lda_mean",
-                torch.empty(
-                    config.speaker_embed_dim,
-                    dtype=torch.float32,
-                ),
-            )
         if config.audio_representation == "continuous":
             representation_dim = config.continuous_audio_config["embedding_dim"]
             self.audio_codec = PocketMimi()
@@ -339,7 +324,6 @@ class DuplexIOForConditionalGeneration(
             self.audio_sampler = DepthAutoregressiveSampler(
                 DepthSamplerConfig(
                     conditioning_dim=hidden_size,
-                    speaker_embedding_dim=speaker_dim,
                     text_vocab_size=self.text_config.vocab_size,
                     codebook_size=quantized["codebook_size"],
                     num_codebooks=quantized["num_codebooks"],
@@ -358,9 +342,8 @@ class DuplexIOForConditionalGeneration(
             adapter_hidden_size,
             hidden_size,
         )
-        self.agent_audio_input_adapter = AgentAudioInputAdapter(
+        self.agent_audio_input_adapter = AudioInputAdapter(
             representation_dim,
-            speaker_dim,
             adapter_hidden_size,
             hidden_size,
         )
@@ -368,9 +351,9 @@ class DuplexIOForConditionalGeneration(
         self.tool_call_emit_head = nn.Linear(DUPLEXIO_NUM_CELLS * hidden_size, 1)
         self.logits_processor = DuplexIOLogitsProcessor(self.text_config.vocab_size)
         self.make_empty_intermediate_tensors = self.llm.base_model.model.make_empty_intermediate_tensors
-        self._voice_pools = load_voice_pools(
+        self._voice_clips = load_voice_clips(
             vllm_config.model_config.model,
-            speaker_embed_dim=config.speaker_embed_dim,
+            sample_rate=config.sample_rate,
             default_voice=config.default_voice,
             revision=vllm_config.model_config.revision,
         )
@@ -410,6 +393,8 @@ class DuplexIOForConditionalGeneration(
             text_last=torch.cat([info["text_last"] for info in duplex_infos]),
             audio_first=torch.cat([info["audio_first"] for info in duplex_infos]),
             audio_last=torch.cat([info["audio_last"] for info in duplex_infos]),
+            prompt_ordinal=torch.cat([info["prompt_ordinal"] for info in duplex_infos]),
+            prompt_last=torch.cat([info["prompt_last"] for info in duplex_infos]),
         )
 
     def supports_cudagraph_replay(
@@ -447,15 +432,14 @@ class DuplexIOForConditionalGeneration(
         if agent_requests:
             states = [request["duplexio_model_state"] for request in agent_requests]
             codes = torch.stack([state.agent_audio_codes for state in states])
-            speakers = torch.stack([state.speaker_embedding for state in states])
         if self.full_cudagraph_enabled and len(agent_requests) == len(requests):
             batch_size = len(requests)
             if batch_size not in self.audio_input_graphs:
                 self.audio_input_graphs[batch_size] = AudioInputGraph(
                     self.user_audio_input_adapter, self.agent_audio_embedding, self.agent_audio_input_adapter,
-                    features, codes, speakers, self.vllm_config.model_config.dtype,
+                    features, codes, self.vllm_config.model_config.dtype,
                 )
-            hidden, agent_hidden = self.audio_input_graphs[batch_size](features, codes, speakers)
+            hidden, agent_hidden = self.audio_input_graphs[batch_size](features, codes)
         else:
             with torch.autocast(
                 device.type, dtype=self.vllm_config.model_config.dtype,
@@ -463,7 +447,7 @@ class DuplexIOForConditionalGeneration(
             ):
                 hidden = self.user_audio_input_adapter(features)
                 if agent_requests:
-                    agent_hidden = self.agent_audio_input_adapter(self.agent_audio_embedding(codes), speakers)
+                    agent_hidden = self.agent_audio_input_adapter(self.agent_audio_embedding(codes))
         for index, request in enumerate(requests):
             request["embed"]["speech_feat"] = features[index : index + 1]
             request["embed"]["user_hidden"] = hidden[index : index + 1]
@@ -519,6 +503,7 @@ class DuplexIOForConditionalGeneration(
         prefill_final = duplex.get("duplexio_prefill_final", False)
         is_system_input = duplex.get("duplexio_system_input", False)
         system_input_final = duplex.get("duplexio_system_input_final", False)
+        is_voice_prompt = duplex.get("duplexio_voice_prompt", False)
         if not all(
             isinstance(value, bool)
             for value in (
@@ -526,6 +511,7 @@ class DuplexIOForConditionalGeneration(
                 prefill_final,
                 is_system_input,
                 system_input_final,
+                is_voice_prompt,
             )
         ):
             raise ValueError("DuplexIO text-input flags must be boolean when present")
@@ -535,11 +521,33 @@ class DuplexIOForConditionalGeneration(
             raise ValueError("DuplexIO system_input_final requires duplexio_system_input")
         if is_prefill and is_system_input:
             raise ValueError("DuplexIO prefill and system input are mutually exclusive")
-        if frame_count != 1 and not (is_prefill or is_system_input):
+        if is_voice_prompt and (is_prefill or is_system_input):
+            raise ValueError(
+                "DuplexIO voice prompt is its own burst, ahead of any text input"
+            )
+        # The prompt is reference audio, not conversation: it carries no live
+        # audio time and cannot follow the frames it is supposed to precede.
+        is_live = not (is_prefill or is_system_input or is_voice_prompt)
+        if frame_count != 1 and is_live:
             raise ValueError("Native DuplexIO batches only silent text-input frames")
+        if is_voice_prompt:
+            if state.frames_seen:
+                raise ValueError(
+                    "DuplexIO pins the voice prompt before the session's first frame"
+                )
+            available = state.voice_prompt.shape[0]
+            written = state.prompt_frames_written
+            if written + frame_count > available:
+                raise ValueError(
+                    f"DuplexIO voice prompt has {available} frames; this burst asks "
+                    f"for {written + frame_count}"
+                )
 
         text_ids = state.text_input_ids.expand(frame_count, -1).clone()
-        if is_system_input:
+        if is_voice_prompt:
+            # Nobody speaks over the reference: every text stream stays silent.
+            text_ids.fill_(self.silence_token_id)
+        elif is_system_input:
             system_token_ids = duplex.get("duplexio_system_token_ids")
             if (
                 not isinstance(system_token_ids, list)
@@ -573,8 +581,13 @@ class DuplexIOForConditionalGeneration(
             if len(system_tokens) < frame_count:
                 text_ids[len(system_tokens) :, 0] = self.silence_token_id
 
-        prepared_features = not (is_prefill or is_system_input) and duplex["payload"]["format"] == "duplexio_features"
-        if is_prefill or is_system_input:
+        prepared_features = is_live and duplex["payload"]["format"] == "duplexio_features"
+        prompt_written = state.prompt_frames_written
+        if is_voice_prompt:
+            user_features = self.llm.channel_emb.new_zeros(frame_count, self.user_asr.output_dim)
+            agent_codes = state.voice_prompt[prompt_written : prompt_written + frame_count]
+            state.prompt_frames_written += frame_count
+        elif is_prefill or is_system_input:
             user_features = self.llm.channel_emb.new_zeros(frame_count, self.user_asr.output_dim)
             agent_codes = self.initial_agent_audio(frame_count)
             if is_prefill:
@@ -636,26 +649,34 @@ class DuplexIOForConditionalGeneration(
             agent_hidden = info["embed"].get("agent_hidden") if prepared_features else None
             if agent_hidden is None:
                 agent_hidden = self.agent_audio_input_adapter(
-                    self.agent_audio_embedding(agent_codes),
-                    state.speaker_embedding.unsqueeze(0),
+                    self.agent_audio_embedding(agent_codes)
                 )
         active_text_count = ((text_ids != self.pad_token_id) & (text_ids != self.silence_token_id)).sum().item()
         text_ids = text_ids.to(input_ids.device, non_blocking=True)
         text_hidden = self.llm.base_model.model.embed_input_ids(text_ids.flatten()).view(
             frame_count, len(TEXT_STREAM_NAMES), -1
         )
-        embeddings, key_active, text_ordinals, text_last, audio_first, audio_last = self.frame_inputs(
+        (
+            embeddings,
+            key_active,
+            text_ordinals,
+            text_last,
+            audio_first,
+            audio_last,
+            prompt_ordinal,
+            prompt_last,
+        ) = self.frame_inputs(
             text_ids, text_hidden, self.llm.channel_emb, user_hidden, agent_hidden,
             self.pad_token_id, self.silence_token_id, state.active_text_tokens,
             state.audio_position, self.config.audio_attention_window_frames,
-            not is_prefill and not is_system_input,
+            is_live, prompt_written, is_voice_prompt,
         )
         state.active_text_tokens += active_text_count
         state.frames_seen += frame_count
         # Audio time advances only on frames that carry real audio: text-only
         # prefill and system-token bursts leave the counter frozen so they do
         # not consume the audio attention window.
-        if not is_prefill and not is_system_input:
+        if is_live:
             state.audio_position += frame_count
         replay = {}
         if runtime_config.get("duplexio_record_inputs", False):
@@ -678,6 +699,8 @@ class DuplexIOForConditionalGeneration(
                     "text_last": text_last,
                     "audio_first": audio_first,
                     "audio_last": audio_last,
+                    "prompt_ordinal": prompt_ordinal,
+                    "prompt_last": prompt_last,
                 },
             },
         )
@@ -990,7 +1013,7 @@ class DuplexIOForConditionalGeneration(
                 ):
                     depth_audio.append(self.audio_sampler.sample(
                         rows[row, AGENT_AUDIO_CELL : AGENT_AUDIO_CELL + 1], texts[row][1:2],
-                        state.depth_speaker_conditioning, temperature=temperature, top_k=top_k,
+                        temperature=temperature, top_k=top_k,
                         generator=state.sampling_generator,
                     )[0])
         if continuous:
@@ -1189,12 +1212,12 @@ class DuplexIOForConditionalGeneration(
         device: torch.device,
     ) -> DuplexIORequestState:
         voice = runtime_config.get("duplexio_voice")
-        if not isinstance(voice, str) or voice not in self._voice_pools:
+        if not isinstance(voice, str) or voice not in self._voice_clips:
             raise ValueError(f"DuplexIO request selected unknown voice {voice!r}")
-        pool = self._voice_pools[voice]
-        embedding_index = runtime_config.get("duplexio_voice_embedding_index", 0)
-        if not isinstance(embedding_index, int) or not 0 <= embedding_index < len(pool):
-            raise ValueError(f"Voice embedding index {embedding_index!r} is invalid for {voice!r}")
+        clips = self._voice_clips[voice]
+        clip_index = runtime_config.get("duplexio_voice_clip_index", 0)
+        if not isinstance(clip_index, int) or not 0 <= clip_index < len(clips):
+            raise ValueError(f"Voice clip index {clip_index!r} is invalid for {voice!r}")
         system_tokens = runtime_config.get("duplexio_system_token_ids", ())
         if not isinstance(system_tokens, (list, tuple)) or not all(isinstance(token, int) for token in system_tokens):
             raise ValueError("duplexio_system_token_ids must be integer token IDs")
@@ -1212,15 +1235,29 @@ class DuplexIOForConditionalGeneration(
             raise ValueError("duplexio_tools must be a list of tool definitions")
         if not isinstance(tool_choice, Mapping):
             raise ValueError("duplexio_tool_choice must be an object")
-        speaker_embedding = pool[embedding_index].to(
-            device=device,
-            dtype=self.llm.channel_emb.dtype,
+        # A clip longer than the pinned region is truncated from the start, which
+        # keeps the speech onset its reference window was chosen around; a shorter
+        # one is pinned as-is, because padded silence teaches nothing about a voice.
+        frame_size = self.config.frame_size
+        prompt_frames = min(
+            clips[clip_index].shape[0] // frame_size,
+            self.config.voice_prompt_max_frames,
         )
-        if self.speaker_lda_projection is not None:
-            speaker_embedding = (
-                (speaker_embedding.float() - self.speaker_lda_mean) @ self.speaker_lda_projection.T
-            ).to(self.llm.channel_emb.dtype)
+        if prompt_frames == 0:
+            raise ValueError(
+                f"DuplexIO voice clip {clip_index} of {voice!r} is shorter than one frame"
+            )
         continuous = isinstance(self.audio_codec, PocketMimi)
+        agent_delay = (
+            None if continuous else self.audio_representation.new_state(device=device)
+        )
+        voice_prompt = self.encode_voice_prompt(
+            clips[clip_index][: prompt_frames * frame_size].to(
+                device=device,
+                dtype=torch.float32,
+            ),
+            agent_delay,
+        )
         return DuplexIORequestState(
             text_input_ids=torch.full(
                 (len(TEXT_STREAM_NAMES),),
@@ -1230,18 +1267,47 @@ class DuplexIOForConditionalGeneration(
             ),
             agent_audio_codes=self.initial_agent_audio(1)[0],
             user_asr=FastConformerAudioStreamState(),
-            agent_delay=(None if continuous else self.audio_representation.new_state(device=device)),
+            agent_delay=agent_delay,
             output_mimi=(self.audio_codec.new_state(1) if continuous else self.audio_codec.new_streaming_state()),
-            speaker_embedding=speaker_embedding,
-            depth_speaker_conditioning=(
-                None if continuous else self.audio_sampler.prepare_speaker(speaker_embedding.unsqueeze(0))
-            ),
+            voice_prompt=voice_prompt,
             system_token_ids=cast(tuple[int, ...], tuple(system_tokens)),
             sampling_generator=sampling_generator,
             tool_call_constraint=self.tool_call_compiler.new_state(
                 cast(list[Mapping[str, Any]], tools),
                 tool_choice,
             ),
+        )
+
+    @torch.inference_mode()
+    def encode_voice_prompt(
+        self,
+        waveform: Tensor,
+        agent_delay: DelayedMimiState | None,
+    ) -> Tensor:
+        """Encode the pinned prompt once, into agent-audio input rows.
+
+        The clip is fixed for the session, so it is encoded in one pass with fresh
+        codec state rather than burst by burst. The delayed-codebook pattern is
+        advanced with the session's own delay state, because the prompt precedes
+        the live stream in exactly the way training's packed sequence does.
+        """
+        frames = waveform.shape[0] // self.config.frame_size
+        batched = waveform[: frames * self.config.frame_size].reshape(1, 1, -1)
+        if isinstance(self.audio_codec, PocketMimi):
+            latent, _ = self.audio_codec.encode(
+                batched,
+                self.audio_codec.new_state(1),
+            )
+            return self.audio_representation.normalize(latent[0].transpose(0, 1))
+        assert agent_delay is not None
+        raw_codes = self.audio_codec.encode(
+            batched,
+            self.audio_representation.num_codebooks,
+            self.audio_codec.new_streaming_state(),
+        )
+        return self.audio_representation.encode_sequence(
+            raw_codes[0].transpose(0, 1),
+            agent_delay,
         )
 
     def initial_agent_audio(self, frames: int) -> Tensor:
@@ -1332,7 +1398,9 @@ def frame_inputs(
     audio_position: int,
     audio_window_frames: int,
     audio_active: bool,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    prompt_position: int,
+    is_voice_prompt: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Assemble six-cell inputs and cache addressing without changing CPU state.
 
     Besides the flattened embeddings this returns one entry per cell: whether the
@@ -1341,6 +1409,10 @@ def frame_inputs(
     range of audio frames the cell may attend. Audio frames are numbered from
     one in audio time, which only advances on frames carrying real audio, so a
     text-only append leaves the range frozen and writes no audio key.
+
+    A pinned voice-prompt burst is the one frame kind that carries audio without
+    being live: its audio cells contribute keys, but audio time stays frozen and
+    the keys land in the cache's pinned region, which no window expires.
     """
     frames, device = text_ids.shape[0], text_ids.device
     text_hidden = text_hidden.masked_fill((text_ids == silence_token_id).unsqueeze(-1), 0)
@@ -1349,8 +1421,9 @@ def frame_inputs(
     ).flatten(0, 1)
     text_active = (text_ids != pad_token_id) & (text_ids != silence_token_id)
     audio_shape = (frames, 2)
+    audio_keyed = audio_active or is_voice_prompt
     key_active = torch.cat(
-        (text_active, torch.full(audio_shape, audio_active, dtype=torch.bool, device=device)), dim=1,
+        (text_active, torch.full(audio_shape, audio_keyed, dtype=torch.bool, device=device)), dim=1,
     ).flatten()
     ordinals = (
         text_active.flatten().cumsum(0, dtype=torch.int32) + active_text_tokens
@@ -1365,6 +1438,25 @@ def frame_inputs(
     rows = torch.arange(frames, dtype=torch.int32, device=device)
     audio_last = audio_position + (rows if audio_active else torch.zeros_like(rows))
     audio_first = (audio_last + int(audio_active) - audio_window_frames).clamp_min(1)
+    # A prompt row's own pinned key is its self key, which the mask merges
+    # separately, so a row sees only the prompt frames written before it.
+    prompt_ordinal_rows = (
+        prompt_position + rows + 1 if is_voice_prompt else torch.zeros_like(rows)
+    )
+    prompt_last_rows = (
+        prompt_position + rows
+        if is_voice_prompt
+        else torch.full_like(rows, prompt_position)
+    )
+    prompt_ordinal = torch.cat(
+        (
+            torch.zeros(
+                (frames, DUPLEXIO_NUM_TEXT_CELLS), dtype=torch.int32, device=device
+            ),
+            prompt_ordinal_rows[:, None].expand(-1, 2),
+        ),
+        dim=1,
+    ).flatten()
 
     def per_cell(values: Tensor) -> Tensor:
         """Give every cell of a row the row's value."""
@@ -1377,6 +1469,8 @@ def frame_inputs(
         per_cell(text_last),
         per_cell(audio_first),
         per_cell(audio_last),
+        prompt_ordinal,
+        per_cell(prompt_last_rows),
     )
 
 

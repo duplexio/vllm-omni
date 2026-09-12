@@ -29,14 +29,19 @@ def resolve_checkpoint_directory(
     return Path(snapshot_download(model_path, revision=revision))
 
 
-def load_voice_pools(
+def load_voice_clips(
     model_path: str,
     *,
-    speaker_embed_dim: int,
+    sample_rate: int,
     default_voice: str | None,
     revision: str | None = None,
-) -> dict[str, Tensor]:
-    """Validate one exported checkpoint and load its named speaker pools."""
+) -> dict[str, tuple[Tensor, ...]]:
+    """Validate one exported checkpoint and load its named voice-prompt clips.
+
+    A voice is reference audio, not an embedding: the bundle holds one mono
+    waveform per clip at the model's sample rate, and the agent's voice comes
+    from pinning one of them ahead of the conversation.
+    """
     root = resolve_checkpoint_directory(model_path, revision=revision)
     exported_voice_ids = validate_export_manifest(root)
     manifest_path = root / "voices.json"
@@ -53,34 +58,39 @@ def load_voice_pools(
     voices = manifest.get("voices") if isinstance(manifest, Mapping) else None
     if not isinstance(voices, Mapping):
         raise ValueError(f"Invalid DuplexIO voice manifest: {manifest_path}")
+    bundle_rate = manifest.get("sample_rate") if isinstance(manifest, Mapping) else None
+    if bundle_rate != sample_rate:
+        raise ValueError(
+            f"DuplexIO voice bundle is at {bundle_rate!r} Hz, model wants "
+            f"{sample_rate}"
+        )
     tensors = load_file(weights_path)
-    pools: dict[str, Tensor] = {}
+    clips: dict[str, tuple[Tensor, ...]] = {}
     for name, value in voices.items():
         if not isinstance(name, str) or not isinstance(value, Mapping):
             raise ValueError(f"Invalid DuplexIO voice entry in {manifest_path}")
-        tensor_name = value.get("tensor")
-        if not isinstance(tensor_name, str) or tensor_name not in tensors:
-            raise ValueError(f"Missing tensor for DuplexIO voice {name!r}")
-        pool = tensors[tensor_name]
-        expected_count = value.get("num_embeddings")
-        if (
-            pool.ndim != 2
-            or pool.shape[0] < 1
-            or pool.shape[1] != speaker_embed_dim
-            or expected_count != pool.shape[0]
-        ):
-            raise ValueError(
-                f"Invalid DuplexIO speaker pool {name!r}: shape={tuple(pool.shape)}, "
-                f"num_embeddings={expected_count!r}"
-            )
-        pools[name] = pool
-    if tuple(sorted(pools)) != exported_voice_ids:
+        tensor_names = value.get("tensors")
+        if not isinstance(tensor_names, list) or not tensor_names:
+            raise ValueError(f"DuplexIO voice {name!r} lists no clips")
+        waveforms: list[Tensor] = []
+        for tensor_name in tensor_names:
+            if not isinstance(tensor_name, str) or tensor_name not in tensors:
+                raise ValueError(f"Missing tensor for DuplexIO voice {name!r}")
+            waveform = tensors[tensor_name]
+            if waveform.ndim != 1 or waveform.shape[0] < 1:
+                raise ValueError(
+                    f"Invalid DuplexIO voice clip {tensor_name!r}: shape="
+                    f"{tuple(waveform.shape)}, expected one mono waveform"
+                )
+            waveforms.append(waveform)
+        clips[name] = tuple(waveforms)
+    if tuple(sorted(clips)) != exported_voice_ids:
         raise ValueError("DuplexIO export manifest and voice artifact disagree")
-    if default_voice is not None and default_voice not in pools:
+    if default_voice is not None and default_voice not in clips:
         raise ValueError(
             f"DuplexIO default voice {default_voice!r} is not exported"
         )
-    return pools
+    return clips
 
 
 def validate_export_manifest(root: Path) -> tuple[str, ...]:
@@ -123,7 +133,7 @@ def validate_export_manifest(root: Path) -> tuple[str, ...]:
 
 
 __all__ = [
-    "load_voice_pools",
+    "load_voice_clips",
     "resolve_checkpoint_directory",
     "validate_export_manifest",
 ]
