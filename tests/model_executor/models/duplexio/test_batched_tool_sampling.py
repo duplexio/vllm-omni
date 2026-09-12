@@ -154,3 +154,62 @@ def test_tools_do_not_read_gpu_scalars_per_request(start_tool):
         model.sample_text_batch(logits, emissions, infos)
     assert serial.count == (16 if start_tool else 8)
     assert batched.count == 0
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param(
+    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+)])
+def test_agent_logprobs_match_the_distributions_actually_sampled(device):
+    """Behaviour log-probs must equal the distributions the draws came from.
+
+    Verified without replaying the generators: the truncated content distribution
+    is deterministic given the logits, the emit outcome is recoverable from
+    whether the returned id is silence, and a thresholded (greedy) decision has
+    probability one. An importance ratio divides by these numbers, so a wrong
+    value here is silently wrong training rather than a crash.
+    """
+    model, infos, vocab = fixture(device, mixed=True)
+    inputs = torch.Generator(device=device).manual_seed(97)
+    logits = torch.randn(8, 2, vocab, device=device, generator=inputs)
+    emissions = torch.randn(8, 2, device=device, generator=inputs)
+
+    ids, emit_logprobs, token_logprobs = model.sample_agent_tokens(
+        logits[:, 0], emissions[:, 0], infos
+    )
+
+    checked_emitted = 0
+    for row, info in enumerate(infos):
+        sampling = _text_sampling(info, model.agent_suppressed_token_ids)
+        emit_logprob, token_logprob = emit_logprobs[row], token_logprobs[row]
+        assert emit_logprob.shape == token_logprob.shape == (1,)
+        assert emit_logprob.dtype == token_logprob.dtype == torch.float32
+
+        if sampling.mode in {"argmax", "max"}:
+            assert float(emit_logprob) == 0.0
+            assert float(token_logprob) == 0.0
+            continue
+
+        emitted = int(ids[row]) != model.silence_token_id
+        scaled = emissions[row, 0].float() / _emit_temperatures(info).agent
+        torch.testing.assert_close(
+            emit_logprob.reshape(()),
+            torch.nn.functional.logsigmoid(scaled if emitted else -scaled),
+            atol=1e-5, rtol=1e-4,
+        )
+        assert float(emit_logprob) < 0.0
+
+        if not emitted:
+            # A content draw discarded by a silent row took no action.
+            assert float(token_logprob) == 0.0
+            continue
+        indices, probabilities = content_distribution(logits[row:row + 1, 0], sampling)
+        position = (indices[0] == int(ids[row])).nonzero().flatten()
+        assert position.numel() == 1, "sampled id must lie in the truncated support"
+        torch.testing.assert_close(
+            token_logprob.reshape(()),
+            probabilities[0, int(position)].float().log(),
+            atol=1e-5, rtol=1e-4,
+        )
+        checked_emitted += 1
+
+    assert checked_emitted, "fixture produced no emitted agent row to verify"
