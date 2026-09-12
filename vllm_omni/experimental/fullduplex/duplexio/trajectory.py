@@ -40,6 +40,14 @@ class TrajectoryRecorder:
             segment["sampled_agent_ids"] = output["agent_token_id"].detach().cpu().clone()
             segment["sampled_tool_ids"] = output["tool_call_token_id"].detach().cpu().clone()
             segment["sampled_audio"] = output["agent_audio_token_ids"].detach().cpu().clone().unsqueeze(0)
+            # The behaviour policy's log probabilities, which only the sampling site can
+            # know: replay recomputes hidden states under current weights, and the stream
+            # projection and LM head have both moved since.
+            for name, key in (
+                ("sampled_agent_logprobs", "agent_token_logprob"),
+                ("agent_emit_logprobs", "agent_emit_logprob"),
+            ):
+                segment[name] = output[key].detach().cpu().clone().float().reshape(1)
             if output["predictor_hiddens"].numel():
                 segment["predictor_hiddens"] = output["predictor_hiddens"].detach().cpu().clone().unsqueeze(0)
         self.segments.append(segment)
@@ -55,7 +63,13 @@ class TrajectoryRecorder:
             },
             **{
                 name: torch.cat([segment[name] for segment in predictions])
-                for name in ("sampled_agent_ids", "sampled_tool_ids", "sampled_audio")
+                for name in (
+                    "sampled_agent_ids",
+                    "sampled_tool_ids",
+                    "sampled_audio",
+                    "sampled_agent_logprobs",
+                    "agent_emit_logprobs",
+                )
             },
             "prediction_rows": torch.tensor(self.prediction_rows, dtype=torch.long),
             "row_versions": torch.tensor(self.row_versions, dtype=torch.long),

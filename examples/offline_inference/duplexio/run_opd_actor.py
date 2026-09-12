@@ -36,6 +36,7 @@ RECEIVER = "vllm_omni.experimental.fullduplex.duplexio.policy_receiver.PolicyWei
 TRAJECTORY_KEYS = (
     "text_ids", "agent_audio", "audio_mask", "prediction_rows",
     "sampled_agent_ids", "sampled_tool_ids", "sampled_audio", "row_versions",
+    "sampled_agent_logprobs", "agent_emit_logprobs",
 )
 
 

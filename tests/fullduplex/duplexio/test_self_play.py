@@ -79,6 +79,8 @@ class FakeEngine:
             "agent_token_id": torch.tensor([17]),
             "tool_call_token_id": torch.tensor([2]),
             "predictor_hiddens": torch.empty(0),
+            "agent_token_logprob": -torch.rand(1) if prediction else torch.empty(0),
+            "agent_emit_logprob": -torch.rand(1) if prediction else torch.empty(0),
             "audio": audio,
             "model_listen": torch.tensor([False]),
             "tool_call_complete": torch.tensor([self.tool_call and not is_prefill]),

@@ -19,6 +19,8 @@ def segment(frames: int, *, live: bool, predict: bool) -> dict[str, torch.Tensor
         "tool_call_token_id": torch.tensor([2]),
         "agent_audio_token_ids": torch.randn(3) if predict else torch.empty(0),
         "predictor_hiddens": torch.randn(6, 8) if predict else torch.empty(0),
+        "agent_token_logprob": -torch.rand(1) if predict else torch.empty(0),
+        "agent_emit_logprob": -torch.rand(1) if predict else torch.empty(0),
     }
 
 
@@ -41,6 +43,9 @@ def test_predictor_indices_cover_final_prefix_and_live_rows_and_tool_burst(tmp_p
         torch.testing.assert_close(trace[key], torch.cat([part[f"replay_{key}"] for part in parts]))
     assert trace["sampled_audio"].shape == (4, 3)
     assert trace["predictor_hiddens"].shape == (4, 6, 8)
+    # One behaviour log-prob per prediction, matching row_versions.
+    assert trace["sampled_agent_logprobs"].shape == trace["row_versions"].shape
+    assert trace["agent_emit_logprobs"].shape == trace["row_versions"].shape
     path = tmp_path / "trace.pt"
     torch.save(trace, path)
     loaded = torch.load(path, weights_only=True)

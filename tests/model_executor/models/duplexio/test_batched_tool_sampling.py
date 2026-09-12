@@ -116,7 +116,7 @@ def test_batched_tool_sampling_preserves_tokens_calls_noise_and_rng(device, comp
         logits = torch.randn(8, 2, vocab, device=device, generator=inputs)
         emissions = torch.randn(8, 2, device=device, generator=inputs)
         expected = [serial_sample(reference, logits[row], emissions[row], info) for row, info in enumerate(original)]
-        texts, calls = model.sample_text_batch(logits, emissions, infos)
+        texts, calls, _, _ = model.sample_text_batch(logits, emissions, infos)
         for row, (info, old) in enumerate(zip(infos, original, strict=True)):
             torch.testing.assert_close(texts[row], expected[row][0], rtol=0, atol=0)
             assert calls[row] == expected[row][1]

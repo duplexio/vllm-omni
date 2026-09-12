@@ -99,6 +99,14 @@ class FramePrediction:
     text_ids: Tensor
     audio: Tensor
     tool_call: dict[str, Any] | None
+    # Log probabilities of the agent stream's sampled emit decision and, where it
+    # emitted, of its sampled content token, both under the truncated distribution
+    # actually drawn from. Distillation only needs the sampled ids; a policy-gradient
+    # objective needs the probability behind them, and the sampling site is the only
+    # place that knows it -- the trainable stream projection and tied LM head have
+    # both moved by the time a trajectory is replayed.
+    agent_emit_logprob: Tensor
+    agent_token_logprob: Tensor
 
 
 @dataclass
@@ -762,6 +770,8 @@ class DuplexIOForConditionalGeneration(
         tool_call_complete_flags: list[Tensor] = []
         tool_call_payloads: list[Tensor] = []
         predictor_hiddens: list[Tensor] = []
+        agent_emit_logprobs: list[Tensor] = []
+        agent_token_logprobs: list[Tensor] = []
         replay_outputs: dict[str, list[Tensor]] = {
             f"replay_{name}": [] for name in ("text_ids", "user_features", "agent_audio", "audio_mask")
         }
@@ -813,6 +823,14 @@ class DuplexIOForConditionalGeneration(
             record_hiddens = duplex["runtime_config"].get("duplexio_record_hiddens", False)
             predictor_hiddens.append(
                 row_hidden.detach() if record_hiddens and prediction is not None else row_hidden.new_empty(0)
+            )
+            # Always recorded, unlike the hiddens: one float per predicting row is free,
+            # and a trajectory missing them cannot be used for policy gradient later.
+            agent_emit_logprobs.append(
+                prediction.agent_emit_logprob if prediction is not None else row_hidden.new_empty(0)
+            )
+            agent_token_logprobs.append(
+                prediction.agent_token_logprob if prediction is not None else row_hidden.new_empty(0)
             )
             replay = info.get("duplexio_replay", {})
             for name, values in replay_outputs.items():
@@ -918,6 +936,8 @@ class DuplexIOForConditionalGeneration(
                 "tool_call_complete": tool_call_complete_flags,
                 "tool_call_json": tool_call_payloads,
                 "predictor_hiddens": predictor_hiddens,
+                "agent_emit_logprob": agent_emit_logprobs,
+                "agent_token_logprob": agent_token_logprobs,
                 **replay_outputs,
             },
         )
@@ -948,7 +968,9 @@ class DuplexIOForConditionalGeneration(
         with torch.profiler.record_function("duplexio.text_projection"):
             text_logits, emit_logits = self.project_text(rows)
         with torch.profiler.record_function("duplexio.text_sampling"):
-            texts, calls = self.sample_text_batch(text_logits, emit_logits, [infos[index] for index in indices])
+            texts, calls, emit_logprobs, token_logprobs = self.sample_text_batch(
+                text_logits, emit_logits, [infos[index] for index in indices]
+            )
         noises: list[Tensor] = []
         depth_audio: list[Tensor] = []
         continuous = isinstance(self.audio_sampler, FlowMapSampler)
@@ -980,8 +1002,10 @@ class DuplexIOForConditionalGeneration(
         else:
             audio = depth_audio
         return {
-            index: FramePrediction(text, latent, call)
-            for index, text, latent, call in zip(indices, texts, audio, calls, strict=True)
+            index: FramePrediction(text, latent, call, emit_logprob, token_logprob)
+            for index, text, latent, call, emit_logprob, token_logprob in zip(
+                indices, texts, audio, calls, emit_logprobs, token_logprobs, strict=True
+            )
         }
 
     def project_text(self, rows: Tensor) -> tuple[Tensor, Tensor]:
@@ -1005,9 +1029,11 @@ class DuplexIOForConditionalGeneration(
         logits: Tensor,
         emit_logits: Tensor,
         infos: list[dict[str, Any]],
-    ) -> tuple[list[Tensor], list[dict[str, Any] | None]]:
+    ) -> tuple[list[Tensor], list[dict[str, Any] | None], list[Tensor], list[Tensor]]:
         """Batch tool decisions and token readback without changing per-request RNG."""
-        agent_ids = self.sample_agent_tokens(logits[:, 0], emit_logits[:, 0], infos)
+        agent_ids, agent_emit_logprobs, agent_token_logprobs = self.sample_agent_tokens(
+            logits[:, 0], emit_logits[:, 0], infos
+        )
         samplings: list[TokenSamplingOptions] = []
         tool_starts = [False] * len(infos)
         pending_indices: list[int] = []
@@ -1055,16 +1081,25 @@ class DuplexIOForConditionalGeneration(
                 constraint = infos[row]["duplexio_working_state"].tool_call_constraint
                 if constraint.accept(token_id):
                     calls[row] = self.tool_call_compiler.take_completed_call(constraint)
-        return texts, calls
+        return texts, calls, agent_emit_logprobs, agent_token_logprobs
 
-    def sample_agent_tokens(self, logits: Tensor, emit_logits: Tensor, infos: list[dict[str, Any]]) -> list[Tensor]:
-        """Filter equal-policy requests together; keep their random draws independent."""
+    def sample_agent_tokens(
+        self, logits: Tensor, emit_logits: Tensor, infos: list[dict[str, Any]]
+    ) -> tuple[list[Tensor], list[Tensor], list[Tensor]]:
+        """Filter equal-policy requests together; keep their random draws independent.
+
+        Returns the sampled ids and, per row, the log probability of the emit decision
+        and of the content draw. Both come from the distributions already materialized
+        for sampling, so nothing is recomputed and no draw order changes.
+        """
         samplings = [_text_sampling(info, self.agent_suppressed_token_ids) for info in infos]
         groups: dict[tuple[str, float, int, float], list[int]] = {}
         for row, sampling in enumerate(samplings):
             key = sampling.mode, sampling.temperature, sampling.top_k, sampling.top_p
             groups.setdefault(key, []).append(row)
         tokens: dict[int, Tensor] = {}
+        emit_logprobs: dict[int, Tensor] = {}
+        token_logprobs: dict[int, Tensor] = {}
         for rows in groups.values():
             sampling = samplings[rows[0]]
             group_logits = torch.stack([logits[row] for row in rows])
@@ -1078,17 +1113,38 @@ class DuplexIOForConditionalGeneration(
             for index, row in enumerate(rows):
                 info = infos[row]
                 generator = info["duplexio_working_state"].sampling_generator
-                emit = _sample_emit(
-                    emit_logits[row:row + 1], 0.0 if greedy else _emit_temperatures(info).agent,
-                    generator=generator,
-                )
+                emit_temperature = 0.0 if greedy else _emit_temperatures(info).agent
+                emit = _sample_emit(emit_logits[row:row + 1], emit_temperature, generator=generator)
                 if greedy:
                     token = content[index:index + 1]
+                    content_logprob = torch.zeros_like(emit, dtype=torch.float32)
                 else:
                     selected = torch.multinomial(probabilities[index:index + 1], 1, generator=generator)
                     token = indices[index:index + 1].gather(-1, selected).squeeze(-1)
+                    content_logprob = (
+                        probabilities[index:index + 1].gather(-1, selected).squeeze(-1).float().log()
+                    )
                 tokens[row] = torch.where(emit, token, torch.full_like(token, self.silence_token_id))
-        return [tokens[row] for row in range(len(infos))]
+                # A thresholded emit decision has probability one, so log p is zero. A
+                # content draw discarded by a silent row took no action, likewise zero.
+                if emit_temperature == 0:
+                    emit_logprobs[row] = torch.zeros_like(content_logprob)
+                else:
+                    scaled = emit_logits[row:row + 1].float() / emit_temperature
+                    emit_logprobs[row] = torch.where(
+                        emit,
+                        torch.nn.functional.logsigmoid(scaled),
+                        torch.nn.functional.logsigmoid(-scaled),
+                    )
+                token_logprobs[row] = torch.where(
+                    emit, content_logprob, torch.zeros_like(content_logprob)
+                )
+        order = range(len(infos))
+        return (
+            [tokens[row] for row in order],
+            [emit_logprobs[row] for row in order],
+            [token_logprobs[row] for row in order],
+        )
 
     def compute_logits(
         self,
