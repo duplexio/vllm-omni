@@ -13,6 +13,7 @@ from typing import Any, cast
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import xgrammar as xgr
 from torch import Tensor, nn
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -64,7 +65,6 @@ from vllm_omni.model_executor.models.duplexio.mimi import (
     MimiModel,
     MimiStreamingState,
 )
-from vllm_omni.model_executor.models.duplexio.numerics import FixedLinear, fixed_linear
 from vllm_omni.model_executor.models.duplexio.pocket_mimi import (
     ContinuousMimiState,
     PocketMimi,
@@ -165,7 +165,7 @@ class DuplexIOLogitsProcessor(LogitsProcessor):
         hidden_states: Tensor,
         embedding_bias: Tensor | None,
     ) -> Tensor:
-        return fixed_linear(hidden_states, lm_head.weight, embedding_bias)
+        return F.linear(hidden_states, lm_head.weight, embedding_bias)
 
 
 class _DuplexIOBaseModel(nn.Module):
@@ -202,7 +202,7 @@ class _DuplexIOMultiStreamQwen(nn.Module):
         )
         self.channel_emb = nn.Parameter(torch.zeros(len(TEXT_STREAM_NAMES), text_config.hidden_size))
         self.output_head_proj = nn.ModuleDict(
-            {name: FixedLinear(text_config.hidden_size, text_config.hidden_size) for name in TARGET_STREAM_NAMES}
+            {name: nn.Linear(text_config.hidden_size, text_config.hidden_size) for name in TARGET_STREAM_NAMES}
         )
 
 

@@ -10,6 +10,7 @@ from itertools import islice
 from typing import Any, cast
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated
 from vllm.compilation.decorators import support_torch_compile
@@ -68,7 +69,7 @@ from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
     DuplexIOKVLayout,
     make_duplexio_kv_cache_spec,
 )
-from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_function, fixed_linear
+from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_function
 from vllm_omni.model_executor.models.duplexio.row_semantics import (
     DUPLEXIO_NUM_CELLS,
     DUPLEXIO_NUM_TEXT_CELLS,
@@ -588,7 +589,7 @@ class DuplexIOQwenAttention(nn.Module):
         cos_sin_cache: Tensor,
         hidden_states: Tensor,
     ) -> Tensor:
-        qkv = fixed_linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
+        qkv = F.linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
         if self.attn_output_gate:
             q_gate, key, value = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size],
@@ -624,7 +625,7 @@ class DuplexIOQwenAttention(nn.Module):
         )
         if gate is not None:
             attended = call_compiled_function(gated_attention_output, attended, gate)
-        output = fixed_linear(attended, self.o_proj.weight)
+        output = F.linear(attended, self.o_proj.weight)
         if get_tensor_model_parallel_world_size() > 1:
             output = tensor_model_parallel_all_reduce(output)
         return output
@@ -772,8 +773,8 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         key_active: Tensor,
     ) -> Tensor:
         num_tokens = hidden_states.shape[0]
-        mixed_qkvz = fixed_linear(hidden_states, self.in_proj_qkvz.weight, self.in_proj_qkvz.bias)
-        projected_ba = fixed_linear(hidden_states, self.in_proj_ba.weight, self.in_proj_ba.bias)
+        mixed_qkvz = F.linear(hidden_states, self.in_proj_qkvz.weight, self.in_proj_qkvz.bias)
+        projected_ba = F.linear(hidden_states, self.in_proj_ba.weight, self.in_proj_ba.bias)
         beta_logits, decay_logits = self.split_ba(projected_ba)
         beta_logits = beta_logits.contiguous()
         decay_logits = decay_logits.contiguous()
@@ -804,7 +805,7 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         normalized = call_compiled_function(
             self.norm, core_output.reshape(-1, self.head_v_dim), output_gate.reshape(-1, self.head_v_dim),
         ).view(num_tokens, -1)
-        output = fixed_linear(normalized, self.out_proj.weight, self.out_proj.bias)
+        output = F.linear(normalized, self.out_proj.weight, self.out_proj.bias)
         if self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
         return output

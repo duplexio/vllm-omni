@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from vllm_omni.model_executor.models.duplexio.numerics import FixedLinear, call_compiled_function
+from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_function
 
 
 @torch.compile(dynamic=True, fullgraph=True)
@@ -37,8 +37,8 @@ class AudioInputAdapter(nn.Module):
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int) -> None:
         super().__init__()
-        self.gate_up_proj = FixedLinear(input_dim, 2 * hidden_dim, bias=False)
-        self.output_proj = FixedLinear(hidden_dim, output_dim, bias=False)
+        self.gate_up_proj = nn.Linear(input_dim, 2 * hidden_dim, bias=False)
+        self.output_proj = nn.Linear(hidden_dim, output_dim, bias=False)
 
     def forward(self, audio_features: Tensor) -> Tensor:
         hidden = call_compiled_function(
@@ -58,9 +58,9 @@ class AgentAudioInputAdapter(nn.Module):
         output_dim: int,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = FixedLinear(input_dim, 2 * hidden_dim, bias=False)
-        self.speaker_modulation = FixedLinear(speaker_dim, 2 * hidden_dim, bias=False)
-        self.output_proj = FixedLinear(hidden_dim, output_dim, bias=False)
+        self.gate_up_proj = nn.Linear(input_dim, 2 * hidden_dim, bias=False)
+        self.speaker_modulation = nn.Linear(speaker_dim, 2 * hidden_dim, bias=False)
+        self.output_proj = nn.Linear(hidden_dim, output_dim, bias=False)
 
     def forward(
         self,
