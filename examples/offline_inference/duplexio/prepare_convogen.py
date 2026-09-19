@@ -92,12 +92,10 @@ def main() -> None:
                 system_token_ids=case.prompt_ids,
                 user_features=torch.cat(features).cpu(),
                 user_token_ids=case.user_token_ids,
-                voice=config.default_voice,
                 tools=[tool.as_openai_tool() for tool in source.tools],
                 metadata={
                     **case.metadata,
                     "teacher_system": source.assistant.system_prompt,
-                    "voice_source": "exported voice pool, not the original dataset speaker",
                 },
             ).model_dump()
         )

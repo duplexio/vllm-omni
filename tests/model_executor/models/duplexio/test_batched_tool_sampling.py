@@ -13,7 +13,7 @@ from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     _sample_emit,
     _sample_factorized_text_ids,
     _text_sampling,
-    sample_tool_token_id,
+    sample_tool_token,
 )
 from vllm_omni.model_executor.models.duplexio.text_sampling import content_distribution
 from vllm_omni.model_executor.models.duplexio.tool_calling import (
@@ -34,6 +34,7 @@ def fixture(device: str, *, mixed: bool):
     torch.nn.Module.__init__(model)
     model.silence_token_id = 0
     model.agent_suppressed_token_ids = torch.tensor([0], device=device)
+    model.user_suppressed_token_ids = model.agent_suppressed_token_ids
     model.tool_suppressed_token_ids = model.agent_suppressed_token_ids
     model.content_distribution = content_distribution
     model.tool_call_compiler = object.__new__(ToolCallConstraintCompiler)
@@ -52,7 +53,6 @@ def fixture(device: str, *, mixed: bool):
             elif index == 3:
                 constraint.force_next_call = True
         infos.append({
-            "duplexio": {"user_token_id": torch.tensor(1, device=device)},
             "duplexio_working_state": SimpleNamespace(
                 sampling_generator=torch.Generator(device=device).manual_seed(17 + index),
                 tool_call_constraint=constraint,
@@ -62,7 +62,7 @@ def fixture(device: str, *, mixed: bool):
                     "mode": ("argmax", "top_k", "top_p")[index % 3] if mixed else "argmax",
                     "temperature": 0.8, "top_k": len(vocab), "top_p": 0.9,
                 },
-                "duplexio_emit_temperatures": {"user": 0.0, "agent": 0.7, "tool_call": 0.9},
+                "duplexio_emit_temperatures": {"user": 0.6, "agent": 0.7, "tool_call": 0.9},
             }},
         })
     return model, infos, len(vocab)
@@ -85,16 +85,23 @@ def serial_sample(model, logits, emissions, info):
             emissions[1:2], 0.0 if sampling.mode == "argmax" else temperatures.tool_call,
             generator=state.sampling_generator,
         ).item())
-    tool = sample_tool_token_id(
+    tool_sample = sample_tool_token(
         logits[1:2], constraint=constraint, emit=emit,
         sampling=sampling, generator=state.sampling_generator,
     )
     call = None
-    if tool is None:
+    if tool_sample is None:
         tool = logits.new_full((1,), 0, dtype=torch.long)
-    elif constraint.accept(tool.item()):
-        call = model.tool_call_compiler.take_completed_call(constraint)
-    return torch.cat((info["duplexio"]["user_token_id"].view(1), agent, tool)), call
+    else:
+        tool = tool_sample.token_id
+        if constraint.accept(tool.item()):
+            call = model.tool_call_compiler.take_completed_call(constraint)
+    user = _sample_factorized_text_ids(
+        logits[2:3], emissions[2:3], silence_token_id=0,
+        sampling=replace(sampling, suppressed_token_ids=model.user_suppressed_token_ids),
+        emit_temperature=temperatures.user, generator=state.sampling_generator,
+    )
+    return torch.cat((user, agent, tool)), call
 
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param(
@@ -113,13 +120,13 @@ def test_batched_tool_sampling_preserves_tokens_calls_noise_and_rng(device, comp
     reference, original, _ = fixture(device, mixed=True)
     inputs = torch.Generator(device=device).manual_seed(53)
     for _ in range(60):
-        logits = torch.randn(8, 2, vocab, device=device, generator=inputs)
-        emissions = torch.randn(8, 2, device=device, generator=inputs)
+        logits = torch.randn(8, 3, vocab, device=device, generator=inputs)
+        emissions = torch.randn(8, 3, device=device, generator=inputs)
         expected = [serial_sample(reference, logits[row], emissions[row], info) for row, info in enumerate(original)]
-        texts, calls, _, _ = model.sample_text_batch(logits, emissions, infos)
+        sampled = model.sample_text_batch(logits, emissions, infos)
         for row, (info, old) in enumerate(zip(infos, original, strict=True)):
-            torch.testing.assert_close(texts[row], expected[row][0], rtol=0, atol=0)
-            assert calls[row] == expected[row][1]
+            torch.testing.assert_close(sampled.text_ids[row], expected[row][0], rtol=0, atol=0)
+            assert sampled.tool_calls[row] == expected[row][1]
             actual_rng = info["duplexio_working_state"].sampling_generator
             expected_rng = old["duplexio_working_state"].sampling_generator
             torch.testing.assert_close(
@@ -144,8 +151,8 @@ class ScalarReads(TorchDispatchMode):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="checks GPU scalar readback")
 def test_tools_do_not_read_gpu_scalars_per_request(start_tool):
     model, infos, vocab = fixture("cuda", mixed=False)
-    logits = torch.zeros(8, 2, vocab, device="cuda")
-    emissions = torch.full((8, 2), 100.0 if start_tool else -100.0, device="cuda")
+    logits = torch.zeros(8, 3, vocab, device="cuda")
+    emissions = torch.full((8, 3), 100.0 if start_tool else -100.0, device="cuda")
     with ScalarReads() as serial:
         for row, info in enumerate(infos):
             serial_sample(model, logits[row], emissions[row], info)
@@ -213,3 +220,30 @@ def test_agent_logprobs_match_the_distributions_actually_sampled(device):
         checked_emitted += 1
 
     assert checked_emitted, "fixture produced no emitted agent row to verify"
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param(
+    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+)])
+@pytest.mark.parametrize("mode", ["argmax", "top_k", "top_p"])
+def test_tool_emit_logprobs_score_all_decisions_including_forced_emit_and_wait(device, mode):
+    model, infos, vocab = fixture(device, mixed=True)
+    for info in infos:
+        info["duplex"]["runtime_config"]["duplexio_text_sampling"]["mode"] = mode
+    logits = torch.zeros(8, 3, vocab, device=device)
+    emissions = torch.zeros(8, 3, device=device)
+    emissions[:, 1] = torch.tensor([0, 0, -100, -100, -100, 100, -0.4, 0.4], device=device)
+    sampled = model.sample_text_batch(logits, emissions, infos)
+    for row in range(8):
+        emitted = sampled.text_ids[row][2].item() != model.silence_token_id
+        # Score raw logits, independent of sampling temperature or forced actions.
+        signed_logit = emissions[row, 1] if emitted else -emissions[row, 1]
+        expected = -torch.logaddexp(torch.zeros_like(signed_logit), -signed_logit)
+        torch.testing.assert_close(sampled.tool_emit_logprobs[row][0], expected)
+        if not emitted or mode == "argmax":
+            assert sampled.tool_token_logprobs[row].item() == 0
+        if row < 2:
+            assert not emitted
+        elif row < 4:
+            assert emitted  # active continuation / forced start ignores the negative emit logit
+            assert sampled.tool_emit_logprobs[row].item() == -100

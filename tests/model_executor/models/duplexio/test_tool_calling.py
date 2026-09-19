@@ -9,7 +9,7 @@ import xgrammar as xgr
 
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     TokenSamplingOptions,
-    sample_tool_token_id,
+    sample_tool_token,
 )
 from vllm_omni.model_executor.models.duplexio.tool_calling import (
     ToolCallCapture,
@@ -57,15 +57,16 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream() -> None
     for frame in range(100):
         logits = torch.zeros(1, len(vocab))
         logits[0, 0] = 100
-        token_id = sample_tool_token_id(
+        sampled = sample_tool_token(
             logits,
             constraint=state,
             emit=frame == 0,
             sampling=sampling,
             generator=generator,
         )
-        assert token_id is not None
-        sampled_id = token_id.item()
+        assert sampled is not None
+        assert sampled.logprob.item() == 0
+        sampled_id = sampled.token_id.item()
         complete = state.accept(sampled_id)
         assert sampled_id != 0
         generated += vocab[sampled_id]
@@ -83,6 +84,42 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream() -> None
     }
     state.begin()
     assert state.active
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param(
+    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+)])
+@pytest.mark.parametrize("mode", ["argmax", "top_k", "top_p"])
+def test_forced_continuation_records_actual_constrained_token_probability(device, mode):
+    vocab = ["<silence>", "a", "b", "c", "d"]
+    tokenizer = xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=len(vocab))
+    grammar = xgr.GrammarCompiler(tokenizer).compile_grammar('root ::= "a" | "b" | "c"')
+    state = ToolCallConstraintState(compiled_grammar=grammar)
+    state.begin()
+    sampling = TokenSamplingOptions(
+        mode=mode, temperature=0.7, top_k=2, top_p=0.8,
+        suppressed_token_ids=torch.tensor([0], device=device),
+    )
+    logits = torch.tensor([[100.0, 0.2, 0.6, 0.9, 90.0]], device=device)
+    sampled = sample_tool_token(
+        logits, constraint=state, emit=False, sampling=sampling,
+        generator=torch.Generator(device=device).manual_seed(42),
+    )
+    assert sampled is not None
+    token = sampled.token_id.item()
+    assert token in (2, 3)  # the grammar excludes the two highest raw logits; top-k excludes a
+    if mode == "argmax":
+        assert token == 3
+        assert sampled.logprob.item() == 0
+    else:
+        # Independent reference: grammar leaves a/b/c, then top-k retains c/b.
+        values = torch.tensor([0.9, 0.6], device=device) / 0.7
+        probabilities = values.softmax(-1)
+        if mode == "top_p" and probabilities[0] > 0.8:
+            probabilities = torch.tensor([1.0, 0.0], device=device)
+        expected = probabilities[0 if token == 3 else 1].log()
+        torch.testing.assert_close(sampled.logprob[0], expected)
+        assert sampled.logprob.item() < 0  # forcing emit does not force the content token
 
 
 def test_constrained_sampler_captures_structured_call_while_accepting_bytes() -> None:

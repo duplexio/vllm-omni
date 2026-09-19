@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+import base64
 import hashlib
 import json
-from pathlib import Path
 import time
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -18,7 +19,6 @@ from torch import Tensor
 
 from vllm_omni.experimental.fullduplex.duplexio.tool_simulator import ToolSimulator, decode_tool_calls
 from vllm_omni.experimental.fullduplex.duplexio.trajectory import TrajectoryRecorder
-from vllm_omni.experimental.fullduplex.engine.contracts import duplex_resource_request_id
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 if TYPE_CHECKING:
@@ -27,6 +27,30 @@ if TYPE_CHECKING:
     from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 SYSTEM_INPUT_CHUNK_FRAMES = 128
+
+
+@dataclass(frozen=True)
+class VoicePrompt:
+    """Reference audio encoded for the native session boundary."""
+
+    audio: str
+    frames: int
+
+    @classmethod
+    def from_file(cls, path: Path, max_frames: int) -> VoicePrompt:
+        """Read mono 24 kHz reference audio, bounded to complete model frames."""
+        import soundfile as sf
+        import torchaudio.functional as AF
+
+        samples, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(samples).mean(dim=1)
+        if sample_rate != 24000:
+            waveform = AF.resample(waveform, sample_rate, 24000)
+        frames = min(waveform.numel() // 1920, max_frames)
+        if frames < 1:
+            raise ValueError(f"Voice reference is shorter than 80 ms: {path}")
+        audio = base64.b64encode(waveform[:frames * 1920].numpy().tobytes()).decode("ascii")
+        return cls(audio, frames)
 
 
 @dataclass
@@ -56,8 +80,6 @@ class PreparedConversation(BaseModel):
     system_token_ids: list[int] = Field(min_length=1)
     user_features: Tensor
     user_token_ids: Tensor
-    voice: str
-    voice_clip_index: int = Field(default=0, ge=0)
     tools: list[dict[str, Any]]
     metadata: dict[str, Any]
 
@@ -117,7 +139,8 @@ class PoolConversation:
 
 
 def load_pool_shard(
-    pool_dir: Path, shard: int, shards: int, *, max_rows: int, reserved_rows: int = 512, min_live_rows: int = 125,
+    pool_dir: Path, shard: int, shards: int, *, max_rows: int, voice_prompt_frames: int,
+    reserved_rows: int = 512, min_live_rows: int = 125,
 ) -> list[PoolConversation]:
     """Return this actor's slice of the pool index, sorted by conversation ID.
 
@@ -127,7 +150,7 @@ def load_pool_shard(
     index = json.loads((pool_dir / "index.json").read_text())
     usable, dropped = [], 0
     for c in index["conversations"]:
-        if c["prefix_frames"] + min_live_rows + reserved_rows > max_rows:
+        if voice_prompt_frames + c["prefix_frames"] + min_live_rows + reserved_rows >= max_rows:
             dropped += 1
             continue
         usable.append(PoolConversation(c["conversation_id"], c["file_stem"], c["frames"]))
@@ -139,7 +162,8 @@ def load_pool_shard(
 
 
 def prepared_from_pool(
-    pool_dir: Path, entry: PoolConversation, *, max_rows: int, reserved_rows: int = 512,
+    pool_dir: Path, entry: PoolConversation, *, max_rows: int, voice_prompt_frames: int,
+    reserved_rows: int = 512,
 ) -> PreparedConversation:
     """Load one conversation's inputs when its session starts.
 
@@ -151,7 +175,7 @@ def prepared_from_pool(
     info = json.loads((pool_dir / f"{entry.file_stem}.json").read_text())
     tensors = load_file(pool_dir / f"{entry.file_stem}.safetensors")
     system_token_ids = tensors["system_token_ids"].tolist()
-    live_limit = max_rows - len(system_token_ids) - reserved_rows
+    live_limit = max_rows - voice_prompt_frames - len(system_token_ids) - reserved_rows - 1
     if live_limit < 1:
         raise ValueError(f"{info['conversation_id']}: prefix of {len(system_token_ids)} rows leaves no room for audio")
     return PreparedConversation(
@@ -159,8 +183,6 @@ def prepared_from_pool(
         system_token_ids=system_token_ids,
         user_features=tensors["user_features"][:live_limit].float(),
         user_token_ids=tensors["user_token_ids"][:live_limit],
-        voice=info["voice"],
-        voice_clip_index=info["voice_clip_index"],
         tools=info["tools"],
         metadata={**info["metadata"], "teacher_system": info["teacher_system"]},
     )
@@ -218,6 +240,7 @@ async def rollout_conversation(
     engine: AsyncOmni,
     conversation: PreparedConversation,
     *,
+    voice_prompt: VoicePrompt,
     sampling_config: dict[str, Any],
     seed: int,
     gate: RolloutGate,
@@ -232,14 +255,16 @@ async def rollout_conversation(
     With a tool participant, each completed tool call is answered by a
     simulated result injected as a system-input burst while user audio keeps
     streaming, exactly as the realtime adapter would.
+    Each append collects its output before the next input is submitted;
+    separate conversations remain concurrent.
     """
     session_id = f"opd-{conversation.conversation_id}-{seed}"
     fence = DuplexFence(session_id)
     runtime = {
         **sampling_config,
         "duplexio_system_token_ids": conversation.system_token_ids,
-        "duplexio_voice": conversation.voice,
-        "duplexio_voice_clip_index": conversation.voice_clip_index,
+        "duplexio_voice_prompt_audio": voice_prompt.audio,
+        "duplexio_voice_prompt_frames": voice_prompt.frames,
         "duplexio_tools": conversation.tools,
         "duplexio_tool_choice": {"mode": "auto" if conversation.tools else "none"},
         "duplexio_sampling_seed": seed,
@@ -258,10 +283,11 @@ async def rollout_conversation(
     )
     recorder = TrajectoryRecorder()
     started = time.perf_counter()
-    pending = asyncio.Semaphore(8)
-    first_submitted = asyncio.Event()
-    prefix_frames = len(conversation.system_token_ids)
-    prefix_segments = (prefix_frames + 255) // 256
+    prefill_finished = started
+    input_lock = asyncio.Lock()
+    system_frames = len(conversation.system_token_ids)
+    prefix_frames = voice_prompt.frames + system_frames
+    prefix_segments = (voice_prompt.frames + 255) // 256 + (system_frames + 255) // 256
     frame_count = conversation.user_features.shape[0]
     if first_turn is not None:
         user_end = first_utterance_end(
@@ -273,7 +299,6 @@ async def rollout_conversation(
         recorded_frames = frame_count
     submitted_segments = 0  # every append yields exactly one output
     live_rows_submitted = 0
-    submit_done = asyncio.Event()
     live_final_submitted = False
     last_agent_row = -1  # live row index of the last emitted agent token
     tool_history: list[dict[str, Any]] = []
@@ -291,24 +316,52 @@ async def rollout_conversation(
     last_tool_sequence = 0  # the engine re-reports a call every frame until the next one
 
     async def append(payload: dict[str, Any], *, final: bool = False) -> None:
-        nonlocal submitted_segments
-        await pending.acquire()
+        nonlocal submitted_segments, prefill_finished, last_agent_row, last_tool_sequence
         await gate.wait_and_submit()
         submitted_segments += 1
-        await engine.append_duplex_input_async(
+        result = await engine.append_duplex_input_async(
             session_id,
             mode="append_audio_chunk",
             payload=payload,
             final=final,
             fence=fence,
             timeout=120.0,
-            collect_outputs=False,
+            collect_outputs=True,
         )
-        first_submitted.set()
+        outputs = result.get("data_plane_outputs", [])
+        if len(outputs) != 1:
+            raise RuntimeError(f"DuplexIO expected one output per append, got {len(outputs)}: session={session_id}")
+        output = outputs[0]
+        if output.error is not None:
+            raise RuntimeError(output.error)
+        recorder.append(output.multimodal_output, gate.version)
+        gate.collected()
+        if submitted_segments == prefix_segments:
+            prefill_finished = time.perf_counter()
+        if first_turn is not None and output.multimodal_output["agent_audio_token_ids"].numel():
+            agent_token = int(output.multimodal_output["agent_token_id"].reshape(-1)[0])
+            if agent_token != first_turn.silence_token_id:
+                last_agent_row = live_rows_submitted - 1
+        if tools is not None and not live_final_submitted:
+            for call in decode_tool_calls(output.multimodal_output.get("tool_call_json")):
+                if call["sequence"] <= last_tool_sequence:
+                    continue
+                last_tool_sequence = call["sequence"]
+                task = tool_group.create_task(answer(call))
+                tool_tasks.add(task)
+                task.add_done_callback(tool_tasks.discard)
 
     async def submit() -> None:
-        for offset in range(0, prefix_frames, 256):
-            frames = min(256, prefix_frames - offset)
+        for offset in range(0, voice_prompt.frames, 256):
+            frames = min(256, voice_prompt.frames - offset)
+            await append({
+                "type": "audio", "audio": "", "format": "pcm_f32le",
+                "sample_rate_hz": 24000, "frame_size": 1920,
+                "frame_count": frames, "valid_samples": frames * 1920,
+                "duplexio_voice_prompt": True, "decode_audio": False,
+            })
+        for offset in range(0, system_frames, 256):
+            frames = min(256, system_frames - offset)
             await append(
                 {
                     "type": "audio",
@@ -319,29 +372,30 @@ async def rollout_conversation(
                     "frame_count": frames,
                     "valid_samples": frames * 1920,
                     "duplexio_prefill": True,
-                    "duplexio_prefill_final": offset + frames == prefix_frames,
+                    "duplexio_prefill_final": offset + frames == system_frames,
                     "decode_audio": False,
                 }
             )
         nonlocal live_final_submitted, live_rows_submitted
 
-        async def live(features: Tensor, user_token: int, *, final: bool) -> None:
+        async def live(features: Tensor, *, final: bool) -> None:
             nonlocal live_final_submitted, live_rows_submitted
             if final:
                 # Late tool results cannot follow the final live frame.
-                await asyncio.gather(*tool_tasks)
+                while tool_tasks:
+                    await asyncio.gather(*tool_tasks)
                 live_final_submitted = True
-            live_rows_submitted += 1
-            await append(
-                {"format": "duplexio_features", "features": features, "user_token_id": user_token,
-                 "decode_audio": False},
-                final=final,
-            )
+            async with input_lock:
+                live_rows_submitted += 1
+                await append(
+                    {"format": "duplexio_features", "features": features,
+                     "decode_audio": False},
+                    final=final,
+                )
 
-        user_tokens = conversation.user_token_ids.tolist()
         for frame in range(recorded_frames):
             final = first_turn is None and frame + 1 == recorded_frames
-            await live(conversation.user_features[frame : frame + 1], user_tokens[frame], final=final)
+            await live(conversation.user_features[frame : frame + 1], final=final)
         if first_turn is not None:
             silence = first_turn.silence_features
             while True:
@@ -356,12 +410,10 @@ async def rollout_conversation(
                 final = finished or live_rows_submitted + 1 >= max_live_rows
                 await live(
                     silence[live_rows_submitted % silence.shape[0]].unsqueeze(0),
-                    first_turn.silence_token_id,
                     final=final,
                 )
                 if final:
                     break
-        submit_done.set()
 
     def transcript() -> str:
         assert tools is not None
@@ -397,85 +449,31 @@ async def rollout_conversation(
         if live_final_submitted or not fits:
             return
         tool_rows_budget -= len(token_ids)
-        for offset in range(0, len(token_ids), SYSTEM_INPUT_CHUNK_FRAMES):
-            chunk = token_ids[offset : offset + SYSTEM_INPUT_CHUNK_FRAMES]
-            await append(
-                {
-                    "type": "audio",
-                    "audio": "",
-                    "format": "pcm_f32le",
-                    "sample_rate_hz": 24000,
-                    "frame_size": 1920,
-                    "frame_count": len(chunk),
-                    "valid_samples": len(chunk) * 1920,
-                    "duplexio_system_input": True,
-                    "duplexio_system_input_final": offset + len(chunk) == len(token_ids),
-                    "duplexio_system_token_ids": chunk,
-                    "decode_audio": False,
-                }
-            )
-
-    async def collect() -> tuple[float, float]:
-        nonlocal last_tool_sequence, last_agent_row
-        await first_submitted.wait()
-        completed = 0
-        live_completed = 0  # segments that consumed a live row (prefill and tool results do not)
-        idle_since: float | None = None
-        # Tool tasks may still be waiting on their LLM after every queued segment
-        # has returned, so poll briefly and only fail when segments are outstanding.
-        while (
-            not submit_done.is_set()
-            or completed < submitted_segments
-            or any(not task.done() for task in tool_tasks)
-        ):
-            outputs = await engine.collect_duplex_data_plane_outputs_async(
-                duplex_resource_request_id(fence, "stage0"), timeout=5.0,
-            )
-            if not outputs:
-                if completed < submitted_segments:
-                    idle_since = idle_since or time.monotonic()
-                    if time.monotonic() - idle_since > 120.0:
-                        raise TimeoutError(
-                            f"Timed out waiting for a queued input segment: session={session_id} "
-                            f"completed={completed}/{submitted_segments} live_submitted={live_rows_submitted} "
-                            f"live_completed={live_completed} recorded={recorded_frames} "
-                            f"max_live={max_live_rows} last_agent_row={last_agent_row} "
-                            f"submit_done={submit_done.is_set()} final_submitted={live_final_submitted} "
-                            f"tool_tasks={sum(not task.done() for task in tool_tasks)} "
-                            f"gate_open={gate.open.is_set()} prefix_segments={prefix_segments} "
-                            f"answered={answered_calls}"
-                        )
-                continue
-            idle_since = None
-            for output in outputs:
-                if output.error is not None:
-                    raise RuntimeError(output.error)
-                recorder.append(output.multimodal_output, gate.version)
-                completed += 1
-                if completed == prefix_segments:
-                    prefill_finished = time.perf_counter()
-                gate.collected()
-                pending.release()
-                if output.multimodal_output["agent_audio_token_ids"].numel():
-                    live_completed += 1
-                    agent_token = int(output.multimodal_output["agent_token_id"].reshape(-1)[0])
-                    if first_turn is not None and agent_token != first_turn.silence_token_id:
-                        last_agent_row = live_completed - 1
-                if tools is not None:
-                    for call in decode_tool_calls(output.multimodal_output.get("tool_call_json")):
-                        if call["sequence"] <= last_tool_sequence:
-                            continue
-                        last_tool_sequence = call["sequence"]
-                        task = asyncio.create_task(answer(call))
-                        tool_tasks.add(task)
-                        task.add_done_callback(tool_tasks.discard)
-        return prefill_finished, time.perf_counter()
+        # Context bursts predict feedback only on their final row; live input
+        # cannot resume between chunks of the same tool result.
+        async with input_lock:
+            for offset in range(0, len(token_ids), SYSTEM_INPUT_CHUNK_FRAMES):
+                chunk = token_ids[offset : offset + SYSTEM_INPUT_CHUNK_FRAMES]
+                await append(
+                    {
+                        "type": "audio",
+                        "audio": "",
+                        "format": "pcm_f32le",
+                        "sample_rate_hz": 24000,
+                        "frame_size": 1920,
+                        "frame_count": len(chunk),
+                        "valid_samples": len(chunk) * 1920,
+                        "duplexio_system_input": True,
+                        "duplexio_system_input_final": offset + len(chunk) == len(token_ids),
+                        "duplexio_system_token_ids": chunk,
+                        "decode_audio": False,
+                    }
+                )
 
     try:
-        async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(submit())
-            collection = tasks.create_task(collect())
-        prefill_finished, decode_finished = collection.result()
+        async with asyncio.TaskGroup() as tool_group:
+            await submit()
+        decode_finished = time.perf_counter()
     finally:
         await engine.close_duplex_session_async(session_id, fence=fence, timeout=120.0)
     return {
@@ -498,6 +496,7 @@ async def rollout_conversations(
     engine: AsyncOmni,
     conversations: Sequence[Any],
     *,
+    voice_prompt: VoicePrompt,
     concurrency: int,
     sampling_config: dict[str, Any],
     seed: int,
@@ -534,6 +533,7 @@ async def rollout_conversations(
             trace = await rollout_conversation(
                 engine,
                 conversation,
+                voice_prompt=voice_prompt,
                 sampling_config=sampling_config,
                 seed=conversation_seed(seed + 1_000_003 * pass_index, conversation.conversation_id),
                 gate=gate,

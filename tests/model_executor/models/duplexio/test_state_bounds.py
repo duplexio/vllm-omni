@@ -51,6 +51,7 @@ def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
         text_input_ids=torch.zeros(4, dtype=torch.long),
         agent_audio_codes=torch.zeros(8, dtype=torch.long),
         user_asr=FastConformerAudioStreamState(),
+        input_mimi=MimiStreamingState(),
         agent_delay=DelayedMimiState(torch.zeros(7, dtype=torch.long)),
         output_mimi=MimiStreamingState(
             encoder_transformer=MimiTransformerState.empty(2),

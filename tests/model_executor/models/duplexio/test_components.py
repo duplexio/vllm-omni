@@ -559,7 +559,7 @@ def test_emit_temperatures_are_read_per_stream() -> None:
             "duplex": {
                 "runtime_config": {
                     "duplexio_emit_temperatures": {
-                        "user": 0.2,
+                        "user": 0.6,
                         "agent": 0.4,
                         "tool_call": 0.8,
                     }
@@ -568,9 +568,37 @@ def test_emit_temperatures_are_read_per_stream() -> None:
         }
     )
 
-    assert temperatures.user == 0.2
+    assert temperatures.user == 0.6
     assert temperatures.agent == 0.4
     assert temperatures.tool_call == 0.8
+
+
+def test_voice_prompt_rows_do_not_run_prediction_heads() -> None:
+    model = DuplexIOForConditionalGeneration.__new__(
+        DuplexIOForConditionalGeneration
+    )
+
+    predictions = model.sample_frames(
+        torch.zeros(6, 4),
+        [(0, 6)],
+        [{"duplex": {"duplexio_voice_prompt": True}}],
+    )
+
+    assert predictions == {}
+
+
+def test_training_only_heads_are_ignored_when_loading_serving_weights() -> None:
+    names = DuplexIOForConditionalGeneration.hf_to_vllm_mapper.apply_list(
+        [
+            "llm.output_head_proj.system.weight",
+            "llm.output_head_proj.user.weight",
+            "user_token_projection.weight",
+            "user_emit_head.weight",
+            "llm.output_head_proj.agent.weight",
+        ]
+    )
+
+    assert names == ["user_token_projection.weight", "user_emit_head.weight", "llm.output_head_proj.agent.weight"]
 
 
 def test_vocabulary_suppression_is_model_owned_and_sampling_temperature_stays_dynamic() -> None:

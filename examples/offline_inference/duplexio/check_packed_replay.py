@@ -8,9 +8,8 @@ from pathlib import Path
 
 import torch
 from duplexio.opd import PolicyTrajectory, pack_policy_replay
-from safetensors.torch import load_file
 
-from examples.offline_inference.duplexio.check_backbone_parity import VoiceManifest, load_reference
+from examples.offline_inference.duplexio.check_backbone_parity import load_reference
 
 
 @torch.inference_mode()
@@ -24,17 +23,8 @@ def main() -> None:
         for path in args.trajectories
     ]
     model = load_reference(args.checkpoint).cuda()
-    voices = VoiceManifest.model_validate_json((args.checkpoint / "voices.json").read_text())
-    pools = load_file(args.checkpoint / "voices.safetensors")
-    speakers = torch.stack([
-        pools[voices.voices[trace.runtime_config["duplexio_voice"]].tensor][
-            trace.runtime_config["duplexio_voice_embedding_index"]
-        ]
-        for trace in traces
-    ])
     batch = pack_policy_replay(
         traces,
-        speakers,
         silence_token_id=model.silence_token_id,
         device=torch.device("cuda"),
     )

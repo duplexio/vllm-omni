@@ -28,7 +28,7 @@ from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_prepared_frame_preserves_features_and_user_token_without_audio_transport() -> None:
+def test_prepared_frame_preserves_features_without_transcript_or_audio_transport() -> None:
     features = torch.randn(1, 1024)
     prompt = build_duplexio_data_plane_prompt(
         request_id="request-1",
@@ -41,7 +41,6 @@ def test_prepared_frame_preserves_features_and_user_token_without_audio_transpor
         payload={
             "format": "duplexio_features",
             "features": features,
-            "user_token_id": 17,
         },
         final=False,
     )
@@ -53,7 +52,7 @@ def test_prepared_frame_preserves_features_and_user_token_without_audio_transpor
     assert prompt["prompt_token_ids"] == [0] * 6
     assert prompt["model_intermediate_buffer"]["embed"]["speech_feat"] is features
     assert "features" not in duplex["payload"]
-    assert duplex["user_token_id"] == 17
+    assert "user_token_id" not in duplex
     assert "audio" not in duplex["payload"]
     assert duplex["decode_audio"] is False
 

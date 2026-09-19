@@ -22,12 +22,22 @@ CHUNK_METADATA_KEYS: frozenset[str] = frozenset(
         "replay_user_features",
         "replay_agent_audio",
         "replay_audio_mask",
+        "replay_prompt_frames",
         "sample_rate_hz",
         "segment_end",
         "tool_call_token_id",
+        "tool_emit_logprob",
+        "tool_token_logprob",
         "tts_is_last_chunk",
         "turn_end",
         "user_token_id",
+        "user_emit",
+        "user_emit_logprob",
+        "user_token_logprob",
+        "user_action_logprob",
+        "user_action_eligible",
+        "user_token_eligible",
+        "policy_version",
     }
 )
 

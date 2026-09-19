@@ -16,6 +16,7 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.experimental.fullduplex.duplexio.offline import (
     PreparedConversation,
     RolloutGate,
+    VoicePrompt,
     rollout_conversations,
 )
 from vllm_omni.model_executor.models.duplexio.configuration_duplexio import DuplexIOConfig
@@ -23,6 +24,7 @@ from vllm_omni.model_executor.models.duplexio.configuration_duplexio import Dupl
 
 async def run(args: argparse.Namespace, actor_index: int = 0, round_barrier: Barrier | None = None) -> None:
     config = DuplexIOConfig.from_pretrained(args.checkpoint, local_files_only=True)
+    voice_prompt = VoicePrompt.from_file(args.voice_clip, config.voice_prompt_max_frames)
     conversations = TypeAdapter(list[PreparedConversation]).validate_python(
         torch.load(args.inputs, map_location="cpu", weights_only=True)
     )
@@ -36,7 +38,7 @@ async def run(args: argparse.Namespace, actor_index: int = 0, round_barrier: Bar
         "duplexio_scheduler_token_id": config.pad_token_id,
         "duplexio_text_sampling": sampling,
         "duplexio_emit_temperatures": {
-            "user": 0.0,
+            "user": sampling["emit_temperature"],
             "agent": sampling["emit_temperature"],
             "tool_call": sampling["emit_temperature"],
         },
@@ -92,6 +94,7 @@ async def run(args: argparse.Namespace, actor_index: int = 0, round_barrier: Bar
                 await rollout_conversations(
                     engine,
                     conversations,
+                    voice_prompt=voice_prompt,
                     concurrency=args.concurrency,
                     sampling_config=runtime,
                     seed=args.seed,
@@ -143,6 +146,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("inputs", type=Path)
+    parser.add_argument("--voice-clip", type=Path, required=True)
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--concurrency", type=int, default=1, help="Concurrent conversations per actor")
     parser.add_argument("--devices", type=int, nargs="+", help="One independent rollout actor per listed GPU")

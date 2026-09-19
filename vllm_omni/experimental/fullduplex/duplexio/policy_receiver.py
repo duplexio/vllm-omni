@@ -122,6 +122,7 @@ class PolicyWeightReceiver:
         except BaseException:
             self._policy_commit_failed = True
             raise
+        self.model_runner.model.policy_version = version
         self._policy_version = version
         self._policy_pending = None
         return len(self._policy_buffer)

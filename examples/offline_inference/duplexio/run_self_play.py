@@ -52,7 +52,7 @@ async def run(args: argparse.Namespace) -> None:
         "duplexio_scheduler_token_id": config.pad_token_id,
         "duplexio_text_sampling": sampling,
         "duplexio_emit_temperatures": {
-            "user": 0.0,
+            "user": sampling["emit_temperature"],
             "agent": sampling["emit_temperature"],
             "tool_call": sampling["emit_temperature"],
         },

@@ -8,9 +8,6 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
-from safetensors.torch import load_file
-from torch import Tensor
-
 EXPORT_MANIFEST_FILENAME = "duplexio_export.json"
 
 
@@ -43,7 +40,7 @@ def validate_export_manifest(root: Path) -> None:
     manifest = json.loads(manifest_path.read_text())
     if not isinstance(manifest, Mapping):
         raise ValueError(f"Invalid DuplexIO export manifest: {manifest_path}")
-    if manifest.get("format") != "duplexio_vllm" or manifest.get("version") != 5:
+    if manifest.get("format") != "duplexio_vllm" or manifest.get("version") != 6:
         raise ValueError(f"Unsupported DuplexIO export manifest: {manifest_path}")
     weight_files = manifest.get("weight_files")
     if (

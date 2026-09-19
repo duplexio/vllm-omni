@@ -4,8 +4,6 @@
 import json
 
 import pytest
-import torch
-from safetensors.torch import save_file
 
 from vllm_omni.model_executor.models.duplexio.checkpoint import (
     resolve_checkpoint_directory,
@@ -19,7 +17,7 @@ def _write_checkpoint(tmp_path) -> None:
         json.dumps(
             {
                 "format": "duplexio_vllm",
-                "version": 5,
+                "version": 6,
                 "weight_files": ["model.safetensors"],
             }
         )
@@ -41,6 +39,17 @@ def test_checkpoint_contract_rejects_missing_weight_file(tmp_path) -> None:
     (tmp_path / "model.safetensors").unlink()
 
     with pytest.raises(ValueError, match="missing weight files"):
+        validate_export_manifest(tmp_path)
+
+
+def test_checkpoint_contract_rejects_old_export_version(tmp_path) -> None:
+    _write_checkpoint(tmp_path)
+    manifest_path = tmp_path / "duplexio_export.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["version"] = 5
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="Unsupported DuplexIO export manifest"):
         validate_export_manifest(tmp_path)
 
 

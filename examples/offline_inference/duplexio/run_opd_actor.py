@@ -12,9 +12,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-from functools import partial
 import json
 import socket
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,7 @@ from vllm_omni.experimental.fullduplex.duplexio.offline import (
     FirstTurnPolicy,
     RolloutGate,
     ToolParticipant,
+    VoicePrompt,
     load_pool_shard,
     prepared_from_pool,
     rollout_conversations,
@@ -35,9 +36,12 @@ from vllm_omni.model_executor.models.duplexio.configuration_duplexio import Dupl
 
 RECEIVER = "vllm_omni.experimental.fullduplex.duplexio.policy_receiver.PolicyWeightReceiver"
 TRAJECTORY_KEYS = (
-    "text_ids", "agent_audio", "audio_mask", "prediction_rows",
+    "text_ids", "user_features", "agent_audio", "audio_mask", "prompt_frames", "prediction_rows",
     "sampled_agent_ids", "sampled_tool_ids", "sampled_audio", "row_versions",
     "sampled_agent_logprobs", "agent_emit_logprobs",
+    "sampled_tool_logprobs", "tool_emit_logprobs",
+    "sampled_user_emits", "user_emit_logprobs", "sampled_user_ids", "sampled_user_logprobs",
+    "user_action_logprobs", "user_action_eligible", "user_token_eligible",
 )
 
 
@@ -47,7 +51,7 @@ def sampling_runtime(config: DuplexIOConfig) -> dict[str, Any]:
         "duplexio_scheduler_token_id": config.pad_token_id,
         "duplexio_text_sampling": sampling,
         "duplexio_emit_temperatures": {
-            "user": 0.0,
+            "user": sampling["emit_temperature"],
             "agent": sampling["emit_temperature"],
             "tool_call": sampling["emit_temperature"],
         },
@@ -99,8 +103,13 @@ async def update_policy(
 
 async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
     device = args.devices[actor_index]
+    global_actor_index = args.node_rank * len(args.devices) + actor_index
     config = DuplexIOConfig.from_pretrained(args.checkpoint, local_files_only=True)
-    conversations = load_pool_shard(args.inputs, actor_index, len(args.devices), max_rows=args.max_session_rows)
+    voice_prompt = VoicePrompt.from_file(args.voice_clip, config.voice_prompt_max_frames)
+    conversations = load_pool_shard(
+        args.inputs, global_actor_index, args.num_nodes * len(args.devices), max_rows=args.max_session_rows,
+        voice_prompt_frames=voice_prompt.frames,
+    )
     if not conversations:
         raise ValueError("Each rollout actor needs at least one conversation")
     engine = AsyncOmni(
@@ -136,6 +145,7 @@ async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
         )
     link = ActorLink(args.trainer, f"{socket.gethostname()}-gpu{device}", str(args.inputs.resolve()))
     gate = RolloutGate(version=args.initial_version)
+    await gate.pause()
     sent = 0
     keys = TRAJECTORY_KEYS + (("predictor_hiddens",) if args.record_hiddens else ())
 
@@ -153,14 +163,18 @@ async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
         rollout_conversations(
             engine,
             conversations,
+            voice_prompt=voice_prompt,
             concurrency=args.concurrency,
             sampling_config=sampling_runtime(config) | {"duplexio_record_hiddens": args.record_hiddens},
-            seed=args.seed + 7919 * actor_index,
+            seed=args.seed + 7919 * global_actor_index,
             sink=sink,
             gate=gate,
             passes=None,
             tools=tools,
-            load=partial(prepared_from_pool, args.inputs, max_rows=args.max_session_rows),
+            load=partial(
+                prepared_from_pool, args.inputs, max_rows=args.max_session_rows,
+                voice_prompt_frames=voice_prompt.frames,
+            ),
             first_turn=first_turn,
         )
     )
@@ -184,7 +198,7 @@ async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
             elif kind == PREPARE_UPDATE:
                 version = header["version"]
                 await update_policy(engine, gate, link, header, args.init_timeout)
-                print(json.dumps({"actor": actor_index, "version": version, "trajectories_sent": sent}), flush=True)
+                print(json.dumps({"actor": global_actor_index, "version": version, "trajectories_sent": sent}), flush=True)
             elif kind == SHUTDOWN:
                 rollouts.cancel()
                 break
@@ -209,8 +223,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path, help="Native export the engine starts from")
     parser.add_argument("inputs", type=Path, help="Rollout pool directory (duplexio prepare_opd_pool)")
+    parser.add_argument("--voice-clip", type=Path, required=True, help="Reference audio for the agent's voice")
     parser.add_argument("--trainer", required=True, help="Trainer rank-0 endpoint, e.g. tcp://dgx065:29600")
     parser.add_argument("--devices", type=int, nargs="+", required=True, help="One actor per GPU")
+    parser.add_argument("--node-rank", type=int, default=0, help="Index among rollout nodes")
+    parser.add_argument("--num-nodes", type=int, default=1, help="Rollout nodes, each using the same number of GPUs")
     parser.add_argument("--concurrency", type=int, default=32, help="Concurrent conversations per actor")
     parser.add_argument("--initial-version", type=int, default=0, help="Policy version of the starting export")
     parser.add_argument("--seed", type=int, default=17000)
@@ -230,6 +247,8 @@ def main() -> None:
     parser.add_argument("--max-response-seconds", type=float, default=60.0)
     parser.add_argument("--max-tool-calls", type=int, default=8, help="Answered calls per conversation")
     args = parser.parse_args()
+    if not 0 <= args.node_rank < args.num_nodes:
+        parser.error("Node rank must be between zero and num-nodes minus one")
     if len(set(args.devices)) != len(args.devices) or min(args.devices) < 0:
         parser.error("Devices must be distinct nonnegative GPU indices")
     if len(args.devices) > 1:

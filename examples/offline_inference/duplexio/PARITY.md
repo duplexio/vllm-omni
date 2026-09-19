@@ -1,17 +1,62 @@
 # Native/training parity
 
-Semantic equality is required at the **recorded-feature boundary**; small measured
-numerical differences are accepted. Earlier exact-equality results below predate
-the recurrent-decode simplification and the paged full-attention simplification
-(2026-09-10), which reduces full attention to one paged FlexAttention call per
-layer plus a query-local diagonal merge and no longer rounds like training's
-dense matmul. OPD optimizer updates remain
-disabled. This does not certify raw-audio encoding, other compiler stacks,
-tensor parallelism, or the complete rollout/teacher/learner update loop.
+## Training alignment, 2026-09-18
 
-Both worktrees contain uncommitted integration changes. The checks use the
-actual DuplexIO training code on main (base commit
-`751cf4f24d9c4f7df3b1271f8f4364bda1c679bc`), not the former isolated prototype.
+The current checks use the training worktree at base commit `47309195` and its
+current local changes. Serving targets version-six exports: pinned voice audio,
+no speaker embedding, and all waveform rows encoded in their original order.
+Text prefixes and tool-result rows encode silence without advancing live audio
+time. Live agent feedback remains the sampled representation; decoded PCM keeps
+the input codec history ready for subsequent context rows.
+
+The paged cache now includes the pinned prompt region in each step's page table.
+Previously, page selection retained only the live-audio ring and text region,
+so prompt keys were omitted from attention despite having dedicated slots.
+
+Recorded-input replay preserves the actual user features and both disjoint frame
+masks: live `audio_mask` and pinned `prompt_frames`. Actor transport, learner
+packing, and padding retain those masks. Older recordings without the prompt mask
+must be regenerated. The learner's weight plan excludes training-only system/user
+per-cell output projections; the full-frame user-token projection and user emit
+head are served and included in policy updates.
+
+Validation covers context-row state progression, prompt recording through learner
+packing, depth/text sampling, Pocket Mimi encoding/decoding, audio adapters,
+backbone normalization/projections, and paged attention against the current
+training attention implementation with pinned voice rows, tool bursts and ring
+wraparound. Paged attention retains its existing BF16 tolerance (`atol=rtol=0.03`);
+this is not a claim of bitwise equality for the complete model. Packed-versus-
+streaming Pocket Mimi uses training's varlen-attention tolerance
+(`atol=0.02, rtol=0.01`) and requires relative L2 error below 1%. Native versus
+training incremental encoding remains exact on the same chunks.
+
+Results: 62 focused H100 tests passed (Slurm job `507255`, one full eight-H100
+node); 193 serving CPU tests passed with 97 CUDA-dependent skips; 27 learner
+replay/weight-plan tests passed with two CUDA-dependent skips. Ruff F/E9 checks
+and diff whitespace checks passed. H100 logs and the exact reproduction script
+are in `/dcai/users/thuand/duplexio-sync-20260918/` (`gpu_checks.sh`,
+`gpu-507255.log`, `gpu-507255.err`).
+
+The GPU checks used the training PyTorch `2.13.0+cu130` environment, including its
+FlashAttention CUTE backend, with the project's existing vLLM `0.26.1` source and
+CUDA extensions from `duplexio-h100-throughput-20260908-01LODi`. The older local
+vLLM wheel is built against a different PyTorch ABI and cannot run these checks.
+No shared environment was modified.
+Five updated diagnostic/preparation modules also passed import checks. The
+Convogen pair-preparation helper could not complete its import check because
+the existing environment lacks its optional `boto3` dependency.
+
+The current checks do not certify a whole-engine run of a real version-six
+checkpoint, raw-audio end-to-end parity, tensor parallelism, or a complete OPD
+optimizer/update loop. Throughput was not measured. Decoder work now also occurs
+when output PCM is suppressed, because the input encoder needs the waveform.
+
+## Historical results
+
+The results below predate current training and are retained as historical
+measurements, not current guarantees. The September 10 implementation reduced
+full attention to paged FlexAttention plus a query-local diagonal merge, accepting
+small numerical differences at the recorded-feature boundary.
 
 ## Paged full attention, 2026-09-10
 

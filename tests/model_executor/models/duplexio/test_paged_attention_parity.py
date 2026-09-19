@@ -55,7 +55,7 @@ def cells(values: Tensor) -> Tensor:
     return values[:, None].expand(-1, DUPLEXIO_NUM_CELLS).flatten()
 
 
-def session_fields(audio_active: Tensor, text_active: Tensor) -> dict[str, Tensor]:
+def session_fields(audio_active: Tensor, text_active: Tensor, prompt_frames: int = 0) -> dict[str, Tensor]:
     """Per-token frame fields for a whole session, as ``frame_inputs`` derives them.
 
     ``audio_active`` is (rows,) and ``text_active`` (rows, 4). A row without
@@ -63,12 +63,14 @@ def session_fields(audio_active: Tensor, text_active: Tensor) -> dict[str, Tenso
     clock frozen and therefore consumes no window budget.
     """
     rows = audio_active.shape[0]
+    pinned = torch.arange(rows) < prompt_frames
+    text_active = text_active & ~pinned[:, None]
     audio_position = audio_active.cumsum(0, dtype=torch.int32)
     emitted = text_active.int().flatten().cumsum(0, dtype=torch.int32).view(rows, -1)
     audio_padding = torch.zeros(rows, NUM_AUDIO_CELLS, dtype=torch.int32)
     return {
         "key_active": torch.cat(
-            (text_active, audio_active[:, None].expand(-1, NUM_AUDIO_CELLS)), 1
+            (text_active, (audio_active | pinned)[:, None].expand(-1, NUM_AUDIO_CELLS)), 1
         ).flatten(),
         "text_ordinal": torch.cat(
             (torch.where(text_active, emitted, 0), audio_padding), 1
@@ -78,9 +80,12 @@ def session_fields(audio_active: Tensor, text_active: Tensor) -> dict[str, Tenso
         ),
         "audio_first": cells((audio_position - WINDOW).clamp_min(1)),
         "audio_last": cells(audio_position - audio_active.int()),
-        # This session pins no voice prompt; the pinned region stays empty.
-        "prompt_ordinal": torch.zeros(rows * DUPLEXIO_NUM_CELLS, dtype=torch.int32),
-        "prompt_last": torch.zeros(rows * DUPLEXIO_NUM_CELLS, dtype=torch.int32),
+        "prompt_ordinal": torch.cat((
+            torch.zeros(rows, DUPLEXIO_NUM_TEXT_CELLS, dtype=torch.int32),
+            torch.where(pinned, torch.arange(rows, dtype=torch.int32) + 1, 0)[:, None].expand(-1, NUM_AUDIO_CELLS),
+        ), dim=1).flatten(),
+        "prompt_last": cells(torch.arange(rows, dtype=torch.int32).clamp_max(prompt_frames)),
+        "pinned": cells(pinned),
         # Audio time, for the dense reference: not a cache-addressing field.
         "audio_position": cells(audio_position),
     }
@@ -104,7 +109,7 @@ def dense_attention(
         fields["audio_position"][:, None],
         fields["audio_position"][None],
         fields["key_active"][None],
-        torch.zeros_like(fields["key_active"][None], dtype=torch.bool),
+        fields["pinned"][None],
         audio_attention_window_frames=WINDOW,
     )
     groups = query.shape[1] // key.shape[1]
@@ -114,6 +119,25 @@ def dense_attention(
     return torch.einsum(
         "hts,shd->thd", scores.masked_fill(~visible, -torch.inf).softmax(-1), values
     )
+
+
+def training_attention(query: Tensor, key: Tensor, value: Tensor, fields: dict[str, Tensor], scale: float) -> Tensor:
+    training = pytest.importorskip("duplexio.models.duplexio")
+    from duplexio.modules.stream_attention import unified_attention
+
+    positions = torch.arange(query.shape[0], device=query.device)
+    sequence = torch.zeros_like(positions)
+    frame = positions // DUPLEXIO_NUM_CELLS
+    cell = positions % DUPLEXIO_NUM_CELLS
+    audio = fields["audio_position"]
+    mask, indices = training.attention_mask(
+        sequence, frame, audio, cell, sequence, frame, audio, cell,
+        fields["key_active"], fields["pinned"], WINDOW, query.shape[-1],
+    )
+    return unified_attention(
+        query.transpose(0, 1)[None], key[indices].transpose(0, 1)[None],
+        value[indices].transpose(0, 1)[None], mask, scale,
+    )[0].transpose(0, 1).float()
 
 
 def paged_backend(
@@ -215,6 +239,9 @@ def run_session(
     dim: int,
     heads: int,
     kv_heads: int,
+    *,
+    prompt_frames: int = 0,
+    training_reference: bool = False,
 ) -> None:
     """Replay ``len(prefixes)`` sessions through the paged backend, step by step."""
     torch.manual_seed(731)
@@ -229,7 +256,7 @@ def run_session(
             dtype=dtype,
         ),
         audio_window_frames=WINDOW,
-        voice_prompt_frames=1,
+        voice_prompt_frames=max(prompt_frames, 1),
         max_model_len=rows * DUPLEXIO_NUM_CELLS,
     )
     layout = spec.layout
@@ -241,13 +268,14 @@ def run_session(
         {
             name: field.to(device)
             for name, field in session_fields(
-                *session_activity(rows, prefix, request)
+                *session_activity(rows, prefix, request), prompt_frames,
             ).items()
         }
         for request, prefix in enumerate(prefixes)
     ]
+    reference = training_attention if training_reference else dense_attention
     expected = [
-        dense_attention(query[i], key[i], value[i], fields[i], dim**-0.5)
+        reference(query[i], key[i], value[i], fields[i], dim**-0.5)
         for i in range(requests)
     ]
 
@@ -347,18 +375,24 @@ def test_batched_sessions_stay_isolated_in_a_shuffled_block_table() -> None:
     run_session([3, 5, 4], 20, torch.bfloat16, 128, 8, 2)
 
 
-def test_only_pages_a_step_can_touch_are_listed() -> None:
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged cache")
+@torch.inference_mode()
+def test_paged_sessions_match_current_training_with_pinned_voice_and_tool_bursts() -> None:
+    run_session([3, 5], 72, torch.bfloat16, 256, 16, 4, prompt_frames=2, training_reference=True)
+
+
+@pytest.mark.parametrize("rows,prompt_frames", [(1, 125), (30, 1), (70, 125)])
+def test_only_pages_a_step_can_touch_are_listed(rows: int, prompt_frames: int) -> None:
     """The scan must follow the session, not the layout bound.
 
     A long-session layout leaves a wide band of never-written pages between the
     audio ring and the text base, and scanning one costs as much as scanning
     live keys.
     """
-    rows = 30
     layout = DuplexIOKVLayout(
         block_size=BLOCK_SIZE,
         audio_window_frames=WINDOW,
-        voice_prompt_frames=1,
+        voice_prompt_frames=prompt_frames,
         max_model_len=600 * DUPLEXIO_NUM_CELLS,
     )
     text_base = layout.text_base_page
@@ -378,7 +412,13 @@ def test_only_pages_a_step_can_touch_are_listed() -> None:
 
     audio_pages = -(-rows * NUM_AUDIO_CELLS // BLOCK_SIZE)
     text_pages = -(-rows * DUPLEXIO_NUM_TEXT_CELLS // BLOCK_SIZE)
-    expected = {*range(audio_pages), *range(text_base, text_base + text_pages)}
+    prompt_base = layout.prompt_base // BLOCK_SIZE
+    prompt_pages = -(-min(rows, layout.voice_prompt_frames) * NUM_AUDIO_CELLS // BLOCK_SIZE)
+    expected = {
+        *range(audio_pages),
+        *range(prompt_base, prompt_base + prompt_pages),
+        *range(text_base, text_base + text_pages),
+    }
     assert {page for page, entry in enumerate(listed[0].tolist()) if entry} == expected
     assert len(expected) < layout.max_blocks
     assert int(compact) == layout.persistent_text_base + rows * DUPLEXIO_NUM_TEXT_CELLS

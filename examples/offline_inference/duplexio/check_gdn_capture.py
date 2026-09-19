@@ -43,16 +43,16 @@ def main() -> None:
     projected_weights = [weights[f"in_proj_{name}.weight"] for name in ("qkv", "z", "b", "a")]
     result = {"input": hidden}
     if args.native:
-        from vllm_omni.model_executor.models.duplexio.numerics import fixed_linear
+        from torch.nn.functional import linear
 
-        qkvz = fixed_linear(hidden, torch.cat(projected_weights[:2]))
-        ba = fixed_linear(hidden, torch.cat(projected_weights[2:]))
+        qkvz = linear(hidden, torch.cat(projected_weights[:2]))
+        ba = linear(hidden, torch.cat(projected_weights[2:]))
         qkv, z = qkvz.split(widths[:2], -1)
         b, a = ba.chunk(2, -1)
     else:
-        from duplexio.modules.fixed_linear import fixed_linear
+        from torch.nn.functional import linear
 
-        qkv, z, b, a = fixed_linear(hidden, torch.cat(projected_weights)).split(widths, -1)
+        qkv, z, b, a = linear(hidden, torch.cat(projected_weights)).split(widths, -1)
     result.update(qkv=qkv, z=z, b=b, a=a)
     conv_weight = weights["conv1d.weight"]
     if args.native:
@@ -114,7 +114,7 @@ def main() -> None:
     norm.weight = nn.Parameter(weights["norm.weight"])
     norm.compile(dynamic=True, fullgraph=True)
     normalized = norm(core.reshape(-1, vd), z.reshape(-1, vd)).view(length, -1)
-    output = fixed_linear(normalized, weights["out_proj.weight"])
+    output = linear(normalized, weights["out_proj.weight"])
     result.update(conv=conv, q=q, k=k, v=v, g=g, beta=beta, core=core, normalized=normalized, output=output)
     from duplexio.modules.fla_block_gated_delta_rule.chunk import chunk_gated_delta_rule_fwd_h
     from duplexio.modules.fla_block_gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_intra

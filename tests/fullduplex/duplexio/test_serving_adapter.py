@@ -125,7 +125,7 @@ async def test_serving_config_pins_the_client_reference_audio(
         "top_p": 0.95,
     }
     assert runtime["duplexio_emit_temperatures"] == {
-        "user": 0.0,
+        "user": 1.0,
         "agent": 1.0,
         "tool_call": 1.0,
     }
@@ -248,7 +248,6 @@ async def test_serving_config_applies_client_sampling_parameters(
                     },
                     "audio": {"temperature": 0.75, "top_k": 64},
                     "emit": {
-                        "user": 0.2,
                         "agent": 0.4,
                         "tool_call": 0.8,
                     },
@@ -270,7 +269,7 @@ async def test_serving_config_applies_client_sampling_parameters(
         "top_k": 64,
     }
     assert runtime["duplexio_emit_temperatures"] == {
-        "user": 0.2,
+        "user": 1.0,
         "agent": 0.4,
         "tool_call": 0.8,
     }
@@ -283,6 +282,11 @@ def test_serving_config_rejects_invalid_client_sampling() -> None:
         )
 
     assert exc_info.value.code == "invalid_sampling"
+
+
+def test_serving_config_accepts_user_emit_sampling() -> None:
+    config = parse_client_sampling_config({"duplexio_sampling": {"emit": {"user": 0.2}}})
+    assert config.emit.user == 0.2
 
 
 def test_duplexio_capabilities_use_native_scheduler_data_plane() -> None:

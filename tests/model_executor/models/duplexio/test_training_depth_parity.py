@@ -19,7 +19,6 @@ def test_batched_depth_sampling_matches_training(codebooks: int, rank: int | Non
     torch.manual_seed(81)
     reference = training.DepthAutoregressiveSampler(
         conditioning_dim=12,
-        speaker_embedding_dim=6,
         text_vocab_size=32,
         low_rank_embeddings=rank,
         codebook_size=16,
@@ -37,8 +36,7 @@ def test_batched_depth_sampling_matches_training(codebooks: int, rank: int | Non
     native = DepthAutoregressiveSampler(
         DepthSamplerConfig(
             conditioning_dim=12,
-            speaker_embedding_dim=6,
-            text_vocab_size=32,
+                text_vocab_size=32,
             low_rank_embeddings=rank,
             codebook_size=16,
             num_codebooks=codebooks,
@@ -51,12 +49,12 @@ def test_batched_depth_sampling_matches_training(codebooks: int, rank: int | Non
         )
     )
     native.load_state_dict(reference.state_dict(), strict=True)
-    conditioning, speakers = torch.randn(4, 12), torch.randn(4, 6)
+    conditioning = torch.randn(4, 12)
     text = torch.tensor([3, 7, 1, 5])
     torch.manual_seed(31)
-    expected = reference.sample(conditioning, text, speakers)
+    expected = reference.sample(conditioning, text)
     torch.manual_seed(31)
-    actual = native.sample(conditioning, text, native.prepare_speaker(speakers))
+    actual = native.sample(conditioning, text)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     if top_k == 1:
         independent = torch.cat(
@@ -64,7 +62,6 @@ def test_batched_depth_sampling_matches_training(codebooks: int, rank: int | Non
                 native.sample(
                     conditioning[i : i + 1],
                     text[i : i + 1],
-                    native.prepare_speaker(speakers[i : i + 1]),
                 )
                 for i in range(4)
             ]

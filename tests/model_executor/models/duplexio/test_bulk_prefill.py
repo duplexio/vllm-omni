@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Text-only prefixes use masked initial audio, never advance codec state."""
+"""Context rows encode silence in frame order without advancing live audio time."""
 
 from types import SimpleNamespace
 
@@ -17,7 +17,7 @@ from vllm_omni.model_executor.models.duplexio.audio_representation import (
 from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FastConformerAudioStreamState,
 )
-from vllm_omni.model_executor.models.duplexio.mimi import MimiStreamingState
+from vllm_omni.model_executor.models.duplexio.mimi import MimiStreamingState, MimiTransformerState
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
     DuplexIORequestState,
@@ -34,6 +34,24 @@ class TextEmbedding(nn.Module):
         return self.embedding(input_ids)
 
 
+class CountingASR:
+    output_dim = 8
+
+    def encode_audio_chunk(self, waveform, state):
+        frames = waveform.numel() // 1280
+        positions = torch.arange(state.next_mel_frame + 1, state.next_mel_frame + frames + 1)
+        state.next_mel_frame += frames
+        return positions.float()[None, :, None].expand(1, -1, self.output_dim), state
+
+
+class CountingCodec(nn.Module):
+    def encode(self, waveform, codebooks, state):
+        frames = waveform.numel() // 1920
+        start = state.encoder_transformer.position
+        state.encoder_transformer.position += frames
+        return torch.arange(start + 1, start + frames + 1)[None, None].expand(1, codebooks, -1)
+
+
 def model_fixture() -> DuplexIOForConditionalGeneration:
     torch.manual_seed(17)
     model = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
@@ -43,7 +61,7 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
     model.full_cudagraph_enabled = False
     model.frame_inputs = frame_inputs
     # Audio cells see a two-frame window here, so eviction shows up in the test.
-    model.config = SimpleNamespace(audio_attention_window_frames=2)
+    model.config = SimpleNamespace(audio_attention_window_frames=2, frame_size=1920, sample_rate=24000)
     model.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(dtype=torch.float32)
     )
@@ -55,7 +73,8 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
     model.agent_audio_embedding = MimiEmbedding(3, 64, 5)
     model.user_audio_input_adapter = AudioInputAdapter(8, 7, 11)
     model.agent_audio_input_adapter = AudioInputAdapter(5, 7, 11)
-    model.user_asr = SimpleNamespace(output_dim=8)
+    model.user_asr = CountingASR()
+    model.audio_codec = CountingCodec()
     model.llm = SimpleNamespace(
         base_model=SimpleNamespace(model=TextEmbedding(11)),
         channel_emb=nn.Parameter(torch.randn(4, 11)),
@@ -70,6 +89,7 @@ def request_state(model: DuplexIOForConditionalGeneration) -> DuplexIORequestSta
         user_asr=FastConformerAudioStreamState(),
         agent_delay=model.audio_representation.new_state(device=torch.device("cpu")),
         output_mimi=MimiStreamingState(),
+        input_mimi=MimiStreamingState(encoder_transformer=MimiTransformerState.empty(0)),
         # Two pinned prompt frames of encoded agent-audio rows.
         voice_prompt=torch.zeros(2, 3, dtype=torch.long),
         system_token_ids=(3, 4, 5),
@@ -153,8 +173,10 @@ def test_text_only_bulk_and_serial_frames_are_identical(system: bool) -> None:
     assert state.frames_seen == serial_state.frames_seen == 3
     assert state.active_text_tokens == serial_state.active_text_tokens == 3
     assert state.audio_position == serial_state.audio_position == 0
-    assert state.user_asr is initial.user_asr
-    assert state.user_asr.encoder.past_key_values is None
+    assert state.user_asr.next_mel_frame == 3
+    assert initial.user_asr.next_mel_frame == 0
+    assert state.input_mimi.encoder_transformer.position == 3
+    assert initial.input_mimi.encoder_transformer.position == 0
     assert not bulk_update["duplexio"]["key_active"].view(3, 6)[:, 4:].any()
     torch.testing.assert_close(state.agent_audio_codes, model.initial_agent_audio(1)[0])
 
@@ -164,6 +186,7 @@ def test_cached_live_frame_inserts_user_token_and_generated_agent_feedback() -> 
     model = model_fixture()
     state = request_state(model)
     state.system_token_offset = 3
+    state.text_input_ids[1] = 9
     state.text_input_ids[2] = 12
     state.agent_audio_codes = torch.tensor([3, 4, 5])
     user_features = torch.randn(1, 8)
@@ -174,7 +197,6 @@ def test_cached_live_frame_inserts_user_token_and_generated_agent_feedback() -> 
             "frame_count": 1,
             "runtime_config": {"duplexio_record_inputs": True},
             "payload": {"format": "duplexio_features"},
-            "user_token_id": 9,
         },
     )
     model.preprocess_batch(req_ids=["live"], model_intermediate_buffer={"live": info}, device=torch.device("cpu"))
@@ -207,7 +229,7 @@ def test_cached_live_frame_inserts_user_token_and_generated_agent_feedback() -> 
     ]
 
 
-def test_recorded_prefix_contains_only_system_text_and_masked_audio() -> None:
+def test_recorded_prefix_contains_encoded_silence_and_frozen_audio_clock() -> None:
     model = model_fixture()
     info = input_info(request_state(model), [3, 4, 5], system=False, final=True)
     info["duplex"]["runtime_config"]["duplexio_record_inputs"] = True
@@ -215,5 +237,63 @@ def test_recorded_prefix_contains_only_system_text_and_masked_audio() -> None:
     replay = update["duplexio_replay"]
     assert replay["text_ids"].tolist() == [[3, 2, 2, 2], [4, 2, 2, 2], [5, 2, 2, 2]]
     assert not replay["audio_mask"].any()
-    assert not replay["user_features"].any()
-    torch.testing.assert_close(replay["agent_audio"], model.initial_agent_audio(3))
+    assert not replay["prompt_frames"].any()
+    torch.testing.assert_close(replay["user_features"], torch.arange(1, 4).float()[:, None].expand(-1, 8))
+    torch.testing.assert_close(replay["agent_audio"], torch.tensor([[1, 64, 64], [2, 1, 1], [3, 2, 2]]))
+
+
+def test_voice_prompt_can_span_multiple_bursts_and_records_pinning() -> None:
+    model = model_fixture()
+    state = request_state(model)
+    for _ in range(2):
+        _, _, update = model.preprocess(torch.zeros(6, dtype=torch.long), None,
+            duplexio_model_state=state,
+            duplex={"frame_count": 1, "duplexio_voice_prompt": True,
+                    "runtime_config": {"duplexio_record_inputs": True}},
+        )
+        state = update["duplexio_working_state"]
+        assert update["duplexio_replay"]["prompt_frames"].tolist() == [True]
+        assert update["duplexio_replay"]["audio_mask"].tolist() == [False]
+    assert state.prompt_frames_written == state.frames_seen == 2
+    assert state.audio_position == 0
+    assert state.user_asr.next_mel_frame == 2
+
+
+def test_live_feedback_advances_encoder_before_later_context_silence() -> None:
+    model = model_fixture()
+    state = request_state(model)
+    state.agent_waveform = torch.ones(1920)
+    state.agent_audio_codes = torch.tensor([7, 8, 9])
+    info = dict(
+        duplexio_model_state=state, embed={"speech_feat": torch.ones(1, 8)},
+        duplex={"frame_count": 1, "runtime_config": {"duplexio_record_inputs": True},
+                "payload": {"format": "duplexio_features"}},
+    )
+    model.preprocess_batch(req_ids=["live"], model_intermediate_buffer={"live": info}, device=torch.device("cpu"))
+    _, _, update = model.preprocess(torch.zeros(6, dtype=torch.long), None, **info)
+    torch.testing.assert_close(update["duplexio_replay"]["agent_audio"], state.agent_audio_codes[None])
+    consumed = update["duplexio_working_state"]
+    assert consumed.input_mimi.encoder_transformer.position == 1
+    assert state.input_mimi.encoder_transformer.position == 0
+    _, _, update = model.preprocess(torch.zeros(6, dtype=torch.long), None,
+        **input_info(consumed, [5], system=True, final=True),
+    )
+    assert update["duplexio_working_state"].input_mimi.encoder_transformer.position == 2
+
+
+@pytest.mark.parametrize("encoded_frames,waveform_frame", [(1, 1), (2, 1)])
+def test_tool_context_consumes_late_waveforms_only_once(encoded_frames: int, waveform_frame: int) -> None:
+    model = model_fixture()
+    state = request_state(model)
+    state.frames_seen = 2
+    state.input_audio_frames = encoded_frames
+    state.input_mimi.encoder_transformer.position = encoded_frames
+    state.agent_waveform = torch.ones(1920)
+    state.agent_waveform_frame = waveform_frame
+    _, _, update = model.preprocess(torch.zeros(6, dtype=torch.long), None,
+        **input_info(state, [5], system=True, final=True),
+    )
+    consumed = update["duplexio_working_state"]
+    assert consumed.input_audio_frames == consumed.input_mimi.encoder_transformer.position == 3
+    assert consumed.agent_waveform is None
+    assert state.input_mimi.encoder_transformer.position == encoded_frames

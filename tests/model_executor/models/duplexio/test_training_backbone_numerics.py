@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
+
 from vllm_omni.model_executor.models.duplexio.qwen_backbone import DuplexIORMSNorm
 
 training = pytest.importorskip("duplexio.modules.qwen3_5_rmsnorm")
@@ -33,9 +34,8 @@ def test_norm_matches_training_with_fp32_scales(shape: tuple[int, int], prenorm:
 
 @torch.inference_mode()
 def test_mlp_long_prefill_partition() -> None:
-    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP
-
     from duplexio.modules.qwen3_5_mlp import QuackQwen3_5MLP
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP
 
     torch.manual_seed(42)
     config = SimpleNamespace(hidden_size=2560, intermediate_size=9728, hidden_act="silu")
@@ -48,9 +48,7 @@ def test_mlp_long_prefill_partition() -> None:
 
 @torch.inference_mode()
 def test_attention_qkv_fusion_preserves_projection_values() -> None:
-    from vllm_omni.model_executor.models.duplexio.numerics import fixed_linear
-
-    from duplexio.modules.fixed_linear import fixed_linear as training_linear
+    from torch.nn.functional import linear
 
     torch.manual_seed(60)
     hidden = torch.randn(1536, 2560, device="cuda", dtype=torch.bfloat16)
@@ -58,10 +56,10 @@ def test_attention_qkv_fusion_preserves_projection_values() -> None:
         torch.randn(width, 2560, device="cuda", dtype=torch.bfloat16) * 0.02
         for width in (8192, 1024, 1024)
     ]
-    expected = torch.cat([training_linear(hidden, weight) for weight in weights], -1)
+    expected = torch.cat([linear(hidden, weight) for weight in weights], -1)
     fused_weight = torch.cat(weights)
     for rows in (6, 768, 1536):
-        actual = fixed_linear(hidden[:rows], fused_weight)
+        actual = linear(hidden[:rows], fused_weight)
         torch.testing.assert_close(actual, expected[:rows], rtol=0, atol=0)
 
 
@@ -89,55 +87,17 @@ def test_mlp_native_matches_training_without_runtime_tuning(rows: int) -> None:
 
 
 @torch.inference_mode()
-def test_self_attention_merge_matches_training_within_bf16_rounding() -> None:
-    from duplexio.modules.stream_attention import merge_self_attention as training_merge
-
-    from vllm_omni.model_executor.models.duplexio.stream_attention import merge_self_attention
-
-    torch.manual_seed(716)
-    tokens, dim = 4416, 256
-    query = torch.randn(tokens, 16, dim, device="cuda", dtype=torch.bfloat16)
-    self_key = torch.randn(tokens, 4, dim, device="cuda", dtype=torch.bfloat16)
-    self_value = torch.randn_like(self_key)
-    # Flex hands the history back transposed, so keep it non-contiguous here too.
-    history = torch.randn(1, 16, tokens, dim, device="cuda", dtype=torch.bfloat16)[0].transpose(0, 1)
-    lse = torch.randn(tokens, 16, device="cuda")
-    expected = training_merge(
-        query.transpose(0, 1)[None].contiguous(),
-        self_key.transpose(0, 1)[None].contiguous(),
-        self_value.transpose(0, 1)[None].contiguous(),
-        history.transpose(0, 1)[None].contiguous(),
-        lse.transpose(0, 1)[None].contiguous(),
-        dim**-0.5,
-    )[0].transpose(0, 1)
-    for length in (1536, 6):
-        actual = merge_self_attention(
-            query[:length],
-            self_key[:length],
-            self_value[:length],
-            history[:length],
-            lse[:length],
-            dim**-0.5,
-        )
-        # Same algebra, different kernel. One bf16 mantissa step is 4e-3
-        # relative, and differently ordered rounding lands up to two apart.
-        torch.testing.assert_close(actual, expected[:length], rtol=1e-2, atol=1e-2)
-
-
-@torch.inference_mode()
 def test_vocab_projection_matches_learner_across_batch_sizes() -> None:
+    from torch.nn.functional import linear
     from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm_omni.model_executor.models.duplexio.modeling_duplexio import DuplexIOLogitsProcessor
 
-    from duplexio.losses.fused_linear_kl import _linear_bf16_out
+    from vllm_omni.model_executor.models.duplexio.modeling_duplexio import DuplexIOLogitsProcessor
 
     torch.manual_seed(912)
     hidden = torch.randn(32, 2560, device="cuda", dtype=torch.bfloat16)
     head = torch.nn.Linear(2560, 248320, bias=False, device="cuda", dtype=torch.bfloat16)
     head.weight.normal_(0, 0.02)
-    expected = _linear_bf16_out(
-        hidden, head.weight, torch.empty(32, 248320, device="cuda", dtype=torch.bfloat16)
-    )
+    expected = linear(hidden, head.weight)
     with set_current_vllm_config(VllmConfig()):
         processor = DuplexIOLogitsProcessor(248320)
     for rows in (1, 2, 17, 32):

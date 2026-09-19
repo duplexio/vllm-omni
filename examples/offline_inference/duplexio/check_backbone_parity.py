@@ -14,19 +14,19 @@ from duplexio.modules.audio_codec import MimiCodec, PocketMimiCodec
 from duplexio.modules.audio_representation import ContinuousAudioRepresentation, QuantizedAudioRepresentation
 from duplexio.modules.continuous_mimi import ContinuousMimiModel
 from duplexio.modules.fastconformer_rnnt import FastConformerRNNT
-from duplexio.modules.fixed_linear import fixed_linear
 from duplexio.multistream.checkpoint import prepare_qwen_for_multistream
 from duplexio.multistream.modeling import MultiStreamQwen
 from duplexio.opd import PolicyTrajectory, pack_policy_replay
 from pydantic import BaseModel
 from safetensors.torch import load_file
+from torch.nn.functional import linear
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForRNNT, AutoProcessor, AutoTokenizer, MimiModel
 
 
 class ReferenceExport(BaseModel):
     """Portable metadata needed by the training-side checker, without vLLM."""
 
-    duplexio_export_version: Literal[5]
+    duplexio_export_version: Literal[6]
     emit_head_input: Literal["full_frame"]
     audio_conditioning: Literal["agent_audio_cell"]
     text_config: dict[str, Any]
@@ -40,24 +40,15 @@ class ReferenceExport(BaseModel):
     depth_transformer_config: dict[str, Any] = {}
     tied_weight_aliases: dict[str, str]
     silence_token_id: int
-    speaker_embed_dim: int
-    speaker_lda_dim: int | None
     audio_attention_window_frames: int
     sample_rate: int
     frame_rate: float
     frame_size: int
+    voice_prompt_max_frames: int
 
 
 class WeightIndex(BaseModel):
     weight_map: dict[str, str]
-
-
-class VoiceEntry(BaseModel):
-    tensor: str
-
-
-class VoiceManifest(BaseModel):
-    voices: dict[str, VoiceEntry]
 
 
 def load_reference(checkpoint: Path) -> DuplexIOModel:
@@ -65,11 +56,8 @@ def load_reference(checkpoint: Path) -> DuplexIOModel:
 
     This is an inference/replay check, not optimizer or audio-loss resumption.
     FlowMap's training-only loss precision is deliberately absent from exports.
-    Current validation checkpoints do not use speaker LDA.
     """
     export = ReferenceExport.model_validate_json((checkpoint / "config.json").read_text())
-    if export.speaker_lda_dim is not None:
-        raise ValueError("This reference checker does not yet load speaker-LDA assets")
     index = WeightIndex.model_validate_json((checkpoint / "model.safetensors.index.json").read_text())
     weights = {}
     for shard in sorted(set(index.weight_map.values())):
@@ -112,10 +100,10 @@ def load_reference(checkpoint: Path) -> DuplexIOModel:
         "llm_multistream_checkpoint": str(checkpoint),
         "audio_representation": export.audio_representation,
         "audio_adapter": export.audio_adapter_config,
-        "speaker_embed_dim": export.speaker_embed_dim,
         "audio_attention_window_frames": export.audio_attention_window_frames,
         "sample_rate": export.sample_rate,
         "frame_rate": export.frame_rate,
+        "voice_prompt_max_frames": export.voice_prompt_max_frames,
         "gradient_checkpointing": False,
         "vap": {"enabled": False},
     }
@@ -170,13 +158,8 @@ def main() -> None:
     trace = PolicyTrajectory.model_validate(torch.load(args.trajectory, map_location="cpu", weights_only=True))
     assert trace.predictor_hiddens is not None, "Generate the trajectory with --record-hiddens"
     model = load_reference(args.checkpoint).cuda()
-    voices = VoiceManifest.model_validate_json((args.checkpoint / "voices.json").read_text())
-    voice = voices.voices[trace.runtime_config["duplexio_voice"]]
-    pool = load_file(args.checkpoint / "voices.safetensors")[voice.tensor]
-    speaker = pool[trace.runtime_config["duplexio_voice_embedding_index"]]
     batch = pack_policy_replay(
         [trace],
-        speaker.unsqueeze(0),
         silence_token_id=model.silence_token_id,
         device=torch.device("cuda"),
     )
@@ -309,8 +292,8 @@ def main() -> None:
     for start in range(0, native.shape[0], 16):
         stop = start + 16
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            native_logits = fixed_linear(agent_projection(native[start:stop, 2].cuda()), model.token_head.weight)
-            reference_logits = fixed_linear(agent_projection(reference[start:stop, 2].cuda()), model.token_head.weight)
+            native_logits = linear(agent_projection(native[start:stop, 2].cuda()), model.token_head.weight)
+            reference_logits = linear(agent_projection(reference[start:stop, 2].cuda()), model.token_head.weight)
         native_logits[:, model.silence_token_id] = -torch.inf
         reference_logits[:, model.silence_token_id] = -torch.inf
         native_logp = native_logits.float().log_softmax(-1)
@@ -349,7 +332,7 @@ def main() -> None:
                 if "token_logits" not in record:
                     continue
                 frame = record["positions"][-1].item() // 6
-                logits = fixed_linear(
+                logits = linear(
                     torch.stack((agent_projected[frame], tool_projected[frame])), model.token_head.weight
                 )
                 expected = {
@@ -387,7 +370,7 @@ def main() -> None:
             name: batch.model_inputs[name].unsqueeze(0)
             for name in (
                 "system_ids", "user_ids", "agent_ids", "tool_call_ids",
-                "mask", "user_audio_enc", "agent_audio_enc",
+                "mask", "prompt_frames", "user_audio_enc", "agent_audio_enc",
             )
         }
         prefill = trace.prediction_rows[0].item() + 1
@@ -398,7 +381,6 @@ def main() -> None:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 cached = model(
                     **{name: value[:, start:stop] for name, value in frame_inputs.items()},
-                    agent_speaker_embeddings=batch.model_inputs["agent_speaker_embeddings"],
                     past_key_values=cache,
                     use_cache=True,
                     return_audio_conditioning=False,

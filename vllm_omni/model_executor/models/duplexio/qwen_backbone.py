@@ -183,8 +183,15 @@ def step_page_bounds(
     audio_slots = rows.clamp(max=layout.audio_ring_frames) * layout.num_audio_cells
     text_pages = cdiv(text_slots, layout.block_size)[:, None]
     base = layout.text_base_page
+    prompt_base = layout.prompt_base // layout.block_size
+    prompt_pages = cdiv(
+        rows.clamp(max=layout.voice_prompt_frames) * layout.num_audio_cells,
+        layout.block_size,
+    )[:, None]
     touched = (page_ids < cdiv(audio_slots, layout.block_size)[:, None]) | (
         (page_ids >= base) & (page_ids - base < text_pages)
+    ) | (
+        (page_ids >= prompt_base) & (page_ids - prompt_base < prompt_pages)
     )
     compact_seq_lens.copy_(
         (layout.persistent_text_base + text_slots).clamp(max=layout.max_compact_slots)

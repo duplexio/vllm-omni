@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import json
 import secrets
 from collections.abc import Callable, Mapping
 from typing import Any, Literal
@@ -271,7 +270,7 @@ class DuplexIOServingRuntimeAdapter:
         if config.temperature is not None:
             text_sampling["temperature"] = config.temperature
         emit_temperatures = {
-            "user": 0.0,
+            "user": 1.0,
             "agent": 1.0,
             "tool_call": 1.0,
         }

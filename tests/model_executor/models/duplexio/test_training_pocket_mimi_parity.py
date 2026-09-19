@@ -1,11 +1,62 @@
 """Compare native streaming codec with the training checkpoint implementation."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.duplexio.audio_representation import ContinuousAudioRepresentation
+from vllm_omni.model_executor.models.duplexio.modeling_duplexio import DuplexIOForConditionalGeneration
+from vllm_omni.model_executor.models.duplexio.pocket_mimi import PocketMimi
+
 reference = pytest.importorskip("duplexio.modules.continuous_mimi")
 
-from vllm_omni.model_executor.models.duplexio.pocket_mimi import PocketMimi
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA codec parity")
+@torch.inference_mode()
+@torch.backends.cudnn.flags(allow_tf32=False)
+def test_context_silence_matches_training_in_original_frame_order() -> None:
+    torch.manual_seed(71)
+    training = reference.ContinuousMimiModel().cuda().eval()
+    native = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
+    torch.nn.Module.__init__(native)
+    native.audio_codec = PocketMimi().cuda().eval()
+    native.audio_codec.load_state_dict(training.state_dict(), strict=True)
+    native.audio_representation = ContinuousAudioRepresentation(32).cuda()
+    native.vllm_config = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16))
+    # Voice prompt, text prefix, live audio, and a tool-result burst.
+    chunks = [
+        torch.randn(2 * 1920, device="cuda") * 0.1,
+        torch.zeros(3 * 1920, device="cuda"),
+        torch.randn(2 * 1920, device="cuda") * 0.1,
+        torch.zeros(2 * 1920, device="cuda"),
+    ]
+    waveform = torch.cat(chunks)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        expected, _ = training.encode_to_latent(waveform[None, None])
+    training_state = reference.ContinuousMimiState(
+        encoder=training.encoder.get_initial_state(),
+        decoder=training.decoder.get_initial_state(),
+        downsample=training.downsample.get_initial_state(),
+        upsample=training.upsample.get_initial_state(),
+        encoder_transformer=training.encoder_transformer.get_initial_state(waveform[None, None]),
+        decoder_transformer=training.decoder_transformer.get_initial_state(waveform[None, None]),
+    )
+    state = native.audio_codec.new_state(1)
+    encoded = []
+    for chunk in chunks:
+        rows, state = native.encode_agent_audio(chunk, state, None)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            streamed, training_state = training.step_encode(chunk[None, None], training_state)
+        torch.testing.assert_close(rows, streamed[0].T.float(), atol=0, rtol=0)
+        encoded.append(rows)
+    # Training's packed varlen attention and incremental SDPA have different
+    # BF16 reductions. Require exact native/streaming parity above, and bound
+    # the full-sequence difference with training's varlen attention tolerance.
+    actual = torch.cat(encoded)
+    torch.testing.assert_close(actual, expected[0].T.float(), atol=0.02, rtol=0.01)
+    assert (actual - expected[0].T.float()).norm() / expected.float().norm() < 0.01
+    assert encoded[1].abs().max() > 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA codec parity")

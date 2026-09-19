@@ -17,17 +17,16 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from transformers import AutoTokenizer
-
 from convogen.scenarios import ToolDefinition, _tool_def_to_openai_tool
 from convogen.simulator import AGENT_TURN_SUFFIX, USER_TURN_SUFFIX
 from duplexio.duplexio_data import render_chat_system_content
 from duplexio.multistream.tokenization import _encode_text
+from transformers import AutoTokenizer
+
 from vllm_omni.experimental.fullduplex.duplexio.self_play import (
     PreparedRole,
     PreparedScenarioPair,
 )
-from vllm_omni.model_executor.models.duplexio.configuration_duplexio import DuplexIOConfig
 
 
 def _role_metadata(row: dict[str, Any], role: str) -> dict[str, Any]:
@@ -119,17 +118,11 @@ def main() -> None:
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("conversations", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--agent-voice")
-    parser.add_argument("--user-voice")
+    parser.add_argument("--agent-voice", required=True, help="Agent reference-audio pool entry")
+    parser.add_argument("--user-voice", required=True, help="User reference-audio pool entry")
     args = parser.parse_args()
     if args.output.exists():
         parser.error("Prepared output already exists")
-    config = DuplexIOConfig.from_pretrained(args.checkpoint, local_files_only=True)
-    default_voice = config.default_voice
-    agent_voice = args.agent_voice or default_voice
-    user_voice = args.user_voice or default_voice
-    if not agent_voice or not user_voice:
-        parser.error("Pass --agent-voice and --user-voice when the checkpoint has no default voice")
     tokenizer = AutoTokenizer.from_pretrained(
         args.checkpoint,
         local_files_only=True,
@@ -148,8 +141,8 @@ def main() -> None:
                     prepare_row(
                         row,
                         tokenizer,
-                        agent_voice=agent_voice,
-                        user_voice=user_voice,
+                        agent_voice=args.agent_voice,
+                        user_voice=args.user_voice,
                     ).model_dump()
                 )
             except (TypeError, ValueError, json.JSONDecodeError) as exc:

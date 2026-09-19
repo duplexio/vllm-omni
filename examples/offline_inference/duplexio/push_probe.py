@@ -11,22 +11,21 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import time
+from pathlib import Path
 
 import torch
-from duplexio.modules.fixed_linear import fixed_linear
 from duplexio.opd import RolloutPool, pack_policy_replay
 from duplexio.opd_link import Coordinator, iterate_serving_weights, serving_weight_plan
+from torch.nn.functional import linear
 
 from examples.offline_inference.duplexio.check_backbone_parity import load_reference
 
 
 @torch.inference_mode()
-def replay_metrics(model, pool: RolloutPool, trajectory, version: int) -> dict[str, float]:
+def replay_metrics(model, trajectory, version: int) -> dict[str, float]:
     batch = pack_policy_replay(
         [trajectory],
-        pool.speaker_embedding(trajectory.conversation_id).unsqueeze(0),
         silence_token_id=model.silence_token_id,
         device=torch.device("cuda"),
     )
@@ -38,8 +37,8 @@ def replay_metrics(model, pool: RolloutPool, trajectory, version: int) -> dict[s
     native = trajectory.predictor_hiddens.cuda().float()
     projection = model.llm.stream_output_projection("agent")
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        native_logits = fixed_linear(projection(native[:, 2]), model.token_head.weight).float()
-        replay_logits = fixed_linear(projection(reference[:, 2]), model.token_head.weight).float()
+        native_logits = linear(projection(native[:, 2]), model.token_head.weight).float()
+        replay_logits = linear(projection(reference[:, 2]), model.token_head.weight).float()
     for logits in (native_logits, replay_logits):
         logits[:, model.silence_token_id] = -torch.inf
     native_logp = native_logits.log_softmax(-1)
@@ -136,7 +135,7 @@ def main() -> None:
             for message in messages:
                 trajectory = pool.trajectory(message)
                 torch.save(trajectory.model_dump(), args.output_dir / f"trajectory_{index:06d}.pt")
-                metrics = replay_metrics(model, pool, trajectory, version=1)
+                metrics = replay_metrics(model, trajectory, version=1)
                 versions = sorted(set(trajectory.row_versions.tolist()))
                 print(json.dumps({"trajectory": index, "conversation": trajectory.conversation_id,
                                   "frames": trajectory.text_ids.shape[0], "row_versions": versions,

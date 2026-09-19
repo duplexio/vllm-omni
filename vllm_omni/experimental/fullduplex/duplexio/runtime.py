@@ -11,7 +11,7 @@ import copy
 from typing import Any, Literal
 
 import torch
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 from torch import Tensor
 
 from vllm_omni.experimental.fullduplex.duplexio.input import (
@@ -35,7 +35,6 @@ class PreparedUserFrame(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", strict=True)
     format: Literal["duplexio_features"]
     features: Tensor
-    user_token_id: int = Field(ge=0)
     decode_audio: bool = False
 
     @field_validator("features")
@@ -151,7 +150,6 @@ def build_duplexio_data_plane_prompt(
                 "duplexio_system_input_final": duplexio_system_input_final,
                 "duplexio_voice_prompt": duplexio_voice_prompt,
                 "duplexio_system_token_ids": duplexio_system_token_ids,
-                "user_token_id": payload.get("user_token_id"),
                 "decode_audio": payload.get("decode_audio", True),
             },
         },
@@ -256,19 +254,20 @@ def _validated_frame_count(payload: object) -> int:
         raise ValueError("DuplexIO frame_count must be a positive integer")
     is_prefill = payload.get("duplexio_prefill", False)
     is_system_input = payload.get("duplexio_system_input", False)
-    if not isinstance(is_prefill, bool) or not isinstance(is_system_input, bool):
-        raise ValueError("DuplexIO text-input flags must be boolean when present")
-    if is_prefill and is_system_input:
-        raise ValueError("DuplexIO prefill and system input are mutually exclusive")
-    is_silent_text_input = is_prefill or is_system_input
-    if frame_count != 1 and not is_silent_text_input:
+    is_voice_prompt = payload.get("duplexio_voice_prompt", False)
+    if not all(isinstance(flag, bool) for flag in (is_prefill, is_system_input, is_voice_prompt)):
+        raise ValueError("DuplexIO context-input flags must be boolean when present")
+    if sum((is_prefill, is_system_input, is_voice_prompt)) > 1:
+        raise ValueError("DuplexIO prefill, system input and voice prompt are mutually exclusive")
+    is_context_input = is_prefill or is_system_input or is_voice_prompt
+    if frame_count != 1 and not is_context_input:
         raise ValueError("DuplexIO live audio requires exactly one frame per append")
     audio = payload.get("audio")
     if not isinstance(audio, str):
         raise ValueError("DuplexIO data plane requires base64 audio")
-    if is_silent_text_input:
+    if is_context_input:
         if audio:
-            raise ValueError("DuplexIO text prefill creates silence inside the model")
+            raise ValueError("DuplexIO context audio is supplied by the model")
     else:
         try:
             raw = base64.b64decode(audio, validate=True)
@@ -283,8 +282,8 @@ def _validated_frame_count(payload: object) -> int:
     valid_samples = payload.get("valid_samples")
     if not isinstance(valid_samples, int) or not 1 <= valid_samples <= frame_count * DUPLEXIO_FRAME_SIZE:
         raise ValueError("DuplexIO valid_samples is outside the framed PCM payload")
-    if is_silent_text_input and valid_samples != frame_count * DUPLEXIO_FRAME_SIZE:
-        raise ValueError("DuplexIO text prefill must contain complete silent frames")
+    if is_context_input and valid_samples != frame_count * DUPLEXIO_FRAME_SIZE:
+        raise ValueError("DuplexIO context input must contain complete frames")
     return frame_count
 
 
