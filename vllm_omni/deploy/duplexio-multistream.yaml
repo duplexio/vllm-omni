@@ -19,7 +19,7 @@ stages:
     max_num_seqs: 2
     # Reserve one bounded compact cache layout per admitted session.
     max_model_len: 24576
-    max_num_batched_tokens: 4096
+    max_num_batched_tokens: 6144
     # FlexAttention tiles pages, so the page must be a power of two. Without
     # this the hybrid cache would derive 528 tokens per page from the mamba
     # state size. 1024 spans the same slots in fewer, larger pages.

@@ -28,33 +28,15 @@ from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_prepared_frame_preserves_features_without_transcript_or_audio_transport() -> None:
-    features = torch.randn(1, 1024)
-    prompt = build_duplexio_data_plane_prompt(
-        request_id="request-1",
-        fence=DuplexFence("session-1"),
-        session_config={},
-        runtime_config={},
-        seq=1,
-        turn_seq=1,
-        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
-        payload={
-            "format": "duplexio_features",
-            "features": features,
-        },
-        final=False,
-    )
-    wire = serialize_additional_information(prompt["model_intermediate_buffer"])
-    decoded_wire = MsgpackDecoder(AdditionalInformationPayload).decode(MsgpackEncoder().encode(wire))
-    restored = deserialize_additional_information(decoded_wire)
-    torch.testing.assert_close(restored["embed"]["speech_feat"], features)
-    duplex = prompt["model_intermediate_buffer"]["duplex"]
-    assert prompt["prompt_token_ids"] == [0] * 6
-    assert prompt["model_intermediate_buffer"]["embed"]["speech_feat"] is features
-    assert "features" not in duplex["payload"]
-    assert "user_token_id" not in duplex
-    assert "audio" not in duplex["payload"]
-    assert duplex["decode_audio"] is False
+def test_data_plane_rejects_preencoded_features() -> None:
+    with pytest.raises(ValueError, match="pcm_f32le"):
+        build_duplexio_data_plane_prompt(
+            request_id="request-1", fence=DuplexFence("session-1"),
+            session_config={}, runtime_config={}, seq=1, turn_seq=1,
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+            payload={"format": "duplexio_features", "features": torch.randn(1, 1024)},
+            final=False,
+        )
 
 
 def test_data_plane_prompt_reserves_six_cells_for_one_frame() -> None:
@@ -86,7 +68,13 @@ def test_data_plane_prompt_reserves_six_cells_for_one_frame() -> None:
     assert duplex["row_cell_count"] == 6
     assert duplex["scheduler_token_budget"] == 6
     assert duplex["duplexio_prefill"] is False
-    assert duplex["duplexio_prefill_final"] is False
+    assert duplex["pcm"] == base64.b64decode(payload["audio"])
+    assert "audio" not in duplex["payload"]
+    assert "audio" in payload  # Planning must not mutate the caller's append.
+    wire = serialize_additional_information(prompt["model_intermediate_buffer"])
+    decoded = MsgpackDecoder(AdditionalInformationPayload).decode(MsgpackEncoder().encode(wire))
+    restored = deserialize_additional_information(decoded)
+    assert restored["duplex"]["pcm"] == duplex["pcm"]
 
 
 def test_data_plane_prompt_preserves_prefill_flags_for_the_model() -> None:
@@ -98,13 +86,12 @@ def test_data_plane_prompt_preserves_prefill_flags_for_the_model() -> None:
         "valid_samples": 1_920,
         "audio": "",
         "duplexio_prefill": True,
-        "duplexio_prefill_final": True,
     }
     prompt = build_duplexio_data_plane_prompt(
         request_id="request-1",
         fence=DuplexFence("session-1"),
         session_config={},
-        runtime_config={},
+        runtime_config={"duplexio_voice_prompt_frames": 0, "duplexio_system_token_ids": [10]},
         seq=1,
         turn_seq=1,
         mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
@@ -114,7 +101,6 @@ def test_data_plane_prompt_preserves_prefill_flags_for_the_model() -> None:
 
     duplex = prompt["model_intermediate_buffer"]["duplex"]
     assert duplex["duplexio_prefill"] is True
-    assert duplex["duplexio_prefill_final"] is True
 
 
 def test_data_plane_prompt_batches_all_prefill_frames() -> None:
@@ -126,14 +112,14 @@ def test_data_plane_prompt_batches_all_prefill_frames() -> None:
         "valid_samples": 3 * 1_920,
         "audio": "",
         "duplexio_prefill": True,
-        "duplexio_prefill_final": True,
     }
 
     prompt = build_duplexio_data_plane_prompt(
         request_id="request-1",
         fence=DuplexFence("session-1"),
         session_config={},
-        runtime_config={"duplexio_scheduler_token_id": 17},
+        runtime_config={"duplexio_scheduler_token_id": 17, "duplexio_voice_prompt_frames": 2,
+                        "duplexio_system_token_ids": [10]},
         seq=1,
         turn_seq=1,
         mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
@@ -154,7 +140,6 @@ def test_data_plane_prompt_batches_system_input_frames() -> None:
         "valid_samples": 3 * 1_920,
         "audio": "",
         "duplexio_system_input": True,
-        "duplexio_system_input_final": True,
         "duplexio_system_token_ids": [41, 42, 43],
     }
 
@@ -175,7 +160,8 @@ def test_data_plane_prompt_batches_system_input_frames() -> None:
     assert duplex["duplexio_system_token_ids"] == [41, 42, 43]
 
 
-def test_data_plane_prompt_rejects_misaligned_system_tokens() -> None:
+@pytest.mark.parametrize("tokens", [[41, 42], [41, 42, -1], [41, 42, "43"], None])
+def test_data_plane_prompt_rejects_invalid_system_tokens(tokens) -> None:
     payload = {
         "format": "pcm_f32le",
         "sample_rate_hz": 24_000,
@@ -184,8 +170,7 @@ def test_data_plane_prompt_rejects_misaligned_system_tokens() -> None:
         "valid_samples": 3 * 1_920,
         "audio": "",
         "duplexio_system_input": True,
-        "duplexio_system_input_final": True,
-        "duplexio_system_token_ids": [41, 42],
+        "duplexio_system_token_ids": tokens,
     }
 
     with pytest.raises(ValueError, match="one token ID per frame"):

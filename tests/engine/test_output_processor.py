@@ -19,6 +19,35 @@ from vllm_omni.outputs.output_processor import MultimodalOutputProcessor, OmniRe
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
+@pytest.mark.parametrize("kind", list(RequestOutputKind))
+@pytest.mark.parametrize("flat", [False, True])
+def test_producer_chunk_metadata_preserves_native_output_modes(kind, flat):
+    state = _make_state(kind)
+    for step, length in enumerate((3, 5)):
+        metadata = {"new_field": torch.tensor(step), "variable_shape": torch.ones(step + 1)}
+        payload = {"audio": torch.ones(length)}
+        payload.update({f"chunk.{key}": value for key, value in metadata.items()} if flat else {"chunk": metadata})
+        state.add_multimodal_tensor(payload, mm_type="audio")
+        output = state.make_request_output([step], None, FinishReason.STOP if step else None, None)
+        if kind is RequestOutputKind.FINAL_ONLY and not step:
+            assert output is None
+            continue
+        result = output.outputs[0].multimodal_output
+        assert result["new_field"].item() == step
+        assert result["variable_shape"].shape == (step + 1,)
+        audio = result["audio"]
+        if isinstance(audio, list):
+            audio = torch.cat(audio)
+        assert audio.numel() == (length if kind is RequestOutputKind.DELTA else sum((3, 5)[:step + 1]))
+        if not step:
+            first = result
+    if kind is not RequestOutputKind.FINAL_ONLY:
+        assert first["new_field"].item() == 0
+        assert first["variable_shape"].shape == (1,)
+    if kind is RequestOutputKind.DELTA:
+        assert "new_field" not in state.mm_accumulated
+
 # Audio is explicitly listed as a drainable modality
 AUDIO = OutputModalityNames.AUDIO
 
@@ -242,11 +271,11 @@ def test_delta_drains_audio_chunk_metadata_per_step():
     s.add_multimodal_tensor(
         {
             "model_outputs": torch.ones(5),
-            "meta.duplex_epoch": torch.tensor([7], dtype=torch.int32),
-            "meta.duplex_turn_id": torch.tensor([1], dtype=torch.int32),
-            "meta.llm_output_text_utf8": segment_utf8,
-            "meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
-            "meta.tts_is_last_chunk": torch.tensor([0], dtype=torch.int32),
+            "chunk.meta.duplex_epoch": torch.tensor([7], dtype=torch.int32),
+            "chunk.meta.duplex_turn_id": torch.tensor([1], dtype=torch.int32),
+            "chunk.meta.llm_output_text_utf8": segment_utf8,
+            "chunk.meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
+            "chunk.meta.tts_is_last_chunk": torch.tensor([0], dtype=torch.int32),
         },
         mm_type=AUDIO,
     )
@@ -258,11 +287,11 @@ def test_delta_drains_audio_chunk_metadata_per_step():
     s.add_multimodal_tensor(
         {
             "model_outputs": torch.ones(3),
-            "meta.duplex_epoch": torch.tensor([8], dtype=torch.int32),
-            "meta.duplex_turn_id": torch.tensor([2], dtype=torch.int32),
-            "meta.llm_output_text_utf8": segment_utf8,
-            "meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
-            "meta.tts_is_last_chunk": torch.tensor([1], dtype=torch.int32),
+            "chunk.meta.duplex_epoch": torch.tensor([8], dtype=torch.int32),
+            "chunk.meta.duplex_turn_id": torch.tensor([2], dtype=torch.int32),
+            "chunk.meta.llm_output_text_utf8": segment_utf8,
+            "chunk.meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
+            "chunk.meta.tts_is_last_chunk": torch.tensor([1], dtype=torch.int32),
         },
         mm_type=AUDIO,
     )
@@ -284,11 +313,11 @@ def test_cumulative_audio_replaces_chunk_metadata_per_step():
     s.add_multimodal_tensor(
         {
             "model_outputs": torch.ones(5),
-            "meta.duplex_epoch": torch.tensor([7], dtype=torch.int32),
-            "meta.duplex_turn_id": torch.tensor([1], dtype=torch.int32),
-            "meta.llm_output_text_utf8": segment_utf8,
-            "meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
-            "meta.tts_is_last_chunk": torch.tensor([0], dtype=torch.int32),
+            "chunk.meta.duplex_epoch": torch.tensor([7], dtype=torch.int32),
+            "chunk.meta.duplex_turn_id": torch.tensor([1], dtype=torch.int32),
+            "chunk.meta.llm_output_text_utf8": segment_utf8,
+            "chunk.meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
+            "chunk.meta.tts_is_last_chunk": torch.tensor([0], dtype=torch.int32),
         },
         mm_type=AUDIO,
     )
@@ -299,11 +328,11 @@ def test_cumulative_audio_replaces_chunk_metadata_per_step():
     s.add_multimodal_tensor(
         {
             "model_outputs": torch.ones(3),
-            "meta.duplex_epoch": torch.tensor([8], dtype=torch.int32),
-            "meta.duplex_turn_id": torch.tensor([2], dtype=torch.int32),
-            "meta.llm_output_text_utf8": segment_utf8,
-            "meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
-            "meta.tts_is_last_chunk": torch.tensor([1], dtype=torch.int32),
+            "chunk.meta.duplex_epoch": torch.tensor([8], dtype=torch.int32),
+            "chunk.meta.duplex_turn_id": torch.tensor([2], dtype=torch.int32),
+            "chunk.meta.llm_output_text_utf8": segment_utf8,
+            "chunk.meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
+            "chunk.meta.tts_is_last_chunk": torch.tensor([1], dtype=torch.int32),
         },
         mm_type=AUDIO,
     )
@@ -325,7 +354,7 @@ def test_delta_audio_non_final_tts_chunk_overrides_spurious_finish():
     s.add_multimodal_tensor(
         {
             "model_outputs": torch.ones(5),
-            "meta.tts_is_last_chunk": torch.tensor([0]),
+            "chunk.meta.tts_is_last_chunk": torch.tensor([0]),
         },
         mm_type=AUDIO,
     )
@@ -344,7 +373,7 @@ def test_delta_audio_final_tts_chunk_keeps_finish():
     s.add_multimodal_tensor(
         {
             "model_outputs": torch.ones(5),
-            "meta.tts_is_last_chunk": torch.tensor([1]),
+            "chunk.meta.tts_is_last_chunk": torch.tensor([1]),
         },
         mm_type=AUDIO,
     )
@@ -517,7 +546,7 @@ def _audio_engine_output(*, is_segment_finished: bool, is_last_chunk: bool):
         request_id="r",
         multimodal_output={
             "model_outputs": torch.arange(8, dtype=torch.float32),
-            "meta.tts_is_last_chunk": torch.tensor([int(is_last_chunk)]),
+            "chunk.meta.tts_is_last_chunk": torch.tensor([int(is_last_chunk)]),
         },
         output_type="audio",
         pooling_output=None,

@@ -168,6 +168,7 @@ class DuplexRequestClient:
             request_state,
             response_stage_id=response_stage_id,
             timeout=timeout,
+            until_segment_finished=True,
         )
         if outputs:
             result = dict(result)
@@ -269,7 +270,9 @@ class DuplexRequestClient:
         *,
         response_stage_id: int | None,
         timeout: float | None,
+        until_segment_finished: bool = False,
     ) -> list[OmniRequestOutput]:
+        """Poll an output, or collect an append through its segment boundary."""
         deadline = None if timeout is None else time.monotonic() + timeout
         wall_start_ts = request_state.request_arrival_ts or time.time()
         final_stage_id = response_stage_id if response_stage_id is not None else max(0, self.output_port.num_stages - 1)
@@ -337,10 +340,9 @@ class DuplexRequestClient:
                     stage_event_cursor,
                 )
             if output_to_collect is not None and (is_response_stage or is_direct_response):
-                if message.finished:
-                    output_to_collect.finished = True
+                output_to_collect.finished = message.finished
                 outputs.append(output_to_collect)
-            if message.finished or outputs:
+            if message.finished or (outputs and (is_direct_response or not until_segment_finished)):
                 break
         return outputs
 

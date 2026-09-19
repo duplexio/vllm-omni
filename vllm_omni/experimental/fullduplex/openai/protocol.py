@@ -8,6 +8,8 @@ from enum import Enum
 from types import MappingProxyType
 from uuid import uuid4
 
+from vllm_omni.experimental.fullduplex.openai.session_tasks import DuplexSessionTasks
+
 
 class DuplexOverlapPolicy(str, Enum):
     AUTO = "auto"
@@ -427,6 +429,7 @@ class DuplexPendingToolCall:
 class DuplexSession:
     session_id: str
     config: DuplexSessionConfig
+    tasks: DuplexSessionTasks = field(default_factory=DuplexSessionTasks, init=False, repr=False, compare=False)
     capabilities: DuplexCapabilities = field(default_factory=DuplexCapabilities)
     incarnation: int = 0
     state: DuplexSessionState = DuplexSessionState.OPEN

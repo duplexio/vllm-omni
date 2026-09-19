@@ -20,7 +20,7 @@ def test_model_buffer_survives_engine_wire_and_streaming_update(dtype, direct) -
         "prompt_token_ids": [0] * 6,
         "model_intermediate_buffer": {
             "embed": {"speech_feat": features},
-            "duplex": {"seq": 3, "payload": {"format": "duplexio_features"}},
+            "duplex": {"seq": 3},
         },
     }
     params = SamplingParams(max_tokens=1)

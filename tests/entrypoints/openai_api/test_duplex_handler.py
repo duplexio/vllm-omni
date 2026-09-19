@@ -44,6 +44,7 @@ from vllm_omni.experimental.fullduplex.openai.serving import (
     OmniDuplexSessionHandler,
     should_enable_duplex_endpoint,
 )
+from vllm_omni.experimental.fullduplex.openai.session_tasks import DuplexSessionTasks
 from vllm_omni.experimental.fullduplex.openai.websocket import DuplexWebSocketActor
 from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
 from vllm_omni.outputs import OmniRequestOutput
@@ -1375,7 +1376,7 @@ def _install_direct_silence_scheduler(
     handler: OmniDuplexSessionHandler,
     session: DuplexSession,
 ) -> None:
-    native = handler._minicpmo_session_state(session)
+    handler._minicpmo_session_state(session)
 
     async def _schedule(payload: object, **kwargs: Any) -> bool:
         if handler._native_silence_continuation_is_stale(
@@ -1398,7 +1399,7 @@ def _install_direct_silence_scheduler(
         )
         return append_ok
 
-    native.silence_continuation_scheduler = _schedule
+    session.tasks.silence_continuation_scheduler = _schedule
 
 
 def test_minicpmo_pcm_append_buffer_flush_preserves_accumulated_speech_marker():
@@ -1459,12 +1460,12 @@ def test_minicpmo_merge_drops_serving_new_user_turn_marker():
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_clear_continuation_does_not_cancel_pending_silence_task():
+async def test_server_clear_continuation_does_not_cancel_pending_silence_task():
     async def _pending() -> bool:
         await asyncio.sleep(3600)
         return True
 
-    native = MiniCPMO45ServingSessionState()
+    native = DuplexSessionTasks()
     task = asyncio.create_task(_pending())
     native.continuation_owner_id = "owner"
     native.continuation_units = 1
@@ -2948,7 +2949,7 @@ async def test_minicpmo_pre_response_continuation_drops_after_model_turn_ends():
     session.bind_request(request_id)
     model_turn_id = session.turn_id
 
-    native = handler._minicpmo_session_state(session)
+    handler._minicpmo_session_state(session)
 
     async def _stale_before_append(payload: object, **kwargs: Any) -> bool:
         session.complete_model_turn(model_turn_id)
@@ -2972,7 +2973,7 @@ async def test_minicpmo_pre_response_continuation_drops_after_model_turn_ends():
         )
         return append_ok
 
-    native.silence_continuation_scheduler = _stale_before_append
+    session.tasks.silence_continuation_scheduler = _stale_before_append
 
     await handler._maybe_continue_native_response(
         TimedWebSocket().send_json,
@@ -4365,8 +4366,9 @@ async def test_realtime_resume_preserves_append_tail_order_across_connections():
         pytest.fail("resumable session did not open")
     session = handler._registry.get("sid-resume-append-order")
     assert session is not None
-    native_state = handler._minicpmo_session_state(session)
-    first_scheduler = native_state.silence_continuation_scheduler
+    original_tasks = session.tasks
+    original_model_state = handler._minicpmo_session_state(session)
+    first_scheduler = original_tasks.silence_continuation_scheduler
     assert first_scheduler is not None
     first.put(
         {
@@ -4402,7 +4404,9 @@ async def test_realtime_resume_preserves_append_tail_order_across_connections():
         await asyncio.sleep(0.01)
     else:
         pytest.fail("session did not resume")
-    assert native_state.silence_continuation_scheduler is not first_scheduler
+    assert session.tasks.silence_continuation_scheduler is not first_scheduler
+    assert session.tasks is original_tasks
+    assert handler._minicpmo_session_state(session) is original_model_state
     second.put(
         {
             "type": "input_audio_buffer.append",
@@ -4673,7 +4677,7 @@ async def test_realtime_disconnect_grace_cancels_only_orphan_response():
     session.begin_response()
     session.bind_request("orphan-request")
     orphan_task = asyncio.create_task(asyncio.sleep(10))
-    handler._session_tasks[session.session_id].active_response_task = orphan_task
+    session.tasks.active_response_task = orphan_task
     assert engine.closed == []
 
     await asyncio.sleep(0.05)
@@ -4734,7 +4738,6 @@ async def test_realtime_idle_ttl_lifecycle_removes_detached_serving_projection()
 
     assert handler._registry.get("sid-idle-expired") is None
     assert "sid-idle-expired" not in handler._minicpmo_sessions
-    assert "sid-idle-expired" not in handler._session_tasks
     assert engine.closed == []
 
 
@@ -6022,7 +6025,7 @@ async def test_minicpmo_auto_response_restarts_drain_when_append_races_idle_exit
     )
     session.capabilities = DuplexCapabilities.minicpmo45_native()
     session.bind_request(request_id)
-    native = handler._minicpmo_session_state(session)
+    handler._minicpmo_session_state(session)
     projected_batches: list[object] = []
     projected = asyncio.Event()
 
@@ -6054,7 +6057,7 @@ async def test_minicpmo_auto_response_restarts_drain_when_append_races_idle_exit
         )
         is True
     )
-    first_drain = native.data_plane_task
+    first_drain = session.tasks.data_plane_task
     assert first_drain is not None
     await asyncio.sleep(0.01)
 
@@ -6774,8 +6777,8 @@ async def test_minicpmo_native_auto_response_preserves_silence_continuations_acr
     session.capabilities.chunk_period_ms = 50
     session.bind_request(request_id)
     response_id = session.begin_response(turn_id=session.turn_id)
-    native = handler._minicpmo_session_state(session)
-    scheduler = native.silence_continuation_scheduler
+    handler._minicpmo_session_state(session)
+    scheduler = session.tasks.silence_continuation_scheduler
     assert scheduler is not None
 
     payload = handler._native_silence_unit_payload()

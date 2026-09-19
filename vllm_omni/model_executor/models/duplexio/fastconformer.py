@@ -187,9 +187,9 @@ class FastConformerRNNT(nn.Module):
         return torch.cat(parts)
 
     def prepare_streaming_audio_chunk(self, waveform: Tensor, *, first: bool) -> Tensor:
-        """Extract one exact upstream streaming mel chunk from 16 kHz audio."""
+        """Extract exact streaming mels from one window or a batch of equal windows."""
         inputs = self.processor(
-            waveform,
+            waveform.unbind(0) if waveform.ndim == 2 else waveform,
             sampling_rate=SAMPLE_RATE,
             is_streaming=True,
             is_first_audio_chunk=first,
@@ -260,7 +260,8 @@ class FastConformerRNNT(nn.Module):
         buffer_start = state.buffer_start_sample
         next_mel_frame = state.next_mel_frame
         encoder_state = state.encoder
-        outputs = []
+        starts_stream = next_mel_frame == 0
+        raw_chunks = []
         while True:
             first = next_mel_frame == 0
             if first:
@@ -282,10 +283,11 @@ class FastConformerRNNT(nn.Module):
             raw_chunk = audio_buffer[local_start:local_end]
             if raw_start < 0:
                 raw_chunk = torch.cat((raw_chunk.new_zeros(-raw_start), raw_chunk))
-            features = self.prepare_streaming_audio_chunk(raw_chunk, first=first)
-            encoded, encoder_state = self.encode_feature_chunk(features, encoder_state)
-            outputs.append(encoded)
-            next_mel_frame += features.shape[1]
+            raw_chunks.append(raw_chunk)
+            next_mel_frame += (
+                self.processor.num_mel_frames_first_audio_chunk
+                if first else self.processor.num_mel_frames_per_audio_chunk
+            )
             next_raw_start = max(
                 next_mel_frame * self.processor.feature_extractor.hop_length
                 - self.processor.feature_extractor.n_fft // 2,
@@ -294,8 +296,16 @@ class FastConformerRNNT(nn.Module):
             drop = next_raw_start - buffer_start
             audio_buffer = audio_buffer[drop:]
             buffer_start = next_raw_start
-        if outputs:
-            states = torch.cat(outputs, dim=1)
+        if raw_chunks:
+            # Only the initial window uses centered STFT. All following windows
+            # have identical geometry and can share one batched frontend call.
+            feature_chunks = []
+            if starts_stream:
+                feature_chunks.append(self.prepare_streaming_audio_chunk(raw_chunks.pop(0), first=True))
+            if raw_chunks:
+                features = self.prepare_streaming_audio_chunk(torch.stack(raw_chunks), first=False)
+                feature_chunks.append(features.flatten(0, 1).unsqueeze(0))
+            states, encoder_state = self.encode_feature_chunk(torch.cat(feature_chunks, dim=1), encoder_state)
         else:
             model_param = next(self.model.parameters())
             states = model_param.new_empty((1, 0, self.output_dim))

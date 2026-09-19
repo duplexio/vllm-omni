@@ -45,8 +45,7 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream() -> None
         tools=tuple(tools),
     )
     sampling = TokenSamplingOptions(
-        mode="argmax",
-        temperature=1.0,
+        temperature=0.0,
         top_k=len(vocab),
         top_p=1.0,
         suppressed_token_ids=torch.tensor([0], dtype=torch.long),
@@ -97,7 +96,7 @@ def test_forced_continuation_records_actual_constrained_token_probability(device
     state = ToolCallConstraintState(compiled_grammar=grammar)
     state.begin()
     sampling = TokenSamplingOptions(
-        mode=mode, temperature=0.7, top_k=2, top_p=0.8,
+        temperature=0.0 if mode == "argmax" else 0.7, top_k=2, top_p=0.8 if mode == "top_p" else None,
         suppressed_token_ids=torch.tensor([0], device=device),
     )
     logits = torch.tensor([[100.0, 0.2, 0.6, 0.9, 90.0]], device=device)

@@ -5,59 +5,6 @@ import torch
 from vllm_omni.outputs.mm_outputs import MultimodalPayload
 from vllm_omni.outputs.output_modality import DRAINABLE_MODALITIES
 
-CHUNK_METADATA_KEYS: frozenset[str] = frozenset(
-    {
-        "agent_audio_token_ids",
-        "agent_emit_logprob",
-        "agent_token_id",
-        "agent_token_logprob",
-        "audio_text_total_chars",
-        "duplex_epoch",
-        "duplex_turn_id",
-        "end_of_turn",
-        "llm_output_text_utf8",
-        "model_listen",
-        "predictor_hiddens",
-        "replay_text_ids",
-        "replay_user_features",
-        "replay_agent_audio",
-        "replay_audio_mask",
-        "replay_prompt_frames",
-        "sample_rate_hz",
-        "segment_end",
-        "tool_call_token_id",
-        "tool_emit_logprob",
-        "tool_token_logprob",
-        "tts_is_last_chunk",
-        "turn_end",
-        "user_token_id",
-        "user_emit",
-        "user_emit_logprob",
-        "user_token_logprob",
-        "user_action_logprob",
-        "user_action_eligible",
-        "user_token_eligible",
-        "policy_version",
-    }
-)
-
-
-def _is_chunk_metadata_key(key: str) -> bool:
-    if key.startswith("meta."):
-        return key.split(".", 1)[1] in CHUNK_METADATA_KEYS
-    return key in CHUNK_METADATA_KEYS
-
-
-def replace_snapshot_keys(
-    accumulated: MultimodalPayload,
-    incoming: MultimodalPayload,
-) -> None:
-    """Replace per-chunk metadata with the latest values."""
-    for key in (*incoming.tensors, *incoming.metadata):
-        if _is_chunk_metadata_key(key):
-            accumulated.tensors.pop(key, None)
-            accumulated.metadata.pop(key, None)
-
 
 def drain_delta_payload(payload: MultimodalPayload) -> None:
     """Remove client-facing delta data while retaining request-level state."""
@@ -66,18 +13,9 @@ def drain_delta_payload(payload: MultimodalPayload) -> None:
         payload.tensors.pop(key, None)
         payload.metadata.pop(key, None)
 
-    for metadata_key in CHUNK_METADATA_KEYS:
-        flat_key = f"meta.{metadata_key}"
-        payload.tensors.pop(flat_key, None)
-        payload.metadata.pop(flat_key, None)
-
-    meta = payload.metadata.get("meta")
-    if isinstance(meta, dict):
-        filtered = {key: value for key, value in meta.items() if key not in CHUNK_METADATA_KEYS}
-        if filtered:
-            payload.metadata["meta"] = filtered
-        else:
-            payload.metadata.pop("meta", None)
+    for key in payload.chunk_keys:
+        payload.metadata.pop(key, None)
+    payload.chunk_keys.clear()
 
 
 def _payload_meta_value(payload: MultimodalPayload, key: str) -> Any:

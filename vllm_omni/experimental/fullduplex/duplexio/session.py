@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from vllm_omni.experimental.fullduplex.duplexio.input import (
@@ -26,13 +24,6 @@ class DuplexIOServingSessionState:
     committed_audio_reserved_bytes: int = 0
     deferred_response_create: bool = False
     deferred_precreate_response: bool = False
-    data_plane_task: asyncio.Task[None] | None = None
-    data_plane_restart_requested: bool = False
-    continuation_owner_id: str | None = None
-    continuation_units: int = 0
-    pending_silence_task: asyncio.Task[bool] | None = None
-    pending_silence_owner_id: str | None = None
-    silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
 
     def retain_committed_audio(
         self,
@@ -54,11 +45,6 @@ class DuplexIOServingSessionState:
         self.deferred_precreate_response = False
         return reserved_bytes
 
-    def clear_continuation(self) -> None:
-        self.continuation_owner_id = None
-        self.continuation_units = 0
-        self.pending_silence_task = None
-        self.pending_silence_owner_id = None
 
 
 __all__ = ["DuplexIOServingSessionState"]

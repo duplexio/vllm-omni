@@ -25,7 +25,7 @@ class DuplexIOConfig(PretrainedConfig):
         *,
         text_config: dict[str, Any] | PretrainedConfig | None = None,
         audio_codec_config: dict[str, Any] | None = None,
-        duplexio_export_version: int = 6,
+        duplexio_export_version: int = 7,
         user_asr_config: dict[str, Any] | None = None,
         user_asr_streaming_config: dict[str, Any] | None = None,
         audio_representation: str = "continuous",
@@ -48,7 +48,6 @@ class DuplexIOConfig(PretrainedConfig):
         audio_adapter_config: dict[str, Any] | None = None,
         quantized_audio_config: dict[str, Any] | None = None,
         depth_transformer_config: dict[str, Any] | None = None,
-        rollout_sampling_config: dict[str, Any] | None = None,
         tied_weight_aliases: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -78,15 +77,6 @@ class DuplexIOConfig(PretrainedConfig):
         self.audio_adapter_config = dict(audio_adapter_config or {})
         self.quantized_audio_config = dict(quantized_audio_config or {})
         self.depth_transformer_config = dict(depth_transformer_config or {})
-        self.rollout_sampling_config = dict(
-            rollout_sampling_config
-            or {
-                "mode": "argmax",
-                "temperature": 1.0,
-                "top_k": 50,
-                "top_p": 0.95,
-            }
-        )
         self.tied_weight_aliases = dict(tied_weight_aliases or {})
         self._validate_duplexio_contract()
 
@@ -99,9 +89,10 @@ class DuplexIOConfig(PretrainedConfig):
         return self.text_config
 
     def _validate_duplexio_contract(self) -> None:
-        if self.duplexio_export_version != 6:
+        if self.duplexio_export_version != 7:
             raise ValueError(
-                f"Unsupported DuplexIO export version: {self.duplexio_export_version}"
+                f"Unsupported DuplexIO export version: {self.duplexio_export_version}; "
+                "re-export as version 7 and pass sampling settings to the caller"
             )
         if self.stream_names != ["system", "user", "agent", "tool_call"]:
             raise ValueError(f"Unsupported DuplexIO stream layout: {self.stream_names}")
@@ -270,20 +261,6 @@ class DuplexIOConfig(PretrainedConfig):
             or self.audio_codec_config.get("frame_rate") != self.frame_rate
         ):
             raise ValueError("DuplexIO and codec frame geometry differ")
-        rollout_mode = self.rollout_sampling_config.get("mode")
-        if rollout_mode not in {"argmax", "max", "top_k", "top_p"}:
-            raise ValueError(
-                f"Unsupported DuplexIO rollout sampling mode: {rollout_mode!r}"
-            )
-        temperature = self.rollout_sampling_config.get("temperature")
-        top_k = self.rollout_sampling_config.get("top_k")
-        top_p = self.rollout_sampling_config.get("top_p")
-        if not isinstance(temperature, (int, float)) or temperature <= 0:
-            raise ValueError("DuplexIO rollout sampling temperature must be positive")
-        if not isinstance(top_k, int) or top_k < 1:
-            raise ValueError("DuplexIO rollout sampling top_k must be positive")
-        if not isinstance(top_p, (int, float)) or not 0 < top_p <= 1:
-            raise ValueError("DuplexIO rollout sampling top_p must be in (0, 1]")
         if self.audio_attention_window_frames < 1:
             raise ValueError("DuplexIO audio attention window must be positive")
 

@@ -59,7 +59,6 @@ from vllm_omni.experimental.fullduplex.openai.session_runner import (
 )
 from vllm_omni.experimental.fullduplex.openai.websocket import (
     DOMAIN_TERMINAL_EVENTS,
-    DuplexSessionTasks,
     DuplexWebSocketActor,
 )
 
@@ -134,7 +133,6 @@ class OmniDuplexSessionHandler(
             )
         else:
             raise ValueError("A duplex serving runtime adapter must be explicitly configured")
-        self._session_tasks: dict[str, DuplexSessionTasks] = {}
         self._realtime_protocols: dict[str, NativeRealtimeSessionProtocol] = {}
         self._lease_generations: dict[str, int] = {}
         self._resync_required_sessions: set[str] = set()
@@ -209,18 +207,16 @@ class OmniDuplexSessionHandler(
                 journal=False,
             )
 
-        tasks = self._session_tasks.pop(session.session_id, None)
-        if tasks is not None:
-            await tasks.cancel_append_tasks()
-            active_response_task = tasks.active_response_task
-            if active_response_task is not None and not active_response_task.done():
-                active_response_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await active_response_task
-        native = self._serving_runtime_adapter.session_states.get(session.session_id)
-        if native is not None and native.data_plane_task is not None:
-            data_plane_task = native.data_plane_task
-            native.data_plane_task = None
+        tasks = session.tasks
+        await tasks.cancel_append_tasks()
+        active_response_task = tasks.active_response_task
+        if active_response_task is not None and not active_response_task.done():
+            active_response_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await active_response_task
+        if tasks.data_plane_task is not None:
+            data_plane_task = tasks.data_plane_task
+            tasks.data_plane_task = None
             data_plane_task.cancel()
             with suppress(asyncio.CancelledError):
                 await data_plane_task

@@ -1,5 +1,61 @@
 # Native/training parity
 
+## Request/output cleanup, 2026-09-19
+
+Failed rollout appends retain their weight-update gate reservations until engine
+session cleanup succeeds; failed cleanup keeps the gate held. Sampling options
+are resolved on the first prediction and on settings changes, with model-owned
+suppression tensors. Codec decoding is separate from response assembly, and
+prefill timing follows the explicit prefix append. Validation: 174 tests passed,
+three skipped (`507865`), including cancellation, failed recording/close, cache
+updates, seeded sampling and behavior log probabilities. The real-engine prefix,
+live, chunked-tool, live smoke also passed (`507864`). No throughput claim is made.
+
+## Six-stream chunked prefill, 2026-09-19
+
+Tool results now follow the same complete-append contract as prefixes. Offline
+and online callers no longer split results or supply a final-chunk flag; the
+scheduler owns sampling eligibility. Prompt progress is derived from consumed
+frames, and payload validation stays at the runtime boundary. The updated suite
+passed 137 tests with one skip (`507852`), including tool/prefix replay, RNG,
+pinned-speaker visibility, and exclusion of concurrent live appends. A real
+version-seven engine consumed a 1,100-frame synthetic tool result in two chunks
+between live frames and resumed decoding successfully (`507851`).
+
+Version-seven prefixes use one append containing speaker-reference and system
+frames. The native scheduler splits it at six-cell frame boundaries; audio
+encoders and the backbone carry state between chunks. Intermediate chunks record
+all model inputs without sampling. Tests cover partitions crossing the
+speaker/system boundary, tool appends at nonzero offsets, continuation state,
+sampling RNG, and collection through the append's completion boundary.
+
+The focused suite passed 134 tests with one optional training-reference test
+skipped on a full eight-H100 allocation (job `507820`). Real-engine smoke tests
+passed for one session and 32 concurrent sessions (jobs `507816`, `507817`).
+The sampler remains compiled, but its automatic CUDA graph trees are disabled:
+they caused failures when interleaved with vLLM's captured graphs. Backbone and
+audio CUDA graphs remain enabled. The graph-tree/cuBLAS workspace interaction is
+suspected from source and diagnostics; its exact pointer-level failure mechanism
+has not been independently established.
+
+The full 32-conversation actor benchmark completed successfully (job `507821`).
+Median per-session prefill time was 34.14 seconds and median total rollout time
+600.11 seconds, versus 727.01 and 1335.33 seconds in the original frame-wise
+encoding/prefix run (`507710`) on the same conversation set. The intermediate
+bulk-encoder, whole-prefix path measured 52.38 and 621.64 seconds (`507767`).
+These wall times include scheduling and cold compilation/cache effects, exclude
+engine startup, and are not controlled steady-state kernel measurements. This
+used one engine with 32 concurrent sessions on a full-node allocation, not eight
+parallel actors, and did not exercise learner updates or tool simulation.
+
+Real-weight ASR parallel/streaming FP32 tests with TF32 disabled agree within
+approximately 1–7 ppm relative RMS error and preserve continuation state.
+BF16 is not equivalent at that tolerance: random-audio tests measured roughly
+1.5% relative drift at 32 frames and up to 9% at 128 frames. These are feature
+differences, not WER measurements. Transcription-quality validation and a complete
+learner/actor OPD update loop remain outstanding. Logs and reproduction scripts
+are under `/dcai/users/thuand/duplexio/logs/opd/`.
+
 ## Training alignment, 2026-09-18
 
 The current checks use the training worktree at base commit `47309195` and its

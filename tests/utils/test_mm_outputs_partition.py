@@ -6,6 +6,16 @@ from vllm_omni.utils.mm_outputs import partition_flat_payload, partition_payload
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_producer_declared_chunk_metadata_routes_without_a_field_registry():
+    payload = {
+        "model_outputs": torch.zeros(1, 2400),
+        "chunk.meta.previously_unknown_field": torch.tensor(7),
+    }
+    inter, client = partition_flat_payload(payload)
+    assert client == payload
+    assert inter == {"meta.previously_unknown_field": payload["chunk.meta.previously_unknown_field"]}
+
+
 def test_partition_thinker_latent_payload():
     payload = {
         "hidden_states.layer_0": torch.zeros(2, 4),

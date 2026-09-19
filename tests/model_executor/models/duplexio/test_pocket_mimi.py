@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.models.duplexio.pocket_mimi import (
+    PocketMimi,
     StreamingMultiheadAttention,
 )
 
@@ -17,6 +18,27 @@ def test_attention_cache_is_bounded_by_its_window() -> None:
         assert state.k.shape[1] <= 6
         assert state.v.shape == state.k.shape
     assert state.seq_len == 30
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA codec")
+@torch.inference_mode()
+@torch.backends.cudnn.flags(allow_tf32=False)
+def test_combined_prefix_preserves_continuous_codec_state() -> None:
+    torch.manual_seed(44)
+    codec = PocketMimi().cuda().eval()
+    speaker = torch.randn(1, 1, 3 * 1920, device="cuda")
+    silence = torch.zeros(1, 1, 11 * 1920, device="cuda")
+    bulk, bulk_state = codec.encode(torch.cat((speaker, silence), dim=-1), codec.new_state(1))
+    serial_state = codec.new_state(1)
+    outputs = []
+    for chunk in (speaker, *silence.split(1920, dim=-1)):
+        output, serial_state = codec.encode(chunk, serial_state)
+        outputs.append(output)
+    torch.testing.assert_close(bulk, torch.cat(outputs, dim=-1), atol=1e-4, rtol=1e-3)
+    for chunk in (speaker[..., :1920], silence[..., :1920]):
+        actual, bulk_state = codec.encode(chunk, bulk_state)
+        expected, serial_state = codec.encode(chunk, serial_state)
+        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-3)
 
 
 @torch.inference_mode()

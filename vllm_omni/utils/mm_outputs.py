@@ -51,6 +51,9 @@ def partition_flat_payload(
         root = key.split(".", 1)[0]
         if root in _CLIENT_MM_ROOT_KEYS:
             client_mm[key] = value
+        elif root == "chunk":
+            client_mm[key] = value
+            inter_stage[key.removeprefix("chunk.")] = value
         elif root == "meta" and "." in key and key.split(".", 1)[1] in _CLIENT_MM_META_KEYS:
             # Small final-output metadata needed by serving (for example
             # transcript text attached to audio) must ride with client MM

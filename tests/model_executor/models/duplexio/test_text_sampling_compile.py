@@ -14,7 +14,7 @@ from vllm_omni.model_executor.models.duplexio.text_sampling import TokenSampling
 @torch.inference_mode()
 def test_batched_filter_matches_individual_requests(mode: str, device: str) -> None:
     inputs = torch.Generator(device=device).manual_seed(73)
-    options = TokenSamplingOptions(mode, 0.8, 50, 0.95, torch.tensor([0, 1, 2], device=device))
+    options = TokenSamplingOptions(0.8, 50, 0.95 if mode == "top_p" else None, torch.tensor([0, 1, 2], device=device))
     for batch in (1, 8, 32):
         logits = torch.randn(batch, 248320, device=device, dtype=torch.bfloat16, generator=inputs)
         ids, probabilities = content_distribution(logits, options)
@@ -37,9 +37,9 @@ def test_compiled_distribution_matches_eager(mode: str) -> None:
     torch.manual_seed(53)
     compiled = torch.compile(
         content_distribution, fullgraph=True, dynamic=True,
-        options={"emulate_precision_casts": True, "triton.cudagraphs": True},
+        options={"emulate_precision_casts": True, "triton.cudagraphs": False},
     )
-    options = TokenSamplingOptions(mode, 0.8, 50, 0.95, torch.tensor([0, 1, 2], device="cuda"))
+    options = TokenSamplingOptions(0.8, 50, 0.95 if mode == "top_p" else None, torch.tensor([0, 1, 2], device="cuda"))
     for batch in (1, 8, 1):
         logits = torch.randn(batch, 248320, device="cuda", dtype=torch.bfloat16)
         logits[:, :3] = 100
@@ -58,9 +58,9 @@ def test_compiled_distribution_matches_eager(mode: str) -> None:
 def test_compiled_filter_preserves_seeded_draws() -> None:
     compiled = torch.compile(
         content_distribution, fullgraph=True, dynamic=True,
-        options={"emulate_precision_casts": True, "triton.cudagraphs": True},
+        options={"emulate_precision_casts": True, "triton.cudagraphs": False},
     )
-    options = TokenSamplingOptions("top_p", 0.8, 50, 0.95, torch.tensor([0, 1], device="cuda"))
+    options = TokenSamplingOptions(0.8, 50, 0.95, torch.tensor([0, 1], device="cuda"))
     eager_generator = torch.Generator(device="cuda").manual_seed(37)
     compiled_generator = torch.Generator(device="cuda").manual_seed(37)
     for _ in range(100):

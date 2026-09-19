@@ -266,25 +266,16 @@
         <summary>Sampling parameters</summary>
         <fieldset id="sampling-picker">
           <label>
-            Text strategy
-            <select id="text-sampling-mode">
-              <option value="">Checkpoint default</option>
-              <option value="argmax">Argmax</option>
-              <option value="top_k">Top K</option>
-              <option value="top_p">Top P</option>
-            </select>
-          </label>
-          <label>
             Text temperature
-            <input id="text-temperature" type="number" min="0.01" step="0.01" placeholder="Checkpoint default">
+            <input id="text-temperature" type="number" min="0" step="0.01" placeholder="0 = greedy">
           </label>
           <label>
             Text top K
-            <input id="text-top-k" type="number" min="1" step="1" placeholder="Checkpoint default">
+            <input id="text-top-k" type="number" min="1" step="1" placeholder="Unrestricted">
           </label>
           <label>
             Text top P
-            <input id="text-top-p" type="number" min="0.01" max="1" step="0.01" placeholder="Checkpoint default">
+            <input id="text-top-p" type="number" min="0.01" max="1" step="0.01" placeholder="Unrestricted">
           </label>
           <label>
             Audio temperature
@@ -295,22 +286,14 @@
             <input id="audio-top-k" type="number" min="1" step="1" placeholder="Checkpoint default">
           </label>
           <label>
-            User emit temperature
-            <input id="user-emit-temperature" type="number" min="0" step="0.01" placeholder="Checkpoint default">
-          </label>
-          <label>
-            Agent emit temperature
+            Agent/tool emit temperature
             <input id="agent-emit-temperature" type="number" min="0" step="0.01" placeholder="Checkpoint default">
-          </label>
-          <label>
-            Tool-call emit temperature
-            <input id="tool-call-emit-temperature" type="number" min="0" step="0.01" placeholder="Checkpoint default">
           </label>
           <label>
             Seed
             <input id="sampling-seed" type="number" min="0" max="9007199254740991" step="1" placeholder="Random per session">
           </label>
-          <small>Text settings choose words; audio settings, when the checkpoint has a tunable audio head, choose Mimi codes; emit temperatures control each stream's speak-versus-silence gate. Zero is deterministic.</small>
+          <small>Text settings choose words; audio settings, when the checkpoint has a tunable audio head, choose Mimi codes; emit temperatures control the agent and tool-call speak-versus-silence gates. Zero is deterministic.</small>
         </fieldset>
       </details>
       <fieldset id="tool-picker" class="tool-picker">

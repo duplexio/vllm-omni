@@ -232,15 +232,14 @@ class NativeRuntimeBridgeMixin:
             return False
         session.bind_request(request_id)
 
-        native = self._runtime_session_state(session)
-        old_task = native.data_plane_task
+        old_task = session.tasks.data_plane_task
         if old_task is not None and not old_task.done():
             if self._session_auto_responds(session):
                 # One persistent drain per session, like the official worker's
                 # single synchronous loop: the resumable data-plane request id
                 # is stable, and cancel/restart on every append orphans any
                 # decision that lands in the swap window.
-                native.data_plane_restart_requested = True
+                session.tasks.data_plane_restart_requested = True
                 return False
             old_task.cancel()
             try:
@@ -284,16 +283,16 @@ class NativeRuntimeBridgeMixin:
                             }
                         )
             finally:
-                if native.data_plane_task is task:
-                    native.data_plane_task = None
+                if session.tasks.data_plane_task is task:
+                    session.tasks.data_plane_task = None
                 restart_requested = (
-                    native.data_plane_restart_requested
+                    session.tasks.data_plane_restart_requested
                     and close_reason is None
                     and session.state != DuplexSessionState.CLOSED
                     and session.active_request_id == request_id
                     and (expected_epoch is None or session.epoch == expected_epoch)
                 )
-                native.data_plane_restart_requested = False
+                session.tasks.data_plane_restart_requested = False
                 if close_reason is None and not self._session_auto_responds(session):
                     # Auto-respond sessions keep one resumable stage-1 stream
                     # whose audio accumulates across speak units; the offset
@@ -311,7 +310,7 @@ class NativeRuntimeBridgeMixin:
                 await self._maybe_continue_native_response(send_json, session=session, expected_epoch=expected_epoch)
 
         task = asyncio.create_task(_run())
-        native.data_plane_task = task
+        session.tasks.data_plane_task = task
         return True
 
     # One model unit (1 s at 16 kHz) of pcm_f32le silence, matching the
@@ -331,9 +330,8 @@ class NativeRuntimeBridgeMixin:
     def _native_response_continuations_remaining(self, session: DuplexSession, response_id: str) -> bool:
         if self._session_auto_responds(session):
             return True
-        native = self._runtime_session_state(session)
         owner_id = f"response:{response_id}"
-        count = native.continuation_units if native.continuation_owner_id == owner_id else 0
+        count = session.tasks.continuation_units if session.tasks.continuation_owner_id == owner_id else 0
         return count < self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS
 
     def _native_silence_continuation_is_stale(
@@ -375,13 +373,12 @@ class NativeRuntimeBridgeMixin:
         response/turn ownership remains the continuation fence.
         """
         response_id = session.active_response_id
-        native = self._runtime_session_state(session)
         if session.state == DuplexSessionState.CLOSED:
-            native.clear_continuation()
+            session.tasks.clear_continuation()
             return
         request_id = session.active_request_id
         if request_id is None:
-            native.clear_continuation()
+            session.tasks.clear_continuation()
             return
         if expected_epoch is not None and session.epoch != expected_epoch:
             return
@@ -394,17 +391,17 @@ class NativeRuntimeBridgeMixin:
             )
         else:
             if not auto_response or expected_model_turn_id is None or session.turn_id != expected_model_turn_id:
-                native.clear_continuation()
+                session.tasks.clear_continuation()
                 return
             owner_id = f"model-turn:{expected_model_turn_id}"
             payload_turn_id = expected_model_turn_id
-        count = native.continuation_units if native.continuation_owner_id == owner_id else 0
+        count = session.tasks.continuation_units if session.tasks.continuation_owner_id == owner_id else 0
         if not auto_response and count >= self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS:
             return
         payload = self._native_silence_unit_payload()
         payload["duplex_turn_id"] = payload_turn_id
 
-        scheduler = native.silence_continuation_scheduler
+        scheduler = session.tasks.silence_continuation_scheduler
         if scheduler is None:
             return
         try:
@@ -423,14 +420,13 @@ class NativeRuntimeBridgeMixin:
             logger.exception("Failed to schedule duplex native response continuation: %s", exc)
             scheduled = False
         if scheduled:
-            native.continuation_owner_id = owner_id
-            native.continuation_units = count + 1
+            session.tasks.continuation_owner_id = owner_id
+            session.tasks.continuation_units = count + 1
 
     async def _cancel_native_data_plane_stream(self, session: DuplexSession) -> bool:
-        native = self._runtime_session_state(session)
-        task = native.data_plane_task
-        native.data_plane_task = None
-        native.data_plane_restart_requested = False
+        task = session.tasks.data_plane_task
+        session.tasks.data_plane_task = None
+        session.tasks.data_plane_restart_requested = False
         if task is None or task.done():
             return False
         task.cancel()
@@ -971,7 +967,7 @@ class NativeRuntimeBridgeMixin:
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
             if self._session_auto_responds(session):
-                self._runtime_session_state(session).clear_continuation()
+                session.tasks.clear_continuation()
                 emitted_response = True
                 payload = {
                     "type": "response.listen",

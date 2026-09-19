@@ -289,7 +289,7 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
 
     segment_output = _forward(model, [segment])
 
-    assert segment_output.multimodal_outputs["meta.turn_end"][0].item() is False
+    assert segment_output.multimodal_outputs["chunk.meta.turn_end"][0].item() is False
     # A Talker unit boundary only drains pending codec tokens. The official
     # streaming path keeps Token2wav open until the assistant turn ends.
     assert token2wav.flow.encoder.last_chunk_calls[-1] is False
@@ -304,14 +304,14 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
 
     payload = output.multimodal_outputs
     assert "meta" not in payload
-    assert payload["meta.duplex_epoch"][0].item() == 3
-    assert payload["meta.duplex_turn_id"][0].item() == 7
+    assert payload["chunk.meta.duplex_epoch"][0].item() == 3
+    assert payload["chunk.meta.duplex_turn_id"][0].item() == 7
     torch.testing.assert_close(
-        payload["meta.llm_output_text_utf8"][0],
+        payload["chunk.meta.llm_output_text_utf8"][0],
         segment_text_utf8,
     )
-    assert payload["meta.tts_is_last_chunk"][0].item() is True
-    assert payload["meta.turn_end"][0].item() is True
+    assert payload["chunk.meta.tts_is_last_chunk"][0].item() is True
+    assert payload["chunk.meta.turn_end"][0].item() is True
     assert token2wav.flow.encoder.last_chunk_calls[-1] is True
     assert "duplex" not in model._states
 
@@ -675,18 +675,18 @@ def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
     assert prompt_cache_id.startswith("runtime-ref-")
     assert Path(prompt_wav).is_file()
     torch.testing.assert_close(
-        output.multimodal_outputs["meta.llm_output_text_utf8"][0],
+        output.multimodal_outputs["chunk.meta.llm_output_text_utf8"][0],
         segment_text_utf8,
     )
-    assert output.multimodal_outputs["meta.duplex_turn_id"][0].item() == 7
-    assert output.multimodal_outputs["meta.duplex_epoch"][0].item() == 3
+    assert output.multimodal_outputs["chunk.meta.duplex_turn_id"][0].item() == 7
+    assert output.multimodal_outputs["chunk.meta.duplex_epoch"][0].item() == 3
 
     final = _info("voice-a", 1, [3, 4], last_chunk=True)
     final["meta"].pop("prompt_cache_id")
     final["meta"]["tts_is_last_chunk"] = True
     output = _forward(model, [final])
 
-    assert output.multimodal_outputs["meta.tts_is_last_chunk"][0].item() is True
+    assert output.multimodal_outputs["chunk.meta.tts_is_last_chunk"][0].item() is True
     assert model._request_prompt_keys["voice-a"] == prompt_key
     model.on_requests_finished(["voice-a"])
     assert "voice-a" not in model._request_prompt_keys

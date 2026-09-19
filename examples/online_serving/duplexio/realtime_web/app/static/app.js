@@ -17,15 +17,12 @@
   // knows: whatever clip is chosen is resampled here and pinned by the server.
   let referenceAudio = null;
   const samplingPicker = document.getElementById('sampling-picker');
-  const textSamplingMode = document.getElementById('text-sampling-mode');
   const textTemperature = document.getElementById('text-temperature');
   const textTopK = document.getElementById('text-top-k');
   const textTopP = document.getElementById('text-top-p');
   const audioTemperature = document.getElementById('audio-temperature');
   const audioTopK = document.getElementById('audio-top-k');
-  const userEmitTemperature = document.getElementById('user-emit-temperature');
   const agentEmitTemperature = document.getElementById('agent-emit-temperature');
-  const toolCallEmitTemperature = document.getElementById('tool-call-emit-temperature');
   const samplingSeed = document.getElementById('sampling-seed');
   const toolPicker = document.getElementById('tool-picker');
   const statusElement = document.getElementById('status');
@@ -224,10 +221,9 @@
 
   function populateSampling() {
     const sampling = config.sampling || {};
-    const text = sampling.text || {};
+    const text = sampling.agent?.content || {};
     const audio = sampling.audio || {};
-    const emit = sampling.emit || {};
-    textSamplingMode.value = text.mode || '';
+    const emit = sampling.agent?.emission || {};
     textTemperature.value = text.temperature ?? '';
     textTopK.value = text.top_k ?? '';
     textTopP.value = text.top_p ?? '';
@@ -239,13 +235,7 @@
     for (const input of [audioTemperature, audioTopK]) {
       input.closest('label').hidden = sampling.audio === undefined;
     }
-    userEmitTemperature.value = emit.user ?? '';
-    agentEmitTemperature.value = Number.isInteger(emit.agent)
-      ? emit.agent.toFixed(1)
-      : emit.agent ?? '';
-    toolCallEmitTemperature.value = Number.isInteger(emit.tool_call)
-      ? emit.tool_call.toFixed(1)
-      : emit.tool_call ?? '';
+    agentEmitTemperature.value = emit.temperature ?? '';
   }
 
   function samplingNumber(input) {
@@ -259,8 +249,6 @@
   function samplingOptions() {
     const text = {};
     const audio = {};
-    const emit = {};
-    if (textSamplingMode.value) text.mode = textSamplingMode.value;
     const textValues = [
       ['temperature', textTemperature],
       ['top_k', textTopK],
@@ -270,29 +258,23 @@
       ['temperature', audioTemperature],
       ['top_k', audioTopK],
     ];
-    const emitValues = [
-      ['user', userEmitTemperature],
-      ['agent', agentEmitTemperature],
-      ['tool_call', toolCallEmitTemperature],
-    ];
     for (const [name, input] of textValues) {
       const value = samplingNumber(input);
-      if (value !== null) text[name] = value;
+      if (name !== 'temperature' || value !== null) text[name] = value;
     }
     for (const [name, input] of audioValues) {
       const value = samplingNumber(input);
       if (value !== null) audio[name] = value;
     }
-    for (const [name, input] of emitValues) {
-      const value = samplingNumber(input);
-      if (value !== null) emit[name] = value;
-    }
+    const emitTemperature = samplingNumber(agentEmitTemperature);
     const seed = samplingNumber(samplingSeed);
     return {
       ...(seed === null ? {} : { seed }),
-      ...(Object.keys(text).length ? { text } : {}),
+      agent: {
+        content: text,
+        emission: emitTemperature === null ? {} : { temperature: emitTemperature },
+      },
       ...(Object.keys(audio).length ? { audio } : {}),
-      ...(Object.keys(emit).length ? { emit } : {}),
     };
   }
 

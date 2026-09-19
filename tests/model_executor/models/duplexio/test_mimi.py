@@ -110,6 +110,30 @@ def test_native_mimi_streaming_matches_whole_sequence() -> None:
     torch.testing.assert_close(streaming_audio, offline_audio)
 
 
+@torch.inference_mode()
+def test_combined_speaker_and_system_audio_matches_split_encoding_and_continuation() -> None:
+    torch.manual_seed(44)
+    reference = _transformers_model()
+    native = MimiModel(reference.config.to_dict()).eval()
+    native.load_state_dict(reference.state_dict(), strict=True)
+    frame_size = native.config.frame_size
+    speaker = torch.randn(1, 1, 3 * frame_size)
+    silence = torch.zeros(1, 1, 11 * frame_size)
+    bulk_state = native.new_streaming_state()
+    serial_state = native.new_streaming_state()
+    bulk = native.encode(torch.cat((speaker, silence), dim=-1), 3, bulk_state)
+    serial = torch.cat([
+        native.encode(chunk, 3, serial_state)
+        for chunk in (speaker, *silence.split(frame_size, dim=-1))
+    ], dim=-1)
+    torch.testing.assert_close(bulk, serial)
+    for continuation in (torch.randn(1, 1, frame_size), torch.zeros(1, 1, frame_size)):
+        torch.testing.assert_close(
+            native.encode(continuation, 3, bulk_state),
+            native.encode(continuation, 3, serial_state),
+        )
+
+
 def test_native_mimi_streaming_state_stays_bounded() -> None:
     torch.manual_seed(5)
     reference = _transformers_model()

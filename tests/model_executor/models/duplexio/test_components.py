@@ -30,10 +30,9 @@ from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
 )
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
+    EmitSamplingTemperatures,
     TokenSamplingOptions,
-    _emit_temperatures,
     _sample_factorized_text_ids,
-    _text_sampling,
     text_suppression_ids,
 )
 from vllm_omni.model_executor.models.duplexio.pipeline import DUPLEXIO_PIPELINE
@@ -540,8 +539,7 @@ def test_factorized_text_argmax_excludes_silence_from_content() -> None:
         emit_logits,
         silence_token_id=2,
         sampling=TokenSamplingOptions(
-            mode="argmax",
-            temperature=1.0,
+            temperature=0.0,
             top_k=4,
             top_p=0.95,
             suppressed_token_ids=torch.tensor([2], dtype=torch.long),
@@ -554,26 +552,14 @@ def test_factorized_text_argmax_excludes_silence_from_content() -> None:
 
 
 def test_emit_temperatures_are_read_per_stream() -> None:
-    temperatures = _emit_temperatures(
-        {
-            "duplex": {
-                "runtime_config": {
-                    "duplexio_emit_temperatures": {
-                        "user": 0.6,
-                        "agent": 0.4,
-                        "tool_call": 0.8,
-                    }
-                }
-            }
-        }
-    )
+    temperatures = EmitSamplingTemperatures.model_validate({"user": 0.6, "agent": 0.4, "tool_call": 0.8})
 
     assert temperatures.user == 0.6
     assert temperatures.agent == 0.4
     assert temperatures.tool_call == 0.8
 
 
-def test_voice_prompt_rows_do_not_run_prediction_heads() -> None:
+def test_unfinished_tool_context_does_not_run_prediction_heads() -> None:
     model = DuplexIOForConditionalGeneration.__new__(
         DuplexIOForConditionalGeneration
     )
@@ -581,7 +567,8 @@ def test_voice_prompt_rows_do_not_run_prediction_heads() -> None:
     predictions = model.sample_frames(
         torch.zeros(6, 4),
         [(0, 6)],
-        [{"duplex": {"duplexio_voice_prompt": True}}],
+        [{"duplex": {"duplexio_system_input": True}}],
+        [False],
     )
 
     assert predictions == {}
@@ -612,11 +599,17 @@ def test_vocabulary_suppression_is_model_owned_and_sampling_temperature_stays_dy
     assert agent_ids == [11, 12, 13, 18, 19]
     assert tool_ids == [11, 12, 13]
     suppressed = torch.tensor(agent_ids, dtype=torch.long)
-    options = {"mode": "top_k", "temperature": 0.3, "top_k": 5, "top_p": 1.0}
-    info = {"duplex": {"runtime_config": {"duplexio_text_sampling": options}}}
-    first = _text_sampling(info, suppressed)
+    model = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.agent_suppressed_token_ids = suppressed
+    model.tool_suppressed_token_ids = torch.tensor(tool_ids)
+    model.user_suppressed_token_ids = suppressed
+    options = {"temperature": 0.3, "top_k": 5, "top_p": 1.0}
+    runtime = {"duplexio_text_sampling": options, "duplexio_user_sampling": {"content": options},
+               "duplexio_emit_temperatures": {"user": 1.0, "agent": 1.0, "tool_call": 1.0}}
+    first = model.resolve_sampling(runtime).agent
     options["temperature"] = 1.2
-    second = _text_sampling(info, suppressed)
+    second = model.resolve_sampling(runtime).agent
     assert (first.temperature, second.temperature) == (0.3, 1.2)
     assert first.suppressed_token_ids is second.suppressed_token_ids is suppressed
 

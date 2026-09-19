@@ -9,13 +9,18 @@ import struct
 from types import SimpleNamespace
 
 import pytest
+from tokenizers import Tokenizer, models
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
+from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.experimental.fullduplex.duplexio.input import (
     DUPLEXIO_FRAME_SIZE,
 )
 from vllm_omni.experimental.fullduplex.duplexio.serving_adapter import (
     DuplexIOClientRuntimeConfigError,
     DuplexIOServingRuntimeAdapter,
+    _voice_prompt_from_session,
     parse_client_sampling_config,
 )
 from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSessionConfig
@@ -55,12 +60,6 @@ async def test_serving_config_pins_the_client_reference_audio(
             initial_user_prefix="<|im_start|>user\n",
             pad_token_id=11,
             silence_token_id=13,
-            rollout_sampling_config={
-                "mode": "argmax",
-                "temperature": 1.0,
-                "top_k": 50,
-                "top_p": 0.95,
-            },
             depth_transformer_config={
                 "sampling_temperature": 0.9,
                 "sampling_top_k": 32,
@@ -80,7 +79,7 @@ async def test_serving_config_pins_the_client_reference_audio(
     }
     tokenizer = SimpleNamespace(
         encode=lambda text, add_special_tokens: encoded[text],
-        decode=lambda token_ids, skip_special_tokens: "decoded",
+        backend_tokenizer=Tokenizer(models.BPE()),
         all_special_ids=[11, 12],
     )
     monkeypatch.setattr(
@@ -104,8 +103,11 @@ async def test_serving_config_pins_the_client_reference_audio(
         model_config=model_config,
     )
 
-    assert runtime["duplexio_voice_prompt_audio"] == reference_audio()
+    assert runtime["duplexio_voice_prompt_pcm"] == base64.b64decode(reference_audio())
     assert runtime["duplexio_voice_prompt_frames"] == REFERENCE_FRAMES
+    wire = serialize_additional_information({"duplex": {"runtime_config": runtime}})
+    decoded = MsgpackDecoder(AdditionalInformationPayload).decode(MsgpackEncoder().encode(wire))
+    assert deserialize_additional_information(decoded)["duplex"]["runtime_config"] == runtime
     assert runtime["duplexio_scheduler_token_id"] == 11
     assert isinstance(runtime["duplexio_sampling_seed"], int)
     assert runtime["duplexio_system_token_ids"] == [
@@ -119,13 +121,12 @@ async def test_serving_config_pins_the_client_reference_audio(
         "top_k": 32,
     }
     assert runtime["duplexio_text_sampling"] == {
-        "mode": "argmax",
-        "temperature": 1.0,
-        "top_k": 50,
+        "temperature": 0.6,
+        "top_k": 20,
         "top_p": 0.95,
     }
     assert runtime["duplexio_emit_temperatures"] == {
-        "user": 1.0,
+        "user": 0.0,
         "agent": 1.0,
         "tool_call": 1.0,
     }
@@ -149,6 +150,37 @@ async def test_serving_config_requires_reference_audio(tmp_path) -> None:
         await adapter.prepare_runtime_config(config, model_config=model_config)
 
     assert exc_info.value.code == "ref_audio_required"
+
+
+def test_reference_frame_count_is_decided_at_ingestion() -> None:
+    raw = struct.pack("<f", 0.25) * (4 * DUPLEXIO_FRAME_SIZE + 100)
+    config = DuplexSessionConfig(extra_body={
+        "full_duplex": True,
+        "ref_audio_data": base64.b64encode(raw).decode("ascii"),
+    })
+    pcm, frames = _voice_prompt_from_session(config, SimpleNamespace(voice_prompt_max_frames=2))
+    assert frames == 2
+    assert pcm == raw
+
+
+@pytest.mark.parametrize("replacement", [None, "same", "different", "invalid"])
+def test_reference_update_checks_original_audio(replacement: str | None) -> None:
+    raw = base64.b64decode(reference_audio())
+    extra_body = {"full_duplex": True}
+    if replacement is not None:
+        extra_body["ref_audio_data"] = {
+            "same": reference_audio(), "different": reference_audio(2), "invalid": "!invalid",
+        }[replacement]
+    config = DuplexSessionConfig(extra_body=extra_body)
+    current = {"instructions": None, "duplexio_voice_prompt_pcm": raw}
+    if replacement in (None, "same"):
+        DuplexIOServingRuntimeAdapter.validate_runtime_config_for_session(config, current)
+    else:
+        with pytest.raises(DuplexIOClientRuntimeConfigError) as error:
+            DuplexIOServingRuntimeAdapter.validate_runtime_config_for_session(config, current)
+        assert error.value.code == (
+            "voice_update_unsupported" if replacement == "different" else "ref_audio_invalid"
+        )
 
 
 @pytest.mark.asyncio
@@ -208,12 +240,6 @@ async def test_serving_config_applies_client_sampling_parameters(
             initial_user_prefix="user",
             pad_token_id=11,
             silence_token_id=13,
-            rollout_sampling_config={
-                "mode": "top_p",
-                "temperature": 0.6,
-                "top_k": 20,
-                "top_p": 0.95,
-            },
             depth_transformer_config={
                 "sampling_temperature": 0.8,
                 "sampling_top_k": 250,
@@ -223,7 +249,7 @@ async def test_serving_config_applies_client_sampling_parameters(
     )
     tokenizer = SimpleNamespace(
         encode=lambda text, add_special_tokens: [1],
-        decode=lambda token_ids, skip_special_tokens: "decoded",
+        backend_tokenizer=Tokenizer(models.BPE()),
         all_special_ids=[11],
     )
     monkeypatch.setattr(
@@ -240,17 +266,12 @@ async def test_serving_config_applies_client_sampling_parameters(
                 "ref_audio_data": reference_audio(),
                 "duplexio_sampling": {
                     "seed": 1234,
-                    "text": {
-                        "mode": "top_k",
+                    "agent": {"content": {
                         "temperature": 0.7,
                         "top_k": 12,
                         "top_p": 0.9,
-                    },
+                    }, "emission": {"temperature": 0.4}},
                     "audio": {"temperature": 0.75, "top_k": 64},
-                    "emit": {
-                        "agent": 0.4,
-                        "tool_call": 0.8,
-                    },
                 },
             },
         ),
@@ -259,7 +280,6 @@ async def test_serving_config_applies_client_sampling_parameters(
 
     assert runtime["duplexio_sampling_seed"] == 1234
     assert runtime["duplexio_text_sampling"] == {
-        "mode": "top_k",
         "temperature": 0.7,
         "top_k": 12,
         "top_p": 0.9,
@@ -269,24 +289,26 @@ async def test_serving_config_applies_client_sampling_parameters(
         "top_k": 64,
     }
     assert runtime["duplexio_emit_temperatures"] == {
-        "user": 1.0,
+        "user": 0.0,
         "agent": 0.4,
-        "tool_call": 0.8,
+        "tool_call": 0.4,
     }
 
 
 def test_serving_config_rejects_invalid_client_sampling() -> None:
     with pytest.raises(DuplexIOClientRuntimeConfigError) as exc_info:
         parse_client_sampling_config(
-            {"duplexio_sampling": {"text": {"top_p": 0.0}}}
+            {"duplexio_sampling": {"agent": {"content": {"top_p": 0.0}}}}
         )
 
     assert exc_info.value.code == "invalid_sampling"
 
 
 def test_serving_config_accepts_user_emit_sampling() -> None:
-    config = parse_client_sampling_config({"duplexio_sampling": {"emit": {"user": 0.2}}})
-    assert config.emit.user == 0.2
+    config = parse_client_sampling_config({"duplexio_sampling": {
+        "user": {"emission": {"temperature": 0.0}, "content": {"temperature": 0.0}},
+    }})
+    assert config.user.emission.temperature == 0.0
 
 
 def test_duplexio_capabilities_use_native_scheduler_data_plane() -> None:
@@ -313,45 +335,32 @@ def test_duplexio_initial_payloads_pin_the_voice_then_seed_the_prompt() -> None:
         )
     )
 
-    assert len(payloads) == 2
-    prompt, prefill = payloads
-    # The reference the voice is cloned from precedes the instructions.
-    assert prompt["duplexio_voice_prompt"] is True
-    assert prompt["frame_count"] == 2
-    assert "duplexio_prefill" not in prompt
+    assert len(payloads) == 1
+    prefill = payloads[0]
     assert prefill["audio"] == ""
     assert prefill["frame_size"] == DUPLEXIO_FRAME_SIZE
-    assert prefill["frame_count"] == 3
-    assert prefill["valid_samples"] == 3 * DUPLEXIO_FRAME_SIZE
-    assert prefill["duplexio_prefill_final"] is True
+    assert prefill["frame_count"] == 5
+    assert prefill["valid_samples"] == 5 * DUPLEXIO_FRAME_SIZE
+    assert prefill["duplexio_prefill"] is True
     assert prefill["duplex_turn_id"] == 4
 
 
-def test_duplexio_initial_payloads_chunk_long_system_prompts() -> None:
+def test_duplexio_initial_payload_contains_all_speaker_and_system_frames() -> None:
     adapter = DuplexIOServingRuntimeAdapter(lambda *_args: None)
     payloads = adapter.initial_data_plane_payloads(
         SimpleNamespace(
             runtime_config={
                 "duplexio_system_token_ids": list(range(260)),
-                # A long prompt chunks like the text does.
                 "duplexio_voice_prompt_frames": 130,
             },
             turn_id=4,
         )
     )
 
-    prompt = [payload for payload in payloads if payload.get("duplexio_voice_prompt")]
-    prefill = [payload for payload in payloads if payload.get("duplexio_prefill")]
-    assert [payload["frame_count"] for payload in prompt] == [128, 2]
-    assert [payload["frame_count"] for payload in prefill] == [128, 128, 4]
-    assert [payload["duplexio_prefill_final"] for payload in prefill] == [
-        False,
-        False,
-        True,
-    ]
-    assert sum(payload["valid_samples"] for payload in prefill) == (
-        260 * DUPLEXIO_FRAME_SIZE
-    )
+    assert len(payloads) == 1
+    assert payloads[0]["duplexio_prefill"]
+    assert payloads[0]["frame_count"] == 390
+    assert payloads[0]["valid_samples"] == 390 * DUPLEXIO_FRAME_SIZE
 
 
 def test_duplexio_tool_result_payloads_feed_consecutive_system_tokens() -> None:
@@ -366,7 +375,7 @@ def test_duplexio_tool_result_payloads_feed_consecutive_system_tokens() -> None:
         encode=encode,
     )
     adapter.data_plane.configure_text_decoder(
-        lambda token_ids: "",
+        Tokenizer(models.BPE()),
         silence_token_id=13,
     )
 
@@ -383,16 +392,15 @@ def test_duplexio_tool_result_payloads_feed_consecutive_system_tokens() -> None:
     assert payloads[0]["audio"] == ""
     assert payloads[0]["duplexio_system_token_ids"] == [41, 42, 43]
     assert payloads[0]["duplexio_system_input"] is True
-    assert payloads[0]["duplexio_system_input_final"] is True
 
 
-def test_duplexio_tool_result_payloads_chunk_long_results() -> None:
+def test_duplexio_tool_result_is_one_complete_append() -> None:
     adapter = DuplexIOServingRuntimeAdapter(lambda *_args: None)
     adapter.tokenizer = SimpleNamespace(
         encode=lambda text, add_special_tokens: list(range(260)),
     )
     adapter.data_plane.configure_text_decoder(
-        lambda token_ids: "",
+        Tokenizer(models.BPE()),
         silence_token_id=13,
     )
 
@@ -401,17 +409,9 @@ def test_duplexio_tool_result_payloads_chunk_long_results() -> None:
         "large result",
     )
 
-    assert [payload["frame_count"] for payload in payloads] == [128, 128, 4]
-    assert [payload["duplexio_system_input_final"] for payload in payloads] == [
-        False,
-        False,
-        True,
-    ]
-    assert [
-        token_id
-        for payload in payloads
-        for token_id in payload["duplexio_system_token_ids"]
-    ] == list(range(260))
+    assert len(payloads) == 1
+    assert payloads[0]["frame_count"] == 260
+    assert payloads[0]["duplexio_system_token_ids"] == list(range(260))
 
 
 @pytest.mark.parametrize(

@@ -690,12 +690,14 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # Generation runner wire payloads are flat and tensor-only.
                 # Dotted metadata keys are unflattened again by the output
                 # processor before the full-duplex data plane consumes them.
-                "meta.duplex_epoch": [torch.tensor(item.duplex_epoch, dtype=torch.int32) for item in items],
-                "meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
-                "meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],
-                "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
-                "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
-                "meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],
+                "chunk.meta.duplex_epoch": [torch.tensor(item.duplex_epoch, dtype=torch.int32) for item in items],
+                "chunk.meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
+                "chunk.meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],
+                "chunk.meta.tts_is_last_chunk": [
+                    torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items
+                ],
+                "chunk.meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
+                "chunk.meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],
             },
         )
 

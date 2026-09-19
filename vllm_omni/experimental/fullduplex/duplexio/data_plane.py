@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from tokenizers import Tokenizer, decoders
 from torch import Tensor
 
 from vllm_omni.experimental.fullduplex.duplexio.input import (
@@ -21,7 +22,6 @@ from vllm_omni.experimental.fullduplex.engine.contracts import (
 )
 
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
-DecodeTokens = Callable[[list[int]], str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,20 +41,19 @@ class DuplexIODataPlaneSession:
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         self._encode_audio = encode_audio
-        self._decode_tokens: DecodeTokens | None = None
+        self.tokenizer: Tokenizer | None = None
         self._silence_token_id: int | None = None
         self._terminal_request_ids: set[str] = set()
-        self._user_token_ids: dict[str, list[int]] = {}
-        self._user_text_cursors: dict[str, str] = {}
+        self.user_decoders: dict[str, decoders.DecodeStream] = {}
         self._tool_call_sequences: dict[str, int] = {}
 
     def configure_text_decoder(
         self,
-        decode_tokens: DecodeTokens,
+        tokenizer: Tokenizer,
         *,
         silence_token_id: int,
     ) -> None:
-        self._decode_tokens = decode_tokens
+        self.tokenizer = tokenizer
         self._silence_token_id = silence_token_id
 
     @property
@@ -65,8 +64,6 @@ class DuplexIODataPlaneSession:
 
     def begin_request(self, request_id: str) -> None:
         self._terminal_request_ids.discard(request_id)
-        self._user_token_ids.setdefault(request_id, [])
-        self._user_text_cursors.setdefault(request_id, "")
 
     def is_terminal(self, request_id: str | None) -> bool:
         return request_id in self._terminal_request_ids if request_id else False
@@ -93,12 +90,8 @@ class DuplexIODataPlaneSession:
             for request_id in self._terminal_request_ids
             if not duplex_resource_request_belongs_to_session(request_id, session_id)
         }
-        self._user_token_ids = self._without_session_requests(
-            self._user_token_ids,
-            session_id,
-        )
-        self._user_text_cursors = self._without_session_requests(
-            self._user_text_cursors,
+        self.user_decoders = self._without_session_requests(
+            self.user_decoders,
             session_id,
         )
         self._tool_call_sequences = self._without_session_requests(
@@ -107,8 +100,7 @@ class DuplexIODataPlaneSession:
         )
 
     def _discard_request_state(self, request_id: str) -> None:
-        self._user_token_ids.pop(request_id, None)
-        self._user_text_cursors.pop(request_id, None)
+        self.user_decoders.pop(request_id, None)
         self._tool_call_sequences.pop(request_id, None)
 
     @staticmethod
@@ -277,35 +269,12 @@ class DuplexIODataPlaneSession:
         if (
             token_id is None
             or token_id == self._silence_token_id
-            or self._decode_tokens is None
+            or self.tokenizer is None
         ):
             return ""
-        token_ids = self._user_token_ids.setdefault(request_id, [])
-        token_ids.append(token_id)
-        text = self._decode_tokens(token_ids)
-        return self._text_delta(
-            request_id,
-            text,
-            cursors=self._user_text_cursors,
-            stream="user",
-        )
-
-    @staticmethod
-    def _text_delta(
-        request_id: str,
-        text: str,
-        *,
-        cursors: dict[str, str],
-        stream: str,
-    ) -> str:
-        previous = cursors.get(request_id, "")
-        if not text.startswith(previous):
-            raise RuntimeError(
-                f"DuplexIO accumulated {stream} text moved backwards for "
-                f"{request_id}: {text!r} does not extend {previous!r}"
-            )
-        cursors[request_id] = text
-        return text[len(previous) :]
+        if request_id not in self.user_decoders:
+            self.user_decoders[request_id] = decoders.DecodeStream(skip_special_tokens=True)
+        return self.user_decoders[request_id].step(self.tokenizer, token_id) or ""
 
 
 def _first_completion(output: object) -> object | None:

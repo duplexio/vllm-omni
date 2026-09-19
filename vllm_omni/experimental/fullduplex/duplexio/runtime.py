@@ -8,11 +8,7 @@ from __future__ import annotations
 import base64
 import binascii
 import copy
-from typing import Any, Literal
-
-import torch
-from pydantic import BaseModel, ConfigDict, field_validator
-from torch import Tensor
+from typing import Any
 
 from vllm_omni.experimental.fullduplex.duplexio.input import (
     DUPLEXIO_FRAME_BYTES,
@@ -29,27 +25,27 @@ from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 DUPLEXIO_ROW_CELL_COUNT = 6
 
 
-class PreparedUserFrame(BaseModel):
-    """One causally encoded user frame, without waveform/JSON transport."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", strict=True)
-    format: Literal["duplexio_features"]
-    features: Tensor
-    decode_audio: bool = False
-
-    @field_validator("features")
-    @classmethod
-    def validate_features(cls, features: Tensor) -> Tensor:
-        if features.ndim != 2 or features.shape[0] != 1 or features.shape[1] < 1:
-            raise ValueError("Prepared user features must have shape (1, ASR hidden size)")
-        if features.dtype != torch.float32:
-            raise ValueError("Prepared ASR features must retain the encoder's float32 output dtype")
-        return features
+def prefix_payload(prompt_frames: int, system_frames: int, *, decode_audio: bool) -> dict[str, Any]:
+    """Submit the known prefix; the scheduler may split it at frame boundaries."""
+    frames = prompt_frames + system_frames
+    return {
+        "type": "audio", "audio": "", "format": "pcm_f32le",
+        "sample_rate_hz": DUPLEXIO_SAMPLE_RATE, "frame_size": DUPLEXIO_FRAME_SIZE,
+        "frame_count": frames, "valid_samples": frames * DUPLEXIO_FRAME_SIZE,
+        "duplexio_prefill": True, "decode_audio": decode_audio,
+    }
 
 
-def duplexio_scheduler_token_budget(payload: object) -> int:
-    """Return the exact flattened-cell count represented by one PCM append."""
-    return _validated_frame_count(payload) * DUPLEXIO_ROW_CELL_COUNT
+def tool_result_payload(token_ids: list[int], *, decode_audio: bool) -> dict[str, Any]:
+    """Submit one complete tool result for scheduler-owned chunking."""
+    frames = len(token_ids)
+    return {
+        "type": "audio", "audio": "", "format": "pcm_f32le",
+        "sample_rate_hz": DUPLEXIO_SAMPLE_RATE, "frame_size": DUPLEXIO_FRAME_SIZE,
+        "frame_count": frames, "valid_samples": frames * DUPLEXIO_FRAME_SIZE,
+        "duplexio_system_input": True, "duplexio_system_token_ids": token_ids,
+        "decode_audio": decode_audio,
+    }
 
 
 def build_duplexio_data_plane_prompt(
@@ -69,44 +65,19 @@ def build_duplexio_data_plane_prompt(
         raise ValueError(f"DuplexIO does not support input mode {mode.value!r}")
     if not isinstance(payload, dict):
         raise ValueError("DuplexIO append payload must be a dictionary")
-    features = None
-    if payload.get("format") == "duplexio_features":
-        prepared = PreparedUserFrame.model_validate(payload)
-        features = prepared.features
-        payload = prepared.model_dump(exclude={"features"})
-        frame_count = 1
-    else:
-        frame_count = _validated_frame_count(payload)
+    frame_count, pcm = parse_pcm_append(payload)
+    payload = {key: value for key, value in payload.items() if key != "audio"}
     scheduler_token_budget = frame_count * DUPLEXIO_ROW_CELL_COUNT
     duplexio_prefill = payload.get("duplexio_prefill", False)
-    duplexio_prefill_final = payload.get("duplexio_prefill_final", False)
     duplexio_system_input = payload.get("duplexio_system_input", False)
-    duplexio_system_input_final = payload.get(
-        "duplexio_system_input_final",
-        False,
-    )
-    duplexio_voice_prompt = payload.get("duplexio_voice_prompt", False)
-    if not all(
-        isinstance(value, bool)
-        for value in (
-            duplexio_prefill,
-            duplexio_prefill_final,
-            duplexio_system_input,
-            duplexio_system_input_final,
-            duplexio_voice_prompt,
+    if duplexio_prefill:
+        expected_frames = runtime_config["duplexio_voice_prompt_frames"] + len(
+            runtime_config["duplexio_system_token_ids"]
         )
-    ):
-        raise ValueError("DuplexIO text-input flags must be boolean when present")
-    if duplexio_prefill_final and not duplexio_prefill:
-        raise ValueError("DuplexIO prefill_final requires duplexio_prefill")
-    if duplexio_system_input_final and not duplexio_system_input:
-        raise ValueError("DuplexIO system_input_final requires duplexio_system_input")
-    if duplexio_prefill and duplexio_system_input:
-        raise ValueError("DuplexIO prefill and system input are mutually exclusive")
-    if duplexio_voice_prompt and (duplexio_prefill or duplexio_system_input):
-        raise ValueError(
-            "DuplexIO voice prompt is its own burst, ahead of any text input"
-        )
+        if frame_count != expected_frames:
+            raise ValueError(
+                f"DuplexIO prefix has {frame_count} frames; expected the complete {expected_frames}-frame prefix"
+            )
     duplexio_system_token_ids = payload.get("duplexio_system_token_ids")
     if duplexio_system_input and (
         not isinstance(duplexio_system_token_ids, list)
@@ -121,7 +92,6 @@ def build_duplexio_data_plane_prompt(
     return {
         "prompt_token_ids": [scheduler_token_id] * scheduler_token_budget,
         "model_intermediate_buffer": {
-            "embed": {"speech_feat": features},
             "request_id": request_id,
             "global_request_id": [fence.session_id],
             "duplex": {
@@ -137,6 +107,7 @@ def build_duplexio_data_plane_prompt(
                 "turn_seq": turn_seq,
                 "mode": mode.value,
                 "payload": dict(payload),
+                "pcm": pcm,
                 "final": final,
                 "session_config": dict(session_config),
                 "runtime_config": dict(runtime_config),
@@ -145,10 +116,7 @@ def build_duplexio_data_plane_prompt(
                 "scheduler_token_budget": scheduler_token_budget,
                 "scheduler_token_id": scheduler_token_id,
                 "duplexio_prefill": duplexio_prefill,
-                "duplexio_prefill_final": duplexio_prefill_final,
                 "duplexio_system_input": duplexio_system_input,
-                "duplexio_system_input_final": duplexio_system_input_final,
-                "duplexio_voice_prompt": duplexio_voice_prompt,
                 "duplexio_system_token_ids": duplexio_system_token_ids,
                 "decode_audio": payload.get("decode_audio", True),
             },
@@ -174,9 +142,8 @@ class DuplexIORuntimeExtension:
             params = clone() if callable(clone) else copy.copy(default)
             if hasattr(params, "max_tokens"):
                 setattr(params, "max_tokens", 1)
-            # Every append is one frame; DELTA drains the audio chunk after
-            # each segment so the resumable request does not hand cumulative
-            # audio to later frames.
+            # DELTA emits only this chunk's outputs, including when a context
+            # append spans multiple scheduler steps.
             if hasattr(params, "output_kind"):
                 setattr(params, "output_kind", RequestOutputKind.DELTA)
             configured.append(params)
@@ -237,12 +204,8 @@ class DuplexIORuntimeExtension:
         return None
 
 
-def _validated_frame_count(payload: object) -> int:
-    if not isinstance(payload, dict):
-        raise ValueError("DuplexIO append payload must be a dictionary")
-    if payload.get("format") == "duplexio_features":
-        PreparedUserFrame.model_validate(payload)
-        return 1
+def parse_pcm_append(payload: dict[str, Any]) -> tuple[int, bytes | None]:
+    """Validate wire framing and decode PCM once, before worker transport."""
     if payload.get("format") != "pcm_f32le":
         raise ValueError("DuplexIO data plane requires format='pcm_f32le'")
     if payload.get("sample_rate_hz") != DUPLEXIO_SAMPLE_RATE:
@@ -254,17 +217,17 @@ def _validated_frame_count(payload: object) -> int:
         raise ValueError("DuplexIO frame_count must be a positive integer")
     is_prefill = payload.get("duplexio_prefill", False)
     is_system_input = payload.get("duplexio_system_input", False)
-    is_voice_prompt = payload.get("duplexio_voice_prompt", False)
-    if not all(isinstance(flag, bool) for flag in (is_prefill, is_system_input, is_voice_prompt)):
+    if not all(isinstance(flag, bool) for flag in (is_prefill, is_system_input)):
         raise ValueError("DuplexIO context-input flags must be boolean when present")
-    if sum((is_prefill, is_system_input, is_voice_prompt)) > 1:
-        raise ValueError("DuplexIO prefill, system input and voice prompt are mutually exclusive")
-    is_context_input = is_prefill or is_system_input or is_voice_prompt
+    if is_prefill and is_system_input:
+        raise ValueError("DuplexIO prefill and system input are mutually exclusive")
+    is_context_input = is_prefill or is_system_input
     if frame_count != 1 and not is_context_input:
         raise ValueError("DuplexIO live audio requires exactly one frame per append")
     audio = payload.get("audio")
     if not isinstance(audio, str):
         raise ValueError("DuplexIO data plane requires base64 audio")
+    raw = None
     if is_context_input:
         if audio:
             raise ValueError("DuplexIO context audio is supplied by the model")
@@ -284,12 +247,11 @@ def _validated_frame_count(payload: object) -> int:
         raise ValueError("DuplexIO valid_samples is outside the framed PCM payload")
     if is_context_input and valid_samples != frame_count * DUPLEXIO_FRAME_SIZE:
         raise ValueError("DuplexIO context input must contain complete frames")
-    return frame_count
+    return frame_count, raw
 
 
 __all__ = [
     "DUPLEXIO_ROW_CELL_COUNT",
     "DuplexIORuntimeExtension",
     "build_duplexio_data_plane_prompt",
-    "duplexio_scheduler_token_budget",
 ]

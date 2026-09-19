@@ -22,7 +22,8 @@ stages:
     # cells grow with this: 12288 frames * 4 text cells * 32 KiB/token is 1.6 GB
     # of the reserved KV cache.
     max_model_len: 73728
-    max_num_batched_tokens: 4096
+    # Scheduler chunks contain whole six-cell frames across all streams.
+    max_num_batched_tokens: 6144
     # FlexAttention tiles pages, so the page must be a power of two. Without
     # this the hybrid cache would derive 528 tokens per page from the mamba
     # state size. 1024 spans the same slots in fewer, larger pages.
@@ -35,8 +36,7 @@ stages:
     compilation_config:
       # mode 0: capture CUDA graphs without an inductor pass. The model calls
       # quack GEMMs through a torch.compiler.disable()d boundary, which a
-      # fullgraph dynamo trace rejects; this is also the mode the rollout
-      # actors are measured in (duplexio_opd_h100*.yaml).
+      # fullgraph dynamo trace rejects.
       mode: 0
       # With max_num_seqs=1, every live append is one uniform six-cell frame.
       # Larger system/tool prefills run eagerly outside this graph.

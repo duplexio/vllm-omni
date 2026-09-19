@@ -22,7 +22,7 @@ def test_default_deploy_uses_flexattention_compatible_tiles() -> None:
     # 12288 frames of six cells: a 16-minute session, past the model's
     # 4096-frame audio window so the audio ring actually recycles slots.
     assert stage.max_model_len == 12288 * 6
-    assert stage.max_num_batched_tokens == 4096
+    assert stage.max_num_batched_tokens == 1024 * 6
     assert deploy.enable_chunked_prefill
     assert not stage.enforce_eager
     # mode 0: graph capture without an inductor pass, because a fullgraph
@@ -45,6 +45,8 @@ def test_multistream_deploy_uses_batched_flexattention_path() -> None:
     assert deploy.active_stream_window == 2
     assert deploy.duplex_session.max_sessions == 2
     assert stage.max_num_seqs == 2
+    assert stage.max_num_batched_tokens == 1024 * 6
+    assert deploy.enable_chunked_prefill
     assert not stage.enforce_eager
     assert stage.compilation_config == {
         "mode": 0,

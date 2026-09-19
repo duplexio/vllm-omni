@@ -9,7 +9,7 @@ import base64
 import binascii
 import secrets
 from collections.abc import Callable, Mapping
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -25,6 +25,7 @@ from vllm_omni.experimental.fullduplex.duplexio.input import (
     DUPLEXIO_FRAME_SIZE,
     DUPLEXIO_SAMPLE_RATE,
 )
+from vllm_omni.experimental.fullduplex.duplexio.runtime import prefix_payload, tool_result_payload
 from vllm_omni.experimental.fullduplex.duplexio.session import (
     DuplexIOServingSessionState,
 )
@@ -35,24 +36,13 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     ServingRuntimeConfigError,
 )
+from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig, sampling_runtime
 from vllm_omni.model_executor.models.duplexio.tool_calling import (
     tool_call_grammar,
 )
 
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
-PREFILL_CHUNK_FRAMES = 128
 CLIENT_SAMPLING_CONFIG_KEY = "duplexio_sampling"
-
-
-class DuplexIOTextSamplingConfig(BaseModel):
-    """Client overrides for the DuplexIO text-token sampler."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    mode: Literal["argmax", "top_k", "top_p"] | None = None
-    temperature: float | None = Field(default=None, gt=0)
-    top_k: int | None = Field(default=None, ge=1)
-    top_p: float | None = Field(default=None, gt=0, le=1)
 
 
 class DuplexIOAudioSamplingConfig(BaseModel):
@@ -64,25 +54,13 @@ class DuplexIOAudioSamplingConfig(BaseModel):
     top_k: int | None = Field(default=None, ge=1)
 
 
-class DuplexIOEmitSamplingConfig(BaseModel):
-    """Per-stream temperatures for binary emit decisions."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    user: float | None = Field(default=None, ge=0)
-    agent: float | None = Field(default=None, ge=0)
-    tool_call: float | None = Field(default=None, ge=0)
-
-
-class DuplexIOClientSamplingConfig(BaseModel):
+class DuplexIOClientSamplingConfig(SamplingConfig):
     """Validated public sampling configuration for one DuplexIO session."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
     seed: int | None = Field(default=None, ge=0, lt=2**63)
-    text: DuplexIOTextSamplingConfig | None = None
     audio: DuplexIOAudioSamplingConfig | None = None
-    emit: DuplexIOEmitSamplingConfig | None = None
 
 
 def parse_client_sampling_config(
@@ -117,6 +95,7 @@ class DuplexIOServingRuntimeAdapter:
             "duplexio_voice_clip_index",
             "duplexio_depth_sampling",
             "duplexio_emit_temperatures",
+            "duplexio_user_sampling",
             "duplexio_text_sampling",
             "duplexio_tools",
             "duplexio_tool_choice",
@@ -242,10 +221,7 @@ class DuplexIOServingRuntimeAdapter:
             raise ValueError("DuplexIO checkpoint is missing silence_token_id")
         self.tokenizer = tokenizer
         self.data_plane.configure_text_decoder(
-            lambda token_ids: tokenizer.decode(
-                token_ids,
-                skip_special_tokens=True,
-            ),
+            tokenizer.backend_tokenizer,
             silence_token_id=silence_token_id,
         )
         system_token_ids = tokenizer.encode(
@@ -262,22 +238,9 @@ class DuplexIOServingRuntimeAdapter:
             add_special_tokens=False,
         )
         client_sampling = parse_client_sampling_config(config.extra_body)
-        text_sampling = dict(getattr(hf_config, "rollout_sampling_config", {}))
-        if client_sampling.text is not None:
-            text_sampling.update(
-                client_sampling.text.model_dump(exclude_none=True)
-            )
+        policies = sampling_runtime(client_sampling)
         if config.temperature is not None:
-            text_sampling["temperature"] = config.temperature
-        emit_temperatures = {
-            "user": 1.0,
-            "agent": 1.0,
-            "tool_call": 1.0,
-        }
-        if client_sampling.emit is not None:
-            emit_temperatures.update(
-                client_sampling.emit.model_dump(exclude_none=True)
-            )
+            policies["duplexio_text_sampling"]["temperature"] = config.temperature
         depth_sampling = {
             "temperature": 0.7,
             "top_k": depth.get("sampling_top_k", 250),
@@ -304,13 +267,14 @@ class DuplexIOServingRuntimeAdapter:
                     )
             depth_sampling.update(audio_sampling)
         return {
+            **policies,
             "instructions": config.instructions,
             "duplexio_system_token_ids": [
                 int(token)
                 for token in (*system_token_ids, *initial_prefix_ids)
             ],
             "duplexio_start_role": start_role,
-            "duplexio_voice_prompt_audio": voice_prompt,
+            "duplexio_voice_prompt_pcm": voice_prompt,
             "duplexio_voice_prompt_frames": voice_prompt_frames,
             "duplexio_scheduler_token_id": scheduler_token_id,
             "duplexio_sampling_seed": (
@@ -318,8 +282,6 @@ class DuplexIOServingRuntimeAdapter:
                 if client_sampling.seed is not None
                 else secrets.randbits(63)
             ),
-            "duplexio_emit_temperatures": emit_temperatures,
-            "duplexio_text_sampling": text_sampling,
             "duplexio_tools": tools,
             "duplexio_tool_choice": tool_choice,
             "duplexio_depth_sampling": depth_sampling,
@@ -330,7 +292,7 @@ class DuplexIOServingRuntimeAdapter:
         self,
         session: object,
     ) -> tuple[dict[str, object], ...]:
-        """Return bounded zero-audio frame batches for the training prompt."""
+        """Return the complete speaker and system prefix in one append."""
         runtime_config = getattr(session, "runtime_config", None)
         if not isinstance(runtime_config, Mapping):
             raise RuntimeError("DuplexIO session is missing runtime_config")
@@ -349,48 +311,9 @@ class DuplexIOServingRuntimeAdapter:
             raise RuntimeError(
                 "DuplexIO session runtime_config has no pinned voice-prompt frames"
             )
-        payloads = []
-        # The pinned voice prompt comes first: the reference the agent's voice is
-        # cloned from precedes the instructions it is supposed to speak.
-        for offset in range(0, prompt_frames, PREFILL_CHUNK_FRAMES):
-            frame_count = min(PREFILL_CHUNK_FRAMES, prompt_frames - offset)
-            payloads.append({
-                "type": "audio",
-                "audio": "",
-                "format": "pcm_f32le",
-                "sample_rate_hz": DUPLEXIO_SAMPLE_RATE,
-                "frame_size": DUPLEXIO_FRAME_SIZE,
-                "frame_count": frame_count,
-                "valid_samples": frame_count * DUPLEXIO_FRAME_SIZE,
-                "force_listen": False,
-                "is_speech": False,
-                "duplex_turn_id": turn_id,
-                "duplexio_voice_prompt": True,
-            })
-        if not system_token_ids:
-            return tuple(payloads)
-        for offset in range(0, len(system_token_ids), PREFILL_CHUNK_FRAMES):
-            frame_count = min(
-                PREFILL_CHUNK_FRAMES,
-                len(system_token_ids) - offset,
-            )
-            payloads.append({
-                "type": "audio",
-                "audio": "",
-                "format": "pcm_f32le",
-                "sample_rate_hz": DUPLEXIO_SAMPLE_RATE,
-                "frame_size": DUPLEXIO_FRAME_SIZE,
-                "frame_count": frame_count,
-                "valid_samples": frame_count * DUPLEXIO_FRAME_SIZE,
-                "force_listen": False,
-                "is_speech": False,
-                "duplex_turn_id": turn_id,
-                "duplexio_prefill": True,
-                "duplexio_prefill_final": (
-                    offset + frame_count == len(system_token_ids)
-                ),
-            })
-        return tuple(payloads)
+        payload = prefix_payload(prompt_frames, len(system_token_ids), decode_audio=True)
+        payload["duplex_turn_id"] = turn_id
+        return (payload,)
 
     def tool_result_data_plane_payloads(
         self,
@@ -407,28 +330,9 @@ class DuplexIOServingRuntimeAdapter:
         token_ids = self.tokenizer.encode(rendered, add_special_tokens=False)
         if not token_ids:
             raise RuntimeError("DuplexIO tokenizer produced no tool-result tokens")
-        payloads = []
-        for offset in range(0, len(token_ids), PREFILL_CHUNK_FRAMES):
-            token_chunk = token_ids[offset : offset + PREFILL_CHUNK_FRAMES]
-            frame_count = len(token_chunk)
-            payloads.append({
-                "type": "audio",
-                "audio": "",
-                "format": "pcm_f32le",
-                "sample_rate_hz": DUPLEXIO_SAMPLE_RATE,
-                "frame_size": DUPLEXIO_FRAME_SIZE,
-                "frame_count": frame_count,
-                "valid_samples": frame_count * DUPLEXIO_FRAME_SIZE,
-                "force_listen": False,
-                "is_speech": False,
-                "duplex_turn_id": turn_id,
-                "duplexio_system_input": True,
-                "duplexio_system_input_final": (
-                    offset + frame_count == len(token_ids)
-                ),
-                "duplexio_system_token_ids": token_chunk,
-            })
-        return tuple(payloads)
+        payload = tool_result_payload(token_ids, decode_audio=True)
+        payload["duplex_turn_id"] = turn_id
+        return (payload,)
 
     @classmethod
     def runtime_config_for_update(
@@ -489,8 +393,15 @@ class DuplexIOServingRuntimeAdapter:
         # The voice is pinned reference audio, already in the cache's pinned
         # region: it cannot be swapped without starting a new session.
         reference = config.extra_body.get("ref_audio_data")
+        if reference is not None:
+            try:
+                reference = base64.b64decode(reference, validate=True)
+            except (ValueError, binascii.Error, TypeError) as error:
+                raise DuplexIOClientRuntimeConfigError(
+                    "Invalid DuplexIO ref_audio_data", code="ref_audio_invalid",
+                ) from error
         if reference is not None and reference != current.get(
-            "duplexio_voice_prompt_audio"
+            "duplexio_voice_prompt_pcm"
         ):
             raise DuplexIOClientRuntimeConfigError(
                 "DuplexIO cannot change the reference audio after a session is "
@@ -641,15 +552,8 @@ def render_tool_system_prompt(
 def _voice_prompt_from_session(
     config: DuplexSessionConfig,
     hf_config: object,
-) -> tuple[str, int]:
-    """Return the session's reference audio and how many frames it pins.
-
-    A voice is audio, not a name: the caller supplies the clip the agent's voice
-    is cloned from, the same way this repo's other native-duplex models take
-    ``ref_audio_data``. The bytes stay base64 here and are decoded once at the
-    model boundary, so a ten-second clip never becomes a quarter-million-element
-    Python list on the way.
-    """
+) -> tuple[bytes, int]:
+    """Decode reference PCM and decide its pinned frame count at ingestion."""
     extra_body = config.extra_body
     for rejected in ("ref_audio_path", "tts_ref_audio_path"):
         if rejected in extra_body or getattr(config, rejected, None):
@@ -699,7 +603,7 @@ def _voice_prompt_from_session(
             "DuplexIO reference audio is shorter than one 80 ms frame",
             code="ref_audio_too_short",
         )
-    return audio_data, frames
+    return raw, frames
 
 
 def _validate_full_duplex_mode(config: DuplexSessionConfig) -> None:

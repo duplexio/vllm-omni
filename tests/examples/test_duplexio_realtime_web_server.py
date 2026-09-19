@@ -86,7 +86,7 @@ def test_index_exposes_sample_clips() -> None:
                 "top_p": 0.95,
             },
             "audio": {"temperature": 0.8, "top_k": 250},
-            "emit": {"user": 0.0, "agent": 0.6, "tool_call": 0.6},
+            "emit": {"agent": 0.6, "tool_call": 0.6},
         },
     )
 
@@ -103,12 +103,6 @@ def test_sampling_defaults_apply_serving_temperatures(tmp_path: Path) -> None:
     config_path.write_text(
         json.dumps(
             {
-                "rollout_sampling_config": {
-                    "mode": "top_p",
-                    "temperature": 0.6,
-                    "top_k": 20,
-                    "top_p": 0.95,
-                },
                 "depth_transformer_config": {
                     "sampling_temperature": 0.8,
                     "sampling_top_k": 250,
@@ -119,14 +113,9 @@ def test_sampling_defaults_apply_serving_temperatures(tmp_path: Path) -> None:
     )
 
     assert server.load_sampling_defaults(config_path) == {
-        "text": {
-            "mode": "top_p",
-            "temperature": 0.6,
-            "top_k": 20,
-            "top_p": 0.95,
-        },
+        "agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.6, "top_k": 20, "top_p": 0.95}},
+        "user": {"emission": {"temperature": 0.0}, "content": {"temperature": 0.0, "top_k": None, "top_p": None}},
         "audio": {"temperature": 0.7, "top_k": 250},
-        "emit": {"user": 0.0, "agent": 1.0, "tool_call": 1.0},
     }
 
 
@@ -139,12 +128,6 @@ def test_sampling_defaults_omit_audio_for_continuous_checkpoint(
         json.dumps(
             {
                 "audio_representation": "continuous",
-                "rollout_sampling_config": {
-                    "mode": "top_p",
-                    "temperature": 0.6,
-                    "top_k": 20,
-                    "top_p": 0.95,
-                },
                 "flowmap_config": {"sampling_temperature": 0.3},
             }
         ),
@@ -152,13 +135,8 @@ def test_sampling_defaults_omit_audio_for_continuous_checkpoint(
     )
 
     assert server.load_sampling_defaults(config_path) == {
-        "text": {
-            "mode": "top_p",
-            "temperature": 0.6,
-            "top_k": 20,
-            "top_p": 0.95,
-        },
-        "emit": {"user": 0.0, "agent": 1.0, "tool_call": 1.0},
+        "agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.6, "top_k": 20, "top_p": 0.95}},
+        "user": {"emission": {"temperature": 0.0}, "content": {"temperature": 0.0, "top_k": None, "top_p": None}},
     }
 
 

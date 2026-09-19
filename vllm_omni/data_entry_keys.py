@@ -8,6 +8,7 @@ Categories under ``OmniPayload``:
     ids            – token-ID sequences
     codes          – codec / audio code tensors
     meta           – scalar metadata, control flags, shapes
+    chunk          – per-chunk output metadata, replaced rather than concatenated
 """
 
 from __future__ import annotations
@@ -94,6 +95,7 @@ class OmniPayloadMeta(TypedDict, total=False):
 
 
 class OmniPayload(TypedDict, total=False):
+    chunk: dict[str, Any]
     hidden_states: HiddenStates
     embed: Embeddings
     ids: Ids
@@ -192,6 +194,7 @@ class MetaStruct(_StructBase):
 
 
 class OmniPayloadStruct(_StructBase):
+    chunk: dict[str, Any] | None = None
     hidden: torch.Tensor | None = None
     hidden_states: HiddenStatesStruct | None = None
     embed: EmbeddingsStruct | None = None
@@ -299,7 +302,7 @@ def _dtype_to_name(dtype: torch.dtype) -> str:
 
 
 # ── Keys whose values are nested dicts (TypedDict sub-categories) ──
-_NESTED_KEYS = frozenset({"hidden_states", "embed", "ids", "codes", "meta"})
+_NESTED_KEYS = frozenset({"hidden_states", "embed", "ids", "codes", "meta", "chunk"})
 
 
 def flatten_payload(payload: dict[str, Any]) -> dict[str, Any]:

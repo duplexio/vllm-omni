@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from tokenizers import Tokenizer, decoders, models
 
 from vllm_omni.experimental.fullduplex.duplexio.data_plane import (
     DuplexIODataPlaneContext,
@@ -16,6 +17,57 @@ from vllm_omni.experimental.fullduplex.duplexio.data_plane import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture
+def byte_tokenizer() -> Tokenizer:
+    tokenizer = Tokenizer(models.BPE(
+        vocab={f"<0x{byte:02X}>": byte for byte in range(256)},
+        merges=[], byte_fallback=True,
+    ))
+    tokenizer.decoder = decoders.ByteFallback()
+    tokenizer.add_special_tokens(["<special>"])
+    return tokenizer
+
+
+@pytest.mark.parametrize("text", ["👋", "Ḥasan", "ǒ", "hello 👋 Ḥasan"])
+def test_user_text_buffers_incomplete_utf8(byte_tokenizer: Tokenizer, text: str) -> None:
+    session = DuplexIODataPlaneSession(lambda *_args: None)
+    session.configure_text_decoder(byte_tokenizer, silence_token_id=257)
+    deltas = []
+    for token_id in text.encode("utf-8"):
+        result = session.project_output(
+            SimpleNamespace(
+                request_id="request-1", outputs=[SimpleNamespace(text="")],
+                multimodal_output={"user_token_id": token_id, "model_listen": True},
+            ),
+            context=DuplexIODataPlaneContext(),
+        )
+        deltas.append(result.get("input_text_delta", ""))
+    assert "�" not in "".join(deltas)
+    assert "".join(deltas) == text
+
+
+def test_user_decoders_are_request_local_and_cleaned_up(byte_tokenizer: Tokenizer) -> None:
+    session = DuplexIODataPlaneSession(lambda *_args: None)
+    session.configure_text_decoder(byte_tokenizer, silence_token_id=257)
+    first, second = "request-1", "request-2"
+    emoji = list("👋".encode())
+    assert session._user_text_delta(first, emoji[0]) == ""
+    assert session._user_text_delta(second, ord("a")) == "a"
+    session.begin_request(first)  # An append must preserve the pending character.
+    assert session._user_text_delta(first, 257) == ""
+    assert session._user_text_delta(first, emoji[1]) == ""
+    assert session._user_text_delta(first, emoji[2]) == ""
+    assert session._user_text_delta(first, emoji[3]) == "👋"
+    assert session._user_text_delta(second, 256) == ""  # Special token.
+    session.mark_terminal(first)
+    session.close_stream(second)
+    assert not session.user_decoders
+    session.begin_request(first)
+    assert session._user_text_delta(first, ord("b")) == "b"
+    session.close_session("session", active_request_id=first)
+    assert not session.user_decoders
 
 
 def test_data_plane_projects_one_native_audio_frame_and_text() -> None:
@@ -199,9 +251,10 @@ def test_data_plane_passes_per_frame_audio_deltas_through() -> None:
 
 def test_data_plane_emits_agent_and_user_text_deltas() -> None:
     session = DuplexIODataPlaneSession(lambda *_args: None)
-    decoded = {7: "you", 8: "you there"}
+    tokenizer = Tokenizer(models.BPE({"you": 7, "Ġthere": 8}, []))
+    tokenizer.decoder = decoders.ByteLevel()
     session.configure_text_decoder(
-        lambda token_ids: decoded[token_ids[-1]],
+        tokenizer,
         silence_token_id=2,
     )
     session.begin_request("request-1")
@@ -235,7 +288,7 @@ def test_data_plane_emits_agent_and_user_text_deltas() -> None:
 def test_data_plane_ignores_user_silence_tokens() -> None:
     session = DuplexIODataPlaneSession(lambda *_args: None)
     session.configure_text_decoder(
-        lambda _token_ids: "must not decode",
+        Tokenizer(models.BPE()),
         silence_token_id=2,
     )
 

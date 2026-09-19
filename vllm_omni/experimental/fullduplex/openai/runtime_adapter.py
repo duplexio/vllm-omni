@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping
+from collections.abc import Iterable, Mapping, MutableMapping
 from importlib import import_module
 from typing import Any, Protocol
 
@@ -76,13 +75,6 @@ class ServingRuntimeSessionState(Protocol):
     committed_audio_reserved_bytes: int
     deferred_response_create: bool
     deferred_precreate_response: bool
-    data_plane_task: asyncio.Task[None] | None
-    data_plane_restart_requested: bool
-    continuation_owner_id: str | None
-    continuation_units: int
-    pending_silence_task: asyncio.Task[bool] | None
-    pending_silence_owner_id: str | None
-    silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None
 
     def retain_committed_audio(
         self,
@@ -94,7 +86,6 @@ class ServingRuntimeSessionState(Protocol):
 
     def clear_committed_audio(self) -> int: ...
 
-    def clear_continuation(self) -> None: ...
 
 
 class RuntimeDataPlane(Protocol):

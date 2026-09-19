@@ -116,14 +116,15 @@ def test_frontend_sends_sampling_parameters_before_session_start() -> None:
     app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
 
     assert '<fieldset id="sampling-picker">' in index
-    assert 'id="text-sampling-mode"' in index
+    assert 'id="text-sampling-mode"' not in index
     assert 'id="audio-temperature"' in index
-    assert 'id="user-emit-temperature"' in index
     assert 'id="agent-emit-temperature"' in index
-    assert 'id="tool-call-emit-temperature"' in index
+    assert 'id="tool-call-emit-temperature"' not in index
+    assert "sampling.agent?.content" in app
+    assert "sampling.agent?.emission" in app
     assert "const sessionSampling = samplingOptions();" in app
     assert "duplexio_sampling: sessionSampling" in app
-    assert "emit.tool_call.toFixed(1)" in app
+    assert "agentEmitTemperature.value = emit.temperature" in app
     assert "samplingPicker.disabled = true" in app
     assert "samplingPicker.disabled = false" in app
 

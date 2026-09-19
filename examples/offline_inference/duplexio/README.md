@@ -1,14 +1,34 @@
-# DuplexIO batched OPD implementation
+# DuplexIO native inference
+
+## Ownership
+
+The application runners now live in the DuplexIO training repository:
+`duplexio.scripts.run_opd_actor`, `duplexio.scripts.run_rollouts`, and
+`duplexio.scripts.run_self_play`. Dataset preparation, simulated tool execution,
+trajectory assembly, and trainer-specific weight exchange live there too.
+The inference implementation in this repository is shared by deployed serving
+and rollout callers; it does not implement OPD/RL objectives or eligibility rules.
+Actor deployment presets are in DuplexIO's `configs/rollout/`.
 
 Worktree branch: `codex/duplexio-opd-batching`.
 
 ## Current training alignment, 2026-09-18
 
-Serving targets version-six exports and the current training model. Voice prompts
+Serving targets version-seven exports and the current training model. Voice prompts
 are pinned reference-audio rows, distinct from live audio. Both user and agent
 encoders consume context silence in frame order, including text prefixes and tool
 results. Generated agent PCM advances the input encoder's history; sampled audio
 representations remain the model's live feedback.
+
+The entire initial prefix is one append: speaker-reference frames followed by
+system-token frames. The user encoder consumes silence for that whole timeline;
+the agent encoder consumes the reference waveform followed by system-frame
+silence. The scheduler splits this prefix into whole six-cell frames under its
+token budget. Each chunk passes through audio encoding and the backbone, carrying
+codec, ASR, KV, and recurrent state into the next chunk. Sampling begins only when
+the complete prefix has been consumed; trajectory recording retains every chunk.
+Only its last row is sampled, then rollout proceeds one live frame at a time.
+Offline rollouts, online sessions, and self-play use the same prefix payload.
 
 Offline rollouts submit one input per conversation and collect its output before
 submitting the next. Conversations run concurrently, and tool requests run
@@ -23,13 +43,37 @@ predictions. Live weight refresh excludes only the unused system/user per-cell o
 projections. The trained full-frame user projection and user emit head are loaded
 and refreshed along with the other policy weights.
 
-See [PARITY.md](PARITY.md) for current tests and their scope. Previous throughput
-numbers below predate this change. Maintaining encoder history requires decoding
-agent audio even when output PCM is suppressed; throughput has not been measured
-for this path. A current real-checkpoint, whole-engine comparison and the complete
-OPD update loop remain unvalidated.
+See [PARITY.md](PARITY.md) for current tests and their scope, including the
+remaining BF16 ASR numerical/quality caveat. Historical throughput numbers below
+predate this change. Maintaining encoder history requires decoding agent audio
+even when output PCM is suppressed. The complete OPD update loop remains
+unvalidated with the new prefix path.
 
 ## Learned user-token feedback
+
+Sampling settings belong to the caller, not the model export. Offline entry points
+require `--sampling-config` with a JSON object containing independent `agent` and
+`user` settings:
+
+```json
+{
+  "agent": {
+    "emission": {"temperature": 1.0},
+    "content": {"temperature": 0.6, "top_k": 20, "top_p": 0.95}
+  },
+  "user": {
+    "emission": {"temperature": 1.0},
+    "content": {"temperature": 1.0}
+  }
+}
+```
+
+This explores both user actions during joint ASR RL/OPD. Omitted content filters
+mean full-vocabulary sampling. Temperature zero is greedy, independently for
+emission and content. For deterministic ASR evaluation or serving, set both user
+temperatures to zero. Realtime sessions accept the same object under
+`duplexio_sampling` (with optional `audio` settings and `seed`); their default user
+temperatures are zero. There is no sampling `mode` or adjustable emission threshold.
 
 The user stream uses `user_emit_head(h[t].flatten())` and the shared vocabulary
 head applied to `user_token_projection(h[t].flatten())`. Each predictor consumes
@@ -169,16 +213,15 @@ passed 70 focused sampler, codec, replay, and conditional-KL tests.
 Prepared ASR frames use the existing typed `embed.speech_feat` transport field and
 are transferred together before per-request preprocessing. Real streaming encoder
 outputs are FP32, even when its weights are BF16; no output cast is introduced.
-The offline driver continuously refills independent sessions, recording actual
-consumed inputs and explicit predictor rows. Its full-engine execution is still
-under validation. Live frames carry their user token explicitly. The old PCM-only
-realtime client has not yet been migrated to provide that user-token contract.
+The DuplexIO harness continuously refills independent sessions, recording actual
+consumed inputs and explicit predictor rows. Serving samples user tokens and feeds
+them into the following live frame; callers do not inject reference transcripts.
 
 The training-side `duplexio/opd.py` packs recorded trajectories without padding
 and selects only emitted-agent predictor rows. Its conditional forward-KL helper
 passes dense-reference value/gradient tests, including student-only vocabulary
-entries. Teacher context construction and a complete optimizer/update loop remain
-unimplemented; this is not yet an end-to-end OPD trainer.
+entries. Teacher context construction and the optimizer/update loop live in the
+training repository, not in the inference implementation.
 
 The synchronous self-play runner now opens two native DuplexIO sessions per case:
 one with the Convogen agent prompt and one with the Convogen user prompt. After
@@ -201,7 +244,7 @@ precision policy; this is not a claim of bitwise equality to uncompiled BF16.
 Text filtering and frame-input construction are also compiled. See PARITY.md
 for the numerical checks, measured scope, and remaining CPU overhead.
 
-## Remaining work, in order
+## Historical integration checklist (2026-09-07)
 
 1. Extend whole-engine checks to a current quantized-Mimi/depth export and raw
    audio feedback, including acoustic-delay state and longer tool conversations.
@@ -226,11 +269,11 @@ engine has its own replica):
 
 ```bash
 PYTHONPATH=/path/to/duplexio:$PYTHONPATH \
-python examples/offline_inference/duplexio/prepare_convogen_pairs.py \
+python -m duplexio.scripts.prepare_self_play \
   /path/to/checkpoint /path/to/conversations.jsonl /tmp/pairs.pt \
-  --agent-voice AGENT_VOICE_ID --user-voice USER_VOICE_ID
+  --agent-voice /path/to/agent.wav --user-voice /path/to/user.wav
 
-python examples/offline_inference/duplexio/run_self_play.py \
+python -m duplexio.scripts.run_self_play \
   /path/to/checkpoint /tmp/pairs.pt /tmp/self-play \
   --policy-version checkpoint-2k \
   --agent-devices 0 1 2 3 --user-devices 4 5 6 7 \

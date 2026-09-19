@@ -9,10 +9,8 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
-    _emit_temperatures,
     _sample_emit,
     _sample_factorized_text_ids,
-    _text_sampling,
     sample_tool_token,
 )
 from vllm_omni.model_executor.models.duplexio.text_sampling import content_distribution
@@ -59,20 +57,25 @@ def fixture(device: str, *, mixed: bool):
             ),
             "duplex": {"runtime_config": {
                 "duplexio_text_sampling": {
-                    "mode": ("argmax", "top_k", "top_p")[index % 3] if mixed else "argmax",
-                    "temperature": 0.8, "top_k": len(vocab), "top_p": 0.9,
+                    "temperature": 0.8 if mixed and index % 3 else 0.0,
+                    "top_k": len(vocab), "top_p": 0.9 if index % 3 == 2 else None,
                 },
                 "duplexio_emit_temperatures": {"user": 0.6, "agent": 0.7, "tool_call": 0.9},
+                "duplexio_user_sampling": {"content": {
+                    "temperature": 0.8 if mixed and index % 3 else 0.0,
+                    "top_k": len(vocab), "top_p": 0.9 if index % 3 == 2 else None,
+                }},
             }},
         })
+        infos[-1]["duplexio_working_state"].sampling = model.resolve_sampling(infos[-1]["duplex"]["runtime_config"])
     return model, infos, len(vocab)
 
 
 def serial_sample(model, logits, emissions, info):
     """Original per-request draw order, including the synchronous tool read."""
     state = info["duplexio_working_state"]
-    sampling = _text_sampling(info, model.tool_suppressed_token_ids)
-    temperatures = _emit_temperatures(info)
+    sampling = state.sampling.tool
+    temperatures = state.sampling.emission
     agent = _sample_factorized_text_ids(
         logits[:1], emissions[:1], silence_token_id=0,
         sampling=replace(sampling, suppressed_token_ids=model.agent_suppressed_token_ids),
@@ -82,7 +85,7 @@ def serial_sample(model, logits, emissions, info):
     emit = False
     if constraint is not None and constraint.enabled and not constraint.active:
         emit = constraint.force_next_call or bool(_sample_emit(
-            emissions[1:2], 0.0 if sampling.mode == "argmax" else temperatures.tool_call,
+            emissions[1:2], temperatures.tool_call,
             generator=state.sampling_generator,
         ).item())
     tool_sample = sample_tool_token(
@@ -186,18 +189,13 @@ def test_agent_logprobs_match_the_distributions_actually_sampled(device):
 
     checked_emitted = 0
     for row, info in enumerate(infos):
-        sampling = _text_sampling(info, model.agent_suppressed_token_ids)
+        sampling = info["duplexio_working_state"].sampling.agent
         emit_logprob, token_logprob = emit_logprobs[row], token_logprobs[row]
         assert emit_logprob.shape == token_logprob.shape == (1,)
         assert emit_logprob.dtype == token_logprob.dtype == torch.float32
 
-        if sampling.mode in {"argmax", "max"}:
-            assert float(emit_logprob) == 0.0
-            assert float(token_logprob) == 0.0
-            continue
-
         emitted = int(ids[row]) != model.silence_token_id
-        scaled = emissions[row, 0].float() / _emit_temperatures(info).agent
+        scaled = emissions[row, 0].float() / info["duplexio_working_state"].sampling.emission.agent
         torch.testing.assert_close(
             emit_logprob.reshape(()),
             torch.nn.functional.logsigmoid(scaled if emitted else -scaled),
@@ -205,7 +203,7 @@ def test_agent_logprobs_match_the_distributions_actually_sampled(device):
         )
         assert float(emit_logprob) < 0.0
 
-        if not emitted:
+        if not emitted or sampling.temperature == 0:
             # A content draw discarded by a silent row took no action.
             assert float(token_logprob) == 0.0
             continue
@@ -229,7 +227,7 @@ def test_agent_logprobs_match_the_distributions_actually_sampled(device):
 def test_tool_emit_logprobs_score_all_decisions_including_forced_emit_and_wait(device, mode):
     model, infos, vocab = fixture(device, mixed=True)
     for info in infos:
-        info["duplex"]["runtime_config"]["duplexio_text_sampling"]["mode"] = mode
+        info["duplex"]["runtime_config"]["duplexio_text_sampling"]["temperature"] = 0.0 if mode == "argmax" else 0.8
     logits = torch.zeros(8, 3, vocab, device=device)
     emissions = torch.zeros(8, 3, device=device)
     emissions[:, 1] = torch.tensor([0, 0, -100, -100, -100, 100, -0.4, 0.4], device=device)

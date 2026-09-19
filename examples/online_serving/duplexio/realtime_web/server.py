@@ -9,8 +9,7 @@ import hashlib
 import hmac
 import json
 import logging
-import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode
 
@@ -21,6 +20,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
+from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
+
 logger = logging.getLogger(__name__)
 APP_DIR = Path(__file__).parent / "app"
 STATIC_DIR = APP_DIR / "static"
@@ -29,13 +30,6 @@ DEFAULT_TOOLS_PATH = Path(__file__).parent / "tools.json"
 SESSION_COOKIE_NAME = "__Host-duplexio_session"
 
 
-class TextSamplingDefaults(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    mode: str
-    temperature: float = Field(gt=0)
-    top_k: int = Field(ge=1)
-    top_p: float = Field(gt=0, le=1)
 
 
 class DepthSamplingDefaults(BaseModel):
@@ -48,7 +42,6 @@ class DepthSamplingDefaults(BaseModel):
 class CheckpointSamplingDefaults(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    rollout_sampling_config: TextSamplingDefaults
     # Only a discrete (Mimi depth-transformer) checkpoint has a client-tunable
     # audio sampler. A continuous flow-map head samples at the temperature
     # baked into its checkpoint, so it exports no depth transformer config.
@@ -82,18 +75,14 @@ def load_sampling_defaults(config_path: Path) -> dict[str, object]:
         config_path.read_text(encoding="utf-8")
     )
     depth = checkpoint.depth_transformer_config
+    sampling = SamplingConfig()
     return {
-        "text": checkpoint.rollout_sampling_config.model_dump(),
+        **sampling.model_dump(),
         **(
             {}
             if depth is None
             else {"audio": {"temperature": 0.7, "top_k": depth.sampling_top_k}}
         ),
-        "emit": {
-            "user": 0.0,
-            "agent": 1.0,
-            "tool_call": 1.0,
-        },
     }
 
 

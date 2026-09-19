@@ -298,6 +298,29 @@ async def test_async_omni_duplex_collect_waits_for_response_stage():
 
 
 @pytest.mark.asyncio
+async def test_append_collection_keeps_partial_prefills_until_segment_boundary():
+    request_id = "duplex-prefix"
+    state = ClientRequestState(request_id)
+    client = DuplexRequestClient(
+        SimpleNamespace(), SimpleNamespace(num_stages=1, log_stats=False),
+    )
+    expected = []
+    for index in range(3):
+        output = OmniRequestOutput(request_id=request_id, stage_id=0, final_output_type="audio", finished=False)
+        expected.append(output)
+        await state.queue.put(OutputMessage(
+            request_id=request_id, stage_id=0, engine_outputs=output, finished=index == 2,
+        ))
+    actual = await client.collect_outputs(
+        request_id, state, response_stage_id=0, timeout=1.0, until_segment_finished=True,
+    )
+    assert actual == expected
+    assert not actual[0].finished
+    assert actual[-1].finished
+    assert state.queue.empty()
+
+
+@pytest.mark.asyncio
 async def test_duplex_request_client_retains_output_route_at_segment_terminal():
     request_id = "duplex-sid-e0-stage0"
     request_state = ClientRequestState(request_id)

@@ -298,22 +298,22 @@ class DuplexSessionRunnerMixin:
             return False
 
         def clear_completed_pending_silence() -> None:
-            task = native.pending_silence_task
+            task = actor.tasks.pending_silence_task
             if task is not None and task.done():
-                native.pending_silence_task = None
-                native.pending_silence_owner_id = None
+                actor.tasks.pending_silence_task = None
+                actor.tasks.pending_silence_owner_id = None
 
         def mark_pending_silence_superseded() -> None:
-            task = native.pending_silence_task
+            task = actor.tasks.pending_silence_task
             if task is None:
                 return
             if task.done():
-                native.pending_silence_task = None
+                actor.tasks.pending_silence_task = None
             # Do not cancel the task or clear native_append_tail here. A
             # silence append may already have reached the Engine, and local
             # cancellation cannot retract that RPC. The sequencer preserves
             # wire order; before_append will skip silence that has not started.
-            native.pending_silence_owner_id = None
+            actor.tasks.pending_silence_owner_id = None
 
         def real_native_input_waiting() -> bool:
             clear_completed_pending_silence()
@@ -511,12 +511,12 @@ class DuplexSessionRunnerMixin:
                 response_bound=final or precreate_response,
             )
             if silence_continuation:
-                native.pending_silence_task = task
+                actor.tasks.pending_silence_task = task
 
                 def _clear_done_pending_silence(done: asyncio.Task[bool]) -> None:
-                    if native.pending_silence_task is done:
-                        native.pending_silence_task = None
-                        native.pending_silence_owner_id = None
+                    if actor.tasks.pending_silence_task is done:
+                        actor.tasks.pending_silence_task = None
+                        actor.tasks.pending_silence_owner_id = None
 
                 task.add_done_callback(_clear_done_pending_silence)
             # Let this wire-order effect start before the next mailbox event can
@@ -540,7 +540,7 @@ class DuplexSessionRunnerMixin:
             if session is None:
                 return False
             clear_completed_pending_silence()
-            pending_silence = native.pending_silence_task
+            pending_silence = actor.tasks.pending_silence_task
             if pending_silence is not None and not pending_silence.done():
                 if pending_silence is asyncio.current_task():
                     return False
@@ -555,7 +555,7 @@ class DuplexSessionRunnerMixin:
                 except Exception:
                     return False
                 clear_completed_pending_silence()
-                pending_silence = native.pending_silence_task
+                pending_silence = actor.tasks.pending_silence_task
                 if pending_silence is not None and not pending_silence.done():
                     return False
             append_tail = actor.native_append_tail
@@ -593,7 +593,7 @@ class DuplexSessionRunnerMixin:
                     expected_model_turn_id=expected_model_turn_id,
                 )
 
-            native.pending_silence_owner_id = owner_id
+            actor.tasks.pending_silence_owner_id = owner_id
             task = await start_native_append(
                 payload,
                 final=False,
@@ -601,7 +601,7 @@ class DuplexSessionRunnerMixin:
                 before_append=_still_valid,
             )
             if task is None:
-                native.pending_silence_owner_id = None
+                actor.tasks.pending_silence_owner_id = None
                 return False
             return True
 
@@ -681,9 +681,9 @@ class DuplexSessionRunnerMixin:
             if handshake is None:
                 return
             session = handshake.session
+            actor.tasks = session.tasks
             if handshake.resumed:
                 native = self._serving_runtime_adapter.session_states[session.session_id]
-                actor.tasks = self._session_tasks[session.session_id]
                 persisted_protocol = self._realtime_protocols.get(session.session_id)
                 if persisted_protocol is None:
                     raise RuntimeError(f"Missing Realtime protocol state for resumed session {session.session_id}")
@@ -697,10 +697,9 @@ class DuplexSessionRunnerMixin:
                 reader_task = asyncio.create_task(read_event_loop(), name="duplex-session-reader")
             else:
                 self._serving_runtime_adapter.session_states[session.session_id] = native
-                self._session_tasks[session.session_id] = actor.tasks
                 if realtime_protocol is not None:
                     self._realtime_protocols[session.session_id] = realtime_protocol
-            native.silence_continuation_scheduler = schedule_native_silence_continuation
+            actor.tasks.silence_continuation_scheduler = schedule_native_silence_continuation
             if realtime_protocol is not None:
                 session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
             if not handshake.resumed:
@@ -998,7 +997,7 @@ class DuplexSessionRunnerMixin:
                     had_native_append = await actor.cancel_append_tasks(
                         response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
                     )
-                    had_native_stream = native.data_plane_task is not None
+                    had_native_stream = actor.tasks.data_plane_task is not None
                     cancelled = await self._cancel_active_response(
                         session,
                         actor.active_response_task,
@@ -1433,7 +1432,7 @@ class DuplexSessionRunnerMixin:
                                 native.input_since_commit = False
                                 native.speech_since_commit = False
                                 await actor.cancel_append_tasks()
-                                had_native_stream = native.data_plane_task is not None
+                                had_native_stream = actor.tasks.data_plane_task is not None
                                 cancelled = await self._cancel_active_response(
                                     session,
                                     actor.active_response_task,
@@ -1657,7 +1656,7 @@ class DuplexSessionRunnerMixin:
                         if (
                             not has_pending_native_audio
                             and not actor.native_append_tasks
-                            and native.data_plane_task is None
+                            and actor.tasks.data_plane_task is None
                         ):
                             await emit_event(
                                 {
@@ -1800,12 +1799,12 @@ class DuplexSessionRunnerMixin:
                         if (
                             native_response_in_progress()
                             or actor.native_append_tasks
-                            or native.data_plane_task is not None
+                            or actor.tasks.data_plane_task is not None
                         ):
                             if session.active_response_id is None and (
                                 session.active_request_id is not None
                                 or actor.native_append_tasks
-                                or native.data_plane_task is not None
+                                or actor.tasks.data_plane_task is not None
                             ):
                                 continue
                             await emit_event(
@@ -2026,9 +2025,9 @@ class DuplexSessionRunnerMixin:
                 if resumable_detach:
 
                     async def cancel_orphan_response_after_grace() -> None:
-                        tasks = self._session_tasks.get(session.session_id)
+                        tasks = session.tasks
                         current_session = self._registry.get(session.session_id)
-                        if tasks is None or current_session is not session or session.state != DuplexSessionState.OPEN:
+                        if current_session is not session or session.state != DuplexSessionState.OPEN:
                             return
                         await tasks.cancel_append_tasks(response_bound_only=True)
                         await self._cancel_native_data_plane_stream(session)
@@ -2074,7 +2073,6 @@ class DuplexSessionRunnerMixin:
                         await self._close_runtime_session(session, reason="disconnect")
                     self._cleanup_duplex_session_state(session)
                     self._registry.close(session.session_id)
-                    self._session_tasks.pop(session.session_id, None)
                     self._realtime_protocols.pop(session.session_id, None)
                     self._lease_generations.pop(session.session_id, None)
                     self._resync_required_sessions.discard(session.session_id)

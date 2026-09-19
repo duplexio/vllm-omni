@@ -17,8 +17,8 @@ def test_argmax_emission_is_deterministic_at_default_temperature() -> None:
         logits,
         torch.full((128,), 0.01),
         silence_token_id=0,
-        sampling=TokenSamplingOptions("argmax", 1.0, 3, 1.0, torch.tensor([0], dtype=torch.long)),
-        emit_temperature=1.0,
+        sampling=TokenSamplingOptions(0.0, None, None, torch.tensor([0], dtype=torch.long)),
+        emit_temperature=0.0,
         generator=generator,
     )
     assert result.tolist() == [2] * 128
@@ -32,10 +32,9 @@ def test_factorized_tokens_match_training(mode: str) -> None:
     logits = torch.randn(7, 31)
     emit_logits = torch.randn(7)
     options = training.TokenSamplingOptions(
-        mode=mode,
-        temperature=0.8,
+        temperature=0.0 if mode == "argmax" else 0.8,
         top_k=12,
-        top_p=0.9,
+        top_p=0.9 if mode == "top_p" else None,
         emit_temperature=1.0,
     )
     torch.manual_seed(37)
@@ -44,7 +43,7 @@ def test_factorized_tokens_match_training(mode: str) -> None:
         logits,
         emit_logits,
         silence_token_id=0,
-        sampling=TokenSamplingOptions(mode, 0.8, 12, 0.9, torch.tensor([0], dtype=torch.long)),
+        sampling=TokenSamplingOptions(0.0 if mode == "argmax" else 0.8, 12, 0.9 if mode == "top_p" else None, torch.tensor([0], dtype=torch.long)),
         emit_temperature=1.0,
         generator=torch.Generator().manual_seed(37),
     )
