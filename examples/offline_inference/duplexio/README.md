@@ -144,3 +144,34 @@ python examples/offline_inference/duplexio/check_flowmap_parity.py \
 The cross-repository tests explicitly skip if the training package is unavailable;
 CUDA checks skip without a GPU. The checkpoint checker requires CUDA and loads
 only the FlowMap weights. Neither command is a throughput benchmark.
+
+## Staged policy updates
+
+The OPD actor receives each trainer push into a reusable GPU staging buffer on a
+background thread and a separate CUDA stream. Existing sessions continue decoding
+under the current policy while NCCL transfers the next version. Budget additional
+GPU memory equal to the transmitted tensors (frozen modules are not transmitted).
+The first push allocates this storage; subsequent pushes with the same metadata
+reuse it.
+
+After receipt finishes, the actor closes its rollout gate, drains outstanding
+rows, and commits through the native weight loader. This is atomic with respect
+to decoding: no prediction sees an intermediate set of weights. Commit copies
+into existing parameter storage to preserve CUDA graph addresses; it is not a
+zero-copy pointer swap. Sessions retain their caches, and the policy version is
+advanced only after the commit finishes. A load failure leaves decoding stopped
+and requires restarting the actor; partial copies are not rolled back.
+
+The worker RPCs are `start_policy_weight_update(version, weights)`,
+`policy_weight_update_ready(version)`, and `commit_policy_weight_update(version)`.
+Only one version can be pending. The actor sends the existing `READY` message
+after staging starts and `UPDATED` after commit. Consequently the trainer's
+`push_weights` duration includes overlapped transfer time, not just actor pause
+time. The blocking `receive_policy_weights` RPC remains available for older
+callers that drain before receipt.
+
+Validation: Slurm job `507639` on `dgx087` passed all 23 focused tests using two
+H100s. The two-GPU test uses the training repository's actual NCCL `PolicyGroup`,
+replays a captured graph during receipt, verifies both committed versions through
+that same graph, and checks staging-buffer reuse. These tests exercise transport
+and commit with a small model; a full-checkpoint OPD rollout remains unvalidated.

@@ -192,6 +192,14 @@ class RolloutGate:
         self.outstanding += 1
         self.idle.clear()
 
+    async def wait_and_submit(self) -> None:
+        # An Event waiter may wake after pause() has closed the gate again.
+        # Recheck before counting the input, with no await between the check
+        # and increment, so a drained gate cannot admit a late submission.
+        while not self.open.is_set():
+            await self.open.wait()
+        self.submitted()
+
     def collected(self) -> None:
         self.outstanding -= 1
         if self.outstanding == 0:
@@ -285,8 +293,7 @@ async def rollout_conversation(
     async def append(payload: dict[str, Any], *, final: bool = False) -> None:
         nonlocal submitted_segments
         await pending.acquire()
-        await gate.open.wait()
-        gate.submitted()
+        await gate.wait_and_submit()
         submitted_segments += 1
         await engine.append_duplex_input_async(
             session_id,

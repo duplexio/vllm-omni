@@ -3,7 +3,8 @@
 One engine per listed GPU. Each actor registers with the trainer, joins its
 NCCL policy group, cycles the prepared conversation pool forever, streams every
 finished trajectory back, and loads new weights in place whenever the trainer
-pushes a version. Sessions pause only while an update is in flight.
+pushes a version. Transfers overlap decoding; sessions pause only for the local
+commit after all weights have arrived in a staging buffer.
 """
 
 from __future__ import annotations
@@ -57,11 +58,43 @@ def sampling_runtime(config: DuplexIOConfig) -> dict[str, Any]:
     }
 
 
-async def rpc(engine: AsyncOmni, method: str, args: tuple[Any, ...], timeout: float) -> None:
+async def rpc(engine: AsyncOmni, method: str, args: tuple[Any, ...], timeout: float) -> list[Any]:
     """Worker RPC failures come back as result dicts; treat them as fatal."""
-    for result in await engine.collective_rpc(method, args=args, timeout=timeout):
-        if isinstance(result, dict) and result.get("error"):
-            raise RuntimeError(f"{method} failed on the engine worker: {result['error']}")
+    results = []
+
+    def collect(result: Any) -> None:
+        if isinstance(result, list):
+            for item in result:
+                collect(item)
+        elif isinstance(result, dict) and (result.get("error") or result.get("todo")):
+            raise RuntimeError(f"{method} failed on the engine worker: {result}")
+        else:
+            results.append(result)
+
+    collect(await engine.collective_rpc(method, args=args, timeout=timeout))
+    if not results:
+        raise RuntimeError(f"{method} returned no worker results")
+    return results
+
+
+async def update_policy(
+    engine: AsyncOmni, gate: RolloutGate, link: ActorLink, header: dict[str, Any], timeout: float
+) -> None:
+    """Stage while rolling out, then drain and atomically publish the new version."""
+    version = header["version"]
+    await rpc(engine, "start_policy_weight_update", (version, header["weights"]), timeout)
+    link.send({"type": READY, "version": version})
+    async with asyncio.timeout(timeout):
+        while True:
+            ready = await rpc(engine, "policy_weight_update_ready", (version,), timeout)
+            if all(value is True for value in ready):
+                break
+            await asyncio.sleep(0.05)
+        await gate.pause()
+        await rpc(engine, "commit_policy_weight_update", (version,), timeout)
+    # Never reopen the gate or acknowledge a version after a failed commit.
+    gate.resume(version)
+    link.send({"type": UPDATED, "version": version})
 
 
 async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
@@ -150,11 +183,7 @@ async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
                 link.send({"type": JOINED})
             elif kind == PREPARE_UPDATE:
                 version = header["version"]
-                await gate.pause()
-                link.send({"type": READY, "version": version})
-                await rpc(engine, "receive_policy_weights", (header["weights"],), args.init_timeout)
-                gate.resume(version)
-                link.send({"type": UPDATED, "version": version})
+                await update_policy(engine, gate, link, header, args.init_timeout)
                 print(json.dumps({"actor": actor_index, "version": version, "trajectories_sent": sent}), flush=True)
             elif kind == SHUTDOWN:
                 rollouts.cancel()
@@ -164,7 +193,12 @@ async def run(args: argparse.Namespace, actor_index: int = 0) -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await rollouts  # surfaces rollout errors
     finally:
-        engine.shutdown()
+        rollouts.cancel()
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await rollouts
+        finally:
+            engine.shutdown()
 
 
 def run_actor(actor_index: int, args: argparse.Namespace) -> None:
