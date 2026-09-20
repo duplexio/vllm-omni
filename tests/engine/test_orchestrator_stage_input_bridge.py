@@ -183,6 +183,51 @@ def _request_output(request_id: str) -> RequestOutput:
 
 
 @pytest.mark.asyncio
+async def test_duplex_configuration_is_sent_once_per_stage_and_generation() -> None:
+    from dataclasses import replace
+
+    from vllm_omni.engine.serialization import deserialize_additional_information
+
+    port, pools, _, _, submission = _duplex_stage_port_submission()
+    prompt = {
+        "prompt_token_ids": [1, 2],
+        "model_intermediate_buffer": {
+            "duplex": {"session_config": {"voice": "speaker"}, "runtime_config": {"reference": b"large"}, "pcm": b"frame"},
+        },
+    }
+    submission = replace(submission, prompt=prompt)
+    await port.submit(submission)
+    first = pools[0].submit_initial.call_args.args[2]
+    first_info = deserialize_additional_information(first.model_intermediate_buffer)["duplex"]
+    assert first_info == prompt["model_intermediate_buffer"]["duplex"]
+    continuation = replace(submission, already_submitted=True)
+    await port.submit(continuation)
+    second = pools[0].submit_update.call_args.args[2]
+    assert deserialize_additional_information(second.model_intermediate_buffer)["duplex"] == {"pcm": b"frame"}
+    assert "runtime_config" in prompt["model_intermediate_buffer"]["duplex"]
+    updated = replace(continuation, context=replace(continuation.context, config_generation=1))
+    port.ensure_request(updated.context)
+    await port.submit(updated)
+    third = pools[0].submit_update.call_args.args[2]
+    assert deserialize_additional_information(third.model_intermediate_buffer)["duplex"] == first_info
+    # Another stage has not received this generation yet.
+    await port.submit(replace(updated, context=replace(updated.context, stage_id=1)))
+    other_stage = pools[1].submit_update.call_args.args[2]
+    assert deserialize_additional_information(other_stage.model_intermediate_buffer)["duplex"] == first_info
+
+
+@pytest.mark.asyncio
+async def test_failed_config_submission_does_not_mark_generation_delivered() -> None:
+    from dataclasses import replace
+
+    port, pools, states, _, submission = _duplex_stage_port_submission()
+    pools[0].submit_update.side_effect = RuntimeError("transport failure")
+    with pytest.raises(RuntimeError, match="transport failure"):
+        await port.submit(replace(submission, already_submitted=True))
+    assert states[submission.context.request_id].duplex_sent_config_generations == {}
+
+
+@pytest.mark.asyncio
 async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
     class SourceTokenizer:
         def decode(self, token_ids, *, skip_special_tokens):

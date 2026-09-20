@@ -15,7 +15,7 @@ reference = pytest.importorskip("duplexio.modules.continuous_mimi")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA codec parity")
 @torch.inference_mode()
 @torch.backends.cudnn.flags(allow_tf32=False)
-def test_context_silence_matches_training_in_original_frame_order() -> None:
+def test_real_silence_matches_training_in_acoustic_frame_order() -> None:
     torch.manual_seed(71)
     training = reference.ContinuousMimiModel().cuda().eval()
     native = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
@@ -24,7 +24,7 @@ def test_context_silence_matches_training_in_original_frame_order() -> None:
     native.audio_codec.load_state_dict(training.state_dict(), strict=True)
     native.audio_representation = ContinuousAudioRepresentation(32).cuda()
     native.vllm_config = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16))
-    # Voice prompt, text prefix, live audio, and a tool-result burst.
+    # Real audio and listening pauses; text-only context never reaches a codec.
     chunks = [
         torch.randn(2 * 1920, device="cuda") * 0.1,
         torch.zeros(3 * 1920, device="cuda"),

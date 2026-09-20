@@ -17,7 +17,39 @@ def test_attention_cache_is_bounded_by_its_window() -> None:
         _, state = attention.step(torch.randn(2, 3, 32), state)
         assert state.k.shape[1] <= 6
         assert state.v.shape == state.k.shape
-    assert state.seq_len == 30
+    assert state.seq_len.tolist() == [30, 30]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA codec")
+@pytest.mark.parametrize("operation", ["encode", "decode"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+@torch.backends.cudnn.flags(allow_tf32=False)
+def test_request_batching_preserves_different_ages_and_forks(operation, dtype):
+    torch.manual_seed(82)
+    codec = PocketMimi().to(device="cuda", dtype=dtype).eval()
+    forward = getattr(codec, operation)
+    batch_forward = getattr(codec, operation + "_batch")
+    channels, samples = (1, 1920) if operation == "encode" else (32, 1)
+    states = []
+    for age in (0, 2, 17, 23):
+        state = codec.new_state(1)
+        if age:
+            _, state = forward(torch.randn(1, channels, samples * age, device="cuda", dtype=dtype) * 0.1, state)
+        states.append(state)
+    for order in ([3, 0, 2, 1], [1, 3, 2], [2, 3]):
+        inputs = [torch.randn(1, channels, samples, device="cuda", dtype=dtype) * 0.1 for _ in order]
+        previous = [states[index] for index in order]
+        expected = [forward(value, state)[0] for value, state in zip(inputs, previous, strict=True)]
+        actual, updated = batch_forward(inputs, previous)
+        for index, value, reference, state in zip(order, actual, expected, updated, strict=True):
+            torch.testing.assert_close(value, reference, atol=0.005 if dtype == torch.bfloat16 else 1e-5,
+                                       rtol=0.04 if dtype == torch.bfloat16 else 1e-3)
+            states[index] = state
+        # A speculative batch must not change the accepted states it read.
+        replay, _ = batch_forward(inputs, previous)
+        for first, second in zip(actual, replay, strict=True):
+            torch.testing.assert_close(first, second, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA codec")

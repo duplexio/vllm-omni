@@ -185,6 +185,7 @@ class OrchestratorRequestState:
     duplex_identity: DuplexRequestIdentity | None = None
     duplex_stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     duplex_config_generation: int = -1
+    duplex_sent_config_generations: dict[int, int] = field(default_factory=dict)
     running_counter_registered: bool = False
 
 
@@ -293,9 +294,24 @@ class _OrchestratorDuplexStagePort:
         request_state = self._request_states.get(context.request_id)
         if request_state is None:
             raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
+        prompt = dict(submission.prompt)
+        if (
+            submission.already_submitted
+            and request_state.duplex_sent_config_generations.get(context.stage_id) == context.config_generation
+            and "model_intermediate_buffer" in prompt
+        ):
+            # Workers retain request metadata across appends. Send configuration
+            # on initial submission and explicit updates, not with every frame.
+            intermediate = dict(prompt["model_intermediate_buffer"])
+            if "duplex" in intermediate:
+                duplex = dict(intermediate["duplex"])
+                duplex.pop("session_config", None)
+                duplex.pop("runtime_config", None)
+                intermediate["duplex"] = duplex
+                prompt["model_intermediate_buffer"] = intermediate
         request = build_engine_core_request_from_tokens(
             request_id=context.request_id,
-            prompt=dict(submission.prompt),
+            prompt=prompt,
             params=context.stage_sampling_params,
             model_config=self._stage_pools[context.stage_id].stage_vllm_config.model_config,
             resumable=True,
@@ -312,6 +328,7 @@ class _OrchestratorDuplexStagePort:
                     request,
                     request_state,
                 )
+        request_state.duplex_sent_config_generations[context.stage_id] = context.config_generation
         request_state.duplex_stage_fences[context.stage_id] = context.fence
         request_state.stage_submit_ts[context.stage_id] = _time.time()
         if not request_state.running_counter_registered and self._running_counter is not None:

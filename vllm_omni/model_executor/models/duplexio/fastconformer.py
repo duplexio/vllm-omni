@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import math
+from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +38,60 @@ class FastConformerStreamState:
 
     past_key_values: Any = None
     padding_cache: Any = None
+
+    @property
+    def cached_frames(self) -> int:
+        return 0 if self.past_key_values is None else self.past_key_values.layers[0].keys.shape[-2]
+
+    @classmethod
+    def stack(cls, states: list[FastConformerStreamState]) -> FastConformerStreamState:
+        """Batch equal cache windows without mutating accepted request state.
+
+        Nemotron uses relative positions and one-frame attention chunks. Its
+        temporary batch can therefore start at the retained window length;
+        absolute per-request lengths are restored when splitting the result.
+        """
+        first = states[0]
+        if first.past_key_values is None:
+            assert all(state.past_key_values is None for state in states)
+            return cls()
+        kv = copy.copy(first.past_key_values)
+        kv.layers = []
+        for index, layer in enumerate(first.past_key_values.layers):
+            batched = copy.copy(layer)
+            batched.keys = torch.cat([state.past_key_values.layers[index].keys for state in states])
+            batched.values = torch.cat([state.past_key_values.layers[index].values for state in states])
+            batched.cumulative_length = first.cached_frames
+            kv.layers.append(batched)
+        padding = copy.copy(first.padding_cache)
+        padding.layers = {}
+        for name, layer in first.padding_cache.layers.items():
+            batched = copy.copy(layer)
+            batched.cache = torch.cat([state.padding_cache.layers[name].cache for state in states])
+            padding.layers[name] = batched
+        return cls(kv, padding)
+
+    def unbind(self, previous: list[FastConformerStreamState], frames: int) -> list[FastConformerStreamState]:
+        """Restore request-owned cache containers after one batched forward."""
+        results = []
+        for index, old in enumerate(previous):
+            kv = copy.copy(self.past_key_values)
+            kv.layers = []
+            length = 0 if old.past_key_values is None else old.past_key_values.get_seq_length()
+            for layer in self.past_key_values.layers:
+                single = copy.copy(layer)
+                single.keys = layer.keys[index:index + 1]
+                single.values = layer.values[index:index + 1]
+                single.cumulative_length = length + frames
+                kv.layers.append(single)
+            padding = copy.copy(self.padding_cache)
+            padding.layers = {}
+            for name, layer in self.padding_cache.layers.items():
+                single = copy.copy(layer)
+                single.cache = layer.cache[index:index + 1]
+                padding.layers[name] = single
+            results.append(FastConformerStreamState(kv, padding))
+        return results
 
 
 @dataclass
@@ -85,19 +141,39 @@ def streaming_resample_chunk(
     """
     orig_stride = orig_freq // math.gcd(orig_freq, new_freq)
     new_stride = new_freq // math.gcd(orig_freq, new_freq)
-    if chunk.ndim != 1 or chunk.shape[0] % orig_stride:
+    if chunk.ndim not in (1, 2) or chunk.shape[-1] % orig_stride:
         raise ValueError(
-            f"Streaming resample chunks must be 1-D multiples of {orig_stride} "
+            f"Streaming resample chunks must be 1-D or batched multiples of {orig_stride} "
             f"source samples, got shape {tuple(chunk.shape)}"
         )
     # Comfortably beyond torchaudio's default sinc half-width, and a stride
     # multiple so the polyphase output stays on the whole-signal grid.
     context = 16 * orig_stride
-    buffer = chunk if tail is None else torch.cat((tail, chunk))
+    buffer = chunk if tail is None else torch.cat((tail, chunk), dim=-1)
     resampled = AF.resample(buffer, orig_freq, new_freq)
-    skip = (buffer.shape[0] - chunk.shape[0]) * new_stride // orig_stride
-    emit = chunk.shape[0] * new_stride // orig_stride
-    return resampled[skip : skip + emit], buffer[-context:]
+    skip = (buffer.shape[-1] - chunk.shape[-1]) * new_stride // orig_stride
+    emit = chunk.shape[-1] * new_stride // orig_stride
+    return resampled[..., skip : skip + emit], buffer[..., -context:]
+
+
+def streaming_resample_batch(
+    chunks: list[Tensor], tails: list[Tensor | None], orig_freq: int, new_freq: int,
+) -> tuple[list[Tensor], list[Tensor]]:
+    """Share resampling launches across equal-sized chunks, not audio histories."""
+    groups = defaultdict(list)
+    for index, (chunk, tail) in enumerate(zip(chunks, tails, strict=True)):
+        groups[(chunk.shape[-1], 0 if tail is None else tail.shape[-1])].append(index)
+    outputs = {}
+    updated = {}
+    for (_, tail_size), indices in groups.items():
+        tail = torch.stack([tails[index] for index in indices]) if tail_size else None
+        batch, new_tail = streaming_resample_chunk(
+            torch.stack([chunks[index] for index in indices]), tail, orig_freq, new_freq,
+        )
+        for row, index in enumerate(indices):
+            outputs[index] = batch[row]
+            updated[index] = new_tail[row]
+    return [outputs[index] for index in range(len(chunks))], [updated[index] for index in range(len(chunks))]
 
 
 class FastConformerRNNT(nn.Module):
@@ -243,10 +319,10 @@ class FastConformerRNNT(nn.Module):
             yield features
             mel_frame += features.shape[1]
 
-    def encode_audio_chunk(
+    def take_audio_windows(
         self, waveform: Tensor, state: FastConformerAudioStreamState
-    ) -> tuple[Tensor, FastConformerAudioStreamState]:
-        """Consume available live 16 kHz audio and emit complete encoder states."""
+    ) -> tuple[list[Tensor], FastConformerAudioStreamState]:
+        """Collect complete STFT windows, retaining only the unfinished tail."""
         if waveform.ndim != 1:
             raise ValueError(
                 f"Live FastConformer input must be one waveform chunk, got shape {tuple(waveform.shape)}"
@@ -259,8 +335,6 @@ class FastConformerRNNT(nn.Module):
             audio_buffer = torch.cat((state.audio_buffer, waveform))
         buffer_start = state.buffer_start_sample
         next_mel_frame = state.next_mel_frame
-        encoder_state = state.encoder
-        starts_stream = next_mel_frame == 0
         raw_chunks = []
         while True:
             first = next_mel_frame == 0
@@ -296,29 +370,61 @@ class FastConformerRNNT(nn.Module):
             drop = next_raw_start - buffer_start
             audio_buffer = audio_buffer[drop:]
             buffer_start = next_raw_start
-        if raw_chunks:
-            # Only the initial window uses centered STFT. All following windows
-            # have identical geometry and can share one batched frontend call.
-            feature_chunks = []
-            if starts_stream:
-                feature_chunks.append(self.prepare_streaming_audio_chunk(raw_chunks.pop(0), first=True))
-            if raw_chunks:
-                features = self.prepare_streaming_audio_chunk(torch.stack(raw_chunks), first=False)
-                feature_chunks.append(features.flatten(0, 1).unsqueeze(0))
-            states, encoder_state = self.encode_feature_chunk(torch.cat(feature_chunks, dim=1), encoder_state)
-        else:
-            model_param = next(self.model.parameters())
-            states = model_param.new_empty((1, 0, self.output_dim))
-        return (
-            states,
-            FastConformerAudioStreamState(
-                encoder=encoder_state,
-                rnnt=state.rnnt,
-                audio_buffer=audio_buffer,
-                buffer_start_sample=buffer_start,
-                next_mel_frame=next_mel_frame,
-            ),
+        return raw_chunks, replace(
+            state, audio_buffer=audio_buffer, buffer_start_sample=buffer_start,
+            next_mel_frame=next_mel_frame,
         )
+
+    def encode_audio_chunk(
+        self, waveform: Tensor, state: FastConformerAudioStreamState,
+    ) -> tuple[Tensor, FastConformerAudioStreamState]:
+        """Consume available live 16 kHz audio and emit complete encoder states."""
+        outputs, states = self.encode_audio_batch([waveform], [state])
+        return outputs[0], states[0]
+
+    def encode_audio_batch(
+        self, waveforms: list[Tensor], states: list[FastConformerAudioStreamState],
+    ) -> tuple[list[Tensor], list[FastConformerAudioStreamState]]:
+        """Batch frontends and equal-sized encoder windows across live streams."""
+        windows = []
+        updated = []
+        for waveform, state in zip(waveforms, states, strict=True):
+            raw, new_state = self.take_audio_windows(waveform, state)
+            windows.append(raw)
+            updated.append(new_state)
+        features: list[list[Tensor]] = [[] for _ in states]
+        for first in (True, False):
+            selected = [
+                (index, raw)
+                for index, chunks in enumerate(windows)
+                for chunk_index, raw in enumerate(chunks)
+                if (states[index].next_mel_frame == 0 and chunk_index == 0) == first
+            ]
+            if selected:
+                with torch.profiler.record_function("duplexio.asr_frontend"):
+                    batch = self.prepare_streaming_audio_chunk(torch.stack([raw for _, raw in selected]), first=first)
+                for (index, _), feature in zip(selected, batch, strict=True):
+                    features[index].append(feature)
+        groups = defaultdict(list)
+        inputs = {}
+        for index, chunks in enumerate(features):
+            if chunks:
+                inputs[index] = torch.cat(chunks)
+                groups[(inputs[index].shape[0], states[index].encoder.cached_frames)].append(index)
+        parameter = next(self.model.parameters())
+        outputs = [parameter.new_empty((1, 0, self.output_dim)) for _ in states]
+        for indices in groups.values():
+            previous = [states[index].encoder for index in indices]
+            with torch.profiler.record_function("duplexio.asr_cache_pack"):
+                cache = FastConformerStreamState.stack(previous)
+            with torch.profiler.record_function("duplexio.asr_encoder"):
+                encoded, cache = self.encode_feature_chunk(torch.stack([inputs[index] for index in indices]), cache)
+            with torch.profiler.record_function("duplexio.asr_cache_split"):
+                caches = cache.unbind(previous, encoded.shape[1])
+            for row, (index, encoder_state) in enumerate(zip(indices, caches, strict=True)):
+                outputs[index] = encoded[row:row + 1]
+                updated[index].encoder = encoder_state
+        return outputs, updated
 
     def prediction_step(
         self,

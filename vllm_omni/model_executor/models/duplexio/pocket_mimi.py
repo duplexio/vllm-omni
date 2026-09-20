@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -289,7 +291,7 @@ def apply_rope(
     )
     if positions is None:
         positions = torch.arange(t, device=q.device, dtype=torch.float32) + offset
-    ts = positions.view(-1, 1, 1)
+    ts = positions[..., None, None]
     q = q.view(b, t, h, d // 2, 2)
     k = k.view(b, t, k.shape[2], d // 2, 2)
     cos = torch.cos(freqs * ts)
@@ -322,7 +324,7 @@ class LayerScale(nn.Module):
 class AttentionState:
     k: Tensor
     v: Tensor
-    seq_len: int
+    seq_len: Tensor  # (batch,), independently advancing acoustic positions
 
 
 class StreamingMultiheadAttention(nn.Module):
@@ -342,7 +344,7 @@ class StreamingMultiheadAttention(nn.Module):
         return AttentionState(
             k=torch.empty(shape, device=device, dtype=dtype),
             v=torch.empty(shape, device=device, dtype=dtype),
-            seq_len=0,
+            seq_len=torch.zeros(batch_size, device=device, dtype=torch.long),
         )
 
     def step(self, x: Tensor, state: AttentionState) -> tuple[Tensor, AttentionState]:
@@ -352,15 +354,12 @@ class StreamingMultiheadAttention(nn.Module):
             .view(b, t, 3, self.num_heads, self.dim_per_head)
             .unbind(dim=2)
         )
-        q, k = apply_rope(q, k, offset=state.seq_len)
+        positions = state.seq_len[:, None] + torch.arange(t, device=x.device)
+        q, k = apply_rope(q, k, positions=positions)
         k_cache = torch.cat([state.k, k], dim=1)
         v_cache = torch.cat([state.v, v], dim=1)
-        pos_q = state.seq_len + torch.arange(t, device=x.device)
-        pos_k = (
-            state.seq_len
-            - state.k.shape[1]
-            + torch.arange(k_cache.shape[1], device=x.device)
-        )
+        pos_q = torch.arange(t, device=x.device)
+        pos_k = torch.arange(k_cache.shape[1], device=x.device) - state.k.shape[1]
         delta = pos_q[:, None] - pos_k[None, :]
         mask = (delta >= 0) & (delta < self.context)
         y = F.scaled_dot_product_attention(
@@ -522,6 +521,55 @@ class ContinuousMimiState:
     decoder_transformer: ProjectedTransformerState
 
 
+def map_mimi_tensors(function: Callable[..., Tensor], *states):
+    """Map the codec's explicit state tree when stacking/splitting requests."""
+    first = states[0]
+    if first is None:
+        assert all(state is None for state in states)
+        return None
+    if isinstance(first, Tensor):
+        return function(*states)
+    if isinstance(first, Conv1dState):
+        assert all(state.first == first.first for state in states)
+        return Conv1dState(map_mimi_tensors(function, *(state.previous for state in states)), first.first)
+    if isinstance(first, ConvTranspose1dState):
+        return ConvTranspose1dState(map_mimi_tensors(function, *(state.partial for state in states)))
+    if isinstance(first, SEANetResnetBlockState):
+        return SEANetResnetBlockState([
+            map_mimi_tensors(function, *(state.conv_states[i] for state in states))
+            for i in range(len(first.conv_states))
+        ])
+    if isinstance(first, SEANetState):
+        return SEANetState([
+            map_mimi_tensors(function, *(state.layer_states[i] for state in states))
+            for i in range(len(first.layer_states))
+        ])
+    if isinstance(first, AttentionState):
+        return AttentionState(
+            function(*(state.k for state in states)),
+            function(*(state.v for state in states)),
+            function(*(state.seq_len for state in states)),
+        )
+    if isinstance(first, TransformerLayerState):
+        return TransformerLayerState(map_mimi_tensors(function, *(state.self_attn for state in states)))
+    if isinstance(first, TransformerState):
+        return TransformerState([
+            map_mimi_tensors(function, *(state.layers[i] for state in states))
+            for i in range(len(first.layers))
+        ])
+    if isinstance(first, ProjectedTransformerState):
+        return ProjectedTransformerState(map_mimi_tensors(function, *(state.transformer for state in states)))
+    assert isinstance(first, ContinuousMimiState)
+    return ContinuousMimiState(
+        encoder=map_mimi_tensors(function, *(state.encoder for state in states)),
+        decoder=map_mimi_tensors(function, *(state.decoder for state in states)),
+        downsample=map_mimi_tensors(function, *(state.downsample for state in states)),
+        upsample=map_mimi_tensors(function, *(state.upsample for state in states)),
+        encoder_transformer=map_mimi_tensors(function, *(state.encoder_transformer for state in states)),
+        decoder_transformer=map_mimi_tensors(function, *(state.decoder_transformer for state in states)),
+    )
+
+
 class PocketMimi(nn.Module):
     """The checkpoint's 32-dimensional, 24 kHz continuous codec.
 
@@ -550,6 +598,45 @@ class PocketMimi(nn.Module):
             encoder_transformer=self.encoder_transformer.get_initial_state(empty),
             decoder_transformer=self.decoder_transformer.get_initial_state(empty),
         )
+
+    def encode_batch(
+        self, waveforms: list[Tensor], states: list[ContinuousMimiState],
+    ) -> tuple[list[Tensor], list[ContinuousMimiState]]:
+        """Encode independent requests together, without padding audio."""
+        return self.run_batch(self.encode, waveforms, states)
+
+    def decode_batch(
+        self, latents: list[Tensor], states: list[ContinuousMimiState],
+    ) -> tuple[list[Tensor], list[ContinuousMimiState]]:
+        """Decode independent requests together, retaining per-request positions."""
+        return self.run_batch(self.decode, latents, states)
+
+    def run_batch(
+        self,
+        operation: Callable[[Tensor, ContinuousMimiState], tuple[Tensor, ContinuousMimiState]],
+        inputs: list[Tensor],
+        states: list[ContinuousMimiState],
+    ) -> tuple[list[Tensor], list[ContinuousMimiState]]:
+        groups = defaultdict(list)
+        for index, (value, state) in enumerate(zip(inputs, states, strict=True)):
+            key = (
+                value.shape,
+                state.encoder_transformer.transformer.layers[0].self_attn.k.shape[1],
+                state.decoder_transformer.transformer.layers[0].self_attn.k.shape[1],
+            )
+            groups[key].append(index)
+        outputs = {}
+        updated = {}
+        for indices in groups.values():
+            with torch.profiler.record_function("duplexio.mimi_cache_pack"):
+                state = map_mimi_tensors(lambda *values: torch.cat(values), *(states[index] for index in indices))
+            with torch.profiler.record_function("duplexio.mimi_compute"):
+                batch, state = operation(torch.cat([inputs[index] for index in indices]), state)
+            with torch.profiler.record_function("duplexio.mimi_cache_split"):
+                for row, index in enumerate(indices):
+                    outputs[index] = batch[row:row + 1]
+                    updated[index] = map_mimi_tensors(lambda value: value[row:row + 1], state)
+        return [outputs[index] for index in range(len(inputs))], [updated[index] for index in range(len(inputs))]
 
     def encode(
         self,

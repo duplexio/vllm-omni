@@ -33,7 +33,7 @@ class AudioSampler(nn.Module):
 
 class Codec(CountingCodec):
     def decode(self, codes, state):
-        return torch.zeros(1, 1, 1920)
+        raise AssertionError("decode_audio=False must not run the codec decoder")
 
 
 def feedback_model():

@@ -1528,7 +1528,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         return req_infos
 
-    def _maybe_run_batch_preprocess(self, req_ids: list[str], device: torch.device) -> None:
+    def _maybe_run_batch_preprocess(self, req_ids: list[str], device: torch.device) -> dict:
         """Run an optional model-specific batch preprocess hook.
 
         The generic runner only supplies current request ids and the runner-owned
@@ -1537,12 +1537,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         """
         preprocess_batch = getattr(self.model, "preprocess_batch", None)
         if not callable(preprocess_batch):
-            return
-        preprocess_batch(
+            return {}
+        prepared = preprocess_batch(
             req_ids=req_ids,
             model_intermediate_buffer=self.model_intermediate_buffer,
             device=device,
         )
+        return prepared or {}
 
     def _preprocess(
         self,
@@ -1690,7 +1691,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             # need the scheduled token ids to build or replace those embeddings.
             preprocess_input_ids = input_ids if input_ids is not None else self.input_ids.gpu[:num_input_tokens]
             preprocess_device = preprocess_input_ids.device
-            self._maybe_run_batch_preprocess(self.input_batch.req_ids, preprocess_device)
+            for req_index, req_id in enumerate(self.input_batch.req_ids):
+                req_infos = self.model_intermediate_buffer.setdefault(req_id, {})
+                req_state = self.requests.get(req_id)
+                req_infos["duplex_token_offset"] = int(self.input_batch.num_computed_tokens_cpu[req_index])
+                req_infos["duplex_prompt_len"] = len(req_state.prompt_token_ids) if req_state is not None else None
+                req_infos["_omni_num_scheduled_tokens"] = int(num_scheduled_tokens_np[req_index])
+            prepared_requests = self._maybe_run_batch_preprocess(self.input_batch.req_ids, preprocess_device)
 
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
@@ -1757,8 +1764,6 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 # call the custom process function
                 req_infos["request_id"] = req_id
-                req_infos["duplex_token_offset"] = int(self.input_batch.num_computed_tokens_cpu[req_index])
-                req_infos["duplex_prompt_len"] = len(req_state.prompt_token_ids) if req_state is not None else None
                 prompt_token_ids = getattr(req_state, "prompt_token_ids", ()) if req_state is not None else ()
                 prompt_len = len(prompt_token_ids or ())
                 num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
@@ -1777,6 +1782,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     input_ids=preprocess_input_ids[s:e],
                     input_embeds=embed_slice,
                     **req_infos,
+                    **prepared_requests.get(req_id, {}),
                 )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
