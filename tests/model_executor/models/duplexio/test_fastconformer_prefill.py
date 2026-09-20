@@ -3,6 +3,8 @@
 import pytest
 import torch
 from tokenizers import Tokenizer, models
+from torchaudio import functional as AF
+from torchaudio.transforms import Resample
 from transformers import (
     AutoModelForRNNT,
     NemotronAsrStreamingConfig,
@@ -21,16 +23,25 @@ from vllm_omni.model_executor.models.duplexio.fastconformer import (
 )
 
 
-def test_batched_resampling_keeps_each_stream_history():
+@pytest.mark.parametrize("device", ["cpu", pytest.param(
+    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+)])
+def test_batched_resampling_keeps_each_stream_history(device):
     torch.manual_seed(29)
-    chunks = [torch.randn(length) for length in (1920, 3840, 1920, 1920)]
-    tails = [torch.randn(48), None, torch.randn(48), None]
-    expected = [streaming_resample_chunk(chunk, tail, 24000, 16000)
+    chunks = [torch.randn(length, device=device) for length in (1920, 3840, 1920, 1920)]
+    tails = [torch.randn(48, device=device), None, torch.randn(48, device=device), None]
+    resampler = Resample(24_000, 16_000, dtype=torch.float32).to(device)
+    expected = [streaming_resample_chunk(chunk, tail, resampler)
                 for chunk, tail in zip(chunks, tails, strict=True)]
-    actual, updated = streaming_resample_batch(chunks, tails, 24000, 16000)
+    actual, updated = streaming_resample_batch(chunks, tails, resampler)
     for (reference, tail), output, new_tail in zip(expected, actual, updated, strict=True):
         torch.testing.assert_close(output, reference)
         torch.testing.assert_close(new_tail, tail)
+    for chunk, tail, value in zip(chunks, tails, actual, strict=True):
+        buffer = chunk if tail is None else torch.cat((tail, chunk))
+        start = 0 if tail is None else tail.numel() * 2 // 3
+        reference = AF.resample(buffer, 24_000, 16_000)[start:start + chunk.numel() * 2 // 3]
+        torch.testing.assert_close(value, reference, atol=1e-6, rtol=1e-5)
 
 
 @torch.inference_mode()
@@ -110,6 +121,57 @@ def encoder() -> FastConformerRNNT:
     )
     processor = NemotronAsrStreamingProcessor(NemotronAsrStreamingFeatureExtractor(feature_size=8), tokenizer)
     return FastConformerRNNT(AutoModelForRNNT.from_config(config), processor).eval()
+
+
+@pytest.mark.parametrize("first", [False, True])
+@pytest.mark.parametrize("device", ["cpu", pytest.param(
+    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+)])
+@torch.inference_mode()
+def test_cached_frontend_matches_upstream_processor(encoder, first, device):
+    encoder = encoder.to(device)
+    mel_frames = (encoder.processor.num_mel_frames_first_audio_chunk if first
+                  else encoder.processor.num_mel_frames_per_audio_chunk)
+    samples = (mel_frames - 1) * encoder.feature_hop_length + encoder.feature_n_fft
+    if first:
+        samples -= encoder.feature_n_fft // 2
+    waveform = torch.randn(4, samples, device=device) * 0.1
+    for value in (waveform, waveform * 0):
+        expected = encoder.processor(
+            value.unbind(0), sampling_rate=16_000, is_streaming=True,
+            is_first_audio_chunk=first, return_tensors="pt", device=device,
+        ).input_features[:, :mel_frames]
+        actual = encoder.prepare_streaming_audio_chunk(value, first=first)
+        # The upstream processor returns CPU features even for CUDA waveforms.
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=1e-5, rtol=1e-6)
+    assert len(encoder.frontend_constants) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_encoder_graph_preserves_requests_and_output_ownership(encoder, dtype):
+    import copy
+
+    encoder = encoder.to(device="cuda", dtype=dtype)
+    reference = copy.deepcopy(encoder)
+    encoder.use_cuda_graph = True
+    actual_states = [FastConformerAudioStreamState() for _ in range(3)]
+    expected_states = copy.deepcopy(actual_states)
+    retained = []
+    for order in ([0, 1, 2],) * 12 + ([2, 0], [1, 2, 0], [0, 2]):
+        waveforms = [torch.randn(FRAME_SAMPLES, device="cuda") * 0.1 for _ in order]
+        expected, old = reference.encode_audio_batch(waveforms, [expected_states[index] for index in order])
+        actual, new = encoder.encode_audio_batch(waveforms, [actual_states[index] for index in order])
+        for index, value, target, state, target_state in zip(order, actual, expected, new, old, strict=True):
+            torch.testing.assert_close(value, target, atol=1e-5, rtol=1e-4)
+            actual_states[index], expected_states[index] = state, target_state
+            retained.append((value, value.clone()))
+            for cache, reference_cache in zip(state.encoder.tensors(), target_state.encoder.tensors(), strict=True):
+                torch.testing.assert_close(cache, reference_cache, atol=1e-5, rtol=1e-4)
+    assert set(encoder.graphs) == {2, 3}
+    for value, original in retained:
+        torch.testing.assert_close(value, original, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("frames", [1, 4, 16])

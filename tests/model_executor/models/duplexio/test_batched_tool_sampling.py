@@ -150,6 +150,37 @@ class ScalarReads(TorchDispatchMode):
         return func(*args, **(kwargs or {}))
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param(
+    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+)])
+def test_user_sampling_is_independent_of_batch_order_and_retirement(device):
+    model, infos, vocab = fixture(device, mixed=True)
+    reference, originals, _ = fixture(device, mixed=True)
+    for info in infos + originals:
+        policy = info["duplexio_working_state"].sampling
+        info["duplexio_working_state"].sampling = replace(
+            policy,
+            user=replace(policy.user, temperature=1.0, top_k=None, top_p=None),
+            emission=policy.emission.model_copy(update={"user": 1.0}),
+        )
+    for order in ([7, 0, 4, 2, 6, 1, 5, 3], [3, 1, 7], [7, 3]):
+        logits = torch.randn(8, vocab, device=device)
+        emissions = torch.randn(8, device=device)
+        actual = model.sample_stream_tokens(
+            logits[order], emissions[order], [infos[index] for index in order], stream="user",
+        )
+        for row, index in enumerate(order):
+            expected = reference.sample_stream_tokens(
+                logits[index:index + 1], emissions[index:index + 1], [originals[index]], stream="user",
+            )
+            for values, target in zip(actual, expected, strict=True):
+                torch.testing.assert_close(values[row], target[0])
+            assert torch.equal(
+                infos[index]["duplexio_working_state"].sampling_generator.get_state(),
+                originals[index]["duplexio_working_state"].sampling_generator.get_state(),
+            )
+
+
 @pytest.mark.parametrize("start_tool", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="checks GPU scalar readback")
 def test_tools_do_not_read_gpu_scalars_per_request(start_tool):

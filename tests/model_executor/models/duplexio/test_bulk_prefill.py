@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import Tensor, nn
+from torchaudio.transforms import Resample
 
 from vllm_omni.model_executor.models.duplexio.audio_adapters import (
     AudioInputAdapter,
@@ -83,6 +84,7 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
     model.user_audio_input_adapter = AudioInputAdapter(8, 7, 11)
     model.agent_audio_input_adapter = AudioInputAdapter(5, 7, 11)
     model.user_asr = CountingASR()
+    model.user_audio_resampler = Resample(24_000, 16_000, dtype=torch.float32)
     model.audio_codec = CountingCodec()
     model.llm = SimpleNamespace(
         base_model=SimpleNamespace(model=TextEmbedding(11)),

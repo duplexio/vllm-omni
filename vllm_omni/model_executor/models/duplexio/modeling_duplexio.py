@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import xgrammar as xgr
 from pydantic import BaseModel, ConfigDict, Field
 from torch import Tensor, nn
+from torchaudio.transforms import Resample
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -29,6 +30,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import TokenizerLike, cached_tokenizer_from_config
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.duplexio.audio_adapters import (
@@ -346,7 +348,12 @@ class DuplexIOForConditionalGeneration(
             vllm_config.model_config.model,
             revision=vllm_config.model_config.revision,
         )
-        self.user_asr = FastConformerRNNT.from_export(config.user_asr_config, root)
+        self.user_asr = FastConformerRNNT.from_export(
+            config.user_asr_config, root, use_cuda_graph=self.full_cudagraph_enabled,
+        )
+        self.user_audio_resampler = Resample(config.sample_rate, 16_000, dtype=torch.float32).to(
+            device=self.llm.channel_emb.device,
+        )
         if config.audio_representation == "continuous":
             representation_dim = config.continuous_audio_config["embedding_dim"]
             self.audio_codec = PocketMimi()
@@ -1104,45 +1111,54 @@ class DuplexIOForConditionalGeneration(
         """
         policies = [info["duplexio_working_state"].sampling for info in infos]
         samplings = [policy.user if stream == "user" else policy.agent for policy in policies]
-        groups: dict[tuple[float, int | None, float | None], list[int]] = {}
+        groups: dict[tuple[float, int | None, float | None, float], list[int]] = {}
         for row, sampling in enumerate(samplings):
-            key = sampling.temperature, sampling.top_k, sampling.top_p
+            emission = policies[row].emission
+            emit_temperature = emission.user if stream == "user" else emission.agent
+            key = sampling.temperature, sampling.top_k, sampling.top_p, emit_temperature
             groups.setdefault(key, []).append(row)
         tokens: dict[int, Tensor] = {}
         emit_logprobs: dict[int, Tensor] = {}
         token_logprobs: dict[int, Tensor] = {}
-        for rows in groups.values():
+        for key, rows in groups.items():
+            emit_temperature = key[3]
             sampling = samplings[rows[0]]
             group_logits = torch.stack([logits[row] for row in rows])
+            group_emit_logits = emit_logits[rows].float()
+            generators = {
+                index: infos[row]["duplexio_working_state"].sampling_generator
+                for index, row in enumerate(rows)
+            }
+            if emit_temperature == 0:
+                emitted = group_emit_logits >= 0
+                emission_logprobs = torch.zeros_like(group_emit_logits)
+            else:
+                probability = torch.sigmoid(group_emit_logits / emit_temperature)
+                emitted = torch.cat([
+                    torch.bernoulli(probability[index:index + 1], generator=generator)
+                    for index, generator in generators.items()
+                ]).bool()
+                emission_logprobs = torch.where(emitted, probability, 1 - probability).log()
             greedy = sampling.temperature == 0
             if greedy:
                 content = _sample_content_token_ids(
-                    group_logits, sampling, generator=infos[rows[0]]["duplexio_working_state"].sampling_generator,
+                    group_logits, sampling, generator=generators[0],
                 )
+                content_logprobs = torch.zeros_like(group_emit_logits)
             else:
                 indices, probabilities = self.content_distribution(group_logits, sampling)
+                # vLLM's sampler avoids multinomial's validation/synchronization.
+                # It mutates probabilities; retain the distribution for logprobs.
+                selected = random_sample(probabilities.clone(), generators).unsqueeze(-1)
+                content = indices.gather(-1, selected).squeeze(-1)
+                content_logprobs = probabilities.gather(-1, selected).squeeze(-1).log()
+            content = torch.where(emitted, content, self.silence_token_id)
+            # A discarded content draw on a wait frame is not an action.
+            content_logprobs = torch.where(emitted, content_logprobs, 0)
             for index, row in enumerate(rows):
-                info = infos[row]
-                generator = info["duplexio_working_state"].sampling_generator
-                temperatures = policies[row].emission
-                emit_temperature = temperatures.user if stream == "user" else temperatures.agent
-                emit, emit_logprobs[row] = _sample_emit_with_logprob(
-                    emit_logits[row:row + 1], emit_temperature, generator=generator,
-                )
-                if greedy:
-                    token = content[index:index + 1]
-                    content_logprob = torch.zeros_like(emit, dtype=torch.float32)
-                else:
-                    selected = torch.multinomial(probabilities[index:index + 1], 1, generator=generator)
-                    token = indices[index:index + 1].gather(-1, selected).squeeze(-1)
-                    content_logprob = (
-                        probabilities[index:index + 1].gather(-1, selected).squeeze(-1).float().log()
-                    )
-                tokens[row] = torch.where(emit, token, torch.full_like(token, self.silence_token_id))
-                # A discarded content draw on a wait frame is not an action.
-                token_logprobs[row] = torch.where(
-                    emit, content_logprob, torch.zeros_like(content_logprob)
-                )
+                tokens[row] = content[index:index + 1]
+                emit_logprobs[row] = emission_logprobs[index:index + 1]
+                token_logprobs[row] = content_logprobs[index:index + 1]
         order = range(len(infos))
         return (
             [tokens[row] for row in order],
@@ -1264,7 +1280,7 @@ class DuplexIOForConditionalGeneration(
     def encode_user_audio_batch(self, waveforms: list[Tensor], states: list[DuplexIORequestState]) -> list[Tensor]:
         with torch.profiler.record_function("duplexio.asr_resample"):
             resampled, tails = streaming_resample_batch(
-                waveforms, [state.user_asr.resample_tail for state in states], self.config.sample_rate, 16_000,
+                waveforms, [state.user_asr.resample_tail for state in states], self.user_audio_resampler,
             )
         encoded, caches = self.user_asr.encode_audio_batch(
             resampled, [state.user_asr for state in states],
@@ -1580,17 +1596,6 @@ def _sample_emit(
     ).bool()
 
 
-def _sample_emit_with_logprob(
-    emit_logits: Tensor, temperature: float, *, generator: torch.Generator,
-) -> tuple[Tensor, Tensor]:
-    if temperature == 0:
-        return emit_logits >= 0, torch.zeros_like(emit_logits, dtype=torch.float32)
-    probability = torch.sigmoid(emit_logits.float() / temperature)
-    emit = torch.bernoulli(probability, generator=generator).bool()
-    # Use the exact rounded probability passed to Bernoulli, including saturation.
-    return emit, torch.where(emit, probability, 1 - probability).log()
-
-
 def sample_tool_token(
     logits: Tensor,
     *,
@@ -1623,7 +1628,7 @@ def sample_tool_token(
         token_id = _sample_content_token_ids(constrained_logits, sampling, generator=generator)
         return ToolTokenSample(token_id=token_id, logprob=torch.zeros_like(token_id, dtype=torch.float32))
     indices, probabilities = distribution(constrained_logits, sampling)
-    selected = torch.multinomial(probabilities, 1, generator=generator)
+    selected = random_sample(probabilities.clone(), {0: generator}).unsqueeze(-1)
     return ToolTokenSample(
         token_id=indices.gather(-1, selected).squeeze(-1),
         logprob=probabilities.gather(-1, selected).squeeze(-1).float().log(),
