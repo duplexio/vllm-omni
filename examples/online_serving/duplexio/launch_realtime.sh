@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 serving_dir="$(cd "$script_dir/../../.." && pwd)"
-checkpoint="${1:-$HOME/duplexio/run508723_step28000_v7}"
+checkpoint="${1:-$HOME/duplexio/run508946_step31000_v7}"
 deploy_config="${DEPLOY_CONFIG:-$serving_dir/vllm_omni/deploy/duplexio-multistream.yaml}"
 python="$serving_dir/.venv/bin/python"
 vllm_omni="$serving_dir/.venv/bin/vllm-omni"
