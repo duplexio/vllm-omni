@@ -137,20 +137,22 @@ class DuplexIORMSNorm(nn.Module):
         return rmsnorm(hidden, self.weight, residual=residual, eps=self.eps, prenorm=residual is not None)
 
 
+@torch.compile(dynamic=True, fullgraph=True, options={"emulate_precision_casts": True, "triton.cudagraphs": False})
+def swiglu_mlp(hidden: Tensor, gate_up_weight: Tensor, down_weight: Tensor) -> Tensor:
+    """Use standard BF16 rounding boundaries for the two SwiGLU projections."""
+    gate, up = F.linear(hidden, gate_up_weight).chunk(2, dim=-1)
+    return F.linear(F.silu(gate) * up, down_weight)
+
+
 class DuplexIOQwenMLP(Qwen3NextMLP):
-    """Keep vLLM's sharded weights but use training's fused SwiGLU math."""
+    """Keep vLLM's sharded weights with compiled standard SwiGLU operations."""
 
     def forward(self, hidden: Tensor) -> Tensor:
-        from quack.mlp import mlp_func
-
-        output = mlp_func(
+        output = call_compiled_function(
+            swiglu_mlp,
             hidden,
             self.gate_up_proj.weight,
             self.down_proj.weight,
-            activation="swiglu",
-            recompute=False,
-            concat_layout=True,
-            tuned=False,
         )
         if self.down_proj.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)

@@ -65,7 +65,7 @@ def test_attention_qkv_fusion_preserves_projection_values() -> None:
 
 @pytest.mark.parametrize("rows", [6, 96, 1536, 20622])
 @torch.inference_mode()
-def test_mlp_native_matches_training_without_runtime_tuning(rows: int) -> None:
+def test_mlp_native_matches_training_with_bf16_rounding(rows: int) -> None:
     from duplexio.modules.qwen3_5_mlp import QuackQwen3_5MLP
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP
 
@@ -81,9 +81,14 @@ def test_mlp_native_matches_training_without_runtime_tuning(rows: int) -> None:
     native.down_proj.tp_size = 1
     hidden = torch.randn(rows, 2560, device="cuda", dtype=torch.bfloat16)
     expected = reference(hidden)
-    torch.testing.assert_close(native(hidden), expected, rtol=0, atol=0)
+    # Standard linear materializes BF16 projections before SwiGLU; Quack
+    # applies its fused activation before that rounding boundary.
+    actual = native(hidden)
     partitioned = torch.cat([native(chunk) for chunk in hidden.split(1536)])
-    torch.testing.assert_close(partitioned, expected, rtol=0, atol=0)
+    reference_norm = torch.linalg.vector_norm(expected.float())
+    for output in (actual, partitioned):
+        error_norm = torch.linalg.vector_norm(output.float() - expected.float())
+        assert error_norm / reference_norm < 0.01
 
 
 @torch.inference_mode()

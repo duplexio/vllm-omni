@@ -25,8 +25,7 @@ def test_default_deploy_uses_flexattention_compatible_tiles() -> None:
     assert stage.max_num_batched_tokens == 1024 * 6
     assert deploy.enable_chunked_prefill
     assert not stage.enforce_eager
-    # mode 0: graph capture without an inductor pass, because a fullgraph
-    # dynamo trace rejects the model's torch.compiler.disable()d quack GEMMs.
+    # Capture around the model's separately compiled tensor helpers.
     assert stage.compilation_config == {
         "mode": 0,
         "cudagraph_mode": "FULL_DECODE_ONLY",
@@ -50,5 +49,7 @@ def test_multistream_deploy_uses_batched_flexattention_path() -> None:
     assert not stage.enforce_eager
     assert stage.compilation_config == {
         "mode": 0,
-        "cudagraph_mode": "NONE",
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+        "cudagraph_capture_sizes": [6, 12],
+        "cudagraph_copy_inputs": True,
     }

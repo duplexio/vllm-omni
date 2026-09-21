@@ -31,9 +31,8 @@ stages:
     enforce_eager: false
     async_scheduling: false
     compilation_config:
-      # mode 0: capture CUDA graphs without an inductor pass. The model calls
-      # quack GEMMs through a torch.compiler.disable()d boundary, which a
-      # fullgraph dynamo trace rejects.
+      # Capture the backbone around its explicit compiler boundaries. Tensor
+      # helpers, including the MLP, are compiled separately by the model.
       mode: 0
       # With max_num_seqs=1, every live append is one uniform six-cell frame.
       # Larger system/tool prefills run eagerly outside this graph.

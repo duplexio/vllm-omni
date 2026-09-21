@@ -1,4 +1,4 @@
-"""Warm the DuplexIO prefix path before accepting browser sessions."""
+"""Warm DuplexIO prefix and live audio paths before accepting browser sessions."""
 
 from __future__ import annotations
 
@@ -58,6 +58,7 @@ async def prewarm(
     tools: list[dict[str, object]],
     *,
     timeout_seconds: float,
+    warmup_frames: int,
 ) -> None:
     async with asyncio.timeout(timeout_seconds):
         async with websockets.connect(
@@ -66,6 +67,19 @@ async def prewarm(
         ) as websocket:
             await websocket.send(json.dumps(session_update(model, reference_audio, tools)))
             await wait_for_event(websocket, {"session.updated"})
+            # Agent-first sessions emit one prefix frame before live input.
+            await wait_for_event(websocket, {"response.audio.delta"})
+            silence = base64.b64encode(bytes(FRAME_SIZE * 4)).decode()
+            for _ in range(warmup_frames):
+                await websocket.send(json.dumps({
+                    "type": "input_audio_buffer.append",
+                    "audio": silence,
+                    "format": "pcm_f32le",
+                    "sample_rate_hz": SAMPLE_RATE,
+                }))
+            # Keep input queued so concurrent sessions exercise batched decode.
+            for _ in range(warmup_frames):
+                await wait_for_event(websocket, {"response.audio.delta"})
             await websocket.send(json.dumps({"type": "session.close"}))
             await wait_for_event(websocket, {"session.closed"})
 
@@ -77,9 +91,18 @@ def main() -> None:
     parser.add_argument("--ref-audio", type=Path, required=True, help="Mono 24 kHz reference audio")
     parser.add_argument("--tools", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=60.0)
+    parser.add_argument("--sessions", type=int, default=1, help="Concurrent sessions to warm")
     args = parser.parse_args()
+    if args.sessions < 1:
+        parser.error("--sessions must be positive")
 
     import soundfile as sf
+
+    from vllm_omni.model_executor.models.duplexio.configuration_duplexio import DuplexIOConfig
+
+    config = DuplexIOConfig.from_pretrained(args.model)
+    # Fill the causal encoder cache, then exercise its steady-state graph.
+    warmup_frames = config.user_asr_config["encoder_config"]["sliding_window"] + 1
 
     samples, rate = sf.read(args.ref_audio, dtype="float32")
     if rate != SAMPLE_RATE or samples.ndim != 1 or samples.size < FRAME_SIZE:
@@ -89,15 +112,19 @@ def main() -> None:
     tools = json.loads(args.tools.read_text(encoding="utf-8"))
     if not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools):
         parser.error("--tools must contain a JSON list of tool definitions")
-    asyncio.run(
-        prewarm(
-            args.backend,
-            args.model,
-            reference_audio,
-            tools,
-            timeout_seconds=args.timeout_seconds,
+    async def warm_sessions() -> None:
+        await asyncio.gather(
+            *(prewarm(
+                args.backend,
+                args.model,
+                reference_audio,
+                tools,
+                timeout_seconds=args.timeout_seconds,
+                warmup_frames=warmup_frames,
+            ) for _ in range(args.sessions)),
         )
-    )
+
+    asyncio.run(warm_sessions())
     print("DuplexIO realtime path is warm")
 
 
