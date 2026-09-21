@@ -99,12 +99,21 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
 
         Override in subclasses for platform-specific profiler creation.
         """
+        experimental_config = None
+        if profiler_config.torch_profiler_with_stack:
+            # PyTorch 2.x requires verbose experimental tracing for
+            # export_stacks(); with_stack alone leaves stack fields empty.
+            experimental_config = torch._C._profiler._ExperimentalConfig(
+                verbose=True,
+            )
+
         return torch.profiler.profile(
             activities=[TorchProfilerActivityMap[a] for a in activities],
             record_shapes=profiler_config.torch_profiler_record_shapes,
             profile_memory=profiler_config.torch_profiler_with_memory,
             with_stack=profiler_config.torch_profiler_with_stack,
             with_flops=profiler_config.torch_profiler_with_flops,
+            experimental_config=experimental_config,
             on_trace_ready=self._on_trace_ready,
         )
 
