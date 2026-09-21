@@ -33,7 +33,8 @@ def test_prewarm_waits_for_one_model_frame_and_clean_session_close() -> None:
             await websocket.send(json.dumps({"type": "session.created"}))
             await websocket.send(json.dumps({"type": "session.updated"}))
             messages.append(json.loads(await websocket.recv()))
-            await websocket.send(json.dumps({"type": "response.listen"}))
+            await websocket.send(json.dumps({"type": "response.audio.delta"}))
+            await websocket.send(json.dumps({"type": "response.audio.done"}))
             messages.append(json.loads(await websocket.recv()))
             await websocket.send(json.dumps({"type": "session.closed"}))
 

@@ -13,10 +13,9 @@ import websockets
 
 SAMPLE_RATE = 24_000
 FRAME_SIZE = 1_920
-MODEL_OUTPUT_EVENTS = {
-    "input.transcript.delta",
-    "response.audio.delta",
-    "response.audio_transcript.delta",
+MODEL_OUTPUT_COMPLETE_EVENTS = {
+    "response.audio.done",
+    "response.done",
     "response.listen",
 }
 
@@ -82,7 +81,7 @@ async def prewarm(
             await websocket.send(json.dumps(session_update(model, reference_audio, tools)))
             await wait_for_event(websocket, {"session.updated"})
             await websocket.send(json.dumps(silence_frame()))
-            await wait_for_event(websocket, MODEL_OUTPUT_EVENTS)
+            await wait_for_event(websocket, MODEL_OUTPUT_COMPLETE_EVENTS)
             await websocket.send(json.dumps({"type": "session.close"}))
             await wait_for_event(websocket, {"session.closed"})
 
