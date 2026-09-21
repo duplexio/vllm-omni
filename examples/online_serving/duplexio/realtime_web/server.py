@@ -20,14 +20,22 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
-
 logger = logging.getLogger(__name__)
 APP_DIR = Path(__file__).parent / "app"
 STATIC_DIR = APP_DIR / "static"
 INPUT_SAMPLE_RATE = 24_000
 DEFAULT_TOOLS_PATH = Path(__file__).parent / "tools.json"
 SESSION_COOKIE_NAME = "__Host-duplexio_session"
+DEFAULT_SAMPLING = {
+    "agent": {
+        "emission": {"temperature": 1.0},
+        "content": {"temperature": 0.6, "top_k": 20, "top_p": 0.95},
+    },
+    "user": {
+        "emission": {"temperature": 0.0},
+        "content": {"temperature": 0.0, "top_k": None, "top_p": None},
+    },
+}
 
 
 
@@ -75,9 +83,8 @@ def load_sampling_defaults(config_path: Path) -> dict[str, object]:
         config_path.read_text(encoding="utf-8")
     )
     depth = checkpoint.depth_transformer_config
-    sampling = SamplingConfig()
     return {
-        **sampling.model_dump(),
+        **DEFAULT_SAMPLING,
         **(
             {}
             if depth is None
