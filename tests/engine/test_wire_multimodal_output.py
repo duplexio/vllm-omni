@@ -11,6 +11,7 @@ import torch
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -39,6 +40,26 @@ def test_tensor_only_roundtrip():
     assert isinstance(out.multimodal_output, dict)
     assert torch.allclose(out.multimodal_output["audio"], audio)
     assert out.multimodal_output["sr"].item() == 24000
+
+
+@pytest.mark.parametrize("length", [0, 1, 4])
+@pytest.mark.parametrize("layout", ["list", "passthrough", "shared", "token_aligned"])
+def test_strided_request_tensor_roundtrip(length, layout):
+    source = torch.arange(12, dtype=torch.float32).view(4, 3)[:length, 0]
+    payload = build_mm_cpu({"value": [source] if layout in ("list", "passthrough") else source})
+    value = to_payload_element(
+        payload["value"], 0, 0, length,
+        pass_lists_through=layout == "passthrough",
+        seq_len=length if layout == "token_aligned" else None,
+    )
+    if layout == "passthrough":
+        value = value[0]
+    output = OmniEngineCoreOutput(
+        request_id="strided-output", new_token_ids=[], finish_reason=None,
+        multimodal_output={"value": value},
+    )
+    decoded = _roundtrip(OmniEngineCoreOutputs(outputs=[output]))
+    torch.testing.assert_close(decoded.outputs[0].multimodal_output["value"], source)
 
 
 def test_empty_multimodal_roundtrip():
