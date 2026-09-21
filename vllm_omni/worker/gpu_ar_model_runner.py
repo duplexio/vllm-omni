@@ -45,6 +45,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     get_stage_connector_role,
     stage_sends_async_output,
 )
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -287,6 +288,8 @@ class ExecuteModelState(NamedTuple):
     multimodal_outputs: Any
     # slot_mappings for attention/drafter (aligned with upstream v1 API)
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
+    streaming_retained_tokens: list[int] | None = None
+    streaming_position_budget: list[int] | None = None
 
 
 class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
@@ -1365,6 +1368,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            streaming_retained_tokens = (
+                model_output.streaming_retained_tokens if isinstance(model_output, OmniOutput) else None
+            )
+            streaming_position_budget = (
+                model_output.streaming_position_budget if isinstance(model_output, OmniOutput) else None
+            )
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
             hidden_states_cpu = None
 
@@ -1464,6 +1473,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             cudagraph_stats,
             multimodal_outputs,
             slot_mappings,  # OMNI: pass slot_mappings for drafter
+            streaming_retained_tokens,
+            streaming_position_budget,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -1761,6 +1772,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         num_scheduled_tokens_np: np.ndarray,
         query_start_loc_cpu: Any,
         postprocess_already_applied: bool = False,
+        streaming_retained_tokens: list[int] | None = None,
+        streaming_position_budget: list[int] | None = None,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
@@ -1909,6 +1922,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 pooler_output=None,
                 multimodal_outputs=multimodal_outputs,
                 inter_stage_outputs=inter_stage_outputs,
+                streaming_retained_tokens=(
+                    dict(zip(req_ids_output_copy, streaming_retained_tokens, strict=True))
+                    if streaming_retained_tokens is not None else {}
+                ),
+                streaming_position_budget=(
+                    dict(zip(req_ids_output_copy, streaming_position_budget, strict=True))
+                    if streaming_position_budget is not None else {}
+                ),
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
@@ -1954,6 +1975,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             cudagraph_stats,
             multimodal_outputs,
             slot_mappings,  # OMNI: unpack slot_mappings for drafter
+            streaming_retained_tokens,
+            streaming_position_budget,
         ) = self.execute_model_state
         self.execute_model_state = None
 
@@ -2134,6 +2157,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     query_start_loc_cpu=query_start_loc_cpu,
                     postprocess_already_applied=omni_postprocess_already_applied,
+                    streaming_retained_tokens=streaming_retained_tokens,
+                    streaming_position_budget=streaming_position_budget,
                 )
 
         if not use_async_omni_output:

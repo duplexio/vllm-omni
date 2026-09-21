@@ -125,6 +125,7 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
         _new_prompt_len_snapshot={},
         finished_req_ids=set(),
         finished_req_ids_dict=defaultdict(set),
+        streaming_context_errors={},
         kv_cache_manager=SimpleNamespace(take_events=lambda: None),
         kv_event_publisher=SimpleNamespace(publish=lambda _events: None),
     )

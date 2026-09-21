@@ -52,6 +52,9 @@ class OmniRequest(Request):
         self.additional_information: AdditionalInformationPayload | None = additional_information
         # Runner-owned runtime payload.
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
+        # Only models owning their cache addressing may compact scheduler history.
+        self.streaming_retained_tokens: int | None = None
+        self.streaming_position_budget: int | None = None
 
     @staticmethod
     def _maybe_decode_prompt_embeds(

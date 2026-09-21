@@ -86,12 +86,6 @@ def load_sampling_defaults(config_path: Path) -> dict[str, object]:
     }
 
 
-# A session's engine request cannot outlive max_model_len (duplexio.yaml: 73728
-# tokens, 16 minutes of 80 ms frames), and the demo's own limit has to land
-# inside that with room for the tool-aware system prefill.
-SESSION_SECONDS_LIMIT = 14 * 60
-
-
 async def pump_client_to_backend(client: WebSocket, backend) -> None:
     try:
         while True:
@@ -274,28 +268,8 @@ def build_app(
                 }
                 done, pending = await asyncio.wait(
                     tasks,
-                    timeout=SESSION_SECONDS_LIMIT,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if not done:
-                    # The engine's request is bounded by max_model_len; running
-                    # into it is fatal for the whole engine, so end the session
-                    # first and say why.
-                    logger.info("Ending session after %s s", SESSION_SECONDS_LIMIT)
-                    with contextlib.suppress(Exception):
-                        await websocket.send_json(
-                            {
-                                "type": "error",
-                                "code": "session_length_limit",
-                                "error": (
-                                    "This demo ends a session after "
-                                    f"{SESSION_SECONDS_LIMIT // 60} minutes. "
-                                    "Reconnect to keep talking."
-                                ),
-                            }
-                        )
-                    with contextlib.suppress(Exception):
-                        await websocket.close(code=1000)
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)

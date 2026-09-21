@@ -58,6 +58,7 @@ class DuplexSessionRunnerMixin:
         session: DuplexSession | None = None
         actor = DuplexWebSocketActor(
             websocket,
+            mailbox_byte_limit=self._duplex_session_config.max_pending_input_bytes_per_session,
             current_epoch=lambda: session.epoch if session is not None else None,
             session_closed=lambda: session is not None and session.state == DuplexSessionState.CLOSED,
             outbound_protocol=realtime_protocol,
@@ -216,7 +217,8 @@ class DuplexSessionRunnerMixin:
                     if raw is None:
                         await actor.enqueue_event({"type": "__timeout__"})
                         return
-                    if len(raw.encode("utf-8")) > _MAX_EVENT_BYTES:
+                    wire_bytes = len(raw.encode("utf-8"))
+                    if wire_bytes > _MAX_EVENT_BYTES:
                         await emit_event(
                             {"type": "error", "error": "Duplex event too large", "code": "event_too_large"}
                         )
@@ -258,7 +260,7 @@ class DuplexSessionRunnerMixin:
                         pending_turn_reservations += 1
                     if is_input_event(event_type) and native_response_in_progress():
                         event["_duplex_overlap_candidate"] = True
-                    await actor.enqueue_event(event)
+                    await actor.enqueue_event(event, wire_bytes=wire_bytes)
             except WebSocketDisconnect:
                 await actor.enqueue_event({"type": "__disconnect__"})
 
@@ -2015,6 +2017,7 @@ class DuplexSessionRunnerMixin:
                     pending_turn_reservations -= 1
                 resumable_detach = (
                     transport_detached
+                    and not actor.closing
                     and runtime_opened
                     and not runtime_closed
                     and session.state == DuplexSessionState.OPEN
@@ -2079,8 +2082,8 @@ class DuplexSessionRunnerMixin:
                     with suppress(Exception):
                         await self._attachment_registry.close(session.session_id)
                     self._stop_lifecycle_listener_if_idle()
-            await actor.close_writer()
             with suppress(Exception):
+                await asyncio.wait_for(actor.close_writer(), timeout=2.0)
                 await asyncio.wait_for(actor.output_queue.join(), timeout=2.0)
             if not writer_task.done():
                 writer_task.cancel()

@@ -72,6 +72,7 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
     model.frame_inputs = frame_inputs
     # Audio cells see a two-frame window here, so eviction shows up in the test.
     model.config = SimpleNamespace(audio_attention_window_frames=2, frame_size=1920, sample_rate=24000)
+    model.text_config = SimpleNamespace(max_position_embeddings=262144)
     model.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(dtype=torch.float32)
     )
@@ -321,3 +322,17 @@ def test_tool_burst_preserves_next_live_features_and_generated_feedback() -> Non
     for key in ("user_features", "agent_audio"):
         torch.testing.assert_close(replays[0][key], replays[1][key])
     assert model.audio_codec.waveforms == []
+
+
+@torch.inference_mode()
+def test_compacted_scheduler_offsets_do_not_change_model_positions() -> None:
+    model = model_fixture()
+    state = request_state(model)
+    state.frames_seen = 50_000
+    info = input_info(state, [6, 7, 8], system=True)
+    info['duplex_token_offset'] = 6
+    info['duplex_prompt_len'] = 24
+    _, _, update = model.preprocess(torch.zeros(18, dtype=torch.long), None, **info)
+    torch.testing.assert_close(update['duplexio']['positions'], torch.arange(300_000, 300_018))
+    assert update['duplexio_working_state'].frames_seen == 50_003
+    assert update['duplexio_working_state'].active_text_tokens == 3

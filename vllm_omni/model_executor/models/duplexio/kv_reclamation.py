@@ -130,6 +130,7 @@ class DuplexIOFrameMetadata:
     ) -> None:
         self.layout = layout
         self.cell = torch.arange(max_tokens, device=device) % DUPLEXIO_NUM_CELLS
+        self.positions = torch.arange(max_tokens, device=device)
         self.key_active = torch.ones(max_tokens, dtype=torch.bool, device=device)
         self.text_ordinal = torch.zeros(max_tokens, dtype=torch.int32, device=device)
         self.text_last = torch.zeros(max_tokens, dtype=torch.int32, device=device)
@@ -167,6 +168,7 @@ class DuplexIOFrameMetadata:
         """Make tokens inert: no slot to write, no key in the window."""
         region = slice(start, end)
         self.key_active[region] = True
+        self.positions[region] = 0
         self.text_ordinal[region] = 0
         self.text_last[region] = 0
         self.audio_first[region] = 1

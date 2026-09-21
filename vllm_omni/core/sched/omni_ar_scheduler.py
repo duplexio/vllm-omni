@@ -106,6 +106,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.pending_stop_after_extraction: set[str] = set()
 
         self.finished_req_ids_dict = defaultdict(set)
+        self.streaming_context_errors: dict[str, tuple[int, OmniEngineCoreOutput]] = {}
 
         # [Omni] Pre-parse KV transfer criteria
         self.kv_transfer_criteria = self._get_kv_transfer_criteria()
@@ -465,6 +466,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
+            retained = getattr(model_runner_output, "streaming_retained_tokens", {}).get(req_id)
+            if retained is not None:
+                request.streaming_retained_tokens = retained
+            position_budget = getattr(model_runner_output, "streaming_position_budget", {}).get(req_id)
+            if position_budget is not None:
+                request.streaming_position_budget = position_budget
             kv_transfer_params = None
             finish_reason = None
             routed_experts = None
@@ -656,6 +663,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             batch = KVEventBatch(ts=time(), events=events)
             self.kv_event_publisher.publish(batch)
 
+        for req_id, (client_index, error) in self.streaming_context_errors.items():
+            outputs[client_index] = [output for output in outputs[client_index] if output.request_id != req_id]
+            outputs[client_index].append(error)
+        self.streaming_context_errors.clear()
+
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
         engine_core_outputs = {client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()}
@@ -762,6 +774,37 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._free_input_coordinator_request(request.request_id)
         return finished
 
+    def reject_streaming_context_overflow(self, session: Request, update: StreamingUpdate) -> bool:
+        retained = session.streaming_retained_tokens
+        position_budget = session.streaming_position_budget
+        incoming = len(update.prompt_token_ids)
+        if position_budget is not None and incoming > position_budget:
+            reason = "position_context_limit"
+        elif retained is not None and retained + incoming >= self.max_model_len:
+            reason = "retained_context_limit"
+        else:
+            return False
+        session.resumable = False
+        session.stop_reason = reason
+        self.streaming_context_errors[session.request_id] = (
+            session.client_index,
+            OmniEngineCoreOutput(
+                request_id=session.request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                stop_reason=session.stop_reason,
+            ),
+        )
+        return True
+
+    def _handle_stopped_request(self, request: Request) -> bool:
+        if request.resumable and request.streaming_queue:
+            update = request.streaming_queue[0]
+            if update is not None and self.reject_streaming_context_overflow(request, update):
+                request.status = RequestStatus.FINISHED_ERROR
+                return True
+        return super()._handle_stopped_request(request)
+
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """
         Override: Only extend prompt at stage 0, and replace
@@ -770,6 +813,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         Discards the last sampled output token from the prior input chunk at stage 0.
         """
         req_id = session.request_id
+        if self.reject_streaming_context_overflow(session, update):
+            self.finish_requests(req_id, RequestStatus.FINISHED_ERROR)
+            return
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
         if outstanding_async_tokens > 0:
@@ -814,6 +860,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if replace_streaming_prompt:
             self._replace_streaming_session(session, update)
             return
+        retained = session.streaming_retained_tokens
+        if retained is not None:
+            assert 0 < retained <= session.num_computed_tokens
+            assert not session.mm_features and session.prompt_embeds is None
+            discarded = session.num_computed_tokens - retained
+            del session.prompt_token_ids[:discarded]
+            del session._all_token_ids[:discarded]
+            session.num_prompt_tokens -= discarded
+            session.num_computed_tokens = retained
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer

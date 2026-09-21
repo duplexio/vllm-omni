@@ -42,7 +42,7 @@ def test_prewarm_waits_for_one_model_frame_and_clean_session_close() -> None:
             await prewarm_module.prewarm(
                 f"ws://127.0.0.1:{port}",
                 "checkpoint",
-                "voice-333",
+                base64.b64encode(bytes(1_920 * 4)).decode(),
                 [],
                 timeout_seconds=5,
             )
@@ -53,3 +53,12 @@ def test_prewarm_waits_for_one_model_frame_and_clean_session_close() -> None:
     assert messages[1]["type"] == "input_audio_buffer.append"
     assert len(base64.b64decode(messages[1]["audio"])) == 1_920 * 4
     assert messages[2] == {"type": "session.close"}
+
+
+def test_prewarm_supplies_reference_pcm_instead_of_a_voice_name() -> None:
+    reference = base64.b64encode(bytes(1_920 * 4)).decode()
+    session = prewarm_module.session_update("checkpoint", reference, [])["session"]
+    assert "voice" not in session
+    assert session["extra_body"]["ref_audio_data"] == reference
+    assert session["extra_body"]["ref_audio_format"] == "pcm_f32le"
+    assert session["extra_body"]["ref_audio_sample_rate"] == 24_000

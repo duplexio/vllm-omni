@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -97,8 +98,15 @@ class DuplexWebSocketActor:
     websocket: Any
     current_epoch: Callable[[], int | None] | None = None
     session_closed: Callable[[], bool] | None = None
-    output_queue: asyncio.Queue[dict[str, object] | None] = field(default_factory=asyncio.Queue)
-    mailbox: asyncio.Queue[dict[str, object]] = field(default_factory=asyncio.Queue)
+    output_queue: asyncio.Queue[dict[str, object] | None] = field(
+        default_factory=lambda: asyncio.Queue(maxsize=32)
+    )
+    mailbox: asyncio.Queue[tuple[dict[str, object], int]] = field(
+        default_factory=lambda: asyncio.Queue(maxsize=32)
+    )
+    mailbox_byte_limit: int = 16 * 1024 * 1024
+    mailbox_bytes: int = 0
+    mailbox_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     outbound_protocol: Any | None = None
     tasks: DuplexSessionTasks = field(default_factory=DuplexSessionTasks)
     closing: bool = False
@@ -126,13 +134,25 @@ class DuplexWebSocketActor:
     def native_append_tail(self, task: asyncio.Task[bool] | None) -> None:
         self.tasks.native_append_tail = task
 
-    async def enqueue_event(self, event: dict[str, object]) -> None:
-        if is_input_event(event.get("type")):
-            self._queued_input_events += 1
-        await self.mailbox.put(event)
+    async def enqueue_event(self, event: dict[str, object], *, wire_bytes: int = 0) -> None:
+        if wire_bytes > self.mailbox_byte_limit:
+            self.closing = True
+            self.close_reason = "input_backpressure"
+            raise WebSocketDisconnect(code=1013, reason=self.close_reason)
+        async with self.mailbox_condition:
+            await self.mailbox_condition.wait_for(
+                lambda: self.mailbox_bytes + wire_bytes <= self.mailbox_byte_limit
+            )
+            await self.mailbox.put((event, wire_bytes))
+            self.mailbox_bytes += wire_bytes
+            if is_input_event(event.get("type")):
+                self._queued_input_events += 1
 
     async def next_event(self) -> dict[str, object]:
-        event = await self.mailbox.get()
+        event, wire_bytes = await self.mailbox.get()
+        async with self.mailbox_condition:
+            self.mailbox_bytes -= wire_bytes
+            self.mailbox_condition.notify_all()
         if is_input_event(event.get("type")):
             self._queued_input_events = max(0, self._queued_input_events - 1)
         self.mailbox.task_done()
@@ -142,7 +162,15 @@ class DuplexWebSocketActor:
         return self._queued_input_events > 0
 
     async def send_json(self, payload: dict[str, object]) -> None:
-        await self.output_queue.put(payload)
+        if not self.output_queue.full():
+            self.output_queue.put_nowait(payload)
+            return
+        try:
+            await asyncio.wait_for(self.output_queue.put(payload), timeout=5.0)
+        except TimeoutError as exc:
+            self.closing = True
+            self.close_reason = "output_backpressure"
+            raise WebSocketDisconnect(code=1013, reason=self.close_reason) from exc
 
     async def close_writer(self) -> None:
         await self.output_queue.put(None)
@@ -159,12 +187,21 @@ class DuplexWebSocketActor:
                     continue
                 try:
                     if raw_realtime:
-                        await self.websocket.send_json(payload)
+                        await asyncio.wait_for(self.websocket.send_json(payload), timeout=5.0)
                     elif self.outbound_protocol is not None:
                         for projected in self.outbound_protocol.encode_outbound_event(payload):
-                            await self.websocket.send_json(projected)
+                            await asyncio.wait_for(self.websocket.send_json(projected), timeout=5.0)
                     else:
-                        await self.websocket.send_json(payload)
+                        await asyncio.wait_for(self.websocket.send_json(payload), timeout=5.0)
+                except TimeoutError:
+                    self.closing = True
+                    self.close_reason = "output_backpressure"
+                    with suppress(Exception):
+                        await asyncio.wait_for(
+                            self.websocket.close(code=1013, reason=self.close_reason), timeout=1.0
+                        )
+                    await self.enqueue_event({"type": "__disconnect__"})
+                    return
                 except (WebSocketDisconnect, RuntimeError):
                     return
             finally:

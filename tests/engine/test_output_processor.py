@@ -641,3 +641,28 @@ def test_no_detokenizer_final_only():
     result = s.make_request_output([], None, FinishReason.STOP, None)
     assert result is not None
     assert AUDIO in result.outputs[0].multimodal_output
+
+
+def test_streaming_context_error_is_terminal_and_preserves_other_requests():
+    processor = MultimodalOutputProcessor(None, log_stats=False, output_modality=OutputModality.AUDIO)
+    state = _make_no_detok_state(RequestOutputKind.DELTA)
+    state.streaming_input = True
+    processor.request_states["r"] = state
+    processor.external_req_ids["r"].append("r")
+    survivor = _make_no_detok_state(RequestOutputKind.DELTA)
+    processor.request_states["survivor"] = survivor
+    error = output_processor.EngineCoreOutput(
+        request_id="r", new_token_ids=[],
+        finish_reason=FinishReason.ERROR, stop_reason="retained_context_limit",
+    )
+
+    result = processor.process_outputs([error])
+
+    assert len(result.request_outputs) == 1
+    output = result.request_outputs[0]
+    assert output.finished
+    assert output.error == "retained_context_limit"
+    assert output.error_status_code == 400
+    assert output.error_type == "context_length_exceeded"
+    assert "r" not in processor.request_states
+    assert processor.request_states["survivor"] is survivor

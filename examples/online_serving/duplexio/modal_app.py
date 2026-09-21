@@ -1,4 +1,9 @@
-"""Deploy the DuplexIO realtime server and web client on Modal."""
+"""Deploy the DuplexIO realtime server and web client on Modal.
+
+Upload the exported checkpoint and a mono 24 kHz ``prewarm.wav`` into
+``MODEL_NAME`` on the ``duplexio-vllm-models`` volume. The startup clip warms
+inference; users upload their own reference voice clip in the browser.
+"""
 
 from __future__ import annotations
 
@@ -24,11 +29,11 @@ SUFFIX = f"-{VARIANT}" if VARIANT else ""
 VARIANT_ENV = {"DUPLEXIO_MODAL_VARIANT": VARIANT} if VARIANT else {}
 APP_NAME = f"duplexio-vllm-omni{SUFFIX}"
 MODEL_VOLUME_NAME = "duplexio-vllm-models"
-MODEL_NAME = "duplexio-opd-warm23k-vllm-v5"
+MODEL_NAME = "run508723_step28000_v7"
 MODEL_PATH = Path("/models") / MODEL_NAME
-# Default voice for prewarm + demo; must exist in the checkpoint voice pool
-# (VoxCeleb id100xx set plus the two custom voices, boxlyx and maya).
-VOICE = "69f67cf0ae15b9e491cd6b21"
+# Upload a mono 24 kHz clip alongside the model for startup warmup.
+# Browser sessions send their own uploaded reference audio.
+PREWARM_AUDIO_PATH = MODEL_PATH / "prewarm.wav"
 APP_ROOT = Path("/app/vllm-omni")
 FRONTEND_ROOT = Path("/app/realtime_web")
 DEPLOY_CONFIG_NAME = "duplexio.yaml"
@@ -271,8 +276,8 @@ def prewarm_backend() -> None:
             LOCAL_BACKEND_WEBSOCKET_URL,
             "--model",
             str(MODEL_PATH),
-            "--voice",
-            VOICE,
+            "--ref-audio",
+            str(PREWARM_AUDIO_PATH),
             "--tools",
             str(
                 APP_ROOT
@@ -310,7 +315,6 @@ def build_model_app(process: subprocess.Popen[bytes]) -> object:
     from examples.online_serving.duplexio.realtime_web.server import (
         build_app,
         load_sampling_defaults,
-        load_voice_options,
     )
 
     tools_path = (
@@ -324,8 +328,8 @@ def build_model_app(process: subprocess.Popen[bytes]) -> object:
     return build_app(
         ws_backend=LOCAL_BACKEND_WEBSOCKET_URL,
         model=str(MODEL_PATH),
-        voice=VOICE,
-        voices=load_voice_options(MODEL_PATH / "voices.json"),
+        sample_clips=[],
+        sample_clip_dir=None,
         sampling=load_sampling_defaults(MODEL_PATH / "config.json"),
         tools=json.loads(tools_path.read_text(encoding="utf-8")),
         health_check=lambda: backend_is_healthy(process),
@@ -338,6 +342,8 @@ def check_model_present() -> None:
             f"Model checkpoint not found at {MODEL_PATH}. Upload {MODEL_NAME} "
             f"to the {MODEL_VOLUME_NAME!r} Modal Volume."
         )
+    if not PREWARM_AUDIO_PATH.is_file():
+        raise RuntimeError(f"Upload a mono 24 kHz startup reference clip to {PREWARM_AUDIO_PATH}")
 
 
 
@@ -418,7 +424,6 @@ def demo() -> object:
     from realtime_web.server import (
         build_app,
         load_sampling_defaults,
-        load_voice_options,
     )
 
     tools_path = FRONTEND_ROOT / "tools.json"
@@ -429,8 +434,8 @@ def demo() -> object:
     return build_app(
         ws_backend=BACKEND_WEBSOCKET_URL,
         model=str(MODEL_PATH),
-        voice=VOICE,
-        voices=load_voice_options(MODEL_PATH / "voices.json"),
+        sample_clips=[],
+        sample_clip_dir=None,
         sampling=load_sampling_defaults(MODEL_PATH / "config.json"),
         tools=json.loads(tools_path.read_text(encoding="utf-8")),
         password_hash=os.environ[AUTH_PASSWORD_HASH_ENV],

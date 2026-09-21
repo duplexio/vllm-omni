@@ -349,11 +349,15 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
         ec_connector_output=None,
         cudagraph_stats=None,
         kv_extracted_req_ids=["r2"],
+        streaming_retained_tokens=[6, 18],
+        streaming_position_budget=[600, 900],
         num_scheduled_tokens_np=torch.tensor([1, 2], dtype=torch.int32).numpy(),
         query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
     )
 
     assert output.req_ids == ["r1", "r2"]
+    assert output.streaming_retained_tokens == {"r1": 6, "r2": 18}
+    assert output.streaming_position_budget == {"r1": 600, "r2": 900}
     assert output.inter_stage_outputs is not None
     assert torch.equal(output.inter_stage_outputs[0]["hidden"], torch.tensor([[1.0]]))
     assert torch.equal(output.inter_stage_outputs[1]["hidden"], torch.tensor([[2.0], [3.0]]))

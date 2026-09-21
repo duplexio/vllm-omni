@@ -143,3 +143,72 @@ async def test_writer_does_not_revoke_accepted_terminal_after_close_starts():
 
     assert websocket.sent == [{"type": "response.done", "epoch": 1, "response_id": "resp-1"}]
     assert actor.stale_output_dropped == 0
+
+
+@pytest.mark.asyncio
+async def test_mailbox_backpressure_preserves_audio_order():
+    actor = DuplexWebSocketActor(FakeWebSocket())
+    assert actor.mailbox.maxsize > 0
+    for index in range(actor.mailbox.maxsize):
+        await actor.enqueue_event({"type": "input_audio_buffer.append", "index": index})
+    blocked = asyncio.create_task(actor.enqueue_event({"type": "session.close"}))
+    await asyncio.sleep(0)
+    assert not blocked.done()
+    assert (await actor.next_event())["index"] == 0
+    await asyncio.wait_for(blocked, timeout=1)
+    for index in range(1, actor.mailbox.maxsize):
+        assert (await actor.next_event())["index"] == index
+    assert (await actor.next_event())["type"] == "session.close"
+
+
+@pytest.mark.asyncio
+async def test_output_backpressure_preserves_audio_order():
+    socket = FakeWebSocket()
+    actor = DuplexWebSocketActor(socket)
+    assert actor.output_queue.maxsize > 0
+    for index in range(actor.output_queue.maxsize):
+        await actor.send_json({"type": "response.audio.delta", "index": index})
+    blocked = asyncio.create_task(actor.send_json({"type": "response.done"}))
+    await asyncio.sleep(0)
+    assert not blocked.done()
+    writer = asyncio.create_task(actor.writer_loop())
+    await asyncio.wait_for(blocked, timeout=1)
+    await actor.close_writer()
+    await asyncio.wait_for(writer, timeout=1)
+    assert [event["index"] for event in socket.sent[:-1]] == list(range(actor.output_queue.maxsize))
+    assert socket.sent[-1]["type"] == "response.done"
+
+
+@pytest.mark.asyncio
+async def test_mailbox_byte_budget_applies_before_model_input_buffer():
+    actor = DuplexWebSocketActor(FakeWebSocket(), mailbox_byte_limit=8)
+    await actor.enqueue_event({"type": "input_audio_buffer.append", "audio": "aaaaaa"}, wire_bytes=6)
+    blocked = asyncio.create_task(actor.enqueue_event({"type": "session.update"}, wire_bytes=4))
+    await asyncio.sleep(0)
+    assert not blocked.done()
+    assert actor.mailbox_bytes == 6
+    assert (await actor.next_event())["audio"] == "aaaaaa"
+    await asyncio.wait_for(blocked, timeout=1)
+    assert actor.mailbox_bytes == 4
+    await actor.next_event()
+    assert actor.mailbox_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_slow_receiver_closes_transport_and_wakes_session():
+    class SlowWebSocket(FakeWebSocket):
+        closed = None
+
+        async def send_json(self, payload):
+            raise TimeoutError
+
+        async def close(self, *, code, reason):
+            self.closed = (code, reason)
+
+    socket = SlowWebSocket()
+    actor = DuplexWebSocketActor(socket)
+    await actor.send_json({"type": "response.audio.delta"})
+    await asyncio.wait_for(actor.writer_loop(), timeout=1)
+    assert socket.closed == (1013, "output_backpressure")
+    assert actor.closing
+    assert (await actor.next_event())["type"] == "__disconnect__"

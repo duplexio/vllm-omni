@@ -317,6 +317,7 @@ class DuplexIOForConditionalGeneration(
             if self.full_cudagraph_enabled else frame_inputs
         )
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
+            ("duplexio", "positions"),
             ("duplexio", "key_active"),
             ("duplexio", "text_ordinals"),
             ("duplexio", "text_last"),
@@ -459,6 +460,8 @@ class DuplexIOForConditionalGeneration(
             prompt_ordinal=torch.cat([info["prompt_ordinal"] for info in duplex_infos]),
             prompt_last=torch.cat([info["prompt_last"] for info in duplex_infos]),
         )
+        positions = torch.cat([info["positions"] for info in duplex_infos])
+        self.frame.positions[:positions.numel()].copy_(positions)
 
     def supports_cudagraph_replay(
         self,
@@ -647,6 +650,11 @@ class DuplexIOForConditionalGeneration(
             is_live, prompt_written, prompt_mask,
         )
         state.active_text_tokens += active_text_count
+        positions = torch.arange(
+            state.frames_seen * DUPLEXIO_NUM_CELLS,
+            (state.frames_seen + frame_count) * DUPLEXIO_NUM_CELLS,
+            device=input_ids.device,
+        )
         state.frames_seen += frame_count
         # Audio time advances only on frames that carry real audio: text-only
         # prefill and system-token bursts leave the counter frozen so they do
@@ -669,6 +677,7 @@ class DuplexIOForConditionalGeneration(
                 "duplexio_working_state": state,
                 "duplexio_replay": replay,
                 "duplexio": {
+                    "positions": positions,
                     "key_active": key_active,
                     "text_ordinals": text_ordinals,
                     "text_last": text_last,
@@ -697,7 +706,7 @@ class DuplexIOForConditionalGeneration(
         del model_intermediate_buffer
         with torch.profiler.record_function("duplexio.backbone"):
             return self.llm.base_model.model(
-                positions=duplexio_frame_positions(positions),
+                positions=duplexio_frame_positions(self.frame.positions[:inputs_embeds.shape[0]]),
                 key_active=self.frame.key_active[: inputs_embeds.shape[0]],
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
@@ -763,6 +772,8 @@ class DuplexIOForConditionalGeneration(
         system_input_complete_flags: list[Tensor] = []
         tool_call_complete_flags: list[Tensor] = []
         tool_call_payloads: list[Tensor] = []
+        retained_tokens: list[int] = []
+        position_budgets: list[int] = []
         predictor_hiddens: list[Tensor] = []
         agent_emit_logprobs: list[Tensor] = []
         agent_token_logprobs: list[Tensor] = []
@@ -793,6 +804,12 @@ class DuplexIOForConditionalGeneration(
             state = info.get("duplexio_working_state")
             if not isinstance(state, DuplexIORequestState):
                 raise RuntimeError(f"DuplexIO request {request_index} is missing working state")
+            # Four text slots per scheduler row; audio and voice KV have fixed
+            # reserved regions. Keep one row to preserve the recurrent-state marker.
+            retained_tokens.append(max(1, (state.active_text_tokens + 3) // 4) * DUPLEXIO_NUM_CELLS)
+            position_budgets.append(
+                (self.text_config.max_position_embeddings - state.frames_seen) * DUPLEXIO_NUM_CELLS
+            )
             span_length = end - start
             if span_length < DUPLEXIO_NUM_CELLS or span_length % DUPLEXIO_NUM_CELLS:
                 raise ValueError(f"DuplexIO request span must contain complete frames, got ({start}, {end})")
@@ -920,6 +937,8 @@ class DuplexIOForConditionalGeneration(
         return OmniOutput(
             text_hidden_states=hidden_states,
             multimodal_outputs=multimodal_outputs,
+            streaming_retained_tokens=retained_tokens,
+            streaming_position_budget=position_budgets,
         )
 
     def sample_frames(
