@@ -1,4 +1,4 @@
-"""Warm the complete DuplexIO realtime path before accepting browser sessions."""
+"""Warm the DuplexIO prefix path before accepting browser sessions."""
 
 from __future__ import annotations
 
@@ -13,19 +13,6 @@ import websockets
 
 SAMPLE_RATE = 24_000
 FRAME_SIZE = 1_920
-MODEL_OUTPUT_EVENTS = {
-    "response.audio.delta",
-    "response.output_audio.delta",
-    "response.audio.done",
-    "response.done",
-    "response.listen",
-}
-MODEL_OUTPUT_TERMINAL_EVENTS = {
-    "response.audio.done",
-    "response.done",
-    "response.listen",
-    "audio.cancelled",
-}
 
 
 def realtime_url(backend: str, model: str) -> str:
@@ -54,15 +41,6 @@ def session_update(model: str, reference_audio: str, tools: list[dict[str, objec
     }
 
 
-def silence_frame() -> dict[str, object]:
-    return {
-        "type": "input_audio_buffer.append",
-        "audio": base64.b64encode(bytes(FRAME_SIZE * 4)).decode(),
-        "format": "pcm_f32le",
-        "sample_rate_hz": SAMPLE_RATE,
-    }
-
-
 async def wait_for_event(websocket, event_types: set[str]) -> dict[str, object]:
     while True:
         event = json.loads(await websocket.recv())
@@ -88,15 +66,6 @@ async def prewarm(
         ) as websocket:
             await websocket.send(json.dumps(session_update(model, reference_audio, tools)))
             await wait_for_event(websocket, {"session.updated"})
-            await websocket.send(json.dumps(silence_frame()))
-            first_output = await wait_for_event(websocket, MODEL_OUTPUT_EVENTS)
-            if first_output.get("type") in {"response.audio.delta", "response.output_audio.delta"}:
-                cancel = {"type": "response.cancel"}
-                response_id = first_output.get("response_id")
-                if isinstance(response_id, str) and response_id:
-                    cancel["response_id"] = response_id
-                await websocket.send(json.dumps(cancel))
-                await wait_for_event(websocket, MODEL_OUTPUT_TERMINAL_EVENTS)
             await websocket.send(json.dumps({"type": "session.close"}))
             await wait_for_event(websocket, {"session.closed"})
 
