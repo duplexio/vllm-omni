@@ -13,10 +13,18 @@ import websockets
 
 SAMPLE_RATE = 24_000
 FRAME_SIZE = 1_920
-MODEL_OUTPUT_COMPLETE_EVENTS = {
+MODEL_OUTPUT_EVENTS = {
+    "response.audio.delta",
+    "response.output_audio.delta",
     "response.audio.done",
     "response.done",
     "response.listen",
+}
+MODEL_OUTPUT_TERMINAL_EVENTS = {
+    "response.audio.done",
+    "response.done",
+    "response.listen",
+    "audio.cancelled",
 }
 
 
@@ -81,7 +89,14 @@ async def prewarm(
             await websocket.send(json.dumps(session_update(model, reference_audio, tools)))
             await wait_for_event(websocket, {"session.updated"})
             await websocket.send(json.dumps(silence_frame()))
-            await wait_for_event(websocket, MODEL_OUTPUT_COMPLETE_EVENTS)
+            first_output = await wait_for_event(websocket, MODEL_OUTPUT_EVENTS)
+            if first_output.get("type") in {"response.audio.delta", "response.output_audio.delta"}:
+                cancel = {"type": "response.cancel"}
+                response_id = first_output.get("response_id")
+                if isinstance(response_id, str) and response_id:
+                    cancel["response_id"] = response_id
+                await websocket.send(json.dumps(cancel))
+                await wait_for_event(websocket, MODEL_OUTPUT_TERMINAL_EVENTS)
             await websocket.send(json.dumps({"type": "session.close"}))
             await wait_for_event(websocket, {"session.closed"})
 

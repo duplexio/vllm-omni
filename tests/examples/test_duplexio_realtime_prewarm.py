@@ -33,8 +33,9 @@ def test_prewarm_waits_for_one_model_frame_and_clean_session_close() -> None:
             await websocket.send(json.dumps({"type": "session.created"}))
             await websocket.send(json.dumps({"type": "session.updated"}))
             messages.append(json.loads(await websocket.recv()))
-            await websocket.send(json.dumps({"type": "response.audio.delta"}))
-            await websocket.send(json.dumps({"type": "response.audio.done"}))
+            await websocket.send(json.dumps({"type": "response.audio.delta", "response_id": "response-1"}))
+            messages.append(json.loads(await websocket.recv()))
+            await websocket.send(json.dumps({"type": "audio.cancelled", "response_id": "response-1"}))
             messages.append(json.loads(await websocket.recv()))
             await websocket.send(json.dumps({"type": "session.closed"}))
 
@@ -53,7 +54,8 @@ def test_prewarm_waits_for_one_model_frame_and_clean_session_close() -> None:
     assert messages[0]["type"] == "session.update"
     assert messages[1]["type"] == "input_audio_buffer.append"
     assert len(base64.b64decode(messages[1]["audio"])) == 1_920 * 4
-    assert messages[2] == {"type": "session.close"}
+    assert messages[2] == {"type": "response.cancel", "response_id": "response-1"}
+    assert messages[3] == {"type": "session.close"}
 
 
 def test_prewarm_supplies_reference_pcm_instead_of_a_voice_name() -> None:
