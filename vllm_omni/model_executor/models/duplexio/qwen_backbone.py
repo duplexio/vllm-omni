@@ -122,11 +122,11 @@ class DuplexIORotaryEmbedding(nn.Module):
 
 
 class DuplexIORMSNorm(nn.Module):
-    """Use the training kernel and preserve its FP32 direct scales."""
+    """Use compute-dtype scales with FP32 normalization arithmetic."""
 
-    def __init__(self, hidden_size: int, eps: float) -> None:
+    def __init__(self, hidden_size: int, eps: float, *, dtype: torch.dtype) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.eps = eps
 
     def forward(
@@ -137,20 +137,21 @@ class DuplexIORMSNorm(nn.Module):
         return rmsnorm(hidden, self.weight, residual=residual, eps=self.eps, prenorm=residual is not None)
 
 
+@torch.compile(dynamic=True, fullgraph=True, options={"triton.cudagraphs": False})
+def swiglu_mlp(hidden: Tensor, gate_up_weight: Tensor, down_weight: Tensor) -> Tensor:
+    """Compute SwiGLU with packed projections and standard compiler optimizations."""
+    gate, up = F.linear(hidden, gate_up_weight).chunk(2, dim=-1)
+    return F.linear(F.silu(gate) * up, down_weight)
+
+
 class DuplexIOQwenMLP(Qwen3NextMLP):
-    """Keep vLLM's sharded weights but use training's fused SwiGLU math."""
+    """Keep vLLM's sharded weights with compiled standard SwiGLU operations."""
 
     def forward(self, hidden: Tensor) -> Tensor:
-        from quack.mlp import mlp_func
-
-        output = mlp_func(
+        output = swiglu_mlp(
             hidden,
             self.gate_up_proj.weight,
             self.down_proj.weight,
-            activation="swiglu",
-            recompute=False,
-            concat_layout=True,
-            tuned=False,
         )
         if self.down_proj.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
@@ -588,8 +589,12 @@ class DuplexIOQwenAttention(nn.Module):
         # finds this step's mask on the layer the way upstream Flex expects.
         self.attn.frame = frame
         self.attn.logical_mask_mod = frame.visible
-        self.q_norm = DuplexIORMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = DuplexIORMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = DuplexIORMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, dtype=vllm_config.model_config.dtype,
+        )
+        self.k_norm = DuplexIORMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, dtype=vllm_config.model_config.dtype,
+        )
 
     def forward(
         self,
@@ -863,10 +868,12 @@ class DuplexIOQwenDecoderLayer(nn.Module):
         self.input_layernorm = DuplexIORMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
+            dtype=vllm_config.model_config.dtype,
         )
         self.post_attention_layernorm = DuplexIORMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
+            dtype=vllm_config.model_config.dtype,
         )
         self.layer_scale = getattr(config, "layer_scale", False)
         if self.layer_scale:
@@ -980,7 +987,9 @@ class DuplexIOQwenModel(nn.Module):
             )
         )
         self.norm = (
-            DuplexIORMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            DuplexIORMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, dtype=vllm_config.model_config.dtype,
+            )
             if get_pp_group().is_last_rank
             else PPMissingLayer()
         )

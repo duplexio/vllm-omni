@@ -1,4 +1,4 @@
-"""Match training's normalization precision, including learned FP32 scales."""
+"""Match training's compiled Qwen MLP and BF16 compute-time normalization."""
 
 from types import SimpleNamespace
 
@@ -15,13 +15,14 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 @pytest.mark.parametrize("shape", [(6, 2560), (64, 256)])
 @pytest.mark.parametrize("prenorm", [False, True])
 @torch.inference_mode()
-def test_norm_matches_training_with_fp32_scales(shape: tuple[int, int], prenorm: bool) -> None:
+def test_norm_matches_training_compute_dtype(shape: tuple[int, int], prenorm: bool) -> None:
     torch.manual_seed(512)
     reference = training.QuackQwen3_5RMSNorm(Qwen3_5RMSNorm(shape[-1], eps=1e-6)).cuda()
     reference.scale.normal_(1, 0.2)
-    native = DuplexIORMSNorm(shape[-1], eps=1e-6).cuda()
+    reference.bfloat16()
+    native = DuplexIORMSNorm(shape[-1], eps=1e-6, dtype=torch.bfloat16).cuda()
     native.weight.copy_(reference.scale)
-    assert native.weight.dtype == torch.float32
+    assert native.weight.dtype == torch.bfloat16
     hidden = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     residual = torch.randn_like(hidden) if prenorm else None
     torch.testing.assert_close(
@@ -34,12 +35,12 @@ def test_norm_matches_training_with_fp32_scales(shape: tuple[int, int], prenorm:
 
 @torch.inference_mode()
 def test_mlp_long_prefill_partition() -> None:
-    from duplexio.modules.qwen3_5_mlp import QuackQwen3_5MLP
+    from duplexio.modules.qwen3_5_mlp import Qwen3_5PackedMLP
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP
 
     torch.manual_seed(42)
     config = SimpleNamespace(hidden_size=2560, intermediate_size=9728, hidden_act="silu")
-    model = QuackQwen3_5MLP(Qwen3_5MLP(config, config.intermediate_size)).cuda().bfloat16()
+    model = Qwen3_5PackedMLP(Qwen3_5MLP(config, config.intermediate_size)).cuda().bfloat16()
     hidden = torch.randn(4422, 2560, device="cuda", dtype=torch.bfloat16)
     expected = model(hidden)
     actual = torch.cat([model(chunk) for chunk in hidden.split(1536)])
@@ -65,15 +66,15 @@ def test_attention_qkv_fusion_preserves_projection_values() -> None:
 
 @pytest.mark.parametrize("rows", [6, 96, 1536, 20622])
 @torch.inference_mode()
-def test_mlp_native_matches_training_without_runtime_tuning(rows: int) -> None:
-    from duplexio.modules.qwen3_5_mlp import QuackQwen3_5MLP
+def test_mlp_native_matches_training(rows: int) -> None:
+    from duplexio.modules.qwen3_5_mlp import Qwen3_5PackedMLP
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP
 
     from vllm_omni.model_executor.models.duplexio.qwen_backbone import DuplexIOQwenMLP
 
     torch.manual_seed(314)
     config = SimpleNamespace(hidden_size=2560, intermediate_size=9728, hidden_act="silu")
-    reference = QuackQwen3_5MLP(Qwen3_5MLP(config, config.intermediate_size)).cuda().bfloat16()
+    reference = Qwen3_5PackedMLP(Qwen3_5MLP(config, config.intermediate_size)).cuda().bfloat16()
     native = DuplexIOQwenMLP.__new__(DuplexIOQwenMLP)
     torch.nn.Module.__init__(native)
     native.gate_up_proj = reference.gate_up_proj
