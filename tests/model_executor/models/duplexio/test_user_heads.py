@@ -8,10 +8,11 @@ import pytest
 import torch
 from torch import nn
 from torch.nn import functional as F
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
 
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
-    DuplexIOLogitsProcessor,
 )
 from vllm_omni.model_executor.models.duplexio.text_sampling import content_distribution
 
@@ -19,8 +20,10 @@ from vllm_omni.model_executor.models.duplexio.text_sampling import content_distr
 class LocalVocabulary(nn.Module):
     """One-rank vocabulary projection, using the actual serving head kernel."""
 
+    head_dtype = torch.float32
+
     def forward(self, head, hidden):
-        return DuplexIOLogitsProcessor._apply_head(self, head, hidden, None).float()
+        return LogitsProcessor._apply_head(self, head, hidden, None)
 
 
 def head_model(device="cpu"):
@@ -32,6 +35,7 @@ def head_model(device="cpu"):
     model.llm = nn.Module()
     model.llm.base_model = nn.Module()
     model.llm.base_model.lm_head = nn.Linear(32, 64, bias=False)
+    model.llm.base_model.lm_head.quant_method = UnquantizedEmbeddingMethod()
     model.llm.output_head_proj = nn.ModuleDict({name: nn.Linear(32, 32) for name in ("agent", "tool_call")})
     model.user_token_projection = nn.Linear(6 * 32, 32)
     model.user_emit_head = nn.Linear(6 * 32, 1)
@@ -94,7 +98,7 @@ def test_user_behavior_probabilities_include_waits_and_actual_truncation(mode, t
             assert emit_logprob.item() == 0
         else:
             p = torch.sigmoid(emissions[row] / temperature)
-            torch.testing.assert_close(emit_logprob[0], (p if emitted[row] else 1 - p).log(), rtol=0, atol=0)
+            torch.testing.assert_close(emit_logprob[0], (p if emitted[row] else 1 - p).log(), rtol=1e-6, atol=1e-7)
         if not emitted[row] or mode == "argmax":
             assert token_logprob.item() == 0
         else:
@@ -183,30 +187,29 @@ def test_staged_user_heads_update_same_captured_graph_and_publish_version():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA training parity")
 @torch.inference_mode()
-def test_training_user_timing_computation_and_next_frame_targets_match_serving():
+def test_training_user_losses_and_next_frame_targets_match_serving():
     reference_path = os.environ.get("DUPLEXIO_USER_HEAD_REFERENCE")
     if reference_path is None:
         pytest.skip("Generate user_head_reference.py with the training environment first")
     torch.backends.cuda.matmul.allow_tf32 = False
     for case in torch.load(reference_path, weights_only=True):
         model = head_model("cuda")
+        dtype = getattr(torch, case["dtype"])
+        model.llm.base_model.lm_head.to(dtype=dtype)
         weights = [
             (name if name.startswith("user_") else "llm.base_model.lm_head.weight", tensor.cuda())
             for name, tensor in case["weights"].items()
         ]
         model.load_weights(weights)
         hidden = case["hidden"].cuda()
-        dtype = getattr(torch, case["dtype"])
         with torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
             logits, emissions = model.project_text(hidden)
         torch.testing.assert_close(logits[:, 2].cpu(), case["logits"], rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(emissions[:, 2].float().cpu(), case["emit_logits"], rtol=1e-5, atol=1e-6)
         target_rows = case["token_rows"].cuda()
         ids = case["user_ids"].cuda()
-        # Training user_timing_losses uses candidate row - 1 as its predictor.
-        # linear_cross_entropy returns per-target values in the input dtype;
-        # training takes their mean in that dtype, including BF16 rounding.
-        ce = F.cross_entropy(logits[target_rows - 1, 2, 1:], ids[target_rows] - 1, reduction="none").to(dtype).mean()
+        # Both supervised and replayed user content use the previous frame.
+        ce = F.cross_entropy(logits[target_rows - 1, 2, 1:], ids[target_rows] - 1)
         labels = ids[1:] != 0
         bce = F.binary_cross_entropy_with_logits(emissions[:-1, 2].float(), labels.float())
         torch.testing.assert_close(ce.cpu(), case["losses"]["user_token_ce"], rtol=1e-5, atol=1e-6)

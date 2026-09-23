@@ -574,18 +574,20 @@ def test_unfinished_tool_context_does_not_run_prediction_heads() -> None:
     assert predictions == {}
 
 
-def test_training_only_heads_are_ignored_when_loading_serving_weights() -> None:
-    names = DuplexIOForConditionalGeneration.hf_to_vllm_mapper.apply_list(
-        [
-            "llm.output_head_proj.system.weight",
-            "llm.output_head_proj.user.weight",
-            "user_token_projection.weight",
-            "user_emit_head.weight",
-            "llm.output_head_proj.agent.weight",
-        ]
+def test_token_heads_load_without_weight_name_mapping() -> None:
+    model = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.llm = nn.Module()
+    model.llm.output_head_proj = nn.ModuleDict(
+        {name: nn.Linear(4, 4) for name in ("agent", "tool_call")}
     )
+    model.user_token_projection = nn.Linear(24, 4)
+    model.user_emit_head = nn.Linear(24, 1)
+    weights = {name: torch.randn_like(value) for name, value in model.state_dict().items()}
 
-    assert names == ["user_token_projection.weight", "user_emit_head.weight", "llm.output_head_proj.agent.weight"]
+    assert model.load_weights(weights.items()) == set(weights)
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, weights[name])
 
 
 def test_vocabulary_suppression_is_model_owned_and_sampling_temperature_stays_dynamic() -> None:

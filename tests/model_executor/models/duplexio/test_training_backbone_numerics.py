@@ -87,22 +87,24 @@ def test_mlp_native_matches_training_without_runtime_tuning(rows: int) -> None:
 
 
 @torch.inference_mode()
-def test_vocab_projection_matches_learner_across_batch_sizes() -> None:
+def test_vocab_projection_matches_learner_across_batch_sizes(monkeypatch: pytest.MonkeyPatch) -> None:
     from torch.nn.functional import linear
-    from vllm.config import VllmConfig, set_current_vllm_config
-
-    from vllm_omni.model_executor.models.duplexio.modeling_duplexio import DuplexIOLogitsProcessor
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
 
     torch.manual_seed(912)
     hidden = torch.randn(32, 2560, device="cuda", dtype=torch.bfloat16)
     head = torch.nn.Linear(2560, 248320, bias=False, device="cuda", dtype=torch.bfloat16)
+    head.quant_method = UnquantizedEmbeddingMethod()
     head.weight.normal_(0, 0.02)
-    expected = linear(hidden, head.weight)
-    with set_current_vllm_config(VllmConfig()):
-        processor = DuplexIOLogitsProcessor(248320)
+    # The learner's accurate linear CE accumulates vocabulary logits in FP32.
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    expected = linear(hidden.float(), head.weight.float())
+    processor = SimpleNamespace(head_dtype=torch.float32)
     for rows in (1, 2, 17, 32):
-        actual = processor._apply_head(head, hidden[:rows], None)
-        torch.testing.assert_close(actual, expected[:rows], rtol=0, atol=0)
+        actual = LogitsProcessor._apply_head(processor, head, hidden[:rows], None)
+        assert actual.dtype == torch.float32
+        torch.testing.assert_close(actual, expected[:rows], rtol=1e-5, atol=1e-5)
 
 
 @torch.inference_mode()

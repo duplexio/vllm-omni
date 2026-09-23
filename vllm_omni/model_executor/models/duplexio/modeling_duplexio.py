@@ -26,7 +26,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLMBase
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import TokenizerLike, cached_tokenizer_from_config
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -211,18 +211,6 @@ class RequestSampling:
     depth: DepthSamplingOptions | None
 
 
-class DuplexIOLogitsProcessor(LogitsProcessor):
-    """Use the learner's fixed BF16 projection before vLLM's vocabulary gather."""
-
-    def _apply_head(
-        self,
-        lm_head: ParallelLMHead,
-        hidden_states: Tensor,
-        embedding_bias: Tensor | None,
-    ) -> Tensor:
-        return F.linear(hidden_states, lm_head.weight, embedding_bias)
-
-
 class _DuplexIOBaseModel(nn.Module):
     def __init__(
         self,
@@ -280,14 +268,6 @@ class DuplexIOForConditionalGeneration(
     postprocess_uses_hidden_states = False
     postprocess_uses_multimodal_outputs = False
     requires_request_sample_eligibility = True
-    # The per-cell system/user projections are training auxiliaries. User
-    # decisions instead use the trained full-frame projection and emit head.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "llm.output_head_proj.system.": None,
-            "llm.output_head_proj.user.": None,
-        },
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
@@ -414,7 +394,7 @@ class DuplexIOForConditionalGeneration(
         self.user_emit_head = nn.Linear(DUPLEXIO_NUM_CELLS * hidden_size, 1)
         self.agent_emit_head = nn.Linear(DUPLEXIO_NUM_CELLS * hidden_size, 1)
         self.tool_call_emit_head = nn.Linear(DUPLEXIO_NUM_CELLS * hidden_size, 1)
-        self.logits_processor = DuplexIOLogitsProcessor(self.text_config.vocab_size)
+        self.logits_processor = LogitsProcessor(self.text_config.vocab_size)
         self.make_empty_intermediate_tensors = self.llm.base_model.model.make_empty_intermediate_tensors
         self._forced_next_token_ids: list[int] | None = None
         self.tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
@@ -1408,10 +1388,7 @@ class DuplexIOForConditionalGeneration(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(
-            weights,
-            mapper=self.hf_to_vllm_mapper,
-        )
+        return AutoWeightsLoader(self).load_weights(weights)
 
     @classmethod
     def get_mamba_state_dtype_from_config(
@@ -1482,7 +1459,7 @@ def frame_inputs(
     text-only append leaves the range frozen and writes no audio key.
 
     A pinned voice-prompt burst is the one frame kind that carries audio without
-    being live: its audio cells contribute keys, but audio time stays frozen and
+    being live: only its agent-audio cell contributes a key; audio time stays frozen and
     the keys land in the cache's pinned region, which no window expires.
     """
     frames, device = text_ids.shape[0], text_ids.device
@@ -1492,7 +1469,9 @@ def frame_inputs(
     ).flatten(0, 1)
     text_active = (text_ids != pad_token_id) & (text_ids != silence_token_id)
     audio_shape = (frames, 2)
-    audio_keyed = (prompt_frames | audio_active)[:, None].expand(-1, 2)
+    audio_keyed = torch.stack(
+        (torch.full_like(prompt_frames, audio_active), prompt_frames | audio_active), dim=-1,
+    )
     key_active = torch.cat(
         (text_active, audio_keyed), dim=1,
     ).flatten()
@@ -1676,8 +1655,8 @@ def serialize_tool_call(
 def _validate_vllm_runtime_contract(vllm_config: VllmConfig) -> None:
     if vllm_config.quant_config is not None:
         raise ValueError("DuplexIO requires unquantized backbone weights to preserve training's fused MLP math")
-    if vllm_config.model_config.head_dtype not in (None, vllm_config.model_config.dtype):
-        raise ValueError("DuplexIO vocabulary projection must retain the training model dtype")
+    if vllm_config.model_config.head_dtype not in (None, torch.float32):
+        raise ValueError("DuplexIO vocabulary logits require FP32 accumulation")
     if vllm_config.parallel_config.pipeline_parallel_size != 1:
         raise ValueError("Native DuplexIO does not support pipeline parallelism")
     if vllm_config.speculative_config is not None:

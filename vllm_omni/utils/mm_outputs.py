@@ -174,7 +174,7 @@ def to_payload_element(
         (seq_len is not None and element.shape[0] == seq_len)
         or (scheduled_seq_len is not None and element.shape[0] == scheduled_seq_len)
     ):
-        return element[start:end].contiguous()
+        return element[start:end].clone(memory_format=torch.contiguous_format)
     # Every other case is shared between prefix cache (passthrough data)
     # and running a model without prefix caching.
     elif isinstance(element, dict):
@@ -191,15 +191,18 @@ def to_payload_element(
             for sk, sv in element.items()
         }
     elif isinstance(element, list):
-        # For lists, clone tensors to avoid cross-request aliasing
+        # Explicit layout also normalizes empty/singleton strides for byte serialization.
         if pass_lists_through:
-            return [elem.clone() if isinstance(elem, torch.Tensor) else elem for elem in element]
+            return [
+                elem.clone(memory_format=torch.contiguous_format) if isinstance(elem, torch.Tensor) else elem
+                for elem in element
+            ]
         element = element[idx] if idx < len(element) else element[0]
         if isinstance(element, torch.Tensor):
-            element = element.clone()
+            element = element.clone(memory_format=torch.contiguous_format)
         return element
     elif isinstance(element, torch.Tensor):
         # List-derived tensor payloads are request-invariant; clone to
         # avoid accidental cross-request aliasing on downstream mutation.
-        return element.clone()
+        return element.clone(memory_format=torch.contiguous_format)
     return element

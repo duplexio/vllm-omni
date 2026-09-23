@@ -67,7 +67,7 @@ class DuplexIOKVLayout:
 
     @property
     def prompt_slots(self) -> int:
-        return self.voice_prompt_frames * self.num_audio_cells
+        return self.voice_prompt_frames
 
     @property
     def persistent_text_base(self) -> int:
@@ -97,12 +97,6 @@ class DuplexIOKVLayout:
         return (
             audio_position % self.audio_ring_frames
         ) * self.num_audio_cells + audio_cell
-
-    def prompt_slot(self, prompt_frame: int, audio_cell: int) -> int:
-        """Pinned prompt frames are dense: they are written once and never move."""
-        assert 0 <= audio_cell < self.num_audio_cells
-        assert 0 <= prompt_frame < self.voice_prompt_frames
-        return self.prompt_base + prompt_frame * self.num_audio_cells + audio_cell
 
     def persistent_text_slot(self, text_ordinal: int) -> int:
         assert 0 <= text_ordinal < self.max_persistent_text_tokens
@@ -197,11 +191,8 @@ class DuplexIOFrameMetadata:
             torch.remainder(audio_last + 1, layout.audio_ring_frames) * layout.num_audio_cells
             + audio_cell
         )
-        prompt_slot = (
-            layout.prompt_base
-            + (prompt_ordinal - 1) * layout.num_audio_cells
-            + audio_cell
-        )
+        # A voice prompt contains agent audio only, one persistent key per frame.
+        prompt_slot = layout.prompt_base + prompt_ordinal - 1
         stored = torch.where(
             is_audio,
             self.key_active[:tokens] & ((audio_last >= 0) | (prompt_ordinal > 0)),
@@ -234,11 +225,7 @@ class DuplexIOFrameMetadata:
             layout.audio_ring_frames,
         )
         audio = (key < layout.audio_slots) & (frame >= self.audio_first[query])
-        prompt_frame = torch.div(
-            key - layout.prompt_base,
-            layout.num_audio_cells,
-            rounding_mode="floor",
-        )
+        prompt_frame = key - layout.prompt_base
         prompt = (
             (key >= layout.prompt_base)
             & (key < layout.prompt_base + layout.prompt_slots)

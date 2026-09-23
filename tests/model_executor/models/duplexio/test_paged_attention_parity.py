@@ -70,7 +70,7 @@ def session_fields(audio_active: Tensor, text_active: Tensor, prompt_frames: int
     audio_padding = torch.zeros(rows, NUM_AUDIO_CELLS, dtype=torch.int32)
     return {
         "key_active": torch.cat(
-            (text_active, (audio_active | pinned)[:, None].expand(-1, NUM_AUDIO_CELLS)), 1
+            (text_active, torch.stack((audio_active, audio_active | pinned), -1)), 1
         ).flatten(),
         "text_ordinal": torch.cat(
             (torch.where(text_active, emitted, 0), audio_padding), 1
@@ -376,9 +376,10 @@ def test_batched_sessions_stay_isolated_in_a_shuffled_block_table() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged cache")
+@pytest.mark.parametrize("training_reference", [False, True])
 @torch.inference_mode()
-def test_paged_sessions_match_current_training_with_pinned_voice_and_tool_bursts() -> None:
-    run_session([3, 5], 72, torch.bfloat16, 256, 16, 4, prompt_frames=2, training_reference=True)
+def test_paged_sessions_with_pinned_voice_and_tool_bursts(training_reference: bool) -> None:
+    run_session([3, 5], 72, torch.bfloat16, 256, 16, 4, prompt_frames=2, training_reference=training_reference)
 
 
 @pytest.mark.parametrize("rows,prompt_frames", [(1, 125), (30, 1), (70, 125)])

@@ -24,7 +24,9 @@ def reference_case(dtype):
     model.user_token_projection = nn.Linear(6 * 32, 32)
     model.user_emit_head = nn.Linear(6 * 32, 1)
     model.silence_token_id = 0
-    model.linear_ce_options = nn.LinearCrossEntropyOptions(batch_chunk_size=16)
+    model.linear_ce_options = nn.LinearCrossEntropyOptions(
+        batch_chunk_size=16, acc_policy="accurate", acc_dtype=torch.float32,
+    )
     model.cuda()
     # The pretrained vocabulary weights have the backbone's dtype in training;
     # the full-frame projection and emit head remain FP32 under autocast.
@@ -32,13 +34,15 @@ def reference_case(dtype):
     hidden = torch.randn(9, 6, 32, device="cuda", dtype=dtype)
     user_ids = torch.tensor([0, 0, 3, 0, 0, 4, 0, 0, 5], device="cuda")
     token_rows = torch.tensor([2, 5, 8], device="cuda")
-    offsets = torch.zeros(9, 5, device="cuda", dtype=torch.long)
     with torch.no_grad(), torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
-        logits = model.token_head(model.user_token_projection(hidden.flatten(-2)))
+        projected = model.user_token_projection(hidden.flatten(-2))
         emit_logits = model.user_emit_head(hidden.flatten(-2)).squeeze(-1)
-        losses, counts, _, _ = model.user_timing_losses(
-            hidden, user_ids, token_rows, offsets, torch.arange(1, 9, device="cuda")
+        content_loss = model.user_content_loss(hidden, user_ids, token_rows)
+        emit_loss, _, _ = model.user_emit_loss(
+            hidden, user_ids, token_rows, torch.tensor([1, 3, 4, 6, 7], device="cuda"),
         )
+    with torch.no_grad():
+        logits = nn.functional.linear(projected.float(), model.token_head.weight.float())
     return {
         "dtype": str(dtype).removeprefix("torch."),
         "weights": {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()},
@@ -47,8 +51,7 @@ def reference_case(dtype):
         "emit_logits": emit_logits.float().cpu(),
         "user_ids": user_ids.cpu(),
         "token_rows": token_rows.cpu(),
-        "losses": {name: value.detach().cpu() for name, value in losses.items()},
-        "counts": {name: value.cpu() for name, value in counts.items()},
+        "losses": {"user_token_ce": content_loss.cpu(), "user_emit": emit_loss.cpu()},
     }
 
 

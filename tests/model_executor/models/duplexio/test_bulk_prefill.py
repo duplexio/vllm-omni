@@ -241,7 +241,7 @@ def test_recorded_prefix_encodes_only_the_speaker_prompt() -> None:
     assert state.input_mimi.encoder_transformer.position == 2
     assert state.audio_position == 0
     masks = update["duplexio"]
-    assert masks["key_active"].view(5, 6)[:, 4:].tolist() == [[True, True]] * 2 + [[False, False]] * 3
+    assert masks["key_active"].view(5, 6)[:, 4:].tolist() == [[False, True]] * 2 + [[False, False]] * 3
     assert masks["prompt_ordinal"].view(5, 6)[:, 4].tolist() == [1, 2, 0, 0, 0]
     assert masks["prompt_last"].view(5, 6)[:, 0].tolist() == [0, 1, 2, 2, 2]
     assert len(model.audio_codec.waveforms) == 1

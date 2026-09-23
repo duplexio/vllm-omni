@@ -49,10 +49,11 @@ class DuplexIOConfig(PretrainedConfig):
         quantized_audio_config: dict[str, Any] | None = None,
         depth_transformer_config: dict[str, Any] | None = None,
         tied_weight_aliases: dict[str, str] | None = None,
+        head_dtype: str = "float32",
         **kwargs: Any,
     ) -> None:
         self.text_config = _text_config(text_config)
-        super().__init__(**kwargs)
+        super().__init__(head_dtype=head_dtype, **kwargs)
         self.audio_codec_config = dict(audio_codec_config or {})
         self.user_asr_config = dict(user_asr_config or {})
         self.user_asr_streaming_config = dict(user_asr_streaming_config or {})

@@ -55,7 +55,7 @@ def install_row(
     window = frame.layout.audio_window_frames
     frame.update(
         key_active=torch.cat(
-            (text_active, torch.full((2,), audio_active or prompt_ordinal > 0))
+            (text_active, torch.tensor([audio_active, audio_active or prompt_ordinal > 0]))
         ),
         text_ordinal=torch.cat((ordinals, torch.zeros(2, dtype=torch.int32))),
         text_last=torch.full((DUPLEXIO_NUM_CELLS,), emitted_before, dtype=torch.int32),
@@ -390,8 +390,8 @@ def test_pinned_prompt_rows_land_outside_the_ring_and_never_expire() -> None:
     # Prompt frames are dense in their own region: neither collides with the
     # ring, whose slots start at zero, nor with each other.
     assert prompt_slots == [
-        [layout.prompt_base, layout.prompt_base + 1],
-        [layout.prompt_base + 2, layout.prompt_base + 3],
+        [-1, layout.prompt_base],
+        [-1, layout.prompt_base + 1],
     ]
     assert layout.audio_slots <= layout.prompt_base
     assert layout.prompt_base + layout.prompt_slots <= layout.persistent_text_base
