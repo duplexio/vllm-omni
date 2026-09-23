@@ -16,6 +16,9 @@
   // The voice is reference audio this page sends, not a name the checkpoint
   // knows: whatever clip is chosen is resampled here and pinned by the server.
   let referenceAudio = null;
+  const sessionPicker = document.getElementById('session-picker');
+  const systemPrompt = document.getElementById('system-prompt');
+  const startRole = document.getElementById('start-role');
   const samplingPicker = document.getElementById('sampling-picker');
   const textTemperature = document.getElementById('text-temperature');
   const textTopK = document.getElementById('text-top-k');
@@ -731,12 +734,13 @@
             model: config.model,
             modalities: ['audio', 'text'],
             response_format: 'pcm',
+            instructions: systemPrompt.value.trim() || null,
             tools: sessionTools,
             tool_choice: sessionTools.length ? 'auto' : 'none',
             extra_body: {
               full_duplex: true,
               auto_response: true,
-              start_role: 'agent',
+              start_role: startRole.value,
               ref_audio_data: referenceAudio,
               ref_audio_format: 'pcm_f32le',
               ref_audio_sample_rate: config.inputSampleRate,
@@ -890,6 +894,7 @@
     muteButton.disabled = true;
     voiceSelect.disabled = false;
     voiceUpload.disabled = false;
+    sessionPicker.disabled = false;
     samplingPicker.disabled = false;
     toolPicker.disabled = false;
     updateRecordingButton();
@@ -908,6 +913,7 @@
     recordButton.disabled = true;
     voiceSelect.disabled = true;
     voiceUpload.disabled = true;
+    sessionPicker.disabled = true;
     samplingPicker.disabled = true;
     toolPicker.disabled = true;
     setStatus('Starting');

@@ -129,6 +129,16 @@ def test_frontend_sends_sampling_parameters_before_session_start() -> None:
     assert "samplingPicker.disabled = false" in app
 
 
+def test_frontend_sends_session_prompt_and_start_role() -> None:
+    index = (APP_ROOT / "index.html").read_text(encoding="utf-8")
+    app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert '<textarea id="system-prompt"' in index
+    assert '<select id="start-role">' in index
+    assert "instructions: systemPrompt.value.trim() || null" in app
+    assert "start_role: startRole.value" in app
+
+
 def test_recording_worklet_preserves_stereo_channels() -> None:
     node = shutil.which("node")
     if node is None:

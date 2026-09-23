@@ -69,6 +69,7 @@
         font-size: 13px;
       }
       select,
+      textarea,
       input[type="number"] {
         box-sizing: border-box;
         width: 100%;
@@ -79,7 +80,10 @@
         background: #27272a;
         font: inherit;
       }
+      textarea { resize: vertical; }
+      .system-prompt { grid-column: 1 / -1; }
       select:disabled,
+      textarea:disabled,
       input:disabled { opacity: .55; }
       .sampling-panel { margin: 16px 0; }
       .sampling-panel fieldset {
@@ -262,6 +266,23 @@
         </select>
         <input id="voice-upload" type="file" accept="audio/*" />
       </label>
+      <details class="sampling-panel" open>
+        <summary>Session settings</summary>
+        <fieldset id="session-picker">
+          <label>
+            Who speaks first
+            <select id="start-role">
+              <option value="user">User</option>
+              <option value="agent" selected>Assistant</option>
+            </select>
+          </label>
+          <label class="system-prompt">
+            System prompt
+            <textarea id="system-prompt" rows="4" placeholder="Leave blank to use the model’s default instructions"></textarea>
+          </label>
+          <small>Choose before starting a session. Changes apply to the next session.</small>
+        </fieldset>
+      </details>
       <details class="sampling-panel" open>
         <summary>Sampling parameters</summary>
         <fieldset id="sampling-picker">
