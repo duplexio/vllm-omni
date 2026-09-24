@@ -79,6 +79,7 @@ from vllm_omni.model_executor.models.duplexio.text_sampling import TokenSampling
 from vllm_omni.model_executor.models.duplexio.tool_calling import (
     ToolCallConstraintCompiler,
     ToolCallConstraintState,
+    next_token_bitmasks,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -1157,15 +1158,19 @@ class DuplexIOForConditionalGeneration(
         tool_token_logprobs = torch.zeros(rows, 1, dtype=torch.float32, device=logits.device)
         emitting = [False] * rows
         pending: list[int] = []
+        calling: list[int] = []
         for row, info in enumerate(infos):
             constraint = info["duplexio_working_state"].tool_call_constraint
             if constraint is None or not constraint.enabled:
                 continue
             if constraint.active or constraint.force_next_call:
                 emitting[row] = True
-                self._sample_tool_row(logits[row, 1:2], info, tool_ids, tool_token_logprobs, row)
-            else:
+                calling.append(row)
+            elif constraint.compiled:
+                # A session whose grammar is still compiling waits to start a call.
                 pending.append(row)
+        if calling:
+            self._sample_tool_rows(logits[:, 1], infos, calling, tool_ids, tool_token_logprobs)
         start_logits = emit_logits[:, 1].float()
         if pending:
             tool_starts, _ = _sample_emits(
@@ -1235,22 +1240,9 @@ class DuplexIOForConditionalGeneration(
         constraints = [infos[row]["duplexio_working_state"].tool_call_constraint for row in pending]
         bitmask = torch.cat([constraint.first_token_bitmask(vocab_size, logits.device) for constraint in constraints])
         xgr.apply_token_bitmask_inplace(constrained, bitmask, vocab_size=vocab_size)
-        samplings = [infos[row]["duplexio_working_state"].sampling.tool for row in pending]
-        groups: dict[tuple[float, int | None, float | None], list[int]] = {}
-        for member, sampling in enumerate(samplings):
-            groups.setdefault((sampling.temperature, sampling.top_k, sampling.top_p), []).append(member)
-        if len(groups) == 1:
-            ids, values = self._sample_content(constrained, samplings[0])
-        else:
-            ids = torch.empty(len(pending), dtype=torch.long, device=logits.device)
-            values = torch.empty(len(pending), dtype=torch.float32, device=logits.device)
-            for members in groups.values():
-                member_index = _to_device(members, torch.long, logits.device)
-                group_ids, group_values = self._sample_content(
-                    constrained.index_select(0, member_index), samplings[members[0]],
-                )
-                ids.index_copy_(0, member_index, group_ids)
-                values.index_copy_(0, member_index, group_values)
+        ids, values = self._sample_grouped(
+            constrained, [infos[row]["duplexio_working_state"].sampling.tool for row in pending],
+        )
         if index is None:
             tool_ids.copy_(torch.where(starts, ids, tool_ids))
             logprobs[:, 0].copy_(torch.where(starts, values, logprobs[:, 0]))
@@ -1259,17 +1251,42 @@ class DuplexIOForConditionalGeneration(
             tool_ids.index_copy_(0, index, torch.where(started, ids, tool_ids.index_select(0, index)))
             logprobs[:, 0].index_copy_(0, index, torch.where(started, values, logprobs[:, 0].index_select(0, index)))
 
-    def _sample_tool_row(
-        self, logits: Tensor, info: dict[str, Any], tool_ids: Tensor, logprobs: Tensor, row: int,
+    def _sample_tool_rows(
+        self, logits: Tensor, infos: list[dict[str, Any]], rows: list[int], tool_ids: Tensor, logprobs: Tensor,
     ) -> None:
-        state = info["duplexio_working_state"]
-        sample = sample_tool_token(
-            logits, constraint=state.tool_call_constraint, emit=True,
-            sampling=state.sampling.tool, distribution=self.content_distribution,
+        """Draw the next token of every row inside a call, or forced to start one."""
+        constraints = [infos[row]["duplexio_working_state"].tool_call_constraint for row in rows]
+        for constraint in constraints:
+            if not constraint.active:
+                constraint.begin()
+        vocab_size = logits.shape[-1]
+        index = _to_device(rows, torch.long, logits.device)
+        # A copy: the grammar mask is applied in place.
+        constrained = logits.index_select(0, index)
+        xgr.apply_token_bitmask_inplace(
+            constrained, next_token_bitmasks(constraints, vocab_size, logits.device), vocab_size=vocab_size,
         )
-        assert sample is not None
-        tool_ids[row : row + 1].copy_(sample.token_id)
-        logprobs[row].copy_(sample.logprob)
+        ids, values = self._sample_grouped(
+            constrained, [infos[row]["duplexio_working_state"].sampling.tool for row in rows],
+        )
+        tool_ids.index_copy_(0, index, ids)
+        logprobs[:, 0].index_copy_(0, index, values)
+
+    def _sample_grouped(self, logits: Tensor, samplings: list[TokenSamplingOptions]) -> tuple[Tensor, Tensor]:
+        """Sample each row with its own options, one draw per distinct setting."""
+        groups: dict[tuple[float, int | None, float | None], list[int]] = {}
+        for row, sampling in enumerate(samplings):
+            groups.setdefault((sampling.temperature, sampling.top_k, sampling.top_p), []).append(row)
+        if len(groups) == 1:
+            return self._sample_content(logits, samplings[0])
+        ids = torch.empty(len(samplings), dtype=torch.long, device=logits.device)
+        values = torch.empty(len(samplings), dtype=torch.float32, device=logits.device)
+        for rows in groups.values():
+            index = _to_device(rows, torch.long, logits.device)
+            group_ids, group_values = self._sample_content(logits.index_select(0, index), samplings[rows[0]])
+            ids.index_copy_(0, index, group_ids)
+            values.index_copy_(0, index, group_values)
+        return ids, values
 
     def sample_agent_tokens(
         self, logits: Tensor, emit_logits: Tensor, infos: list[dict[str, Any]]
@@ -1294,19 +1311,7 @@ class DuplexIOForConditionalGeneration(
             emit_logits.float(),
             [policy.emission.user if stream == "user" else policy.emission.agent for policy in policies],
         )
-        groups: dict[tuple[float, int | None, float | None], list[int]] = {}
-        for row, sampling in enumerate(samplings):
-            groups.setdefault((sampling.temperature, sampling.top_k, sampling.top_p), []).append(row)
-        if len(groups) == 1:
-            content, content_logprobs = self._sample_content(logits, samplings[0])
-        else:
-            content = torch.empty(len(infos), dtype=torch.long, device=logits.device)
-            content_logprobs = torch.empty(len(infos), dtype=torch.float32, device=logits.device)
-            for rows in groups.values():
-                index = _to_device(rows, torch.long, logits.device)
-                ids, values = self._sample_content(logits.index_select(0, index), samplings[rows[0]])
-                content.index_copy_(0, index, ids)
-                content_logprobs.index_copy_(0, index, values)
+        content, content_logprobs = self._sample_grouped(logits, samplings)
         content = torch.where(emitted, content, self.silence_token_id)
         # A discarded content draw on a wait frame is not an action.
         content_logprobs = torch.where(emitted, content_logprobs, 0)

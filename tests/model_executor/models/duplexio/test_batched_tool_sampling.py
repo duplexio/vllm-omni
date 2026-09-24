@@ -1,4 +1,5 @@
 """Batch every stream's draws and read tool starts once, after all sampling is queued."""
+from concurrent.futures import Future
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -266,3 +267,22 @@ def test_tool_emit_logprobs_score_all_decisions_including_forced_emit_and_wait(d
         elif row < 4:
             assert emitted  # active continuation / forced start ignores the negative emit logit
             assert sampled.tool_emit_logprobs[row].item() == -100
+
+
+def test_session_waits_to_start_a_call_until_its_grammar_compiles():
+    model, infos, vocab = fixture("cpu", mixed=False)
+    compiled = infos[0]["duplexio_working_state"].tool_call_constraint.compiled_grammar
+    compiling = Future()
+    for info in infos:
+        info["duplexio_working_state"].tool_call_constraint.compiled_grammar = compiling
+    logits = torch.zeros(8, 3, vocab)
+    emissions = torch.full((8, 3), 100.0)
+
+    sampled = model.sample_text_batch(logits, emissions, infos)
+    assert not sampled.tool_starts.any()
+    assert (sampled.text_ids[:, 2] == model.silence_token_id).all()
+    torch.testing.assert_close(sampled.tool_emit_logprobs, torch.full((8, 1), -100.0))
+
+    compiling.set_result(compiled)
+    sampled = model.sample_text_batch(logits, emissions, infos)
+    assert sampled.tool_starts.all()

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import codecs
+import functools
 import json
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -392,6 +393,11 @@ class ToolCallConstraintState:
         return self.compiled_grammar
 
     @property
+    def compiled(self) -> bool:
+        """Whether the grammar is built, so using it will not wait."""
+        return not isinstance(self.compiled_grammar, Future) or self.compiled_grammar.done()
+
+    @property
     def active(self) -> bool:
         return self.matcher is not None
 
@@ -439,6 +445,31 @@ class ToolCallConstraintState:
         return completed
 
 
+@functools.cache
+def _batch_matcher() -> xgr.BatchGrammarMatcher:
+    return xgr.BatchGrammarMatcher(max_threads=8)
+
+
+def next_token_bitmasks(
+    constraints: Sequence[ToolCallConstraintState], vocab_size: int, device: torch.device,
+) -> torch.Tensor:
+    """Row ``i`` holds active call ``i``'s next-token mask; rows fill in parallel."""
+    matchers = []
+    for constraint in constraints:
+        if constraint.matcher is None:
+            raise RuntimeError("DuplexIO tool-call grammar is not active")
+        matchers.append(constraint.matcher)
+    # Pinned, so the upload never waits behind queued device work.
+    bitmask = torch.empty(
+        xgr.get_bitmask_shape(len(matchers), vocab_size), dtype=torch.int32, pin_memory=device.type == "cuda",
+    )
+    if len(matchers) == 1:
+        matchers[0].fill_next_token_bitmask(bitmask)
+    else:
+        _batch_matcher().batch_fill_next_token_bitmask(matchers, bitmask)
+    return bitmask.to(device, non_blocking=True)
+
+
 class ToolCallConstraintCompiler:
     def __init__(self, tokenizer: PreTrainedTokenizerBase, vocab_size: int) -> None:
         self.tokenizer = tokenizer
@@ -452,9 +483,10 @@ class ToolCallConstraintCompiler:
             cache_limit_bytes=64 * 1024 * 1024,
         )
         # Compiling releases the GIL, so a session's grammar builds while the
-        # batch keeps stepping. The first tool grammar pays a one-time setup
-        # of about a second, spent here rather than in a live session.
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="duplexio-grammar")
+        # batch keeps stepping, and sessions that arrive together build in
+        # parallel. The first tool grammar pays a one-time setup of about a
+        # second, spent here rather than in a live session.
+        self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="duplexio-grammar")
         warmup = {"type": "function", "function": {"name": "warmup", "parameters": {
             "type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"],
         }}}
