@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -177,6 +177,49 @@ class PreparedAudio:
     agent_codes: Tensor
 
 
+class PackedRows(Mapping[str, Tensor]):
+    """One request's rows of tensors packed for the whole step.
+
+    Not a dict, so the runner's request buffer holds it by reference instead of
+    copying each view, and consumers can take the packed batch back whole.
+    """
+
+    __slots__ = ("packed", "rows")
+
+    def __init__(self, packed: dict[str, Tensor], rows: slice) -> None:
+        self.packed = packed
+        self.rows = rows
+
+    def __getitem__(self, name: str) -> Tensor:
+        return self.packed[name][self.rows]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.packed)
+
+    def __len__(self) -> int:
+        return len(self.packed)
+
+
+def shared_packed(values: list[Any], *, contiguous: bool) -> dict[str, Tensor] | None:
+    """The packed batch behind every value, if they all share one.
+
+    With ``contiguous``, the values must also tile its leading rows in order.
+    """
+    if not values or not all(isinstance(value, PackedRows) for value in values):
+        return None
+    packed = values[0].packed
+    if any(value.packed is not packed for value in values):
+        return None
+    if not contiguous:
+        return packed
+    stop = 0
+    for value in values:
+        if value.rows.start != stop:
+            return None
+        stop = value.rows.stop
+    return {name: tensor[:stop] for name, tensor in packed.items()}
+
+
 @dataclass
 class PreparedFrames:
     """Views into one packed batch, consumed by the runner's request hook."""
@@ -324,21 +367,9 @@ class DuplexIOForConditionalGeneration(
             if self.full_cudagraph_enabled else frame_inputs
         )
         self.frame_input_graphs: dict[int, FrameInputGraph] = {}
-        self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
-            ("duplexio", "positions"),
-            ("duplexio", "key_active"),
-            ("duplexio", "text_ordinals"),
-            ("duplexio", "text_last"),
-            ("duplexio", "audio_first"),
-            ("duplexio", "audio_last"),
-            ("duplexio", "prompt_ordinal"),
-            ("duplexio", "prompt_last"),
-            ("duplexio_replay", "text_ids"),
-            ("duplexio_replay", "user_features"),
-            ("duplexio_replay", "agent_audio"),
-            ("duplexio_replay", "audio_mask"),
-            ("duplexio_replay", "prompt_frames"),
-        }
+        # Addressing and replay inputs are PackedRows, which the runner holds by
+        # reference; nothing needs a per-request device copy.
+        self.gpu_resident_buffer_keys: set[tuple[str, str]] = set()
         self.pad_token_id = config.pad_token_id
         self.silence_token_id = config.silence_token_id
         if self.pad_token_id is None or self.silence_token_id is None:
@@ -459,16 +490,20 @@ class DuplexIOForConditionalGeneration(
             self.frame.reset()
             return
         duplex_infos = [info["duplexio"] for info in request_infos]
+        # Requests scheduled in the order they were prepared already form the batch.
+        cells = shared_packed(duplex_infos, contiguous=True) or {
+            name: torch.cat([info[name] for info in duplex_infos]) for name in duplex_infos[0]
+        }
         self.frame.update(
-            key_active=torch.cat([info["key_active"] for info in duplex_infos]),
-            text_ordinal=torch.cat([info["text_ordinals"] for info in duplex_infos]),
-            text_last=torch.cat([info["text_last"] for info in duplex_infos]),
-            audio_first=torch.cat([info["audio_first"] for info in duplex_infos]),
-            audio_last=torch.cat([info["audio_last"] for info in duplex_infos]),
-            prompt_ordinal=torch.cat([info["prompt_ordinal"] for info in duplex_infos]),
-            prompt_last=torch.cat([info["prompt_last"] for info in duplex_infos]),
+            key_active=cells["key_active"],
+            text_ordinal=cells["text_ordinals"],
+            text_last=cells["text_last"],
+            audio_first=cells["audio_first"],
+            audio_last=cells["audio_last"],
+            prompt_ordinal=cells["prompt_ordinal"],
+            prompt_last=cells["prompt_last"],
         )
-        positions = torch.cat([info["positions"] for info in duplex_infos])
+        positions = cells["positions"]
         self.frame.positions[:positions.numel()].copy_(positions)
 
     def supports_cudagraph_replay(
@@ -656,27 +691,25 @@ class DuplexIOForConditionalGeneration(
         positions = (
             metadata[:, 5, None] * DUPLEXIO_NUM_CELLS + torch.arange(DUPLEXIO_NUM_CELLS, device=device)
         ).flatten()
-        live_mask, prompt_mask = metadata[:, 2] != 0, metadata[:, 4] != 0
+        packed_cells = dict(zip(
+            ("positions", "key_active", "text_ordinals", "text_last",
+             "audio_first", "audio_last", "prompt_ordinal", "prompt_last"),
+            (positions, *addressing), strict=True,
+        ))
+        packed_replay = {
+            "text_ids": text_ids, "user_features": user_features, "agent_audio": agent_codes,
+            "audio_mask": metadata[:, 2] != 0, "prompt_frames": metadata[:, 4] != 0,
+        }
         results = []
         offset = 0
         for item, (_, info) in zip(audio, requests, strict=True):
             end = offset + item.frame_count
             cells = slice(offset * DUPLEXIO_NUM_CELLS, end * DUPLEXIO_NUM_CELLS)
-            replay = {}
-            if info["duplex"]["runtime_config"].get("duplexio_record_inputs", False):
-                replay = {
-                    "text_ids": text_ids[offset:end], "user_features": user_features[offset:end],
-                    "agent_audio": agent_codes[offset:end], "audio_mask": live_mask[offset:end],
-                    "prompt_frames": prompt_mask[offset:end],
-                }
+            record = info["duplex"]["runtime_config"].get("duplexio_record_inputs", False)
             results.append(PreparedFrames(embeddings[cells], {
                 "duplexio_working_state": item.state,
-                "duplexio_replay": replay,
-                "duplexio": dict(zip(
-                    ("positions", "key_active", "text_ordinals", "text_last",
-                     "audio_first", "audio_last", "prompt_ordinal", "prompt_last"),
-                    (value[cells] for value in (positions, *addressing)), strict=True,
-                )),
+                "duplexio_replay": PackedRows(packed_replay, slice(offset, end)) if record else {},
+                "duplexio": PackedRows(packed_cells, cells),
             }))
             offset = end
         return results
@@ -804,13 +837,18 @@ class DuplexIOForConditionalGeneration(
                 sampled["predictor_hiddens"] = [batch.hiddens.detach()]
         replay_names = ("text_ids", "user_features", "agent_audio", "audio_mask", "prompt_frames")
         empty = torch.empty(0, dtype=hidden_states.dtype)
+        replays = [info.get("duplexio_replay", {}) for info in infos]
+        packed_replay = shared_packed(replays, contiguous=False)
+        if packed_replay is None:
+            replay = {name: [value.get(name, empty) for value in replays] for name in replay_names}
+        else:
+            replay = {name: [packed_replay[name]] for name in replay_names}
         # Everything is queued; this is the step's one wait for the device.
-        host = to_host({
-            "sampled": sampled,
-            "replay": {
-                name: [info.get("duplexio_replay", {}).get(name, empty) for info in infos] for name in replay_names
-            },
-        })
+        host = to_host({"sampled": sampled, "replay": replay})
+        if packed_replay is not None:
+            host["replay"] = {
+                name: [values[0][value.rows] for value in replays] for name, values in host["replay"].items()
+            }
         host_rows: dict[str, list[Tensor]] = {}
         host_ids: list[list[int]] = []
         if batch is not None:
