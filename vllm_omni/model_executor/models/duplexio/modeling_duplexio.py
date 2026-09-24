@@ -332,6 +332,9 @@ class DuplexIOForConditionalGeneration(
     # The per-frame multimodal metadata carries everything the client needs;
     # skip the per-append hidden-states D2H payload entirely.
     omni_pooler_payload_include_hidden = False
+    # make_omni_output returns fresh host tensors each step, so the runner can
+    # hand them to the payload without another copy.
+    omni_host_owned_multimodal_outputs = True
     has_preprocess = True
     decode_query_len = DUPLEXIO_NUM_CELLS
     has_postprocess = True

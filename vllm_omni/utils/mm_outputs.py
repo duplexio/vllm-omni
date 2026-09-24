@@ -152,6 +152,7 @@ def to_payload_element(
     pass_lists_through: bool = False,
     seq_len: int | None = None,
     scheduled_seq_len: int | None = None,
+    clone: bool = True,
 ):
     """Build an mm payload element corresponding to one request index
     from an element containing 0 or more CPU tensors.
@@ -173,6 +174,8 @@ def to_payload_element(
             mm tensors (e.g. batched ``codes.audio`` with tail-only hidden states)
             are laid out by scheduled tokens instead of the hidden tail shape.
             When omitted, ``seq_len`` is reused for backward compatibility.
+        clone: Whether selected per-request tensors are copied. Models whose
+            outputs are fresh host tensors every step can hand them over as-is.
     """
     if scheduled_seq_len is None:
         scheduled_seq_len = seq_len
@@ -184,7 +187,8 @@ def to_payload_element(
         (seq_len is not None and element.shape[0] == seq_len)
         or (scheduled_seq_len is not None and element.shape[0] == scheduled_seq_len)
     ):
-        return element[start:end].clone(memory_format=torch.contiguous_format)
+        element = element[start:end]
+        return element.clone(memory_format=torch.contiguous_format) if clone else element.contiguous()
     # Every other case is shared between prefix cache (passthrough data)
     # and running a model without prefix caching.
     elif isinstance(element, dict):
@@ -197,6 +201,7 @@ def to_payload_element(
                 pass_lists_through=pass_lists_through,
                 seq_len=seq_len,
                 scheduled_seq_len=scheduled_seq_len,
+                clone=clone,
             )
             for sk, sv in element.items()
         }
@@ -208,10 +213,10 @@ def to_payload_element(
                 for elem in element
             ]
         element = element[idx] if idx < len(element) else element[0]
-        if isinstance(element, torch.Tensor):
+        if isinstance(element, torch.Tensor) and clone:
             element = element.clone(memory_format=torch.contiguous_format)
         return element
-    elif isinstance(element, torch.Tensor):
+    elif isinstance(element, torch.Tensor) and clone:
         # List-derived tensor payloads are request-invariant; clone to
         # avoid accidental cross-request aliasing on downstream mutation.
         return element.clone(memory_format=torch.contiguous_format)

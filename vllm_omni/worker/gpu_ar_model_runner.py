@@ -896,6 +896,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         sparse_mm_index: dict[str, int],
         hidden_seq_len: int,
         scheduled_seq_len: int,
+        clone: bool = True,
     ) -> dict[str, object]:
         if combined_multimodal_outputs:
             return self._build_combined_prefix_cache_mm_payload(
@@ -934,6 +935,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 pass_lists_through=False,
                 seq_len=hidden_seq_len,
                 scheduled_seq_len=scheduled_seq_len,
+                clone=clone,
             )
         return mm_payload
 
@@ -953,6 +955,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         sparse_mm_index: dict[str, int],
         hidden_seq_len: int,
         scheduled_seq_len: int,
+        clone: bool = True,
     ) -> dict[str, object]:
         payload: dict[str, object] = {}
         if not audio_sparse_output:
@@ -980,6 +983,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             sparse_mm_index=sparse_mm_index,
             hidden_seq_len=hidden_seq_len,
             scheduled_seq_len=scheduled_seq_len,
+            clone=clone,
         )
         payload.update(mm_payload)
         return payload
@@ -1622,6 +1626,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def _model_omni_pooler_payload_include_hidden(self) -> bool:
         return self._runner_model_omni_flag("omni_pooler_payload_include_hidden", default=True)
 
+    def _model_omni_host_owned_outputs(self) -> bool:
+        return self._runner_model_omni_flag("omni_host_owned_multimodal_outputs")
+
     def _should_use_async_omni_output(self) -> bool:
         if not self.use_async_scheduling:
             return False
@@ -1825,6 +1832,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # OmniModelRunnerOutput.pooler_output (which is set to None below).
         # The actual multimodal wire transport uses multimodal_outputs instead.
         pooler_output: list[dict[str, object]] | None = None
+        # Models that already build fresh per-step host tensors skip the copy walk and clones.
+        host_owned_outputs = self._model_omni_host_owned_outputs()
         if needs_pooler_payload:
             hidden_seq_len = int(hidden_states.shape[0])
             scheduled_seq_len = int(scheduler_output.total_num_scheduled_tokens)
@@ -1841,7 +1850,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     scheduler_output=scheduler_output,
                     needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
                 )
-            if combined_multimodal_outputs is None:
+            if combined_multimodal_outputs is None and host_owned_outputs:
+                mm_cpu = flatten_payload(multimodal_outputs) if multimodal_outputs else {}
+            elif combined_multimodal_outputs is None:
                 with record_function_or_nullcontext("omni_output_builder:build_mm_cpu"):
                     mm_cpu = build_mm_cpu(
                         flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
@@ -1885,6 +1896,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         sparse_mm_index=sparse_mm_index,
                         hidden_seq_len=hidden_seq_len,
                         scheduled_seq_len=scheduled_seq_len,
+                        clone=not host_owned_outputs,
                     )
                     pooler_output.append(flatten_payload(payload))
 
