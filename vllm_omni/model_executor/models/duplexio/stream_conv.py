@@ -9,7 +9,7 @@ from vllm.triton_utils import tl, triton
 @triton.jit
 def stream_conv_kernel(
     x, weight, bias, state, slots, boundaries, has_state, chunks, output,
-    channels: tl.constexpr, history: tl.constexpr,
+    channels: tl.constexpr, history: tl.constexpr, slot_stride: tl.constexpr,
     x_row: tl.constexpr, x_col: tl.constexpr, weight_row: tl.constexpr,
     state_slot: tl.constexpr, state_channel: tl.constexpr, state_time: tl.constexpr,
     has_bias: tl.constexpr, block_d: tl.constexpr,
@@ -17,7 +17,8 @@ def stream_conv_kernel(
     request = tl.load(chunks + tl.program_id(0) * 2)
     chunk = tl.load(chunks + tl.program_id(0) * 2 + 1)
     start, end = tl.load(boundaries + request), tl.load(boundaries + request + 1)
-    slot, valid_state = tl.load(slots + request), tl.load(has_state + request)
+    slot = tl.load(slots + request * slot_stride).to(tl.int64)
+    valid_state = tl.load(has_state + request)
     tokens = start + chunk * 64 + tl.arange(0, 64)
     dims = tl.program_id(1) * block_d + tl.arange(0, block_d)
     valid = (tokens[:, None] < end) & (dims[None, :] < channels)
@@ -41,13 +42,17 @@ def stream_conv_kernel(
 @triton.jit
 def update_stream_conv_state_kernel(
     x, state, slots, boundaries, has_state,
-    channels: tl.constexpr, history: tl.constexpr, x_row: tl.constexpr, x_col: tl.constexpr,
+    channels: tl.constexpr, history: tl.constexpr, slot_stride: tl.constexpr,
+    x_row: tl.constexpr, x_col: tl.constexpr,
     state_slot: tl.constexpr, state_channel: tl.constexpr, state_time: tl.constexpr,
     block_t: tl.constexpr, block_d: tl.constexpr,
 ):
     request = tl.program_id(0)
     start, end = tl.load(boundaries + request), tl.load(boundaries + request + 1)
-    slot, valid_state = tl.load(slots + request), tl.load(has_state + request)
+    if start == end:
+        return
+    slot = tl.load(slots + request * slot_stride).to(tl.int64)
+    valid_state = tl.load(has_state + request)
     times = tl.arange(0, block_t)
     dims = tl.program_id(1) * block_d + tl.arange(0, block_d)
     source = end - history + times
@@ -79,10 +84,10 @@ def stream_causal_conv(
     output = torch.empty_like(x, memory_format=torch.contiguous_format)
     stream_conv_kernel[(chunk_indices.shape[0], triton.cdiv(channels, 32))](
         x, weight, bias, state, slots, boundaries, has_state, chunk_indices, output,
-        channels, history, *x.stride(), weight.stride(0), *state.stride(), bias is not None, 32,
+        channels, history, slots.stride(0), *x.stride(), weight.stride(0), *state.stride(), bias is not None, 32,
     )
     update_stream_conv_state_kernel[(boundaries.shape[0] - 1, triton.cdiv(channels, 32))](
-        x, state, slots, boundaries, has_state, channels, history, *x.stride(), *state.stride(),
+        x, state, slots, boundaries, has_state, channels, history, slots.stride(0), *x.stride(), *state.stride(),
         triton.next_power_of_2(history), 32,
     )
     return output

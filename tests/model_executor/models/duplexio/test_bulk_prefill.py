@@ -126,6 +126,53 @@ def input_info(
 
 
 @torch.inference_mode()
+def test_packed_preprocess_preserves_mixed_request_boundaries() -> None:
+    model = model_fixture()
+    prefix = input_info(request_state(model), [3, 4, 5], system=False)
+    tool_state = request_state(model)
+    tool_state.frames_seen = 19
+    tool_state.audio_position = 11
+    tool_state.active_text_tokens = 23
+    tool = input_info(tool_state, [6, 7, 8], system=True)
+    live_state = request_state(model)
+    live_state.frames_seen = 40
+    live_state.audio_position = 30
+    live_state.active_text_tokens = 53
+    live_state.text_input_ids = torch.tensor([2, 9, 12, 2])
+    live = {
+        "duplexio_model_state": live_state,
+        "duplex_token_offset": 240, "duplex_prompt_len": 246,
+        "duplex": {"frame_count": 1, "runtime_config": {}, "pcm": torch.randn(1920).numpy().tobytes()},
+    }
+    # Prefix continuation begins inside the speaker prompt, then crosses into text.
+    partial = input_info(request_state(model), [3, 4, 5], system=False)
+    partial["duplexio_model_state"].frames_seen = 1
+    partial["duplex_token_offset"] = 6
+    infos = dict(zip(("live", "prefix", "tool", "partial"), (live, prefix, tool, partial), strict=True))
+    counts = (1, 5, 3, 4)
+    expected = []
+    for info, frames in zip(infos.values(), counts, strict=True):
+        info["_omni_num_scheduled_tokens"] = frames * 6
+        info["duplex"]["runtime_config"]["duplexio_record_inputs"] = True
+        expected.append(model.preprocess(torch.zeros(frames * 6, dtype=torch.long), None, **info))
+    calls = []
+    hook = model.user_audio_input_adapter.register_forward_hook(lambda module, args, result: calls.append(args[0].shape[0]))
+    prepared = model.preprocess_batch(req_ids=list(infos), model_intermediate_buffer=infos, device=torch.device("cpu"))
+    hook.remove()
+    assert calls == [sum(counts)]
+    for (key, info), frames, (_, reference, reference_updates) in zip(infos.items(), counts, expected, strict=True):
+        _, actual, updates = model.preprocess(torch.zeros(frames * 6, dtype=torch.long), None, **info, **prepared[key])
+        torch.testing.assert_close(actual, reference)
+        for field in ("duplexio", "duplexio_replay"):
+            for name, value in reference_updates[field].items():
+                torch.testing.assert_close(updates[field][name], value, rtol=0, atol=0)
+        for name in ("frames_seen", "audio_position", "active_text_tokens"):
+            assert getattr(updates["duplexio_working_state"], name) == getattr(reference_updates["duplexio_working_state"], name)
+    assert live_state.frames_seen == 40
+    assert tool_state.active_text_tokens == 23
+
+
+@torch.inference_mode()
 def test_tool_bulk_and_serial_frames_are_identical() -> None:
     model = model_fixture()
     initial = request_state(model)

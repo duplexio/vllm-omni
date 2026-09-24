@@ -130,6 +130,16 @@ def _to_cpu(value, pending_devices: set[torch.device]):
     if isinstance(value, list):
         if not value:
             return value
+        first = value[0]
+        if isinstance(first, torch.Tensor) and first.device.type == "cuda" and all(
+            isinstance(item, torch.Tensor)
+            and item.device == first.device
+            and item.dtype == first.dtype
+            and item.shape == first.shape
+            for item in value
+        ):
+            # A uniform per-request field needs one transfer for the batch.
+            return list(_to_cpu(torch.stack(value), pending_devices).unbind(0))
         return [_to_cpu(v, pending_devices) for v in value]
     return value
 

@@ -182,6 +182,38 @@ class PreparedAudio:
     agent_codes: Tensor
 
 
+@dataclass
+class PreparedFrames:
+    """Views into one packed batch, consumed by the runner's request hook."""
+
+    embeddings: Tensor
+    updates: dict[str, Any]
+
+
+class FrameInputGraph:
+    """Capture packed projections; CPU request state remains outside the graph."""
+
+    def __init__(
+        self, project: Callable[..., tuple[Tensor, ...]], inputs: tuple[Tensor, ...],
+    ) -> None:
+        self.inputs = tuple(value.clone() for value in inputs)
+        stream = torch.cuda.Stream(device=inputs[0].device)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                project(*self.inputs)
+        torch.cuda.current_stream().wait_stream(stream)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.outputs = project(*self.inputs)
+
+    def __call__(self, inputs: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
+        torch._foreach_copy_(self.inputs, inputs)
+        self.graph.replay()
+        # Outputs can remain in request state after another batch replays.
+        return tuple(value.clone() for value in self.outputs)
+
+
 class EmitSamplingTemperatures(BaseModel):
     """Validated emission temperatures received at the engine boundary."""
 
@@ -296,6 +328,7 @@ class DuplexIOForConditionalGeneration(
             torch.compile(frame_inputs, fullgraph=True, dynamic=True, options={"emulate_precision_casts": True})
             if self.full_cudagraph_enabled else frame_inputs
         )
+        self.frame_input_graphs: dict[int, FrameInputGraph] = {}
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("duplexio", "positions"),
             ("duplexio", "key_active"),
@@ -546,127 +579,131 @@ class DuplexIOForConditionalGeneration(
     @torch.inference_mode()
     def preprocess_batch(
         self, *, req_ids: list[str], model_intermediate_buffer: dict[str, dict[str, Any]], device: torch.device,
-    ) -> dict[str, dict[str, PreparedAudio]]:
+    ) -> dict[str, dict[str, PreparedFrames]]:
         requests = [model_intermediate_buffer[req_id] for req_id in req_ids]
-        prepared = self.prepare_audio_requests(
+        prepared = self.prepare_frames(
             [(info["_omni_num_scheduled_tokens"], info) for info in requests], device,
         )
-        return {req_id: {"prepared_audio": audio} for req_id, audio in zip(req_ids, prepared, strict=True)}
+        return {req_id: {"prepared_frames": frames} for req_id, frames in zip(req_ids, prepared, strict=True)}
 
     @torch.inference_mode()
     def preprocess(
         self,
         input_ids: Tensor,
         input_embeds: Tensor | None,
-        prepared_audio: PreparedAudio | None = None,
+        prepared_frames: PreparedFrames | None = None,
         **info: Any,
     ) -> tuple[Tensor, Tensor, dict[str, object]]:
         del input_embeds
-        input_ids = input_ids.to(self.llm.channel_emb.device)
-        if prepared_audio is None:
-            prepared_audio, = self.prepare_audio_requests([(input_ids.numel(), info)], input_ids.device)
-        state = prepared_audio.state
-        frame_start, frame_count = prepared_audio.frame_start, prepared_audio.frame_count
-        frame_end = frame_start + frame_count
-        prompt_count, prompt_chunk_frames = prepared_audio.prompt_count, prepared_audio.prompt_chunk_frames
-        user_features, agent_codes = prepared_audio.user_features, prepared_audio.agent_codes
-        duplex = info["duplex"]
-        runtime_config = duplex["runtime_config"]
-        is_prefill = duplex.get("duplexio_prefill", False)
-        is_system_input = duplex.get("duplexio_system_input", False)
-        is_live = not (is_prefill or is_system_input)
-        prompt_written = min(state.frames_seen, state.voice_prompt.numel() // self.config.frame_size)
-        prompt_mask = torch.arange(frame_start, frame_end, device=input_ids.device) < prompt_count
-        text_ids = state.text_input_ids.expand(frame_count, -1).clone()
-        if is_prefill:
-            text_ids.fill_(self.silence_token_id)
-            text_ids[prompt_chunk_frames:, 0] = torch.tensor(
-                state.system_token_ids[max(0, frame_start - prompt_count):max(0, frame_end - prompt_count)],
-                dtype=torch.long, device="cpu",
-            )
-        elif is_system_input:
-            system_token_ids = duplex["duplexio_system_token_ids"]
-            text_ids.fill_(self.silence_token_id)
-            text_ids[:, 0] = torch.tensor(
-                system_token_ids[frame_start:frame_end],
-                dtype=torch.long,
-                device="cpu",
-            )
-            state.text_input_ids = torch.full_like(
-                state.text_input_ids,
-                self.silence_token_id,
-            )
-        else:
-            text_ids[:, 0] = self.silence_token_id
+        if prepared_frames is None:
+            prepared_frames, = self.prepare_frames([(input_ids.numel(), info)], input_ids.device)
+        return input_ids, prepared_frames.embeddings, prepared_frames.updates
 
+    def prepare_frames(
+        self, requests: list[tuple[int, dict[str, Any]]], device: torch.device,
+    ) -> list[PreparedFrames]:
+        """Pack scheduled frames once; request boundaries own all running counters."""
+        audio = self.prepare_audio_requests(requests, device)
+        ids = []
+        rows = []
+        preceding_text = 0
+        for item, (_, info) in zip(audio, requests, strict=True):
+            state = item.state
+            start, count = item.frame_start, item.frame_count
+            duplex = info["duplex"]
+            prefill = duplex.get("duplexio_prefill", False)
+            system = duplex.get("duplexio_system_input", False)
+            live = not (prefill or system)
+            text = state.text_input_ids.expand(count, -1).clone()
+            if prefill:
+                text.fill_(self.silence_token_id)
+                text[item.prompt_chunk_frames:, 0] = torch.tensor(
+                    state.system_token_ids[max(0, start - item.prompt_count):max(0, start + count - item.prompt_count)],
+                    dtype=torch.long,
+                )
+            elif system:
+                text.fill_(self.silence_token_id)
+                text[:, 0] = torch.tensor(duplex["duplexio_system_token_ids"][start:start + count], dtype=torch.long)
+                state.text_input_ids = torch.full_like(state.text_input_ids, self.silence_token_id)
+            else:
+                text[:, 0] = self.silence_token_id
+            prompt_written = min(state.frames_seen, state.voice_prompt.numel() // self.config.frame_size)
+            # CPU state provides packed-row offsets; no device readback is needed.
+            rows.extend(
+                (state.active_text_tokens - preceding_text,
+                 state.audio_position + (row if live else 0), live,
+                 prompt_written + min(row + 1, item.prompt_chunk_frames),
+                 row < item.prompt_chunk_frames, state.frames_seen + row)
+                for row in range(count)
+            )
+            emitted = ((text != self.pad_token_id) & (text != self.silence_token_id)).sum().item()
+            state.active_text_tokens += emitted
+            preceding_text += emitted
+            state.frames_seen += count
+            if live:
+                state.audio_position += count
+            ids.append(text)
+        text_ids = torch.cat(ids).to(device, non_blocking=True)
+        metadata = torch.tensor(rows, dtype=torch.int32).to(device, non_blocking=True)
+        user_features = torch.cat([item.user_features for item in audio])
+        agent_codes = torch.cat([item.agent_codes for item in audio])
+        with torch.profiler.record_function("duplexio.frame_inputs"):
+            inputs = (text_ids, metadata, user_features, agent_codes)
+            # Capture bounded one-frame batches; variable-length prefixes stay packed.
+            if self.full_cudagraph_enabled and all(item.frame_count == 1 for item in audio):
+                size = len(audio)
+                if size not in self.frame_input_graphs:
+                    self.frame_input_graphs[size] = FrameInputGraph(self.project_frames, inputs)
+                outputs = self.frame_input_graphs[size](inputs)
+            else:
+                outputs = self.project_frames(*inputs)
+        embeddings, *addressing = outputs
+        positions = (
+            metadata[:, 5, None] * DUPLEXIO_NUM_CELLS + torch.arange(DUPLEXIO_NUM_CELLS, device=device)
+        ).flatten()
+        live_mask, prompt_mask = metadata[:, 2] != 0, metadata[:, 4] != 0
+        results = []
+        offset = 0
+        for item, (_, info) in zip(audio, requests, strict=True):
+            end = offset + item.frame_count
+            cells = slice(offset * DUPLEXIO_NUM_CELLS, end * DUPLEXIO_NUM_CELLS)
+            replay = {}
+            if info["duplex"]["runtime_config"].get("duplexio_record_inputs", False):
+                replay = {
+                    "text_ids": text_ids[offset:end], "user_features": user_features[offset:end],
+                    "agent_audio": agent_codes[offset:end], "audio_mask": live_mask[offset:end],
+                    "prompt_frames": prompt_mask[offset:end],
+                }
+            results.append(PreparedFrames(embeddings[cells], {
+                "duplexio_working_state": item.state,
+                "duplexio_replay": replay,
+                "duplexio": dict(zip(
+                    ("positions", "key_active", "text_ordinals", "text_last",
+                     "audio_first", "audio_last", "prompt_ordinal", "prompt_last"),
+                    (value[cells] for value in (positions, *addressing)), strict=True,
+                )),
+            }))
+            offset = end
+        return results
+
+    def project_frames(
+        self, text_ids: Tensor, metadata: Tensor, user_features: Tensor, agent_codes: Tensor,
+    ) -> tuple[Tensor, ...]:
+        """Tensor-only packed projections and frame construction, shared by all requests."""
         with torch.autocast(
-            device_type=input_ids.device.type,
+            device_type=text_ids.device.type,
             dtype=self.vllm_config.model_config.dtype,
-            enabled=input_ids.is_cuda and self.vllm_config.model_config.dtype != torch.float32,
+            enabled=text_ids.is_cuda and self.vllm_config.model_config.dtype != torch.float32,
         ):
             user_hidden = self.user_audio_input_adapter(user_features)
             agent_hidden = self.agent_audio_input_adapter(self.agent_audio_embedding(agent_codes))
-            if not is_live:
-                user_hidden = user_hidden.masked_fill(~prompt_mask[:, None], 0)
-                agent_hidden = agent_hidden.masked_fill(~prompt_mask[:, None], 0)
-        active_text_count = ((text_ids != self.pad_token_id) & (text_ids != self.silence_token_id)).sum().item()
-        text_ids = text_ids.to(input_ids.device, non_blocking=True)
         text_hidden = self.llm.base_model.model.embed_input_ids(text_ids.flatten()).view(
-            frame_count, len(TEXT_STREAM_NAMES), -1
+            text_ids.shape[0], len(TEXT_STREAM_NAMES), -1
         )
-        (
-            embeddings,
-            key_active,
-            text_ordinals,
-            text_last,
-            audio_first,
-            audio_last,
-            prompt_ordinal,
-            prompt_last,
-        ) = self.frame_inputs(
+        return self.frame_inputs(
             text_ids, text_hidden, self.llm.channel_emb, user_hidden, agent_hidden,
-            self.pad_token_id, self.silence_token_id, state.active_text_tokens,
-            state.audio_position, self.config.audio_attention_window_frames,
-            is_live, prompt_written, prompt_mask,
-        )
-        state.active_text_tokens += active_text_count
-        positions = torch.arange(
-            state.frames_seen * DUPLEXIO_NUM_CELLS,
-            (state.frames_seen + frame_count) * DUPLEXIO_NUM_CELLS,
-            device=input_ids.device,
-        )
-        state.frames_seen += frame_count
-        # Audio time advances only on frames that carry real audio: text-only
-        # prefill and system-token bursts leave the counter frozen so they do
-        # not consume the audio attention window.
-        if is_live:
-            state.audio_position += frame_count
-        replay = {}
-        if runtime_config.get("duplexio_record_inputs", False):
-            replay = {
-                "text_ids": text_ids,
-                "user_features": user_features,
-                "agent_audio": agent_codes,
-                "audio_mask": torch.full((frame_count,), is_live, dtype=torch.bool, device=input_ids.device),
-                "prompt_frames": prompt_mask,
-            }
-        return (
-            input_ids,
-            embeddings,
-            {
-                "duplexio_working_state": state,
-                "duplexio_replay": replay,
-                "duplexio": {
-                    "positions": positions,
-                    "key_active": key_active,
-                    "text_ordinals": text_ordinals,
-                    "text_last": text_last,
-                    "audio_first": audio_first,
-                    "audio_last": audio_last,
-                    "prompt_ordinal": prompt_ordinal,
-                    "prompt_last": prompt_last,
-                },
-            },
+            self.pad_token_id, self.silence_token_id,
+            metadata, self.config.audio_attention_window_frames,
         )
 
     def forward(
@@ -1442,12 +1479,8 @@ def frame_inputs(
     agent_hidden: Tensor,
     pad_token_id: int,
     silence_token_id: int,
-    active_text_tokens: int,
-    audio_position: int,
+    metadata: Tensor,
     audio_window_frames: int,
-    audio_active: bool,
-    prompt_position: int,
-    prompt_frames: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Assemble six-cell inputs and cache addressing without changing CPU state.
 
@@ -1461,8 +1494,18 @@ def frame_inputs(
     A pinned voice-prompt burst is the one frame kind that carries audio without
     being live: only its agent-audio cell contributes a key; audio time stays frozen and
     the keys land in the cache's pinned region, which no window expires.
+
+    Metadata is int32, one row per packed frame: text-cumsum offset, audio
+    position, live flag, total prompt frames seen, prompt flag, absolute frame.
+    The text offset subtracts preceding requests' emissions, isolating the scan.
     """
     frames, device = text_ids.shape[0], text_ids.device
+    text_offsets, audio_last = metadata[:, 0], metadata[:, 1]
+    audio_active, prompt_frames = metadata[:, 2] != 0, metadata[:, 4] != 0
+    prompt_total = metadata[:, 3]
+    acoustic = (audio_active | prompt_frames)[:, None]
+    user_hidden = user_hidden.masked_fill(~acoustic, 0)
+    agent_hidden = agent_hidden.masked_fill(~acoustic, 0)
     text_hidden = text_hidden.masked_fill((text_ids == silence_token_id).unsqueeze(-1), 0)
     embeddings = torch.cat(
         (text_hidden + channel_embedding, user_hidden.unsqueeze(1), agent_hidden.unsqueeze(1)), dim=1,
@@ -1470,27 +1513,24 @@ def frame_inputs(
     text_active = (text_ids != pad_token_id) & (text_ids != silence_token_id)
     audio_shape = (frames, 2)
     audio_keyed = torch.stack(
-        (torch.full_like(prompt_frames, audio_active), prompt_frames | audio_active), dim=-1,
+        (audio_active, prompt_frames | audio_active), dim=-1,
     )
     key_active = torch.cat(
         (text_active, audio_keyed), dim=1,
     ).flatten()
     ordinals = (
-        text_active.flatten().cumsum(0, dtype=torch.int32) + active_text_tokens
-    ).view_as(text_active)
+        text_active.flatten().cumsum(0, dtype=torch.int32).view_as(text_active) + text_offsets[:, None]
+    )
     text_ordinals = torch.cat(
         (torch.where(text_active, ordinals, 0), torch.zeros(audio_shape, dtype=torch.int32, device=device)),
         dim=1,
     ).flatten()
     # A row sees the text its predecessors emitted, never its own siblings'.
     row_emitted = text_active.sum(1, dtype=torch.int32)
-    text_last = row_emitted.cumsum(0) - row_emitted + active_text_tokens
-    rows = torch.arange(frames, dtype=torch.int32, device=device)
-    audio_last = audio_position + (rows if audio_active else torch.zeros_like(rows))
-    audio_first = (audio_last + int(audio_active) - audio_window_frames).clamp_min(1)
+    text_last = row_emitted.cumsum(0) - row_emitted + text_offsets
+    audio_first = (audio_last + audio_active - audio_window_frames).clamp_min(1)
     # A prompt row's own pinned key is its self key, which the mask merges
     # separately, so a row sees only the prompt frames written before it.
-    prompt_total = prompt_frames.cumsum(0, dtype=torch.int32) + prompt_position
     prompt_ordinal_rows = torch.where(prompt_frames, prompt_total, 0)
     prompt_last_rows = torch.where(prompt_frames, prompt_total - 1, prompt_total)
     prompt_ordinal = torch.cat(

@@ -26,3 +26,24 @@ def test_cuda_payload_is_ready_and_independent_on_return():
     assert result["audio"][0].is_contiguous()
     assert result["audio"][1].shape == (12, 0)
     assert result["audio"][0].device.type == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("shape", [(1,), (3, 4), (0,)])
+def test_uniform_cuda_list_preserves_rows_and_snapshot(shape):
+    expected = [torch.full(shape, index, dtype=torch.float32) for index in range(4)]
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        sources = [value.cuda() for value in expected]
+        result = build_mm_cpu({"nested": {"values": sources}})
+        for source in sources:
+            source.fill_(-1)
+    values = result["nested"]["values"]
+    assert len(values) == len(expected)
+    for actual, reference in zip(values, expected, strict=True):
+        assert actual.device.type == "cpu"
+        assert actual.is_contiguous()
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    if values[0].numel():
+        values[0].fill_(-2)
+        torch.testing.assert_close(values[1], expected[1], rtol=0, atol=0)

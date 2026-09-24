@@ -28,10 +28,14 @@ def test_compiled_frame_inputs_preserve_layout() -> None:
         agent = torch.randn_like(user)
         prompt = torch.arange(frames, device="cuda") < prompt_count
         for start in (0, 1, 9, 1057):
+            metadata = torch.tensor([
+                (start, start // 4 + (row if live else 0), live,
+                 min(row + 1, prompt_count), row < prompt_count, row)
+                for row in range(frames)
+            ], dtype=torch.int32, device="cuda")
             # Audio time is frozen on a text-only append, which `live` selects.
             arguments = (
-                ids, text, channels, user, agent, 0, 1, start, start // 4, 3, live,
-                0, prompt,
+                ids, text, channels, user, agent, 0, 1, metadata, 3,
             )
             expected = frame_inputs(*arguments)
             actual = compiled(*arguments)
@@ -45,7 +49,8 @@ def test_compiled_frame_inputs_preserve_layout() -> None:
                     ordinals.append(counter if token not in (0, 1) else 0)
                 ordinals.extend((0, 0))
             assert actual[2].tolist() == ordinals
-            assert actual[1].view(frames, 6)[:, 4:].eq((prompt | live)[:, None]).all()
+            assert actual[1].view(frames, 6)[:, 4].eq(live).all()
+            assert actual[1].view(frames, 6)[:, 5].eq(prompt | live).all()
             prompt_ordinal = actual[6].view(frames, 6)
             assert not prompt_ordinal[:, :4].any()
             expected_ordinals = torch.where(prompt, prompt.cumsum(0), 0)
