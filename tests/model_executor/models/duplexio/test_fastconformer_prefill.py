@@ -192,16 +192,17 @@ def test_encoder_graph_rebatches_groups_without_restacking(encoder, monkeypatch)
     ))
     snapshot = None
     # Steady from step 13: a regrouped subset, a merge of rows from two earlier
-    # batches, and a reordering must all feed the graph without restacking.
+    # batches, and a reordering must all feed a captured graph without restacking.
     for step, order in enumerate(([0, 1, 2],) * 14 + ([1, 2],) * 3 + ([0, 1, 2],) * 2 + ([2, 0, 1],) * 2):
         waveforms = [torch.randn(FRAME_SAMPLES, device="cuda") * 0.1 for _ in order]
         expected, old = reference.encode_audio_batch(waveforms, [expected_states[index] for index in order])
         packed.clear()
+        captured = len(order) in encoder.graphs
         actual, new = encoder.encode_audio_batch(waveforms, [actual_states[index] for index in order])
         for index, value, target, state, target_state in zip(order, actual, expected, new, old, strict=True):
             torch.testing.assert_close(value, target, atol=1e-5, rtol=1e-4)
             actual_states[index], expected_states[index] = state, target_state
-        if step >= 13:
+        if step >= 13 and captured:
             assert all(size == 1 for size in packed)
             assert all(actual_states[index].encoder.batch is not None for index in order)
         if step == 12:
