@@ -817,6 +817,15 @@ class DuplexIOForConditionalGeneration(
             torch.stack([prediction.text_ids for prediction in predictions.values()]).tolist() if predictions else [],
             strict=True,
         ))
+        # Placeholders and request metadata start on the host; only sampled
+        # values cross from the device, once per dtype below.
+        empty = torch.empty(0, dtype=hidden_states.dtype)
+        empty_audio = torch.empty(0, dtype=torch.float32)
+        empty_codes = torch.empty(0, dtype=torch.long)
+        no_tool_call = torch.empty(0, dtype=torch.uint8)
+        flags = {False: torch.tensor([False]), True: torch.tensor([True])}
+        silence_ids = torch.tensor([self.silence_token_id], dtype=torch.long)
+        policy_version = torch.tensor([self.policy_version], dtype=torch.long)
         for request_index, ((start, end), info) in enumerate(zip(request_token_spans, infos, strict=True)):
             state = info.get("duplexio_working_state")
             if not isinstance(state, DuplexIORequestState):
@@ -838,58 +847,43 @@ class DuplexIOForConditionalGeneration(
             row_hidden = hidden_states[end - DUPLEXIO_NUM_CELLS : end]
             prediction = predictions.get(request_index)
             predicting = prediction is not None
-            end_flags.append(torch.tensor([duplex.get("final", False)]))
+            end_flags.append(flags[bool(duplex.get("final", False))])
             epochs.append(torch.tensor([duplex.get("epoch", 0)]))
             turn_ids.append(torch.tensor([duplex.get("turn_id", 0)]))
-            prefill_flags.append(torch.tensor([is_prefill and not predicting]))
-            prefill_complete_flags.append(torch.tensor([is_prefill and predicting]))
-            system_input_flags.append(torch.tensor([is_system_input and not predicting]))
-            system_input_complete_flags.append(torch.tensor([is_system_input and predicting]))
+            prefill_flags.append(flags[bool(is_prefill and not predicting)])
+            prefill_complete_flags.append(flags[bool(is_prefill and predicting)])
+            system_input_flags.append(flags[bool(is_system_input and not predicting)])
+            system_input_complete_flags.append(flags[bool(is_system_input and predicting)])
             record_hiddens = duplex["runtime_config"].get("duplexio_record_hiddens", False)
-            predictor_hiddens.append(
-                row_hidden.detach() if record_hiddens and prediction is not None else row_hidden.new_empty(0)
-            )
+            predictor_hiddens.append(row_hidden.detach() if record_hiddens and prediction is not None else empty)
             # Return sampling probabilities alongside each prediction.
-            agent_emit_logprobs.append(
-                prediction.agent_emit_logprob if prediction is not None else row_hidden.new_empty(0)
-            )
-            agent_token_logprobs.append(
-                prediction.agent_token_logprob if prediction is not None else row_hidden.new_empty(0)
-            )
-            tool_emit_logprobs.append(
-                prediction.tool_emit_logprob if prediction is not None else row_hidden.new_empty(0)
-            )
-            tool_token_logprobs.append(
-                prediction.tool_token_logprob if prediction is not None else row_hidden.new_empty(0)
-            )
+            agent_emit_logprobs.append(prediction.agent_emit_logprob if prediction is not None else empty)
+            agent_token_logprobs.append(prediction.agent_token_logprob if prediction is not None else empty)
+            tool_emit_logprobs.append(prediction.tool_emit_logprob if prediction is not None else empty)
+            tool_token_logprobs.append(prediction.tool_token_logprob if prediction is not None else empty)
             user_values = {}
             if prediction is not None:
                 user_values = {
                     "user_emit": prediction.user_emit,
                     "user_emit_logprob": prediction.user_emit_logprob,
                     "user_token_logprob": prediction.user_token_logprob,
-                    "policy_version": torch.tensor([self.policy_version], dtype=torch.long, device=row_hidden.device),
+                    "policy_version": policy_version,
                 }
             for name, values in user_outputs.items():
-                values.append(user_values.get(name, row_hidden.new_empty(0)))
+                values.append(user_values.get(name, empty))
             replay = info.get("duplexio_replay", {})
             for name, values in replay_outputs.items():
-                values.append(replay.get(name.removeprefix("replay_"), row_hidden.new_empty(0)))
+                values.append(replay.get(name.removeprefix("replay_"), empty))
             if prediction is None:
-                silence_ids = row_hidden.new_full(
-                    (1,),
-                    self.silence_token_id,
-                    dtype=torch.long,
-                )
                 forced_ids.append(self.silence_token_id)
                 user_ids.append(silence_ids)
                 agent_ids.append(silence_ids)
                 tool_ids.append(silence_ids)
-                audio_outputs.append(row_hidden.new_empty(0, dtype=torch.float32))
-                audio_token_ids.append(row_hidden.new_empty(0, dtype=torch.long))
-                listen_flags.append(torch.tensor([False]))
-                tool_call_complete_flags.append(torch.tensor([False]))
-                tool_call_payloads.append(row_hidden.new_empty(0, dtype=torch.uint8))
+                audio_outputs.append(empty_audio)
+                audio_token_ids.append(empty_codes)
+                listen_flags.append(flags[False])
+                tool_call_complete_flags.append(flags[False])
+                tool_call_payloads.append(no_tool_call)
                 continue
             predicted_audio, tool_call = prediction.audio, prediction.tool_call
             _, agent_token_id, tool_token_id = sampled_ids[request_index]
@@ -897,9 +891,7 @@ class DuplexIOForConditionalGeneration(
                 [self.silence_token_id, *sampled_ids[request_index]], dtype=torch.long, device="cpu",
             )
             state.agent_audio_codes = predicted_audio
-            waveform = decoded.get(request_index)
-            if waveform is None:
-                waveform = row_hidden.new_empty(0, dtype=torch.float32)
+            waveform = decoded.get(request_index, empty_audio)
             forced_ids.append(agent_token_id)
 
             user_ids.append(state.text_input_ids[1:2])
@@ -908,22 +900,16 @@ class DuplexIOForConditionalGeneration(
             audio_outputs.append(waveform.detach())
             audio_token_ids.append(predicted_audio.detach())
             model_listen = agent_token_id == self.silence_token_id and tool_token_id == self.silence_token_id
-            listen_flags.append(torch.tensor([model_listen]))
-            tool_call_complete_flags.append(torch.tensor([tool_call is not None]))
+            listen_flags.append(flags[model_listen])
+            tool_call_complete_flags.append(flags[tool_call is not None])
             if tool_call is not None:
                 state.tool_call_sequence += 1
-            tool_call_payloads.append(
-                serialize_tool_call(
-                    tool_call,
-                    state.tool_call_sequence,
-                    row_hidden.device,
-                )
-            )
+            tool_call_payloads.append(serialize_tool_call(tool_call, state.tool_call_sequence))
 
         self._forced_next_token_ids = forced_ids
         multimodal_outputs = cast(
             Any,
-            {
+            to_host({
                 "audio": audio_outputs,
                 "chunk": {
                     "agent_audio_token_ids": audio_token_ids,
@@ -949,7 +935,7 @@ class DuplexIOForConditionalGeneration(
                     **user_outputs,
                     **replay_outputs,
                 },
-            },
+            }),
         )
         return OmniOutput(
             text_hidden_states=hidden_states,
@@ -1675,13 +1661,38 @@ def sample_tool_token(
     )
 
 
-def serialize_tool_call(
-    tool_call: Mapping[str, Any] | None,
-    sequence: int,
-    device: torch.device,
-) -> Tensor:
+def to_host(outputs: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy ``outputs``, nested dicts of per-request tensor lists, to the host.
+
+    Device values that share a dtype cross in one transfer and come back as views
+    of it in their original shapes. Host tensors pass through untouched.
+    """
+    groups: dict[tuple[torch.device, torch.dtype], list[tuple[list[Tensor], int, Tensor]]] = {}
+
+    def lists(values: Mapping[str, Any]) -> dict[str, Any]:
+        host: dict[str, Any] = {}
+        for name, value in values.items():
+            if isinstance(value, Mapping):
+                host[name] = lists(value)
+                continue
+            host[name] = value = list(value)
+            for row, tensor in enumerate(value):
+                if tensor.device.type != "cpu":
+                    groups.setdefault((tensor.device, tensor.dtype), []).append((value, row, tensor))
+        return host
+
+    host = lists(outputs)
+    for items in groups.values():
+        packed = torch.cat([tensor.detach().reshape(-1) for _, _, tensor in items]).cpu()
+        parts = packed.split([tensor.numel() for _, _, tensor in items])
+        for (values, row, tensor), part in zip(items, parts, strict=True):
+            values[row] = part.view(tensor.shape)
+    return host
+
+
+def serialize_tool_call(tool_call: Mapping[str, Any] | None, sequence: int) -> Tensor:
     if tool_call is None:
-        return torch.empty(0, dtype=torch.uint8, device=device)
+        return torch.empty(0, dtype=torch.uint8)
     payload = json.dumps(
         {
             "sequence": sequence,
@@ -1691,7 +1702,7 @@ def serialize_tool_call(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    return torch.tensor(list(payload), dtype=torch.uint8, device=device)
+    return torch.frombuffer(bytearray(payload), dtype=torch.uint8)
 
 
 def _validate_vllm_runtime_contract(vllm_config: VllmConfig) -> None:
