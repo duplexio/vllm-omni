@@ -1159,8 +1159,10 @@ class DuplexIOForConditionalGeneration(
         for key, rows in groups.items():
             emit_temperature = key[3]
             sampling = samplings[rows[0]]
+            # Row views, not list indexing: uploading an index would block the
+            # host until the backbone finishes, before any sampling is queued.
             group_logits = torch.stack([logits[row] for row in rows])
-            group_emit_logits = emit_logits[rows].float()
+            group_emit_logits = torch.stack([emit_logits[row] for row in rows]).float()
             generators = {
                 index: infos[row]["duplexio_working_state"].sampling_generator
                 for index, row in enumerate(rows)
