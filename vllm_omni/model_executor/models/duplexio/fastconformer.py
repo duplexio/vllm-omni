@@ -6,8 +6,9 @@ import copy
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from torch import Tensor, nn
@@ -31,22 +32,92 @@ WORD_START = "\u2581"
 WORD_END_SILENCE_FRAMES = 4
 
 
-@dataclass
 class FastConformerStreamState:
-    """Explicit upstream encoder caches for one streaming utterance."""
+    """Explicit upstream encoder caches for one streaming utterance.
 
-    past_key_values: Any = None
-    padding_cache: Any = None
+    A state split from a batched forward stays a lazy row of that batch until
+    read individually. Batches are never mutated after splitting, so a group
+    that re-forms in the same order re-batches without copying its caches.
+    """
+
+    def __init__(self, past_key_values: Any = None, padding_cache: Any = None) -> None:
+        self._past_key_values = past_key_values
+        self._padding_cache = padding_cache
+        self.batch: FastConformerStreamState | None = None
+        self.row = 0
+        self.length = 0
+
+    @classmethod
+    def row_of(cls, batch: FastConformerStreamState, row: int, length: int) -> FastConformerStreamState:
+        state = cls()
+        state.batch, state.row, state.length = batch, row, length
+        return state
+
+    @property
+    def past_key_values(self) -> Any:
+        self.materialize()
+        return self._past_key_values
+
+    @property
+    def padding_cache(self) -> Any:
+        self.materialize()
+        return self._padding_cache
+
+    def materialize(self) -> None:
+        """Slice this row's containers out of its batch."""
+        batch = self.batch
+        if batch is None:
+            return
+        index = self.row
+        kv = copy.copy(batch._past_key_values)
+        kv.layers = []
+        for layer in batch._past_key_values.layers:
+            single = copy.copy(layer)
+            single.keys = layer.keys[index:index + 1]
+            single.values = layer.values[index:index + 1]
+            single.cumulative_length = self.length
+            kv.layers.append(single)
+        padding = copy.copy(batch._padding_cache)
+        padding.layers = {}
+        for name, layer in batch._padding_cache.layers.items():
+            single = copy.copy(layer)
+            single.cache = layer.cache[index:index + 1]
+            padding.layers[name] = single
+        self._past_key_values, self._padding_cache, self.batch = kv, padding, None
 
     @property
     def cached_frames(self) -> int:
-        return 0 if self.past_key_values is None else self.past_key_values.layers[0].keys.shape[-2]
+        if self.batch is not None:
+            return self.batch.cached_frames
+        return 0 if self._past_key_values is None else self._past_key_values.layers[0].keys.shape[-2]
 
     def tensors(self) -> list[Tensor]:
         """Initialized cache storage, in native layer order."""
         return [
             tensor for layer in self.past_key_values.layers for tensor in (layer.keys, layer.values)
         ] + [layer.cache for layer in self.padding_cache.layers.values()]
+
+    @staticmethod
+    def batch_tensors(states: list[FastConformerStreamState]) -> list[Tensor]:
+        """Batched cache storage for read-only use, sharing an unchanged batch."""
+        batch = states[0].batch
+        if (
+            batch is not None and batch.batch_size == len(states)
+            and all(state.batch is batch and state.row == row for row, state in enumerate(states))
+        ):
+            return batch.tensors()
+        return FastConformerStreamState.stack(states).tensors()
+
+    @property
+    def seq_length(self) -> int:
+        """Absolute frames consumed, beyond the retained window."""
+        if self.batch is not None:
+            return self.length
+        return 0 if self._past_key_values is None else self._past_key_values.get_seq_length()
+
+    @property
+    def batch_size(self) -> int:
+        return self._past_key_values.layers[0].keys.shape[0]
 
     @classmethod
     def stack(cls, states: list[FastConformerStreamState]) -> FastConformerStreamState:
@@ -78,25 +149,10 @@ class FastConformerStreamState:
 
     def unbind(self, previous: list[FastConformerStreamState], frames: int) -> list[FastConformerStreamState]:
         """Restore request-owned cache containers after one batched forward."""
-        results = []
-        for index, old in enumerate(previous):
-            kv = copy.copy(self.past_key_values)
-            kv.layers = []
-            length = 0 if old.past_key_values is None else old.past_key_values.get_seq_length()
-            for layer in self.past_key_values.layers:
-                single = copy.copy(layer)
-                single.keys = layer.keys[index:index + 1]
-                single.values = layer.values[index:index + 1]
-                single.cumulative_length = length + frames
-                kv.layers.append(single)
-            padding = copy.copy(self.padding_cache)
-            padding.layers = {}
-            for name, layer in self.padding_cache.layers.items():
-                single = copy.copy(layer)
-                single.cache = layer.cache[index:index + 1]
-                padding.layers[name] = single
-            results.append(FastConformerStreamState(kv, padding))
-        return results
+        return [
+            FastConformerStreamState.row_of(self, index, old.seq_length + frames)
+            for index, old in enumerate(previous)
+        ]
 
 
 @dataclass
@@ -180,6 +236,15 @@ def streaming_resample_batch(
     return [outputs[index] for index in range(len(chunks))], [updated[index] for index in range(len(chunks))]
 
 
+class StreamingChunkSizes(NamedTuple):
+    """Fixed streaming window sizes, in raw samples and mel frames."""
+
+    first_samples: int
+    samples: int
+    first_mel_frames: int
+    mel_frames: int
+
+
 class FastConformerGraph:
     """Replay one full-window encoder batch without retaining request-owned state."""
 
@@ -203,9 +268,11 @@ class FastConformerGraph:
                 self.features, FastConformerStreamState.stack([self.state]),
             )
 
-    def __call__(self, features: Tensor, state: FastConformerStreamState) -> tuple[Tensor, FastConformerStreamState]:
+    def __call__(
+        self, features: Tensor, states: list[FastConformerStreamState],
+    ) -> tuple[Tensor, FastConformerStreamState]:
         self.features.copy_(features)
-        torch._foreach_copy_(self.state.tensors(), state.tensors())
+        torch._foreach_copy_(self.state.tensors(), FastConformerStreamState.batch_tensors(states))
         self.graph.replay()
         # Both features and caches must survive subsequent replays for other requests.
         return self.output.clone(), FastConformerStreamState.stack([self.output_state])
@@ -261,6 +328,15 @@ class FastConformerRNNT(nn.Module):
         self.register_buffer(
             "stft_window",
             torch.hann_window(feature_extractor.win_length, periodic=False),
+        )
+
+    @cached_property
+    def chunk_sizes(self) -> StreamingChunkSizes:
+        # The processor re-merges its kwargs on every access; the lookahead is fixed.
+        processor = self.processor
+        return StreamingChunkSizes(
+            processor.num_samples_first_audio_chunk, processor.num_samples_per_audio_chunk,
+            processor.num_mel_frames_first_audio_chunk, processor.num_mel_frames_per_audio_chunk,
         )
 
     def train(self, mode: bool = True) -> FastConformerRNNT:
@@ -328,9 +404,9 @@ class FastConformerRNNT(nn.Module):
             magnitudes = torch.view_as_real(spectrum).pow(2).sum(-1).sqrt().pow(2)
             features = (mel_filters @ magnitudes + 2**-24).log().transpose(1, 2)
         required_frames = (
-            self.processor.num_mel_frames_first_audio_chunk
+            self.chunk_sizes.first_mel_frames
             if first
-            else self.processor.num_mel_frames_per_audio_chunk
+            else self.chunk_sizes.mel_frames
         )
         actual_frames = features.shape[1]
         if actual_frames < required_frames or (
@@ -362,13 +438,13 @@ class FastConformerRNNT(nn.Module):
             first = frame == 0
             if first:
                 start = 0
-                size = self.processor.num_samples_first_audio_chunk
+                size = self.chunk_sizes.first_samples
             else:
                 start = (
-                    mel_frame * self.processor.feature_extractor.hop_length
-                    - self.processor.feature_extractor.n_fft // 2
+                    mel_frame * self.feature_hop_length
+                    - self.feature_n_fft // 2
                 )
-                size = self.processor.num_samples_per_audio_chunk
+                size = self.chunk_sizes.samples
             raw_chunk = self.streaming_raw_audio_slice(waveform, start, size)
             features = self.prepare_streaming_audio_chunk(raw_chunk, first=first)
             yield features
@@ -395,13 +471,13 @@ class FastConformerRNNT(nn.Module):
             first = next_mel_frame == 0
             if first:
                 raw_start = 0
-                raw_size = self.processor.num_samples_first_audio_chunk
+                raw_size = self.chunk_sizes.first_samples
             else:
                 raw_start = (
-                    next_mel_frame * self.processor.feature_extractor.hop_length
-                    - self.processor.feature_extractor.n_fft // 2
+                    next_mel_frame * self.feature_hop_length
+                    - self.feature_n_fft // 2
                 )
-                raw_size = self.processor.num_samples_per_audio_chunk
+                raw_size = self.chunk_sizes.samples
             raw_end = raw_start + raw_size
             available_end = buffer_start + audio_buffer.shape[0]
             if available_end < raw_end:
@@ -414,12 +490,12 @@ class FastConformerRNNT(nn.Module):
                 raw_chunk = torch.cat((raw_chunk.new_zeros(-raw_start), raw_chunk))
             raw_chunks.append(raw_chunk)
             next_mel_frame += (
-                self.processor.num_mel_frames_first_audio_chunk
-                if first else self.processor.num_mel_frames_per_audio_chunk
+                self.chunk_sizes.first_mel_frames
+                if first else self.chunk_sizes.mel_frames
             )
             next_raw_start = max(
-                next_mel_frame * self.processor.feature_extractor.hop_length
-                - self.processor.feature_extractor.n_fft // 2,
+                next_mel_frame * self.feature_hop_length
+                - self.feature_n_fft // 2,
                 0,
             )
             drop = next_raw_start - buffer_start
@@ -470,20 +546,22 @@ class FastConformerRNNT(nn.Module):
         outputs = [parameter.new_empty((1, 0, self.output_dim)) for _ in states]
         for indices in groups.values():
             previous = [states[index].encoder for index in indices]
-            with torch.profiler.record_function("duplexio.asr_cache_pack"):
-                cache = FastConformerStreamState.stack(previous)
             with torch.profiler.record_function("duplexio.asr_encoder"):
                 features = torch.stack([inputs[index] for index in indices])
                 steady = (
-                    cache.cached_frames == self.model.config.encoder_config.sliding_window - 1
-                    and features.shape[1] == self.processor.num_mel_frames_per_audio_chunk
+                    previous[0].cached_frames == self.model.config.encoder_config.sliding_window - 1
+                    and features.shape[1] == self.chunk_sizes.mel_frames
                 )
                 if self.use_cuda_graph and steady:
                     batch_size = len(indices)
                     if batch_size not in self.graphs:
-                        self.graphs[batch_size] = FastConformerGraph(self.encode_feature_chunk, features, cache)
-                    encoded, cache = self.graphs[batch_size](features, cache)
+                        self.graphs[batch_size] = FastConformerGraph(
+                            self.encode_feature_chunk, features, FastConformerStreamState.stack(previous),
+                        )
+                    encoded, cache = self.graphs[batch_size](features, previous)
                 else:
+                    with torch.profiler.record_function("duplexio.asr_cache_pack"):
+                        cache = FastConformerStreamState.stack(previous)
                     encoded, cache = self.encode_feature_chunk(features, cache)
             with torch.profiler.record_function("duplexio.asr_cache_split"):
                 caches = cache.unbind(previous, encoded.shape[1])

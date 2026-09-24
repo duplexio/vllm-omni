@@ -18,6 +18,7 @@ from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FRAME_SAMPLES,
     FastConformerAudioStreamState,
     FastConformerRNNT,
+    FastConformerStreamState,
     streaming_resample_batch,
     streaming_resample_chunk,
 )
@@ -172,6 +173,48 @@ def test_encoder_graph_preserves_requests_and_output_ownership(encoder, dtype):
     assert set(encoder.graphs) == {2, 3}
     for value, original in retained:
         torch.testing.assert_close(value, original, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
+@torch.inference_mode()
+def test_encoder_graph_rebatches_unchanged_groups_without_copies(encoder, monkeypatch):
+    import copy
+
+    encoder = encoder.to(device="cuda")
+    reference = copy.deepcopy(encoder)
+    encoder.use_cuda_graph = True
+    actual_states = [FastConformerAudioStreamState() for _ in range(3)]
+    expected_states = copy.deepcopy(actual_states)
+    stack = FastConformerStreamState.stack.__func__
+    packed = []
+    monkeypatch.setattr(FastConformerStreamState, "stack", classmethod(
+        lambda cls, states: packed.append(len(states)) or stack(cls, states)
+    ))
+    snapshot = None
+    for step, order in enumerate(([0, 1, 2],) * 14 + ([1, 2],) * 3 + ([0, 1, 2],) * 3):
+        waveforms = [torch.randn(FRAME_SAMPLES, device="cuda") * 0.1 for _ in order]
+        expected, old = reference.encode_audio_batch(waveforms, [expected_states[index] for index in order])
+        packed.clear()
+        actual, new = encoder.encode_audio_batch(waveforms, [actual_states[index] for index in order])
+        for index, value, target, state, target_state in zip(order, actual, expected, new, old, strict=True):
+            torch.testing.assert_close(value, target, atol=1e-5, rtol=1e-4)
+            actual_states[index], expected_states[index] = state, target_state
+        if step in (13, 16, 19):
+            # The same group in the same order shares the previous batch outright.
+            assert all(size == 1 for size in packed)
+            assert all(actual_states[index].encoder.batch is not None for index in order)
+        if step == 12:
+            # A rejected step rolls back to earlier state, which later replays must not touch.
+            snapshot = [copy.copy(state.encoder) for state in actual_states]
+            saved = [[tensor.clone() for tensor in state.tensors()] for state in snapshot]
+    assert set(encoder.graphs) == {2, 3}
+    for state, tensors in zip(snapshot, saved, strict=True):
+        for cache, original in zip(state.tensors(), tensors, strict=True):
+            torch.testing.assert_close(cache, original, atol=0, rtol=0)
+    for state, target_state in zip(actual_states, expected_states, strict=True):
+        assert state.encoder.seq_length == target_state.encoder.seq_length
+        for cache, reference_cache in zip(state.encoder.tensors(), target_state.encoder.tensors(), strict=True):
+            torch.testing.assert_close(cache, reference_cache, atol=1e-5, rtol=1e-4)
 
 
 @pytest.mark.parametrize("frames", [1, 4, 16])
