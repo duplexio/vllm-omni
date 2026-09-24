@@ -46,6 +46,16 @@ class FastConformerStreamState:
         self.batch: FastConformerStreamState | None = None
         self.row = 0
         self.length = 0
+        # A packed batch keeps every cache as a view of one ``[batch, elements]``
+        # buffer, so moving rows costs one copy; containers are built on demand.
+        self.flat: Tensor | None = None
+        self.layout: FlatCacheLayout | None = None
+
+    @classmethod
+    def packed(cls, layout: FlatCacheLayout, flat: Tensor) -> FastConformerStreamState:
+        state = cls()
+        state.flat, state.layout = flat, layout
+        return state
 
     @classmethod
     def row_of(cls, batch: FastConformerStreamState, row: int, length: int) -> FastConformerStreamState:
@@ -64,10 +74,13 @@ class FastConformerStreamState:
         return self._padding_cache
 
     def materialize(self) -> None:
-        """Slice this row's containers out of its batch."""
+        """Build packed containers, or slice this row's out of its batch."""
+        if self.flat is not None and self._past_key_values is None:
+            self._past_key_values, self._padding_cache = self.layout.containers(self.tensors())
         batch = self.batch
         if batch is None:
             return
+        batch.materialize()
         index = self.row
         kv = copy.copy(batch._past_key_values)
         kv.layers = []
@@ -89,67 +102,48 @@ class FastConformerStreamState:
     def cached_frames(self) -> int:
         if self.batch is not None:
             return self.batch.cached_frames
+        if self.flat is not None:
+            return self.layout.cached_frames
         return 0 if self._past_key_values is None else self._past_key_values.layers[0].keys.shape[-2]
 
     def tensors(self) -> list[Tensor]:
         """Initialized cache storage, in native layer order."""
+        if self.flat is not None:
+            return self.layout.views(self.flat)
         return [
             tensor for layer in self.past_key_values.layers for tensor in (layer.keys, layer.values)
         ] + [layer.cache for layer in self.padding_cache.layers.values()]
 
-    def detached(self, extra: Tensor) -> tuple[Tensor, FastConformerStreamState]:
-        """Copy ``extra`` and every cache out of reusable storage, one kernel per dtype."""
-        tensors = [extra, *self.tensors()]
-        copies: list[Tensor | None] = [None] * len(tensors)
-        groups: dict[torch.dtype, list[int]] = defaultdict(list)
-        for index, tensor in enumerate(tensors):
-            groups[tensor.dtype].append(index)
-        for indices in groups.values():
-            flat = torch.cat([tensors[index].reshape(-1) for index in indices])
-            for index, piece in zip(indices, flat.split([tensors[index].numel() for index in indices]), strict=True):
-                copies[index] = piece.view(tensors[index].shape)
-        kv = copy.copy(self.past_key_values)
-        kv.layers = []
-        position = 1
-        for layer in self.past_key_values.layers:
-            batched = copy.copy(layer)
-            batched.keys, batched.values = copies[position], copies[position + 1]
-            batched.cumulative_length = batched.keys.shape[-2]
-            position += 2
-            kv.layers.append(batched)
-        padding = copy.copy(self.padding_cache)
-        padding.layers = {}
-        for name, layer in self.padding_cache.layers.items():
-            batched = copy.copy(layer)
-            batched.cache = copies[position]
-            position += 1
-            padding.layers[name] = batched
-        return copies[0], FastConformerStreamState(kv, padding)
-
     @staticmethod
-    def copy_rows(states: list[FastConformerStreamState], destination: list[Tensor]) -> None:
-        """Write each state's caches into its row of batched ``destination`` storage.
+    def copy_rows(states: list[FastConformerStreamState], destination: FastConformerStreamState) -> None:
+        """Write each state's caches into its row of packed batch ``destination``.
 
         Rows that sit consecutively in one source batch move as one slice, so a
-        group that re-forms in order costs a single copy per cache tensor.
+        group that re-forms in order costs a single copy, or one per cache
+        tensor when the source is not packed alike.
         """
-        sources: dict[int, list[Tensor]] = {}
-        runs: list[tuple[int, list[Tensor], int, int]] = []
+        runs: list[tuple[int, FastConformerStreamState, int, int]] = []
         for row, state in enumerate(states):
             source, index = (state, 0) if state.batch is None else (state.batch, state.row)
-            tensors = sources.get(id(source))
-            if tensors is None:
-                tensors = sources[id(source)] = source.tensors()
-            if runs and runs[-1][1] is tensors and runs[-1][2] + runs[-1][3] == index:
+            if runs and runs[-1][1] is source and runs[-1][2] + runs[-1][3] == index:
                 start, _, first, length = runs[-1]
-                runs[-1] = (start, tensors, first, length + 1)
+                runs[-1] = (start, source, first, length + 1)
             else:
-                runs.append((row, tensors, index, 1))
+                runs.append((row, source, index, 1))
         targets: list[Tensor] = []
         values: list[Tensor] = []
-        for start, tensors, first, length in runs:
-            targets += [tensor[start:start + length] for tensor in destination]
-            values += [tensor[first:first + length] for tensor in tensors]
+        unpacked: dict[int, list[Tensor]] = {}
+        for start, source, first, length in runs:
+            if source.flat is not None and source.layout.key == destination.layout.key:
+                targets.append(destination.flat[start:start + length])
+                values.append(source.flat[first:first + length])
+                continue
+            if not unpacked:
+                unpacked[id(destination)] = destination.tensors()
+            if id(source) not in unpacked:
+                unpacked[id(source)] = source.tensors()
+            targets += [tensor[start:start + length] for tensor in unpacked[id(destination)]]
+            values += [tensor[first:first + length] for tensor in unpacked[id(source)]]
         torch._foreach_copy_(targets, values)
 
     @property
@@ -157,10 +151,14 @@ class FastConformerStreamState:
         """Absolute frames consumed, beyond the retained window."""
         if self.batch is not None:
             return self.length
+        if self.flat is not None:
+            return self.layout.cached_frames
         return 0 if self._past_key_values is None else self._past_key_values.get_seq_length()
 
     @property
     def batch_size(self) -> int:
+        if self.flat is not None:
+            return self.flat.shape[0]
         return self._past_key_values.layers[0].keys.shape[0]
 
     @classmethod
@@ -197,6 +195,57 @@ class FastConformerStreamState:
             FastConformerStreamState.row_of(self, index, old.seq_length + frames)
             for index, old in enumerate(previous)
         ]
+
+
+class FlatCacheLayout:
+    """Where each cache of one batch row sits within a flat row of one dtype."""
+
+    def __init__(self, template: FastConformerStreamState) -> None:
+        tensors = template.tensors()
+        if len({tensor.dtype for tensor in tensors}) != 1:
+            raise ValueError("Packed FastConformer caches need one dtype")
+        self.shapes = [tensor.shape[1:] for tensor in tensors]
+        self.sizes = [tensor[0].numel() for tensor in tensors]
+        self.key = (tensors[0].dtype, tuple(self.shapes))
+        self.cached_frames = template.cached_frames
+        # Key and value windows lead; the convolution padding caches follow.
+        self.kv_tensors = 2 * len(template.past_key_values.layers)
+        # Keep only the container structure, not the template's storage.
+        self.template = FastConformerStreamState(*self.fill(template, [None] * len(tensors)))
+
+    @staticmethod
+    def pack(tensors: list[Tensor]) -> Tensor:
+        """Flatten batched tensors into one row-major ``[batch, elements]`` buffer."""
+        return torch.cat([tensor.reshape(tensor.shape[0], -1) for tensor in tensors], dim=1)
+
+    def views(self, flat: Tensor) -> list[Tensor]:
+        pieces = flat.split(self.sizes, dim=1)
+        return [piece.view(-1, *shape) for piece, shape in zip(pieces, self.shapes, strict=True)]
+
+    def containers(self, tensors: list[Tensor]) -> tuple[Any, Any]:
+        """Native cache containers shaped like the template's, holding ``tensors``."""
+        return self.fill(self.template, tensors)
+
+    def fill(self, state: FastConformerStreamState, tensors: list[Tensor | None]) -> tuple[Any, Any]:
+        template = state.past_key_values
+        kv = copy.copy(template)
+        kv.layers = []
+        position = 0
+        for layer in template.layers:
+            batched = copy.copy(layer)
+            batched.keys, batched.values = tensors[position], tensors[position + 1]
+            batched.cumulative_length = self.cached_frames
+            position += 2
+            kv.layers.append(batched)
+        template = state.padding_cache
+        padding = copy.copy(template)
+        padding.layers = {}
+        for name, layer in template.layers.items():
+            batched = copy.copy(layer)
+            batched.cache = tensors[position]
+            position += 1
+            padding.layers[name] = batched
+        return kv, padding
 
 
 @dataclass
@@ -290,36 +339,61 @@ class StreamingChunkSizes(NamedTuple):
 
 
 class FastConformerGraph:
-    """Replay one full-window encoder batch without retaining request-owned state."""
+    """Replay one full-window encoder batch without retaining request-owned state.
+
+    Inputs and outputs are packed: caches come in with one copy per run of rows
+    and leave, together with the hidden states, as one flat clone. Graphs of
+    every batch size may share one memory ``pool``: replays run one at a time on
+    one stream, and only each graph's packed output outlives its replay.
+    """
 
     def __init__(
         self,
         encode: Callable[[Tensor, FastConformerStreamState], tuple[Tensor, FastConformerStreamState]],
         features: Tensor,
         state: FastConformerStreamState,
+        pool: tuple[int, int] | None = None,
     ) -> None:
         self.features = features.clone()
-        self.state = FastConformerStreamState.stack([state])
+        self.layout = FlatCacheLayout(state)
+        self.state = FastConformerStreamState.packed(self.layout, self.layout.pack(state.tensors()))
+
+        def run() -> tuple[Tensor, FastConformerStreamState]:
+            # The encoder rewrites its padding caches in place, so those get private
+            # copies; the key and value windows, the bulk of the state, are only read.
+            tensors = self.layout.views(self.state.flat)
+            count = self.layout.kv_tensors
+            private = [*tensors[:count], *(tensor.clone() for tensor in tensors[count:])]
+            return encode(self.features, FastConformerStreamState(*self.layout.containers(private)))
+
         stream = torch.cuda.Stream(device=features.device)
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(3):
-                encode(self.features, FastConformerStreamState.stack([self.state]))
+                run()
         torch.cuda.current_stream().wait_stream(stream)
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            self.output, self.output_state = encode(
-                self.features, FastConformerStreamState.stack([self.state]),
-            )
+        with torch.cuda.graph(self.graph, pool=pool):
+            hidden, output_state = run()
+            self.output = FlatCacheLayout.pack([hidden, *output_state.tensors()])
+        output_layout = FlatCacheLayout(output_state)
+        # Steady windows keep their shape, so outputs feed the next replay row-wise.
+        self.output_layout = self.layout if output_layout.key == self.layout.key else output_layout
+        self.hidden_shape = hidden.shape
+        self.hidden_size = hidden[0].numel()
 
     def __call__(
         self, features: Tensor, states: list[FastConformerStreamState],
     ) -> tuple[Tensor, FastConformerStreamState]:
         self.features.copy_(features)
-        FastConformerStreamState.copy_rows(states, self.state.tensors())
+        FastConformerStreamState.copy_rows(states, self.state)
         self.graph.replay()
         # Both features and caches must survive subsequent replays for other requests.
-        return self.output_state.detached(self.output)
+        flat = self.output.clone()
+        return (
+            flat[:, :self.hidden_size].view(self.hidden_shape),
+            FastConformerStreamState.packed(self.output_layout, flat[:, self.hidden_size:]),
+        )
 
 
 class FastConformerRNNT(nn.Module):
@@ -599,8 +673,10 @@ class FastConformerRNNT(nn.Module):
                 if self.use_cuda_graph and steady:
                     batch_size = len(indices)
                     if batch_size not in self.graphs:
+                        # A pool lives only as long as a graph using it.
+                        pool = next(iter(self.graphs.values())).graph.pool() if self.graphs else None
                         self.graphs[batch_size] = FastConformerGraph(
-                            self.encode_feature_chunk, features, FastConformerStreamState.stack(previous),
+                            self.encode_feature_chunk, features, FastConformerStreamState.stack(previous), pool,
                         )
                     encoded, cache = self.graphs[batch_size](features, previous)
                 else:

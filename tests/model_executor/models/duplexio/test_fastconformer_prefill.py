@@ -190,6 +190,11 @@ def test_encoder_graph_rebatches_groups_without_restacking(encoder, monkeypatch)
     monkeypatch.setattr(FastConformerStreamState, "stack", classmethod(
         lambda cls, states: packed.append(len(states)) or stack(cls, states)
     ))
+    foreach_copy = torch._foreach_copy_
+    copies = []
+    monkeypatch.setattr(torch, "_foreach_copy_", lambda targets, values: (
+        copies.append(len(targets)) or foreach_copy(targets, values)
+    ))
     snapshot = None
     # Steady from step 13: a regrouped subset, a merge of rows from two earlier
     # batches, and a reordering must all feed a captured graph without restacking.
@@ -197,6 +202,7 @@ def test_encoder_graph_rebatches_groups_without_restacking(encoder, monkeypatch)
         waveforms = [torch.randn(FRAME_SAMPLES, device="cuda") * 0.1 for _ in order]
         expected, old = reference.encode_audio_batch(waveforms, [expected_states[index] for index in order])
         packed.clear()
+        copies.clear()
         captured = len(order) in encoder.graphs
         actual, new = encoder.encode_audio_batch(waveforms, [actual_states[index] for index in order])
         for index, value, target, state, target_state in zip(order, actual, expected, new, old, strict=True):
@@ -204,7 +210,11 @@ def test_encoder_graph_rebatches_groups_without_restacking(encoder, monkeypatch)
             actual_states[index], expected_states[index] = state, target_state
         if step >= 13 and captured:
             assert not packed
-            assert all(actual_states[index].encoder.batch is not None for index in order)
+            if step > 14:
+                # One copy per run of rows from the same packed batch.
+                assert copies and sum(copies) <= len(order)
+            # Rows stay views of one packed replay output, so the next replay copies each run once.
+            assert all(actual_states[index].encoder.batch.flat is not None for index in order)
         if step == 12:
             # A rejected step rolls back to earlier state, which later replays must not touch.
             snapshot = [copy.copy(state.encoder) for state in actual_states]
