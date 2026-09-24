@@ -10,7 +10,7 @@ import pytest
 import torch
 from torch import Tensor, nn
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.attention.backends.flex_attention import FlexAttentionMetadata
+from vllm.v1.attention.backends.flex_attention import FlexAttentionMetadata, FlexAttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
@@ -49,6 +49,8 @@ FRAME_FIELDS = (
 # afterwards, so it does not round like a dense matmul. Bit-exactness with
 # training was traded for that simpler reduction.
 TOLERANCE = {torch.float32: 2e-5, torch.bfloat16: 3e-2}
+# Tables the paged mask closure reads at kernel launch.
+UPSTREAM_TABLES = ("doc_ids", "physical_to_logical", "decode_offset", "num_blocks_per_seq", "seq_lens", "block_table")
 
 
 def cells(values: Tensor) -> Tensor:
@@ -193,28 +195,29 @@ def paged_backend(
     return layer, builder, impl
 
 
+def step_common(sizes: list[int], seq_lens: list[int], block_table: Tensor) -> CommonAttentionMetadata:
+    device = block_table.device
+    starts = torch.tensor([0, *accumulate(sizes)], dtype=torch.int32)
+    return CommonAttentionMetadata(
+        query_start_loc=starts.to(device),
+        query_start_loc_cpu=starts,
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        num_reqs=len(sizes),
+        num_actual_tokens=sum(sizes),
+        max_query_len=max(sizes),
+        max_seq_len=max(seq_lens),
+        block_table_tensor=block_table,
+        slot_mapping=torch.zeros(sum(sizes), dtype=torch.long, device=device),
+    )
+
+
 def step_metadata(
     builder: DuplexIOFlexAttentionMetadataBuilder,
     sizes: list[int],
     seq_lens: list[int],
     block_table: Tensor,
 ) -> FlexAttentionMetadata:
-    device = block_table.device
-    starts = torch.tensor([0, *accumulate(sizes)], dtype=torch.int32)
-    return builder.build(
-        0,
-        CommonAttentionMetadata(
-            query_start_loc=starts.to(device),
-            query_start_loc_cpu=starts,
-            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
-            num_reqs=len(sizes),
-            num_actual_tokens=sum(sizes),
-            max_query_len=max(sizes),
-            max_seq_len=max(seq_lens),
-            block_table_tensor=block_table,
-            slot_mapping=torch.zeros(sum(sizes), dtype=torch.long, device=device),
-        ),
-    )
+    return builder.build(0, step_common(sizes, seq_lens, block_table))
 
 
 def session_activity(rows: int, prefix: int, request: int) -> tuple[Tensor, Tensor]:
@@ -450,3 +453,69 @@ def test_only_pages_a_step_can_touch_are_listed(rows: int, prompt_frames: int) -
     written = frame.write_slots(DUPLEXIO_NUM_CELLS)
     assert (written >= 0).any()
     assert {int(slot) // BLOCK_SIZE for slot in written[written >= 0]} <= expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged cache")
+@pytest.mark.parametrize(
+    "sizes,rows",
+    [
+        ([6], [1]),
+        ([18, 6, 6], [40, 3, 70]),
+        # A graph-padded batch can carry requests with no tokens.
+        ([6, 0, 6, 0], [9, 1, 12, 1]),
+        ([6] * 17, list(range(5, 90, 5))),
+    ],
+)
+@torch.inference_mode()
+def test_block_mask_tables_match_upstream_direct_build(sizes: list[int], rows: list[int]) -> None:
+    device = torch.device("cuda")
+    spec = make_duplexio_kv_cache_spec(
+        FullAttentionSpec(block_size=BLOCK_SIZE, num_kv_heads=2, head_size=64, head_size_v=64, dtype=torch.bfloat16),
+        audio_window_frames=WINDOW,
+        voice_prompt_frames=2,
+        max_model_len=100 * DUPLEXIO_NUM_CELLS,
+    )
+    layout = spec.layout
+    requests = len(sizes)
+    pages = layout.max_blocks * requests
+    frame = DuplexIOFrameMetadata(layout, sum(sizes), device)
+    _, builder, _ = paged_backend(spec, frame, 4, requests, pages + 1)
+    block_table = (torch.randperm(pages, device=device, dtype=torch.int32) + 1).view(requests, layout.max_blocks)
+    seq_lens = [row * DUPLEXIO_NUM_CELLS for row in rows]
+
+    metadata = step_metadata(builder, sizes, seq_lens, block_table)
+    tables = {name: getattr(metadata, name).clone() for name in UPSTREAM_TABLES}
+    mask = metadata.block_mask
+    mask_tables = {name: getattr(mask, name).clone() for name in ("kv_num_blocks", "kv_indices")}
+
+    # The upstream direct build over the same compact inputs, as the builder
+    # used to run it.
+    common = step_common(sizes, seq_lens, block_table)
+    step_page_bounds(
+        common.seq_lens,
+        common.block_table_tensor,
+        builder.page_ids,
+        builder.compact_seq_lens[:requests],
+        builder.touched_block_table[:requests],
+        layout,
+    )
+    upstream = FlexAttentionMetadataBuilder.build(
+        builder,
+        0,
+        common.replace(
+            causal=False,
+            seq_lens=builder.compact_seq_lens[:requests],
+            max_seq_len=layout.max_compact_slots,
+            block_table_tensor=builder.touched_block_table[:requests],
+        ),
+    )
+    upstream.decode_offset.copy_(common.query_start_loc[:requests])
+
+    for name in UPSTREAM_TABLES:
+        torch.testing.assert_close(tables[name], getattr(upstream, name), rtol=0, atol=0, msg=name)
+    assert mask.seq_lengths == upstream.block_mask.seq_lengths
+    assert mask.BLOCK_SIZE == upstream.block_mask.BLOCK_SIZE
+    for name, table in mask_tables.items():
+        ours, theirs = getattr(mask, name), getattr(upstream.block_mask, name)
+        assert (ours.data_ptr(), ours.shape, ours.stride()) == (theirs.data_ptr(), theirs.shape, theirs.stride()), name
+        torch.testing.assert_close(table, theirs, rtol=0, atol=0, msg=name)

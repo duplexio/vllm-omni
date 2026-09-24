@@ -5,13 +5,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from itertools import islice
 from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.nn.attention.flex_attention import BlockMask
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_layers_from_vllm_config
@@ -54,6 +55,8 @@ from vllm.v1.attention.backends.flex_attention import (
     FlexAttentionImpl,
     FlexAttentionMetadata,
     FlexAttentionMetadataBuilder,
+    physical_to_logical_mapping,
+    unique_static_unsorted,
 )
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -228,14 +231,68 @@ def physical_slots(
     return physical_slots.masked_fill(~valid, -1)
 
 
+@torch.compile(dynamic=True, fullgraph=True)
+def step_block_mask_tables(
+    query_start_loc: Tensor,
+    seq_lens: Tensor,
+    block_table: Tensor,
+    doc_ids: Tensor,
+    physical_to_logical: Tensor,
+    kv_indices: Tensor,
+    kv_num_blocks: Tensor,
+    decode_offset: Tensor,
+    block_size: int,
+    q_block_size: int,
+    num_pages: int,
+    num_blocks: int,
+) -> Tensor:
+    """Write every index table a paged FlexAttention step reads, in one pass.
+
+    This is upstream's direct block-mask build for a mask with no causal or
+    window pruning - each query block lists the unique pages of the requests
+    it holds - but doc ids come from the query offsets already on the device,
+    so nothing is uploaded. Each query's logical index starts at its batch
+    offset, so it indexes this step's cells. Returns the page count per request.
+    """
+    tokens = doc_ids.shape[0]
+    token_ids = torch.arange(tokens, dtype=query_start_loc.dtype, device=doc_ids.device)
+    # Searching all offsets, not ``query_start_loc[1:]``: Inductor drops the
+    # slice's offset from a searchsorted over it. The first offset is 0.
+    doc_ids.copy_(torch.searchsorted(query_start_loc, token_ids, out_int32=True, right=True) - 1)
+    physical_to_logical.copy_(
+        physical_to_logical_mapping(block_table, seq_lens, block_size, num_blocks)
+    )
+    pages_per_seq = cdiv(seq_lens, block_size)
+    used_pages = block_table[doc_ids, :num_pages]
+    past_seq = torch.arange(num_pages, device=doc_ids.device)[None, :] >= pages_per_seq[doc_ids][:, None]
+    groups = kv_num_blocks.shape[0]
+    used_pages = F.pad(used_pages.masked_fill(past_seq, 0), (0, 0, 0, groups * q_block_size - tokens))
+    packed = unique_static_unsorted(
+        used_pages.reshape(groups, -1).long(), M=num_blocks
+    ).to(torch.int32)
+    kv_indices.copy_(packed)
+    kv_num_blocks.copy_((packed >= 0).sum(dim=-1))
+    decode_offset.copy_(query_start_loc[: decode_offset.shape[0]])
+    return pages_per_seq
+
+
+@dataclass
+class DuplexIOFlexAttentionMetadata(FlexAttentionMetadata):
+    """Upstream metadata whose doc ids arrive already built on the device."""
+
+    def __post_init__(self) -> None:
+        self.num_blocks = self.total_cache_tokens // self.block_size
+        self.mask_mod = self.get_mask_mod()
+
+
 class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
     """Point upstream's paged FlexAttention at DuplexIO's compact slot space.
 
     Slots are addressed by role - an audio ring, then a persistent text region -
     so the only backend-visible differences are the sequence bound (how many
     pages a step scans) and the mask (row causality plus the audio window,
-    instead of token causality). Persistent index buffers, the direct block-mask
-    build and CUDA-graph support are all upstream's.
+    instead of token causality). The block mask is upstream's direct build over
+    its persistent index buffers, written by one compiled pass per step.
     """
 
     def __init__(
@@ -252,6 +309,8 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
                 f"requires the kv block size ({self.kv_block_size}) to equal the "
                 f"cache block size ({self.block_size})"
             )
+        if kv_cache_spec.sliding_window is not None or self.rswa_window is not None:
+            raise ValueError("DuplexIO applies its audio window in the mask, not a sliding window")
         self.layout = kv_cache_spec.layout
         layers = get_layers_from_vllm_config(vllm_config, Attention, self.layer_names)
         frame = next(iter(layers.values())).frame
@@ -287,11 +346,39 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FlexAttentionMetadata:
+        if common_prefix_len:
+            raise NotImplementedError("DuplexIO attention does not support cascade prefixes")
         common = common_attn_metadata
         layout = self.layout
         requests = common.seq_lens.shape[0]
+        tokens = int(common.query_start_loc_cpu[-1])
+        groups = cdiv(tokens, self.q_block_size)
+        num_pages = cdiv(layout.max_compact_slots, self.block_size)
+        num_blocks = self.cache_config.num_gpu_blocks
+        assert num_blocks is not None, "FlexAttention requires num_gpu_blocks to be set"
+        if self.persistent_kv_indices is None:
+            self.persistent_kv_indices = torch.empty(
+                self.max_num_query_groups,
+                self.max_num_kv_indices,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.persistent_physical_to_logical = torch.empty(
+                self.vllm_config.scheduler_config.max_num_seqs,
+                num_blocks,
+                dtype=torch.long,
+                device=self.device,
+            )
+        assert self.persistent_physical_to_logical is not None
+        # Every slice keeps its address across steps of one batch size, which
+        # the paged mask closure and CUDA-graph replay both rely on.
         seq_lens = self.compact_seq_lens[:requests]
         block_table = self.touched_block_table[:requests]
+        doc_ids = self.persistent_doc_ids[:tokens]
+        physical_to_logical = self.persistent_physical_to_logical[:requests]
+        kv_indices = self.persistent_kv_indices[:groups, : self.q_block_size * num_pages]
+        kv_num_blocks = self.persistent_kv_num_blocks[:groups]
+        decode_offset = self.persistent_offset_tensor[:requests]
         step_page_bounds(
             common.seq_lens,
             common.block_table_tensor,
@@ -300,21 +387,59 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
             block_table,
             layout,
         )
-        metadata = super().build(
-            common_prefix_len,
-            common.replace(
-                causal=False,
-                seq_lens=seq_lens,
-                max_seq_len=layout.max_compact_slots,
-                block_table_tensor=block_table,
-            ),
-            fast_build,
+        pages_per_seq = step_block_mask_tables(
+            common.query_start_loc,
+            seq_lens,
+            block_table,
+            doc_ids,
+            physical_to_logical,
+            kv_indices,
+            kv_num_blocks,
+            decode_offset,
+            self.block_size,
+            self.q_block_size,
+            num_pages,
+            num_blocks,
         )
-        # The paged mask closure reads both at kernel launch, so the block mask
-        # super().build() already produced picks them up. Starting every query's
-        # logical index at its batch offset makes it index this step's cells.
-        metadata.logical_mask_mod = self.duplexio_mask
-        metadata.decode_offset.copy_(common.query_start_loc[: seq_lens.shape[0]])
+        metadata = DuplexIOFlexAttentionMetadata(
+            causal=False,
+            num_actual_tokens=common.num_actual_tokens,
+            max_query_len=common.max_query_len,
+            query_start_loc=common.query_start_loc,
+            query_start_loc_cpu=common.query_start_loc_cpu,
+            max_seq_len=layout.max_compact_slots,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            slot_mapping=common.slot_mapping,
+            use_cascade=False,
+            common_prefix_len=0,
+            cu_prefix_query_lens=None,
+            prefix_kv_lens=None,
+            suffix_kv_lens=None,
+            total_cache_tokens=num_blocks * self.block_size,
+            block_size=self.block_size,
+            max_possible_sequence_length=self.model_config.max_model_len,
+            num_reqs=common.num_reqs,
+            physical_to_logical=physical_to_logical,
+            decode_offset=decode_offset,
+            num_blocks_per_seq=pages_per_seq,
+            persistent_kv_indices=self.persistent_kv_indices,
+            persistent_kv_num_blocks=self.persistent_kv_num_blocks,
+            persistent_doc_ids=self.persistent_doc_ids,
+            logical_mask_mod=self.duplexio_mask,
+            doc_ids=doc_ids,
+            q_block_size=self.q_block_size,
+            kv_block_size=self.kv_block_size,
+            mm_prefix_range=common.mm_req_doc_ranges,
+        )
+        metadata.block_mask = BlockMask.from_kv_blocks(
+            kv_num_blocks[None, None],
+            kv_indices[None, None],
+            BLOCK_SIZE=(self.q_block_size, self.kv_block_size),
+            mask_mod=metadata.mask_mod,
+            seq_lengths=(common.num_actual_tokens, metadata.total_cache_tokens),
+            compute_q_blocks=False,
+        )
         return metadata
 
 
