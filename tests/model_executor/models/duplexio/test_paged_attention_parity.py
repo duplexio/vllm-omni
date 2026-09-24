@@ -371,9 +371,10 @@ def test_paged_session_matches_dense_attention(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged cache")
+@pytest.mark.parametrize("requests", [3, 32, 64])
 @torch.inference_mode()
-def test_batched_sessions_stay_isolated_in_a_shuffled_block_table() -> None:
-    run_session([3, 5, 4], 20, torch.bfloat16, 128, 8, 2)
+def test_batched_sessions_stay_isolated_in_a_shuffled_block_table(requests: int) -> None:
+    run_session([3 + request % 3 for request in range(requests)], 20, torch.bfloat16, 128, 8, 2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged cache")

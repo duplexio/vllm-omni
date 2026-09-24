@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
 
 pytest.importorskip("duplexio")
 
@@ -42,6 +43,7 @@ def feedback_model():
     model.audio_sampler = AudioSampler()
     model.policy_version = 0
     model.llm.base_model.lm_head = nn.Linear(11, 32, bias=False)
+    model.llm.base_model.lm_head.quant_method = UnquantizedEmbeddingMethod()
     model.llm.output_head_proj = nn.ModuleDict({name: nn.Linear(11, 11) for name in ("agent", "tool_call")})
     model.user_token_projection = nn.Linear(66, 11)
     model.user_emit_head = nn.Linear(66, 1)
@@ -180,14 +182,21 @@ def test_feedback_actions_and_versions_span_staging_then_commit(monkeypatch):
     source = iter(pushed)
     received, release = Event(), Event()
 
-    def broadcast(tensor):
-        received.set()
-        assert release.wait(5)
-        tensor.copy_(next(source)[1])
+    def receive_views(views):
+        def wait():
+            received.set()
+            assert release.wait(5)
+            for tensor, _ in views:
+                tensor.copy_(next(source)[1])
 
-    receiver.policy_group = SimpleNamespace(broadcast=broadcast)
+        return SimpleNamespace(wait=wait)
+
+    receiver.policy_group = SimpleNamespace(rank=0, receive_views=receive_views)
     try:
-        receiver.start_policy_weight_update(1, [[name, "float32", list(p.shape)] for name, p in pushed])
+        receiver.start_policy_weight_update(1, [
+            [name, "float32", list(p.shape), [[0, 0, 0, p.shape[0] if p.ndim else 1]]]
+            for name, p in pushed
+        ])
         assert received.wait(5)
         assert step()["user_token_id"].item() == 7
     finally:

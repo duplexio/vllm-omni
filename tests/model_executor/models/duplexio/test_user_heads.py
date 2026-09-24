@@ -163,13 +163,24 @@ def test_staged_user_heads_update_same_captured_graph_and_publish_version():
     receiver = pytest.importorskip("duplexio.rollout_policy").PolicyWeightReceiver()
     receiver.device = rows.device
     receiver.model_runner = SimpleNamespace(model=model, get_model=lambda: model)
-    receiver.policy_group = SimpleNamespace(broadcast=lambda tensor: tensor.copy_(next(source)[1]))
+
+    def receive_views(views):
+        def wait():
+            for tensor, _ in views:
+                tensor.copy_(next(source)[1])
+
+        return SimpleNamespace(wait=wait)
+
+    receiver.policy_group = SimpleNamespace(rank=0, receive_views=receive_views)
     receiver._policy_stream = torch.cuda.Stream()
     receiver._policy_stream.wait_stream(torch.cuda.current_stream())
     receiver._policy_pending = receiver._policy_plan = receiver._policy_version = None
     receiver._policy_buffer = []
     receiver._policy_commit_failed = False
-    receiver.start_policy_weight_update(7, [[name, "float32", list(p.shape)] for name, p in pushed])
+    receiver.start_policy_weight_update(7, [
+        [name, "float32", list(p.shape), [[0, 0, 0, p.shape[0] if p.ndim else 1]]]
+        for name, p in pushed
+    ])
     receiver._policy_pending[1].result(timeout=10)
     graph.replay()
     torch.testing.assert_close(logits, old_logits)
