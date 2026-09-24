@@ -155,6 +155,7 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         *,
         model_runner_output_builder: Callable[[], OmniModelRunnerOutput],
         cuda_device: torch.device | int | str | None = None,
+        build_in_background: bool = True,
         **kwargs: Any,
     ) -> None:
         sampled_token_ids = kwargs.pop("sampled_token_ids")
@@ -199,6 +200,10 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self._background_exception: BaseException | None = None
         self._background_thread: threading.Thread | None = None
         self._cuda_device = cuda_device
+        if not build_in_background:
+            # get_output() builds on the engine thread, after the next step's
+            # launch, so a model's host finalize never races that step's prep.
+            return
         self._background_thread = threading.Thread(
             target=self._build_output_in_background,
             daemon=True,
@@ -1640,12 +1645,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         model_config = getattr(self, "model_config", None)
         if model_config is None:
             model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
-        if not bool(getattr(model_config, "async_chunk", False)):
+        model = getattr(self, "model", None)
+        # Single-stage models without chunk transfer may still defer their
+        # output when they finalize it themselves (``finalize_omni_output``).
+        if not bool(getattr(model_config, "async_chunk", False)) and not self._model_omni_flag(
+            model, "async_omni_output_without_async_chunk"
+        ):
             return False
         if bool(getattr(model_config, "enable_return_routed_experts", False)):
             return False
 
-        model = getattr(self, "model", None)
         if not self._model_omni_flag(model, "use_async_omni_output"):
             return False
         if self._model_omni_flag(model, "has_postprocess") and not self._model_omni_flag(
@@ -2146,16 +2155,25 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             multimodal_outputs=multimodal_outputs,
         )
 
+        finalize_omni_output = getattr(getattr(self, "model", None), "finalize_omni_output", None)
+
         def output_builder() -> OmniModelRunnerOutput:
             if output_tensor_snapshot.async_payload is not None:
                 with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
                     output_tensor_snapshot.async_payload.wait()
+            multimodal_outputs_final = output_tensor_snapshot.multimodal_outputs
+            if finalize_omni_output is not None:
+                # The model's host half: wait for its own sampled values and
+                # apply host-side feedback. Under async output this runs after
+                # the next step's launch, overlapping that step's GPU work.
+                with record_function_or_nullcontext("omni_output_builder:model_finalize"):
+                    multimodal_outputs_final = finalize_omni_output(multimodal_outputs_final)
             with record_function_or_nullcontext("omni_output_builder:total"):
                 return self._build_omni_model_runner_output_from_snapshot(
                     scheduler_output=scheduler_output_snapshot,
                     hidden_states=output_tensor_snapshot.hidden_states,
                     staged_hidden_states_cpu=output_tensor_snapshot.staged_hidden_states_cpu,
-                    multimodal_outputs=output_tensor_snapshot.multimodal_outputs,
+                    multimodal_outputs=multimodal_outputs_final,
                     req_ids_output_copy=req_ids_output_snapshot,
                     req_id_to_index_output_copy=req_id_to_index_output_snapshot,
                     valid_sampled_token_ids=valid_sampled_token_ids_snapshot,
@@ -2191,6 +2209,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 async_output = async_output_cls(
                     model_runner_output_builder=output_builder,
                     cuda_device=self.device,
+                    build_in_background=self._runner_model_omni_flag(
+                        "omni_async_output_build_in_background", default=True
+                    ),
                     **async_output_kwargs,
                 )
             else:

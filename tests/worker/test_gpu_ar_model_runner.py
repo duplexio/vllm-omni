@@ -479,6 +479,51 @@ def test_async_omni_output_guard_requires_safe_conditions():
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
 
+def test_async_omni_output_without_async_chunk_is_model_opt_in():
+    runner = _make_async_output_runner()
+    runner.use_async_scheduling = True
+    runner.speculative_config = None
+    runner.model.use_async_omni_output = True
+    runner.model_config.async_chunk = False
+
+    assert not GPUARModelRunner._should_use_async_omni_output(runner)
+
+    runner.model.async_omni_output_without_async_chunk = True
+    assert GPUARModelRunner._should_use_async_omni_output(runner)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("build_in_background", [False, True])
+def test_omni_async_output_builds_on_caller_thread_when_background_disabled(build_in_background):
+    import threading
+
+    threads = []
+
+    def builder():
+        threads.append(threading.current_thread())
+        return OmniModelRunnerOutput(req_ids=["r1"], req_id_to_index={"r1": 0})
+
+    async_output = OmniAsyncGPUModelRunnerOutput(
+        model_runner_output_builder=builder,
+        cuda_device=torch.device("cuda", torch.cuda.current_device()),
+        build_in_background=build_in_background,
+        sampled_token_ids=torch.tensor([[7]], device="cuda"),
+        logprobs_tensors=None,
+        invalid_req_indices=[],
+        async_output_copy_stream=torch.cuda.Stream(),
+        vocab_size=10,
+    )
+    if not build_in_background:
+        assert async_output._background_thread is None
+        assert threads == []
+
+    output = async_output.get_output()
+
+    assert output.sampled_token_ids == [[7]]
+    assert len(threads) == 1
+    assert (threads[0] is threading.current_thread()) is not build_in_background
+
+
 def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
     runner = _make_async_output_runner(engine_output_type="latent")
     runner.model.omni_pooler_payload_include_hidden = False

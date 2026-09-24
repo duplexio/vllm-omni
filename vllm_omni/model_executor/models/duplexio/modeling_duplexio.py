@@ -458,7 +458,7 @@ class DuplexIOForConditionalGeneration(
         self.tool_call_emit_head = nn.Linear(DUPLEXIO_NUM_CELLS * hidden_size, 1)
         self.logits_processor = LogitsProcessor(self.text_config.vocab_size)
         self.make_empty_intermediate_tensors = self.llm.base_model.model.make_empty_intermediate_tensors
-        self._forced_next_token_ids: list[int] | None = None
+        self._forced_next_token_ids: list[int] | Tensor | None = None
         self.tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
         agent_suppressed, tool_suppressed = text_suppression_ids(self.tokenizer, self.silence_token_id)
         self.register_buffer(
@@ -582,7 +582,12 @@ class DuplexIOForConditionalGeneration(
         for index, (item, (_, info)) in enumerate(zip(prepared, requests, strict=True)):
             duplex = info["duplex"]
             if not (duplex.get("duplexio_prefill", False) or duplex.get("duplexio_system_input", False)):
-                waveform = torch.frombuffer(bytearray(duplex["pcm"]), dtype=torch.float32).to(device)
+                # A blocking upload waits for every queued kernel, including the
+                # previous step's; a pageable non_blocking one stages the bytes
+                # and returns at once.
+                waveform = torch.frombuffer(
+                    bytearray(duplex["pcm"]), dtype=torch.float32,
+                ).to(device, non_blocking=True)
             elif item.prompt_chunk_frames:
                 start = item.frame_start * self.config.frame_size
                 count = item.prompt_chunk_frames * self.config.frame_size
@@ -1253,9 +1258,13 @@ class DuplexIOForConditionalGeneration(
             dtype=torch.float32,
             device=hidden_states.device,
         )
+        # Forced ids may already sit on the device; a host list crosses without
+        # blocking the host behind the queued frame.
+        if not isinstance(token_ids, Tensor):
+            token_ids = torch.tensor(token_ids, dtype=torch.long)
         logits[
             torch.arange(hidden_states.shape[0], device=hidden_states.device),
-            torch.tensor(token_ids, device=hidden_states.device),
+            token_ids.to(hidden_states.device, non_blocking=True),
         ] = 0
         return logits
 
@@ -1739,6 +1748,64 @@ def to_host(outputs: Mapping[str, Any]) -> dict[str, Any]:
         for (values, row, tensor), part in zip(items, parts, strict=True):
             values[row] = part.view(tensor.shape)
     return host
+
+
+class PendingHostOutputs:
+    """``to_host`` outputs whose device values are still crossing to the host.
+
+    Until ``wait`` returns, the nested lists keep their device tensors, so a
+    reader that skips ``wait`` still sees correct values, only synchronously.
+    """
+
+    def __init__(
+        self,
+        host: dict[str, Any],
+        transfers: list[tuple[torch.cuda.Event, Tensor, list[tuple[list[Tensor], int, Tensor]]]],
+    ) -> None:
+        self._host = host
+        self._transfers = transfers
+
+    def wait(self) -> dict[str, Any]:
+        for event, packed, items in self._transfers:
+            event.synchronize()
+            parts = packed.split([tensor.numel() for _, _, tensor in items])
+            for (values, row, tensor), part in zip(items, parts, strict=True):
+                values[row] = part.view(tensor.shape)
+        self._transfers = []
+        return self._host
+
+
+def to_host_async(outputs: Mapping[str, Any]) -> PendingHostOutputs:
+    """Queue the ``to_host`` transfer without blocking the host.
+
+    Each dtype still crosses in one copy, into pinned memory behind an event
+    recorded on the current stream, so the copy lands as soon as the kernels
+    that produced it finish. Host tensors pass through untouched.
+    """
+    groups: dict[tuple[torch.device, torch.dtype], list[tuple[list[Tensor], int, Tensor]]] = {}
+
+    def lists(values: Mapping[str, Any]) -> dict[str, Any]:
+        host: dict[str, Any] = {}
+        for name, value in values.items():
+            if isinstance(value, Mapping):
+                host[name] = lists(value)
+                continue
+            host[name] = value = list(value)
+            for row, tensor in enumerate(value):
+                if tensor.device.type != "cpu":
+                    groups.setdefault((tensor.device, tensor.dtype), []).append((value, row, tensor))
+        return host
+
+    host = lists(outputs)
+    transfers = []
+    for (device, dtype), items in groups.items():
+        packed = torch.cat([tensor.detach().reshape(-1) for _, _, tensor in items])
+        staged = torch.empty(packed.shape, dtype=dtype, pin_memory=True)
+        staged.copy_(packed, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device))
+        transfers.append((event, staged, items))
+    return PendingHostOutputs(host, transfers)
 
 
 def serialize_tool_call(tool_call: Mapping[str, Any] | None, sequence: int) -> Tensor:
