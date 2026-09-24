@@ -23,6 +23,7 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.experimental.fullduplex.duplexio.runtime import build_duplexio_data_plane_prompt
 from vllm_omni.experimental.fullduplex.engine.contracts import DuplexInputMode
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
 from vllm_omni.model_executor.models.duplexio.text_sampling import content_distribution
 from vllm_omni.outputs.mm_outputs import MultimodalPayload
 
@@ -160,7 +161,7 @@ def test_feedback_actions_and_versions_span_staging_then_commit(monkeypatch):
         return payload
 
     first = step(prefix=True)
-    assert first["user_token_id"].item() == 7
+    assert frame_fields(first)["user_token_id"] == 7
     step()
     monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
     monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
@@ -196,12 +197,12 @@ def test_feedback_actions_and_versions_span_staging_then_commit(monkeypatch):
             for name, p in pushed
         ])
         assert received.wait(5)
-        assert step()["user_token_id"].item() == 7
+        assert frame_fields(step())["user_token_id"] == 7
     finally:
         release.set()
         receiver._policy_pending[1].result(timeout=5)
     receiver.commit_policy_weight_update(1)
-    assert step()["user_token_id"].item() == 2
+    assert frame_fields(step())["user_token_id"] == 2
     step(final=True)
     trace = recorder.tensors()
     assert consumed_user_ids == [2, 7, 7, 7, 2]
@@ -267,7 +268,7 @@ def test_chunked_context_records_all_rows_and_samples_only_at_boundary():
             payload = MultimodalPayload.from_dict({name: values[0] for name, values in flatten_payload(model.finalize_omni_output(output.multimodal_outputs)).items()})
             recorder.append(payload, version=0)
             state = model.postprocess(None, **info)["duplexio_model_state"]
-            assert payload[f"duplex_{context}_complete"].item() == (index == 2)
+            assert frame_fields(payload)[f"duplex_{context}_complete"] == (index == 2)
             if index < 2:
                 assert payload["agent_audio_token_ids"].numel() == 0
             else:

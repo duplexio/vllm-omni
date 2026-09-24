@@ -882,12 +882,10 @@ class DuplexIOForConditionalGeneration(
                 "tool_starts": [text.tool_starts],
                 "audio": [batch.audio.detach()],
                 "waveforms": [waveform.detach() for waveform in waveforms],
-                "agent_emit_logprob": [text.agent_emit_logprobs],
-                "agent_token_logprob": [text.agent_token_logprobs],
-                "tool_emit_logprob": [text.tool_emit_logprobs],
-                "tool_token_logprob": [text.tool_token_logprobs],
-                "user_emit_logprob": [text.user_emit_logprobs],
-                "user_token_logprob": [text.user_token_logprobs],
+                "frame_logprobs": [torch.cat([
+                    text.agent_emit_logprobs, text.agent_token_logprobs, text.tool_emit_logprobs,
+                    text.tool_token_logprobs, text.user_emit_logprobs, text.user_token_logprobs,
+                ], dim=-1).float()],
             }
             if any(record_hiddens[index] for index in batch.indices):
                 sampled["predictor_hiddens"] = [batch.hiddens.detach()]
@@ -964,21 +962,15 @@ class DuplexIOForConditionalGeneration(
         empty = step.empty
         empty_audio = torch.empty(0, dtype=torch.float32)
         empty_codes = torch.empty(0, dtype=torch.long)
+        no_logprobs = torch.empty(0, dtype=torch.float32)
         no_tool_call = torch.empty(0, dtype=torch.uint8)
-        flags = {False: torch.tensor([False]), True: torch.tensor([True])}
-        silence_ids = torch.tensor([self.silence_token_id], dtype=torch.long)
-        policy_version = torch.tensor([step.policy_version], dtype=torch.long)
-        sample_rate = torch.tensor([self.config.sample_rate])
-        logprob_names = (
-            "agent_emit_logprob", "agent_token_logprob", "tool_emit_logprob", "tool_token_logprob",
-            "user_emit_logprob", "user_token_logprob",
-        )
+        silence = self.silence_token_id
+        record_hiddens = any(step.record_hiddens)
+        frames: list[list[int]] = []
         chunk: dict[str, list[Tensor]] = {
             name: [] for name in (
-                "agent_audio_token_ids", "user_token_id", "agent_token_id", "tool_call_token_id", "model_listen",
-                "end_of_turn", "duplex_epoch", "duplex_turn_id", "duplex_prefill", "duplex_prefill_complete",
-                "duplex_system_input", "duplex_system_input_complete", "tool_call_complete", "tool_call_json",
-                "predictor_hiddens", *logprob_names[:4], "user_emit", *logprob_names[4:], "policy_version",
+                "frame_logprobs", "agent_audio_token_ids", "tool_call_json",
+                *(("predictor_hiddens",) if record_hiddens else ()),
             )
         }
         audio_outputs: list[Tensor] = []
@@ -986,59 +978,57 @@ class DuplexIOForConditionalGeneration(
             if state.pending_output is step:
                 state.pending_output = None
             duplex = info["duplex"]
-            is_prefill = duplex.get("duplexio_prefill", False)
-            is_system_input = duplex.get("duplexio_system_input", False)
+            is_prefill = bool(duplex.get("duplexio_prefill", False))
+            is_system_input = bool(duplex.get("duplexio_system_input", False))
             row = rows.get(request_index)
             predicting = row is not None
-            chunk["end_of_turn"].append(flags[bool(duplex.get("final", False))])
-            chunk["duplex_epoch"].append(torch.tensor([duplex.get("epoch", 0)]))
-            chunk["duplex_turn_id"].append(torch.tensor([duplex.get("turn_id", 0)]))
-            chunk["duplex_prefill"].append(flags[bool(is_prefill and not predicting)])
-            chunk["duplex_prefill_complete"].append(flags[bool(is_prefill and predicting)])
-            chunk["duplex_system_input"].append(flags[bool(is_system_input and not predicting)])
-            chunk["duplex_system_input_complete"].append(flags[bool(is_system_input and predicting)])
             if row is None:
-                for name in (*logprob_names, "user_emit", "policy_version", "predictor_hiddens"):
-                    chunk[name].append(empty)
-                for name in ("user_token_id", "agent_token_id", "tool_call_token_id"):
-                    chunk[name].append(silence_ids)
+                user_token_id = agent_token_id = tool_token_id = silence
+                policy_version, tool_call = -1, None
+                chunk["frame_logprobs"].append(no_logprobs)
+                if record_hiddens:
+                    chunk["predictor_hiddens"].append(empty)
                 audio_outputs.append(empty_audio)
                 chunk["agent_audio_token_ids"].append(empty_codes)
-                chunk["model_listen"].append(flags[False])
-                chunk["tool_call_complete"].append(flags[False])
                 chunk["tool_call_json"].append(no_tool_call)
-                continue
-            # Return sampling probabilities alongside each prediction.
-            for name in logprob_names:
-                chunk[name].append(host_rows[name][row])
-            chunk["predictor_hiddens"].append(
-                host_rows["predictor_hiddens"][row] if step.record_hiddens[request_index] else empty
-            )
-            user_token_id, agent_token_id, tool_token_id = host_ids[row]
-            chunk["user_emit"].append(flags[user_token_id != self.silence_token_id])
-            chunk["policy_version"].append(policy_version)
-            tool_call = batch.text.tool_calls[row]
-            state.text_input_ids = torch.tensor(
-                [self.silence_token_id, *host_ids[row]], dtype=torch.long, device="cpu",
-            )
-            chunk["user_token_id"].append(state.text_input_ids[1:2])
-            chunk["agent_token_id"].append(state.text_input_ids[2:3])
-            chunk["tool_call_token_id"].append(state.text_input_ids[3:4])
-            audio_outputs.append(decoded.get(row, empty_audio))
-            chunk["agent_audio_token_ids"].append(host_rows["audio"][row])
-            model_listen = agent_token_id == self.silence_token_id and tool_token_id == self.silence_token_id
-            chunk["model_listen"].append(flags[model_listen])
-            chunk["tool_call_complete"].append(flags[tool_call is not None])
-            if tool_call is not None:
-                state.tool_call_sequence += 1
-            chunk["tool_call_json"].append(serialize_tool_call(tool_call, state.tool_call_sequence))
+            else:
+                # Return sampling probabilities alongside each prediction.
+                chunk["frame_logprobs"].append(host_rows["frame_logprobs"][row])
+                if record_hiddens:
+                    chunk["predictor_hiddens"].append(
+                        host_rows["predictor_hiddens"][row] if step.record_hiddens[request_index] else empty
+                    )
+                user_token_id, agent_token_id, tool_token_id = host_ids[row]
+                policy_version = step.policy_version
+                tool_call = batch.text.tool_calls[row]
+                state.text_input_ids = torch.tensor(
+                    [silence, *host_ids[row]], dtype=torch.long, device="cpu",
+                )
+                audio_outputs.append(decoded.get(row, empty_audio))
+                chunk["agent_audio_token_ids"].append(host_rows["audio"][row])
+                if tool_call is not None:
+                    state.tool_call_sequence += 1
+                chunk["tool_call_json"].append(serialize_tool_call(tool_call, state.tool_call_sequence))
+            # Order follows frame_output.FRAME_FIELDS.
+            frames.append([
+                duplex.get("epoch", 0), duplex.get("turn_id", 0),
+                is_prefill and not predicting, is_prefill and predicting,
+                is_system_input and not predicting, is_system_input and predicting,
+                bool(duplex.get("final", False)), predicting,
+                predicting and agent_token_id == silence and tool_token_id == silence,
+                tool_call is not None, predicting and user_token_id != silence,
+                user_token_id, agent_token_id, tool_token_id, policy_version, self.config.sample_rate,
+            ])
 
+        replay: dict[str, list[Tensor]] = {}
+        if any(info.get("duplexio_replay") for info in infos):
+            replay = {f"replay_{name}": values for name, values in host["replay"].items()}
         return {
             "audio": audio_outputs,
             "chunk": {
-                "sample_rate_hz": [sample_rate] * len(infos),
+                "frame": list(torch.tensor(frames, dtype=torch.long).unbind(0)),
                 **chunk,
-                **{f"replay_{name}": values for name, values in host["replay"].items()},
+                **replay,
             },
         }
 

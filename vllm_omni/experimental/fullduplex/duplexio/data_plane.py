@@ -20,6 +20,7 @@ from vllm_omni.experimental.fullduplex.duplexio.input import (
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     duplex_resource_request_belongs_to_session,
 )
+from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
 
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
 
@@ -291,7 +292,10 @@ def _multimodal_output(
         getattr(completion, "multimodal_output", None),
     ):
         if isinstance(candidate, Mapping):
-            return dict(candidate)
+            metadata = dict(candidate)
+            if isinstance(metadata.get("frame"), Tensor):
+                metadata.update(frame_fields(metadata))
+            return metadata
     inner = getattr(output, "request_output", None)
     if inner is not None and inner is not output:
         return _multimodal_output(inner, _first_completion(inner))

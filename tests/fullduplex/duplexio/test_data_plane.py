@@ -15,6 +15,7 @@ from vllm_omni.experimental.fullduplex.duplexio.data_plane import (
     DuplexIODataPlaneContext,
     DuplexIODataPlaneSession,
 )
+from vllm_omni.model_executor.models.duplexio.frame_output import pack_frame
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -112,6 +113,30 @@ def test_data_plane_projects_one_native_audio_frame_and_text() -> None:
     assert result["tool_call_token_id"] == 103
     assert result["agent_audio_token_ids"] == [201, 202, 203]
     assert encoded[0][1:] == (24_000, "pcm", 1.0)
+
+
+def test_data_plane_reads_the_packed_model_frame() -> None:
+    frame = {
+        "duplex_epoch": 3, "duplex_turn_id": 7, "predicted": True, "end_of_turn": True, "user_emit": True,
+        "user_token_id": 101, "agent_token_id": 102, "tool_call_token_id": 103, "policy_version": 5,
+        "sample_rate_hz": 24_000,
+    }
+    loose = {name: value for name, value in frame.items() if name not in ("predicted", "user_emit", "policy_version")}
+    projected = []
+    for fields in ({"frame": pack_frame(**frame)}, loose):
+        session = DuplexIODataPlaneSession(lambda *_args: "encoded-audio")
+        output = SimpleNamespace(
+            request_id="request-1",
+            outputs=[SimpleNamespace(text="hello")],
+            multimodal_output={
+                "audio": np.zeros(1_920, dtype=np.float32),
+                "agent_audio_token_ids": torch.tensor([201, 202, 203]),
+                **fields,
+            },
+        )
+        projected.append(session.project_output(output, context=DuplexIODataPlaneContext(epoch=3)))
+    assert projected[0] == projected[1]
+    assert projected[0]["end_of_turn"] and projected[0]["model_turn_id"] == 7
 
 
 def test_data_plane_drops_stale_epoch_output() -> None:
