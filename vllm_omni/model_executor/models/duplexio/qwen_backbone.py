@@ -129,12 +129,17 @@ class DuplexIORMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.eps = eps
 
+    @torch.compile(dynamic=True, fullgraph=True, options={"triton.cudagraphs": False})
     def forward(
         self, hidden: Tensor, residual: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
-        from quack import rmsnorm
-
-        return rmsnorm(hidden, self.weight, residual=residual, eps=self.eps, prenorm=residual is not None)
+        combined = hidden.float()
+        if residual is not None:
+            combined = combined + residual.float()
+        output = F.rms_norm(combined, (combined.shape[-1],), self.weight.float(), self.eps).to(hidden.dtype)
+        if residual is not None:
+            return output, combined.to(residual.dtype)
+        return output
 
 
 @torch.compile(dynamic=True, fullgraph=True, options={"triton.cudagraphs": False})
@@ -173,23 +178,18 @@ def step_page_bounds(
     the bound over-scans into masked-out pages that the emitted count - unknown
     until preprocessing runs - would tighten.
 
-    Pages the step can neither read nor write are blanked, which reads as "skip
-    me" wherever a page list is built: a session's audio ring starts at the
-    bottom of the compact space and its text region at a fixed base far above
-    it, so scanning up to the bound alone would cover a wide band of pages that
-    are never written. Both outputs keep their address for CUDA-graph replay.
+    Scheduler length is compacted around text retention, so it cannot bound
+    audio time. Keep the reserved audio and prompt pages; the attention mask
+    excludes unwritten/expired slots. Only text pages use the scheduler bound.
+    Both outputs keep their address for CUDA-graph replay.
     """
     rows = torch.div(seq_lens, DUPLEXIO_NUM_CELLS, rounding_mode="floor")
     text_slots = rows * DUPLEXIO_NUM_TEXT_CELLS
-    audio_slots = rows.clamp(max=layout.audio_ring_frames) * layout.num_audio_cells
     text_pages = cdiv(text_slots, layout.block_size)[:, None]
     base = layout.text_base_page
     prompt_base = layout.prompt_base // layout.block_size
-    prompt_pages = cdiv(
-        rows.clamp(max=layout.voice_prompt_frames) * layout.num_audio_cells,
-        layout.block_size,
-    )[:, None]
-    touched = (page_ids < cdiv(audio_slots, layout.block_size)[:, None]) | (
+    prompt_pages = cdiv(layout.prompt_slots, layout.block_size)
+    touched = (page_ids < cdiv(layout.audio_slots, layout.block_size)) | (
         (page_ids >= base) & (page_ids - base < text_pages)
     ) | (
         (page_ids >= prompt_base) & (page_ids - prompt_base < prompt_pages)

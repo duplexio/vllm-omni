@@ -23,6 +23,7 @@ from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
     DuplexIOFlexAttentionImpl,
     DuplexIOFlexAttentionMetadataBuilder,
     DuplexIOPagedAttention,
+    physical_slots,
     step_page_bounds,
 )
 from vllm_omni.model_executor.models.duplexio.row_semantics import (
@@ -382,14 +383,29 @@ def test_paged_sessions_with_pinned_voice_and_tool_bursts(training_reference: bo
     run_session([3, 5], 72, torch.bfloat16, 256, 16, 4, prompt_frames=2, training_reference=training_reference)
 
 
+@pytest.mark.parametrize("audio_frame", [511, 512, 2112, 2200])
+def test_text_compaction_preserves_audio_pages(audio_frame: int) -> None:
+    """Text retention cannot bound the independently advancing audio ring."""
+    layout = DuplexIOKVLayout(1024, 2048, 79, 24576)
+    table = torch.arange(20, 20 + layout.max_blocks, dtype=torch.int32)[None]
+    listed = torch.empty_like(table)
+    compact = torch.empty(1, dtype=torch.int32)
+    step_page_bounds(
+        torch.tensor([398 * DUPLEXIO_NUM_CELLS]), table,
+        torch.arange(layout.max_blocks, dtype=torch.int32), compact, listed, layout,
+    )
+    slots = torch.tensor([layout.audio_slot(audio_frame, cell) for cell in range(NUM_AUDIO_CELLS)])
+    requests = torch.zeros_like(slots)
+    torch.testing.assert_close(
+        physical_slots(listed, requests, slots, layout.block_size),
+        physical_slots(table, requests, slots, layout.block_size),
+        rtol=0, atol=0,
+    )
+
+
 @pytest.mark.parametrize("rows,prompt_frames", [(1, 125), (30, 1), (70, 125)])
 def test_only_pages_a_step_can_touch_are_listed(rows: int, prompt_frames: int) -> None:
-    """The scan must follow the session, not the layout bound.
-
-    A long-session layout leaves a wide band of never-written pages between the
-    audio ring and the text base, and scanning one costs as much as scanning
-    live keys.
-    """
+    """Keep reserved audio/prompt pages and bound only the growing text region."""
     layout = DuplexIOKVLayout(
         block_size=BLOCK_SIZE,
         audio_window_frames=WINDOW,
@@ -411,10 +427,10 @@ def test_only_pages_a_step_can_touch_are_listed(rows: int, prompt_frames: int) -
         layout,
     )
 
-    audio_pages = -(-rows * NUM_AUDIO_CELLS // BLOCK_SIZE)
+    audio_pages = -(-layout.audio_slots // BLOCK_SIZE)
     text_pages = -(-rows * DUPLEXIO_NUM_TEXT_CELLS // BLOCK_SIZE)
     prompt_base = layout.prompt_base // BLOCK_SIZE
-    prompt_pages = -(-min(rows, layout.voice_prompt_frames) * NUM_AUDIO_CELLS // BLOCK_SIZE)
+    prompt_pages = -(-layout.prompt_slots // BLOCK_SIZE)
     expected = {
         *range(audio_pages),
         *range(prompt_base, prompt_base + prompt_pages),

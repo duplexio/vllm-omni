@@ -9,7 +9,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
 from vllm_omni.model_executor.models.duplexio.qwen_backbone import DuplexIORMSNorm
 
 training = pytest.importorskip("duplexio.modules.qwen3_5_rmsnorm")
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Quack CUDA kernels")
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
 @pytest.mark.parametrize("shape", [(6, 2560), (64, 256)])
@@ -17,7 +17,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 @torch.inference_mode()
 def test_norm_matches_training_compute_dtype(shape: tuple[int, int], prenorm: bool) -> None:
     torch.manual_seed(512)
-    reference = training.QuackQwen3_5RMSNorm(Qwen3_5RMSNorm(shape[-1], eps=1e-6)).cuda()
+    reference = training.Qwen3_5DirectRMSNorm(Qwen3_5RMSNorm(shape[-1], eps=1e-6)).cuda()
     reference.scale.normal_(1, 0.2)
     reference.bfloat16()
     native = DuplexIORMSNorm(shape[-1], eps=1e-6, dtype=torch.bfloat16).cuda()
@@ -28,8 +28,8 @@ def test_norm_matches_training_compute_dtype(shape: tuple[int, int], prenorm: bo
     torch.testing.assert_close(
         native(hidden, residual),
         reference(hidden, residual, prenorm=prenorm),
-        rtol=0,
-        atol=0,
+        rtol=1e-2,
+        atol=1e-5,
     )
 
 

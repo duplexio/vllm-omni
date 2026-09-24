@@ -99,7 +99,6 @@ duplexio = [
     # Native parity requires vLLM built against the training compiler stack.
     "torch==2.13.0",
     "triton==3.7.1",
-    "quack-kernels==0.5.3",
     "flash-linear-attention==0.5.1",
     "fla-core==0.5.1",
 ]

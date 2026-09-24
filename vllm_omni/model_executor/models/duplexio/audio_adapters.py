@@ -9,10 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_function
 
-
-@torch.compile(dynamic=True, fullgraph=True)
 def audio_adapter_hidden(gate_up: Tensor) -> Tensor:
     """Keep gate and normalization identical in train/decode."""
     gate, value = gate_up.chunk(2, dim=-1)
@@ -20,13 +17,13 @@ def audio_adapter_hidden(gate_up: Tensor) -> Tensor:
     # Normalize in FP32 with a row-local reduction independent of batch size.
     hidden = hidden.float()
     eps = torch.finfo(torch.float32).eps
-    if hidden.is_cuda:
-        from quack import rmsnorm
+    return F.rms_norm(hidden, (hidden.shape[-1],), eps=eps)
 
-        hidden = rmsnorm(hidden, eps=eps)
-    else:
-        hidden = F.rms_norm(hidden, (hidden.shape[-1],), eps=eps)
-    return hidden
+
+@torch.compile(dynamic=True, fullgraph=True, options={"triton.cudagraphs": False})
+def audio_adapter(audio_features: Tensor, gate_up_weight: Tensor, output_weight: Tensor) -> Tensor:
+    """Compile both projections and the intervening activation/normalization together."""
+    return F.linear(audio_adapter_hidden(F.linear(audio_features, gate_up_weight)), output_weight)
 
 
 class AudioInputAdapter(nn.Module):
@@ -42,7 +39,4 @@ class AudioInputAdapter(nn.Module):
         self.output_proj = nn.Linear(hidden_dim, output_dim, bias=False)
 
     def forward(self, audio_features: Tensor) -> Tensor:
-        hidden = call_compiled_function(
-            audio_adapter_hidden, self.gate_up_proj(audio_features)
-        )
-        return self.output_proj(hidden)
+        return audio_adapter(audio_features, self.gate_up_proj.weight, self.output_proj.weight)
