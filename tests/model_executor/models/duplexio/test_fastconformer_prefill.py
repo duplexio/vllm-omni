@@ -177,7 +177,7 @@ def test_encoder_graph_preserves_requests_and_output_ownership(encoder, dtype):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
 @torch.inference_mode()
-def test_encoder_graph_rebatches_unchanged_groups_without_copies(encoder, monkeypatch):
+def test_encoder_graph_rebatches_groups_without_restacking(encoder, monkeypatch):
     import copy
 
     encoder = encoder.to(device="cuda")
@@ -191,7 +191,9 @@ def test_encoder_graph_rebatches_unchanged_groups_without_copies(encoder, monkey
         lambda cls, states: packed.append(len(states)) or stack(cls, states)
     ))
     snapshot = None
-    for step, order in enumerate(([0, 1, 2],) * 14 + ([1, 2],) * 3 + ([0, 1, 2],) * 3):
+    # Steady from step 13: a regrouped subset, a merge of rows from two earlier
+    # batches, and a reordering must all feed the graph without restacking.
+    for step, order in enumerate(([0, 1, 2],) * 14 + ([1, 2],) * 3 + ([0, 1, 2],) * 2 + ([2, 0, 1],) * 2):
         waveforms = [torch.randn(FRAME_SAMPLES, device="cuda") * 0.1 for _ in order]
         expected, old = reference.encode_audio_batch(waveforms, [expected_states[index] for index in order])
         packed.clear()
@@ -199,8 +201,7 @@ def test_encoder_graph_rebatches_unchanged_groups_without_copies(encoder, monkey
         for index, value, target, state, target_state in zip(order, actual, expected, new, old, strict=True):
             torch.testing.assert_close(value, target, atol=1e-5, rtol=1e-4)
             actual_states[index], expected_states[index] = state, target_state
-        if step in (13, 16, 19):
-            # The same group in the same order shares the previous batch outright.
+        if step >= 13:
             assert all(size == 1 for size in packed)
             assert all(actual_states[index].encoder.batch is not None for index in order)
         if step == 12:

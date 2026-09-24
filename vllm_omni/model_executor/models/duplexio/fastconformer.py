@@ -36,8 +36,8 @@ class FastConformerStreamState:
     """Explicit upstream encoder caches for one streaming utterance.
 
     A state split from a batched forward stays a lazy row of that batch until
-    read individually. Batches are never mutated after splitting, so a group
-    that re-forms in the same order re-batches without copying its caches.
+    read individually. Batches are never mutated after splitting, so a later
+    batch copies its rows straight out of them, whatever groups they came from.
     """
 
     def __init__(self, past_key_values: Any = None, padding_cache: Any = None) -> None:
@@ -98,15 +98,30 @@ class FastConformerStreamState:
         ] + [layer.cache for layer in self.padding_cache.layers.values()]
 
     @staticmethod
-    def batch_tensors(states: list[FastConformerStreamState]) -> list[Tensor]:
-        """Batched cache storage for read-only use, sharing an unchanged batch."""
-        batch = states[0].batch
-        if (
-            batch is not None and batch.batch_size == len(states)
-            and all(state.batch is batch and state.row == row for row, state in enumerate(states))
-        ):
-            return batch.tensors()
-        return FastConformerStreamState.stack(states).tensors()
+    def copy_rows(states: list[FastConformerStreamState], destination: list[Tensor]) -> None:
+        """Write each state's caches into its row of batched ``destination`` storage.
+
+        Rows that sit consecutively in one source batch move as one slice, so a
+        group that re-forms in order costs a single copy per cache tensor.
+        """
+        sources: dict[int, list[Tensor]] = {}
+        runs: list[tuple[int, list[Tensor], int, int]] = []
+        for row, state in enumerate(states):
+            source, index = (state, 0) if state.batch is None else (state.batch, state.row)
+            tensors = sources.get(id(source))
+            if tensors is None:
+                tensors = sources[id(source)] = source.tensors()
+            if runs and runs[-1][1] is tensors and runs[-1][2] + runs[-1][3] == index:
+                start, _, first, length = runs[-1]
+                runs[-1] = (start, tensors, first, length + 1)
+            else:
+                runs.append((row, tensors, index, 1))
+        targets: list[Tensor] = []
+        values: list[Tensor] = []
+        for start, tensors, first, length in runs:
+            targets += [tensor[start:start + length] for tensor in destination]
+            values += [tensor[first:first + length] for tensor in tensors]
+        torch._foreach_copy_(targets, values)
 
     @property
     def seq_length(self) -> int:
@@ -272,7 +287,7 @@ class FastConformerGraph:
         self, features: Tensor, states: list[FastConformerStreamState],
     ) -> tuple[Tensor, FastConformerStreamState]:
         self.features.copy_(features)
-        torch._foreach_copy_(self.state.tensors(), FastConformerStreamState.batch_tensors(states))
+        FastConformerStreamState.copy_rows(states, self.state.tensors())
         self.graph.replay()
         # Both features and caches must survive subsequent replays for other requests.
         return self.output.clone(), FastConformerStreamState.stack([self.output_state])
