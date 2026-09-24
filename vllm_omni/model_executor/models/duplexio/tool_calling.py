@@ -358,6 +358,8 @@ class ToolCallConstraintState:
     matcher: xgr.GrammarMatcher | None = None
     capture: ToolCallCapture | None = None
     completed_call: dict[str, Any] | None = None
+    # The grammar's first-token mask on the device, shared by every fork.
+    start_bitmask: torch.Tensor | None = None
 
     def fork(self) -> ToolCallConstraintState:
         return ToolCallConstraintState(
@@ -372,6 +374,7 @@ class ToolCallConstraintState:
                 if self.completed_call is not None
                 else None
             ),
+            start_bitmask=self.start_bitmask,
         )
 
     @property
@@ -393,6 +396,21 @@ class ToolCallConstraintState:
         )
         self.capture = ToolCallCapture(self.tools)
         self.completed_call = None
+
+    def first_token_bitmask(self, vocab_size: int, device: torch.device) -> torch.Tensor:
+        """The mask a call would start with, without starting one."""
+        if self.compiled_grammar is None:
+            raise RuntimeError("Cannot begin a DuplexIO tool call without tools")
+        if self.start_bitmask is None or self.start_bitmask.device != device:
+            bitmask = xgr.allocate_token_bitmask(1, vocab_size)
+            xgr.GrammarMatcher(self.compiled_grammar, terminate_without_stop_token=True).fill_next_token_bitmask(
+                bitmask,
+            )
+            # Pinned, so the upload never waits behind queued device work.
+            self.start_bitmask = (
+                bitmask if device.type == "cpu" else bitmask.pin_memory().to(device, non_blocking=True)
+            )
+        return self.start_bitmask
 
     def next_token_bitmask(self, vocab_size: int, device: torch.device) -> torch.Tensor:
         if self.matcher is None:

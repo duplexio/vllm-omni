@@ -130,6 +130,32 @@ class FrameBatch:
     hiddens: Tensor  # [rows, cells, hidden] backbone outputs.
 
 
+@dataclass(eq=False)
+class DuplexIOStepOutput:
+    """A step's queued draws; ``finalize`` applies them on the host once.
+
+    Under async scheduling the runner finalizes after the next step's launch.
+    A request scheduled again before that finalizes its step early.
+    """
+
+    batch: FrameBatch | None
+    infos: list[dict[str, Any]]
+    states: list[DuplexIORequestState]
+    rows: dict[int, int]
+    decode_rows: list[int]
+    record_hiddens: list[bool]
+    replays: list[PackedRows] | None
+    policy_version: int
+    empty: Tensor
+    host: PendingHostOutputs
+    result: dict[str, Any] | None = None
+
+    def finalize(self, model: DuplexIOForConditionalGeneration) -> dict[str, Any]:
+        if self.result is None:
+            self.result = model._finish_step(self)
+        return self.result
+
+
 @dataclass
 class DuplexIORequestState:
     """Request-owned state; Qwen KV/GDN caches belong to the native runner."""
@@ -149,6 +175,8 @@ class DuplexIORequestState:
     active_text_tokens: int = 0
     tool_call_sequence: int = 0
     sampling: RequestSampling | None = None
+    # The step whose sampled ids this request still waits for on the host.
+    pending_output: DuplexIOStepOutput | None = None
 
     def fork(self) -> DuplexIORequestState:
         """Commit an append only after its model step succeeds."""
@@ -335,6 +363,13 @@ class DuplexIOForConditionalGeneration(
     # make_omni_output returns fresh host tensors each step, so the runner can
     # hand them to the payload without another copy.
     omni_host_owned_multimodal_outputs = True
+    # Under async scheduling the runner finalizes a step (finalize_omni_output)
+    # on the engine thread after launching the next one, so each step's device
+    # work runs under the other's host work. Without it, it finalizes at once.
+    use_async_omni_output = True
+    async_omni_output_without_async_chunk = True
+    eager_omni_postprocess_before_async_output = True
+    omni_async_output_build_in_background = False
     has_preprocess = True
     decode_query_len = DUPLEXIO_NUM_CELLS
     has_postprocess = True
@@ -552,6 +587,10 @@ class DuplexIOForConditionalGeneration(
                 raise ValueError("DuplexIO requires a complete prefix before live input")
             state = self._new_request_state(runtime_config, device)
         else:
+            if state.pending_output is not None:
+                # Scheduled again before its last step was finalized: its
+                # sampled ids are this frame's inputs, so wait for them here.
+                state.pending_output.finalize(self)
             state = state.fork()
 
         is_live = not (is_prefill or is_system_input)
@@ -815,6 +854,12 @@ class DuplexIOForConditionalGeneration(
             state = info.get("duplexio_working_state")
             if not isinstance(state, DuplexIORequestState):
                 raise RuntimeError(f"DuplexIO request {request_index} is missing working state")
+            duplex = info.get("duplex", {})
+            if not isinstance(duplex, Mapping):
+                raise RuntimeError(f"DuplexIO request {request_index} is missing duplex metadata")
+            start, end = request_token_spans[request_index]
+            if end - start < DUPLEXIO_NUM_CELLS or (end - start) % DUPLEXIO_NUM_CELLS:
+                raise ValueError(f"DuplexIO request span must contain complete frames, got ({start}, {end})")
             states.append(state)
         rows = {} if batch is None else {index: row for row, index in enumerate(batch.indices)}
         decode_rows = [row for index, row in rows.items() if infos[index]["duplex"].get("decode_audio", True)]
@@ -851,43 +896,80 @@ class DuplexIOForConditionalGeneration(
             replay = {name: [value.get(name, empty) for value in replays] for name in replay_names}
         else:
             replay = {name: [packed_replay[name]] for name in replay_names}
-        # Everything is queued; this is the step's one wait for the device.
-        host = to_host({"sampled": sampled, "replay": replay})
-        if packed_replay is not None:
+        step = DuplexIOStepOutput(
+            batch=batch, infos=infos, states=states, rows=rows, decode_rows=decode_rows,
+            record_hiddens=record_hiddens, replays=replays if packed_replay is not None else None,
+            policy_version=self.policy_version, empty=empty,
+            host=to_host_async({"sampled": sampled, "replay": replay}),
+        )
+        # The next frame's inputs that are known on the device now; the sampled
+        # ids reach the request once the step is finalized on the host.
+        for index, row in rows.items():
+            states[index].agent_audio_codes = predicted_audio[row]
+            states[index].pending_output = step
+        if batch is None:
+            self._forced_next_token_ids = [self.silence_token_id] * len(infos)
+        else:
+            forced = torch.full((len(infos),), self.silence_token_id, dtype=torch.long, device=hidden_states.device)
+            agent_ids = batch.text.text_ids[:, 1]
+            if batch.indices == list(range(len(batch.indices))):
+                forced[: len(batch.indices)] = agent_ids
+            else:
+                forced.index_copy_(0, _to_device(batch.indices, torch.long, forced.device), agent_ids)
+            self._forced_next_token_ids = forced
+        return OmniOutput(
+            text_hidden_states=hidden_states,
+            multimodal_outputs=cast(Any, step),
+            # Four text slots per scheduler row; audio and voice KV have fixed
+            # reserved regions. Keep one row to preserve the recurrent-state marker.
+            streaming_retained_tokens=[
+                max(1, (state.active_text_tokens + 3) // 4) * DUPLEXIO_NUM_CELLS for state in states
+            ],
+            streaming_position_budget=[
+                (self.text_config.max_position_embeddings - state.frames_seen) * DUPLEXIO_NUM_CELLS
+                for state in states
+            ],
+        )
+
+    def finalize_omni_output(self, outputs: Any) -> Any:
+        """The host half of ``make_omni_output``: wait for the draws, then feed them back."""
+        return outputs.finalize(self) if isinstance(outputs, DuplexIOStepOutput) else outputs
+
+    def _finish_step(self, step: DuplexIOStepOutput) -> dict[str, Any]:
+        host = step.host.wait()
+        batch, infos, states, rows = step.batch, step.infos, step.states, step.rows
+        if step.replays is not None:
             host["replay"] = {
-                name: [values[0][value.rows] for value in replays] for name, values in host["replay"].items()
+                name: [values[0][value.rows] for value in step.replays] for name, values in host["replay"].items()
             }
         host_rows: dict[str, list[Tensor]] = {}
         host_ids: list[list[int]] = []
+        decoded: dict[int, Tensor] = {}
         if batch is not None:
             sampled = host["sampled"]
             host_ids = sampled["text_ids"][0].tolist()
-            started = self.finish_text_batch(
+            self.finish_text_batch(
                 batch.text, [infos[index] for index in batch.indices], host_ids, sampled["tool_starts"][0].tolist(),
             )
-            if started:
-                sampled["tool_token_logprob"] = [batch.text.tool_token_logprobs.cpu()]
             host_rows = {
                 name: list(values[0].unbind(0))
                 for name, values in sampled.items() if name not in ("text_ids", "tool_starts", "waveforms")
             }
-            decoded = dict(zip(decode_rows, sampled["waveforms"], strict=True))
+            decoded = dict(zip(step.decode_rows, sampled["waveforms"], strict=True))
 
         # Placeholders and request metadata start on the host.
+        empty = step.empty
         empty_audio = torch.empty(0, dtype=torch.float32)
         empty_codes = torch.empty(0, dtype=torch.long)
         no_tool_call = torch.empty(0, dtype=torch.uint8)
         flags = {False: torch.tensor([False]), True: torch.tensor([True])}
         silence_ids = torch.tensor([self.silence_token_id], dtype=torch.long)
-        policy_version = torch.tensor([self.policy_version], dtype=torch.long)
+        policy_version = torch.tensor([step.policy_version], dtype=torch.long)
         sample_rate = torch.tensor([self.config.sample_rate])
         logprob_names = (
             "agent_emit_logprob", "agent_token_logprob", "tool_emit_logprob", "tool_token_logprob",
             "user_emit_logprob", "user_token_logprob",
         )
-        forced_ids: list[int] = []
-        retained_tokens: list[int] = []
-        position_budgets: list[int] = []
         chunk: dict[str, list[Tensor]] = {
             name: [] for name in (
                 "agent_audio_token_ids", "user_token_id", "agent_token_id", "tool_call_token_id", "model_listen",
@@ -897,19 +979,10 @@ class DuplexIOForConditionalGeneration(
             )
         }
         audio_outputs: list[Tensor] = []
-        for request_index, ((start, end), info, state) in enumerate(zip(request_token_spans, infos, states, strict=True)):
-            # Four text slots per scheduler row; audio and voice KV have fixed
-            # reserved regions. Keep one row to preserve the recurrent-state marker.
-            retained_tokens.append(max(1, (state.active_text_tokens + 3) // 4) * DUPLEXIO_NUM_CELLS)
-            position_budgets.append(
-                (self.text_config.max_position_embeddings - state.frames_seen) * DUPLEXIO_NUM_CELLS
-            )
-            span_length = end - start
-            if span_length < DUPLEXIO_NUM_CELLS or span_length % DUPLEXIO_NUM_CELLS:
-                raise ValueError(f"DuplexIO request span must contain complete frames, got ({start}, {end})")
-            duplex = info.get("duplex", {})
-            if not isinstance(duplex, Mapping):
-                raise RuntimeError(f"DuplexIO request {request_index} is missing duplex metadata")
+        for request_index, (info, state) in enumerate(zip(infos, states, strict=True)):
+            if state.pending_output is step:
+                state.pending_output = None
+            duplex = info["duplex"]
             is_prefill = duplex.get("duplexio_prefill", False)
             is_system_input = duplex.get("duplexio_system_input", False)
             row = rows.get(request_index)
@@ -924,7 +997,6 @@ class DuplexIOForConditionalGeneration(
             if row is None:
                 for name in (*logprob_names, "user_emit", "policy_version", "predictor_hiddens"):
                     chunk[name].append(empty)
-                forced_ids.append(self.silence_token_id)
                 for name in ("user_token_id", "agent_token_id", "tool_call_token_id"):
                     chunk[name].append(silence_ids)
                 audio_outputs.append(empty_audio)
@@ -937,7 +1009,7 @@ class DuplexIOForConditionalGeneration(
             for name in logprob_names:
                 chunk[name].append(host_rows[name][row])
             chunk["predictor_hiddens"].append(
-                host_rows["predictor_hiddens"][row] if record_hiddens[request_index] else empty
+                host_rows["predictor_hiddens"][row] if step.record_hiddens[request_index] else empty
             )
             user_token_id, agent_token_id, tool_token_id = host_ids[row]
             chunk["user_emit"].append(flags[user_token_id != self.silence_token_id])
@@ -946,8 +1018,6 @@ class DuplexIOForConditionalGeneration(
             state.text_input_ids = torch.tensor(
                 [self.silence_token_id, *host_ids[row]], dtype=torch.long, device="cpu",
             )
-            state.agent_audio_codes = predicted_audio[row]
-            forced_ids.append(agent_token_id)
             chunk["user_token_id"].append(state.text_input_ids[1:2])
             chunk["agent_token_id"].append(state.text_input_ids[2:3])
             chunk["tool_call_token_id"].append(state.text_input_ids[3:4])
@@ -960,8 +1030,7 @@ class DuplexIOForConditionalGeneration(
                 state.tool_call_sequence += 1
             chunk["tool_call_json"].append(serialize_tool_call(tool_call, state.tool_call_sequence))
 
-        self._forced_next_token_ids = forced_ids
-        multimodal_outputs = {
+        return {
             "audio": audio_outputs,
             "chunk": {
                 "sample_rate_hz": [sample_rate] * len(infos),
@@ -969,12 +1038,6 @@ class DuplexIOForConditionalGeneration(
                 **{f"replay_{name}": values for name, values in host["replay"].items()},
             },
         }
-        return OmniOutput(
-            text_hidden_states=hidden_states,
-            multimodal_outputs=cast(Any, multimodal_outputs),
-            streaming_retained_tokens=retained_tokens,
-            streaming_position_budget=position_budgets,
-        )
 
     def sample_frames(
         self,
@@ -1084,8 +1147,9 @@ class DuplexIOForConditionalGeneration(
         user_ids, user_emit_logprobs, user_token_logprobs = self.sample_stream_tokens(
             logits[:, 2], emit_logits[:, 2], infos, stream="user",
         )
-        # Rows inside a call, or forced to start one, sample now; idle rows draw
-        # a start decision the host reads with the other sampled ids.
+        # Rows inside a call, or forced to start one, sample now. Idle rows draw
+        # a start decision and, speculatively, the call's first token, so the
+        # host only commits what the device already chose.
         rows = len(infos)
         tool_ids = torch.full((rows,), self.silence_token_id, dtype=torch.long, device=logits.device)
         tool_token_logprobs = torch.zeros(rows, 1, dtype=torch.float32, device=logits.device)
@@ -1105,6 +1169,7 @@ class DuplexIOForConditionalGeneration(
             tool_starts, _ = _sample_emits(
                 start_logits, [info["duplexio_working_state"].sampling.emission.tool_call for info in infos],
             )
+            self._sample_tool_starts(logits[:, 1], infos, pending, tool_starts, tool_ids, tool_token_logprobs)
         else:
             tool_starts = torch.zeros(rows, dtype=torch.bool, device=logits.device)
         # Score the chosen decision with the raw head, even when serving forced it.
@@ -1140,22 +1205,57 @@ class DuplexIOForConditionalGeneration(
     ) -> list[int]:
         """Start sampled calls and advance constraints once the draws reach the host.
 
-        Patches ``text`` and ``host_ids`` in place; returns the rows that started a
-        call, whose token log probabilities changed after the host read.
+        Host-only: a started call's first token was drawn with the batch. Fills
+        ``text.tool_calls`` and returns the rows that started a call.
         """
         started = [row for row in text.pending_tool_starts if tool_starts[row]]
         for row in started:
-            self._sample_tool_row(
-                text.logits[row, 1:2], infos[row], text.text_ids[:, 2], text.tool_token_logprobs, row,
-            )
-        if started:
-            for row, token_id in zip(started, text.text_ids[started, 2].tolist(), strict=True):
-                host_ids[row][2] = token_id
+            infos[row]["duplexio_working_state"].tool_call_constraint.begin()
         for row in sorted((*text.tool_rows, *started)):
             constraint = infos[row]["duplexio_working_state"].tool_call_constraint
             if constraint.accept(host_ids[row][2]):
                 text.tool_calls[row] = self.tool_call_compiler.take_completed_call(constraint)
         return started
+
+    def _sample_tool_starts(
+        self, logits: Tensor, infos: list[dict[str, Any]], pending: list[int],
+        starts: Tensor, tool_ids: Tensor, logprobs: Tensor,
+    ) -> None:
+        """Draw every idle row's would-be first call token; keep it where a call starts."""
+        vocab_size = logits.shape[-1]
+        if len(pending) == len(infos):
+            index = None
+            # A copy: the grammar mask is applied in place.
+            constrained = logits.clone(memory_format=torch.contiguous_format)
+        else:
+            index = _to_device(pending, torch.long, logits.device)
+            constrained = logits.index_select(0, index)
+        constraints = [infos[row]["duplexio_working_state"].tool_call_constraint for row in pending]
+        bitmask = torch.cat([constraint.first_token_bitmask(vocab_size, logits.device) for constraint in constraints])
+        xgr.apply_token_bitmask_inplace(constrained, bitmask, vocab_size=vocab_size)
+        samplings = [infos[row]["duplexio_working_state"].sampling.tool for row in pending]
+        groups: dict[tuple[float, int | None, float | None], list[int]] = {}
+        for member, sampling in enumerate(samplings):
+            groups.setdefault((sampling.temperature, sampling.top_k, sampling.top_p), []).append(member)
+        if len(groups) == 1:
+            ids, values = self._sample_content(constrained, samplings[0])
+        else:
+            ids = torch.empty(len(pending), dtype=torch.long, device=logits.device)
+            values = torch.empty(len(pending), dtype=torch.float32, device=logits.device)
+            for members in groups.values():
+                member_index = _to_device(members, torch.long, logits.device)
+                group_ids, group_values = self._sample_content(
+                    constrained.index_select(0, member_index), samplings[members[0]],
+                )
+                ids.index_copy_(0, member_index, group_ids)
+                values.index_copy_(0, member_index, group_values)
+        if index is None:
+            tool_ids.copy_(torch.where(starts, ids, tool_ids))
+            logprobs[:, 0].copy_(torch.where(starts, values, logprobs[:, 0]))
+        else:
+            started = starts.index_select(0, index)
+            tool_ids.index_copy_(0, index, torch.where(started, ids, tool_ids.index_select(0, index)))
+            logprobs[:, 0].index_copy_(0, index, torch.where(started, values, logprobs[:, 0].index_select(0, index)))
 
     def _sample_tool_row(
         self, logits: Tensor, info: dict[str, Any], tool_ids: Tensor, logprobs: Tensor, row: int,

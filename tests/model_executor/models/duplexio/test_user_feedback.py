@@ -152,7 +152,7 @@ def test_feedback_actions_and_versions_span_staging_then_commit(monkeypatch):
             request_token_spans=[(0, frames * 6)],
             request_sample_eligible=[True],
         )
-        payload = MultimodalPayload.from_dict({name: values[0] for name, values in flatten_payload(output.multimodal_outputs).items()})
+        payload = MultimodalPayload.from_dict({name: values[0] for name, values in flatten_payload(model.finalize_omni_output(output.multimodal_outputs)).items()})
         assert {"user_action_eligible", "user_token_eligible", "user_action_logprob"}.isdisjoint(payload)
         recorder.append(payload, version=model.policy_version)
         consumed_user_ids.append(updates["duplexio_replay"]["text_ids"][-1, 1].item())
@@ -264,7 +264,7 @@ def test_chunked_context_records_all_rows_and_samples_only_at_boundary():
                 torch.randn(frames * 6, 11), model_intermediate_buffer=[info],
                 request_token_spans=[(0, frames * 6)], request_sample_eligible=[index == 2],
             )
-            payload = MultimodalPayload.from_dict({name: values[0] for name, values in flatten_payload(output.multimodal_outputs).items()})
+            payload = MultimodalPayload.from_dict({name: values[0] for name, values in flatten_payload(model.finalize_omni_output(output.multimodal_outputs)).items()})
             recorder.append(payload, version=0)
             state = model.postprocess(None, **info)["duplexio_model_state"]
             assert payload[f"duplex_{context}_complete"].item() == (index == 2)
