@@ -203,7 +203,7 @@ def test_encoder_graph_rebatches_groups_without_restacking(encoder, monkeypatch)
             torch.testing.assert_close(value, target, atol=1e-5, rtol=1e-4)
             actual_states[index], expected_states[index] = state, target_state
         if step >= 13 and captured:
-            assert all(size == 1 for size in packed)
+            assert not packed
             assert all(actual_states[index].encoder.batch is not None for index in order)
         if step == 12:
             # A rejected step rolls back to earlier state, which later replays must not touch.

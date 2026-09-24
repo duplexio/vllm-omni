@@ -97,6 +97,35 @@ class FastConformerStreamState:
             tensor for layer in self.past_key_values.layers for tensor in (layer.keys, layer.values)
         ] + [layer.cache for layer in self.padding_cache.layers.values()]
 
+    def detached(self, extra: Tensor) -> tuple[Tensor, FastConformerStreamState]:
+        """Copy ``extra`` and every cache out of reusable storage, one kernel per dtype."""
+        tensors = [extra, *self.tensors()]
+        copies: list[Tensor | None] = [None] * len(tensors)
+        groups: dict[torch.dtype, list[int]] = defaultdict(list)
+        for index, tensor in enumerate(tensors):
+            groups[tensor.dtype].append(index)
+        for indices in groups.values():
+            flat = torch.cat([tensors[index].reshape(-1) for index in indices])
+            for index, piece in zip(indices, flat.split([tensors[index].numel() for index in indices]), strict=True):
+                copies[index] = piece.view(tensors[index].shape)
+        kv = copy.copy(self.past_key_values)
+        kv.layers = []
+        position = 1
+        for layer in self.past_key_values.layers:
+            batched = copy.copy(layer)
+            batched.keys, batched.values = copies[position], copies[position + 1]
+            batched.cumulative_length = batched.keys.shape[-2]
+            position += 2
+            kv.layers.append(batched)
+        padding = copy.copy(self.padding_cache)
+        padding.layers = {}
+        for name, layer in self.padding_cache.layers.items():
+            batched = copy.copy(layer)
+            batched.cache = copies[position]
+            position += 1
+            padding.layers[name] = batched
+        return copies[0], FastConformerStreamState(kv, padding)
+
     @staticmethod
     def copy_rows(states: list[FastConformerStreamState], destination: list[Tensor]) -> None:
         """Write each state's caches into its row of batched ``destination`` storage.
@@ -290,7 +319,7 @@ class FastConformerGraph:
         FastConformerStreamState.copy_rows(states, self.state.tensors())
         self.graph.replay()
         # Both features and caches must survive subsequent replays for other requests.
-        return self.output.clone(), FastConformerStreamState.stack([self.output_state])
+        return self.output_state.detached(self.output)
 
 
 class FastConformerRNNT(nn.Module):
