@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 import torch
 import xgrammar as xgr
@@ -83,6 +86,27 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream() -> None
     }
     state.begin()
     assert state.active
+
+
+def test_session_grammar_compiles_without_blocking_its_request() -> None:
+    tools = [{"type": "function", "function": {"name": "ping", "parameters": {"type": "object", "properties": {}}}}]
+    vocab = ["<silence>", *sorted(set("<function=ping>\n</function>"))]
+    compiler = object.__new__(ToolCallConstraintCompiler)
+    compiler.decoded_vocab = tuple(value.encode() for value in vocab)
+    compiler.compiler = xgr.GrammarCompiler(xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=len(vocab)))
+    compiler.executor = ThreadPoolExecutor(max_workers=1)
+    release = threading.Event()
+    compiler.executor.submit(release.wait)
+
+    state = compiler.new_state(tools, {"mode": "auto"})
+    assert state.enabled and not state.compiled_grammar.done()
+    fork = state.fork()
+    release.set()
+    state.begin()
+
+    assert state.active and not fork.active
+    assert fork.grammar is state.grammar
+    compiler.executor.shutdown()
 
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param(

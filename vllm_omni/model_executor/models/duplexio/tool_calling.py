@@ -8,6 +8,7 @@ from __future__ import annotations
 import codecs
 import json
 from collections.abc import Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -351,7 +352,8 @@ class ToolCallCapture:
 
 @dataclass
 class ToolCallConstraintState:
-    compiled_grammar: xgr.CompiledGrammar | None
+    # A pending compile until the first call needs the grammar.
+    compiled_grammar: xgr.CompiledGrammar | Future[xgr.CompiledGrammar] | None
     decoded_vocab: tuple[bytes, ...] = ()
     tools: tuple[Mapping[str, Any], ...] = ()
     force_next_call: bool = False
@@ -382,16 +384,22 @@ class ToolCallConstraintState:
         return self.compiled_grammar is not None
 
     @property
+    def grammar(self) -> xgr.CompiledGrammar:
+        if self.compiled_grammar is None:
+            raise RuntimeError("Cannot begin a DuplexIO tool call without tools")
+        if isinstance(self.compiled_grammar, Future):
+            self.compiled_grammar = self.compiled_grammar.result()
+        return self.compiled_grammar
+
+    @property
     def active(self) -> bool:
         return self.matcher is not None
 
     def begin(self) -> None:
-        if self.compiled_grammar is None:
-            raise RuntimeError("Cannot begin a DuplexIO tool call without tools")
         if self.matcher is not None:
             raise RuntimeError("DuplexIO tool call state is already active")
         self.matcher = xgr.GrammarMatcher(
-            self.compiled_grammar,
+            self.grammar,
             terminate_without_stop_token=True,
         )
         self.capture = ToolCallCapture(self.tools)
@@ -399,11 +407,9 @@ class ToolCallConstraintState:
 
     def first_token_bitmask(self, vocab_size: int, device: torch.device) -> torch.Tensor:
         """The mask a call would start with, without starting one."""
-        if self.compiled_grammar is None:
-            raise RuntimeError("Cannot begin a DuplexIO tool call without tools")
         if self.start_bitmask is None or self.start_bitmask.device != device:
             bitmask = xgr.allocate_token_bitmask(1, vocab_size)
-            xgr.GrammarMatcher(self.compiled_grammar, terminate_without_stop_token=True).fill_next_token_bitmask(
+            xgr.GrammarMatcher(self.grammar, terminate_without_stop_token=True).fill_next_token_bitmask(
                 bitmask,
             )
             # Pinned, so the upload never waits behind queued device work.
@@ -445,6 +451,14 @@ class ToolCallConstraintCompiler:
             tokenizer_info,
             cache_limit_bytes=64 * 1024 * 1024,
         )
+        # Compiling releases the GIL, so a session's grammar builds while the
+        # batch keeps stepping. The first tool grammar pays a one-time setup
+        # of about a second, spent here rather than in a live session.
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="duplexio-grammar")
+        warmup = {"type": "function", "function": {"name": "warmup", "parameters": {
+            "type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"],
+        }}}
+        self.executor.submit(self.compiler.compile_grammar, tool_function_grammar(warmup))
 
     def new_state(
         self,
@@ -455,7 +469,7 @@ class ToolCallConstraintCompiler:
         if grammar is None:
             return ToolCallConstraintState(compiled_grammar=None)
         return ToolCallConstraintState(
-            compiled_grammar=self.compiler.compile_grammar(grammar),
+            compiled_grammar=self.executor.submit(self.compiler.compile_grammar, grammar),
             decoded_vocab=self.decoded_vocab,
             tools=tuple(tools),
             force_next_call=tool_choice.get("mode") in {"required", "named"},
