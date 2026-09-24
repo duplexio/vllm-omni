@@ -5,12 +5,14 @@ import math
 import pytest
 import torch
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule as upstream_gdn
+from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
 from vllm_omni.model_executor.models.duplexio.stream_gdn import (
     append_gdn,
     gdn_cache_dtypes,
     gdn_cache_shapes,
     prepare_gdn_inputs,
+    slot_recurrent_gdn,
 )
 
 pytest.importorskip("duplexio")
@@ -137,6 +139,38 @@ def test_append_gdn_independent_slots_and_reset(prefixes: tuple[int, ...], alias
             append_index += 1
             for i, size in zip(requests, sizes):
                 offsets[i] += size
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("aliased_storage", (False, True))
+@torch.inference_mode()
+def test_slot_recurrence_matches_fla_on_gathered_state_bitwise(aliased_storage: bool) -> None:
+    torch.manual_seed(51)
+    requests = 5
+    tokens = requests * 6
+    q = l2_normalize(torch.randn(tokens, 2, 128, device="cuda", dtype=torch.bfloat16))
+    k = l2_normalize(torch.randn_like(q))
+    # V arrives as a strided slice of the packed projection.
+    v = torch.randn(tokens, 4 * 128 + 64, device="cuda", dtype=torch.bfloat16)[:, 64:].view(tokens, 4, 128)
+    g = -torch.rand(tokens, 4, device="cuda", dtype=torch.float32)
+    beta = torch.rand(tokens, 4, device="cuda", dtype=torch.bfloat16)
+    state = make_state(aliased_storage, requests + 2)
+    state.copy_(torch.randn_like(state))
+    reference = state.clone()
+    slots = torch.tensor([6, 0, 3, 5, 1], device="cuda", dtype=torch.int32)
+    has_state = torch.tensor([True, False, True, True, False], device="cuda")
+    boundaries = torch.arange(0, tokens + 1, 6, device="cuda", dtype=torch.int32)
+
+    initial = torch.where(has_state[:, None, None, None], reference[slots], 0)
+    expected, final = fused_recurrent_gated_delta_rule(
+        *(tensor.unsqueeze(0) for tensor in (q, k, v)), g=g.unsqueeze(0), beta=beta.unsqueeze(0),
+        initial_state=initial, output_final_state=True, cu_seqlens=boundaries,
+    )
+    reference[slots] = final
+    actual = slot_recurrent_gdn(q, k, v, g, beta, state, slots, boundaries, has_state)
+
+    torch.testing.assert_close(actual, expected[0], atol=0, rtol=0)
+    torch.testing.assert_close(state, reference, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
