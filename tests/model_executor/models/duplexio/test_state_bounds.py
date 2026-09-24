@@ -46,7 +46,6 @@ def test_gdn_request_state_shape_is_fixed_for_the_session_lifetime() -> None:
 
 
 def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
-    generator = torch.Generator().manual_seed(7)
     state = DuplexIORequestState(
         text_input_ids=torch.zeros(4, dtype=torch.long),
         agent_audio_codes=torch.zeros(8, dtype=torch.long),
@@ -59,7 +58,6 @@ def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
         ),
         voice_prompt=torch.zeros(1_920),
         system_token_ids=(1, 2, 3),
-        sampling_generator=generator,
         frames_seen=100_000,
         audio_position=99_000,
         active_text_tokens=250_000,

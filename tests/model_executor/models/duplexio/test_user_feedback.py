@@ -115,12 +115,10 @@ def test_sampling_cache_reuses_settings_and_tracks_session_updates():
     assert working.sampling.agent.temperature == 0.9
     assert updated.agent.temperature == 0.3
     valid = working.sampling
-    generator_state = working.sampling_generator.get_state()
     settings["duplexio_emit_temperatures"]["user"] = -1.0
     with pytest.raises(ValueError):
         model.sample_text_batch(logits, emissions, [info])
     assert working.sampling is valid
-    assert torch.equal(working.sampling_generator.get_state(), generator_state)
 
 
 @torch.inference_mode()
@@ -249,7 +247,6 @@ def test_chunked_context_records_all_rows_and_samples_only_at_boundary():
     state = request_state(model)
     recorder = TrajectoryRecorder()
     for context in ("prefill", "system_input"):
-        generator_state = state.sampling_generator.get_state()
         prompt_len = (state.frames_seen + 5) * 6
         for index, frames in enumerate((1, 2, 2)):
             info = {
@@ -273,7 +270,6 @@ def test_chunked_context_records_all_rows_and_samples_only_at_boundary():
             assert payload[f"duplex_{context}_complete"].item() == (index == 2)
             if index < 2:
                 assert payload["agent_audio_token_ids"].numel() == 0
-                assert torch.equal(state.sampling_generator.get_state(), generator_state)
             else:
                 assert payload["agent_audio_token_ids"].numel() > 0
     trace = recorder.tensors()

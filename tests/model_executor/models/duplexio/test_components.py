@@ -571,7 +571,7 @@ def test_unfinished_tool_context_does_not_run_prediction_heads() -> None:
         [False],
     )
 
-    assert predictions == {}
+    assert predictions is None
 
 
 def test_token_heads_load_without_weight_name_mapping() -> None:

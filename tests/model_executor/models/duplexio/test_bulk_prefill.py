@@ -104,7 +104,6 @@ def request_state(model: DuplexIOForConditionalGeneration) -> DuplexIORequestSta
         input_mimi=MimiStreamingState(encoder_transformer=MimiTransformerState.empty(0)),
         voice_prompt=torch.ones(2 * 1920),
         system_token_ids=(3, 4, 5),
-        sampling_generator=torch.Generator().manual_seed(9),
     )
 
 

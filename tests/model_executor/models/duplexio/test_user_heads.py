@@ -49,9 +49,9 @@ def head_model(device="cpu"):
     return model.to(device)
 
 
-def sampling_info(model, device="cpu", mode="top_k", seed=17, emit_temperature=0.7):
+def sampling_info(model, device="cpu", mode="top_k", emit_temperature=0.7):
     info = {
-        "duplexio_working_state": SimpleNamespace(sampling_generator=torch.Generator(device=device).manual_seed(seed)),
+        "duplexio_working_state": SimpleNamespace(),
         "duplex": {
             "runtime_config": {
                 "duplexio_text_sampling": {"temperature": 0.6, "top_k": 4, "top_p": 0.8},
@@ -82,7 +82,7 @@ def sampling_info(model, device="cpu", mode="top_k", seed=17, emit_temperature=0
 @pytest.mark.parametrize("temperature", [0.0, 0.7])
 def test_user_behavior_probabilities_include_waits_and_actual_truncation(mode, temperature, device):
     model = head_model(device)
-    infos = [sampling_info(model, device=device, mode=mode, seed=seed, emit_temperature=temperature) for seed in range(64)]
+    infos = [sampling_info(model, device=device, mode=mode, emit_temperature=temperature) for _ in range(64)]
     logits = torch.tensor([[100.0, 0.2, 0.4, 1.0, 1.2, 1.4]], device=device).expand(64, -1)
     emissions = torch.linspace(-2, 2, 64, device=device)
     ids, emit_logprobs, token_logprobs = model.sample_stream_tokens(
@@ -91,14 +91,14 @@ def test_user_behavior_probabilities_include_waits_and_actual_truncation(mode, t
         infos,
         stream="user",
     )
-    emitted = torch.cat(ids) != 0
+    emitted = ids != 0
     assert emitted.any() and (~emitted).any()
     for row, (token, emit_logprob, token_logprob) in enumerate(zip(ids, emit_logprobs, token_logprobs, strict=True)):
         if temperature == 0:
             assert emit_logprob.item() == 0
         else:
             p = torch.sigmoid(emissions[row] / temperature)
-            torch.testing.assert_close(emit_logprob[0], (p if emitted[row] else 1 - p).log(), rtol=1e-6, atol=1e-7)
+            torch.testing.assert_close(emit_logprob, (p if emitted[row] else 1 - p).log(), rtol=1e-6, atol=1e-7)
         if not emitted[row] or mode == "argmax":
             assert token_logprob.item() == 0
         else:
@@ -112,7 +112,7 @@ def test_user_behavior_probabilities_include_waits_and_actual_truncation(mode, t
                 values[remove] = -torch.inf
             probs = values.softmax(-1)
             position = (indices + 1 == token.item()).nonzero().item()
-            torch.testing.assert_close(token_logprob[0], probs[position].log(), rtol=1e-6, atol=1e-7)
+            torch.testing.assert_close(token_logprob, probs[position].log(), rtol=1e-6, atol=1e-7)
 
 
 def test_saturated_bernoulli_probabilities_are_recorded_exactly():
@@ -120,11 +120,11 @@ def test_saturated_bernoulli_probabilities_are_recorded_exactly():
     ids, emit_logprobs, _ = model.sample_stream_tokens(
         torch.ones(2, 6),
         torch.tensor([100.0, -100.0]),
-        [sampling_info(model), sampling_info(model, seed=18)],
+        [sampling_info(model), sampling_info(model)],
         stream="user",
     )
     assert ids[0].item() != 0 and ids[1].item() == 0
-    assert torch.cat(emit_logprobs).tolist() == [0.0, 0.0]
+    assert emit_logprobs.tolist() == [0.0, 0.0]
 
 
 def test_checkpoint_loader_loads_both_user_heads_in_place():
