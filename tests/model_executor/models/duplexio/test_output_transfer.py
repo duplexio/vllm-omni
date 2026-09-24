@@ -94,7 +94,11 @@ def test_compute_logits_forces_host_or_device_ids(on_device):
         model, "_forced_next_token_ids", torch.tensor(forced, device="cuda") if on_device else forced,
     )
 
-    logits = DuplexIOForConditionalGeneration.compute_logits(model, hidden)
+    torch.cuda.set_sync_debug_mode("error")  # the batch queue overlaps only if the host never waits here
+    try:
+        logits = DuplexIOForConditionalGeneration.compute_logits(model, hidden)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
 
     assert model._forced_next_token_ids is None
     assert logits.argmax(-1).tolist() == forced

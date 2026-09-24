@@ -1361,13 +1361,12 @@ class DuplexIOForConditionalGeneration(
             device=hidden_states.device,
         )
         # Forced ids may already sit on the device; a host list crosses without
-        # blocking the host behind the queued frame.
+        # blocking the host behind the queued frame. A scalar scatter keeps the
+        # zero on the host: index assignment would copy it to the device with a
+        # stream synchronization, stalling the host until the frame finished.
         if not isinstance(token_ids, Tensor):
             token_ids = torch.tensor(token_ids, dtype=torch.long)
-        logits[
-            torch.arange(hidden_states.shape[0], device=hidden_states.device),
-            token_ids.to(hidden_states.device, non_blocking=True),
-        ] = 0
+        logits.scatter_(1, token_ids.to(hidden_states.device, non_blocking=True).view(-1, 1), 0.0)
         return logits
 
     def postprocess(
