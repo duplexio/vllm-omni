@@ -201,6 +201,8 @@ def test_agent_logprobs_match_the_distributions_actually_sampled(device):
     inputs = torch.Generator(device=device).manual_seed(97)
     logits = torch.randn(8, 2, vocab, device=device, generator=inputs)
     emissions = torch.randn(8, 2, device=device, generator=inputs)
+    # Draws come from the global generator; pin it so at least one row emits.
+    torch.manual_seed(0)
 
     ids, emit_logprobs, token_logprobs = model.sample_agent_tokens(
         logits[:, 0], emissions[:, 0], infos
