@@ -30,6 +30,12 @@ WORD_START = "\u2581"
 # which is p50 8 / p90 12 frames here — inside that support, where 8 frames
 # (p50 12 / p90 16) left half the words past anything training showed.
 WORD_END_SILENCE_FRAMES = 4
+# Encoder graphs are captured for these batch sizes; a batch pads to the next.
+GRAPH_BATCH_SIZES = (1, 2, 4, 8, 12, 16, 20, 24, 28, 32)
+
+
+def graph_batch_size(rows: int) -> int:
+    return next((size for size in GRAPH_BATCH_SIZES if size >= rows), rows)
 
 
 class FastConformerStreamState:
@@ -385,13 +391,15 @@ class FastConformerGraph:
     def __call__(
         self, features: Tensor, states: list[FastConformerStreamState],
     ) -> tuple[Tensor, FastConformerStreamState]:
-        self.features.copy_(features)
+        # Rows past the batch replay whatever an earlier batch left there.
+        rows = features.shape[0]
+        self.features[:rows].copy_(features)
         FastConformerStreamState.copy_rows(states, self.state)
         self.graph.replay()
         # Both features and caches must survive subsequent replays for other requests.
-        flat = self.output.clone()
+        flat = self.output[:rows].clone()
         return (
-            flat[:, :self.hidden_size].view(self.hidden_shape),
+            flat[:, :self.hidden_size].view(rows, *self.hidden_shape[1:]),
             FastConformerStreamState.packed(self.output_layout, flat[:, self.hidden_size:]),
         )
 
@@ -671,12 +679,16 @@ class FastConformerRNNT(nn.Module):
                     and features.shape[1] == self.chunk_sizes.mel_frames
                 )
                 if self.use_cuda_graph and steady:
-                    batch_size = len(indices)
+                    batch_size = graph_batch_size(len(indices))
                     if batch_size not in self.graphs:
                         # A pool lives only as long as a graph using it.
                         pool = next(iter(self.graphs.values())).graph.pool() if self.graphs else None
+                        padding = batch_size - len(indices)
                         self.graphs[batch_size] = FastConformerGraph(
-                            self.encode_feature_chunk, features, FastConformerStreamState.stack(previous), pool,
+                            self.encode_feature_chunk,
+                            torch.cat([features, features[-1:].expand(padding, -1, -1)]),
+                            FastConformerStreamState.stack(previous + previous[-1:] * padding),
+                            pool,
                         )
                     encoded, cache = self.graphs[batch_size](features, previous)
                 else:

@@ -19,6 +19,7 @@ from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FastConformerAudioStreamState,
     FastConformerRNNT,
     FastConformerStreamState,
+    graph_batch_size,
     streaming_resample_batch,
     streaming_resample_chunk,
 )
@@ -170,7 +171,7 @@ def test_encoder_graph_preserves_requests_and_output_ownership(encoder, dtype):
             retained.append((value, value.clone()))
             for cache, reference_cache in zip(state.encoder.tensors(), target_state.encoder.tensors(), strict=True):
                 torch.testing.assert_close(cache, reference_cache, atol=1e-5, rtol=1e-4)
-    assert set(encoder.graphs) == {2, 3}
+    assert set(encoder.graphs) == {2, 4}
     for value, original in retained:
         torch.testing.assert_close(value, original, atol=0, rtol=0)
 
@@ -203,7 +204,7 @@ def test_encoder_graph_rebatches_groups_without_restacking(encoder, monkeypatch)
         expected, old = reference.encode_audio_batch(waveforms, [expected_states[index] for index in order])
         packed.clear()
         copies.clear()
-        captured = len(order) in encoder.graphs
+        captured = graph_batch_size(len(order)) in encoder.graphs
         actual, new = encoder.encode_audio_batch(waveforms, [actual_states[index] for index in order])
         for index, value, target, state, target_state in zip(order, actual, expected, new, old, strict=True):
             torch.testing.assert_close(value, target, atol=1e-5, rtol=1e-4)
@@ -219,7 +220,7 @@ def test_encoder_graph_rebatches_groups_without_restacking(encoder, monkeypatch)
             # A rejected step rolls back to earlier state, which later replays must not touch.
             snapshot = [copy.copy(state.encoder) for state in actual_states]
             saved = [[tensor.clone() for tensor in state.tensors()] for state in snapshot]
-    assert set(encoder.graphs) == {2, 3}
+    assert set(encoder.graphs) == {2, 4}
     for state, tensors in zip(snapshot, saved, strict=True):
         for cache, original in zip(state.tensors(), tensors, strict=True):
             torch.testing.assert_close(cache, original, atol=0, rtol=0)
