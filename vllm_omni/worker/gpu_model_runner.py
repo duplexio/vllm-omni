@@ -1750,6 +1750,12 @@ class OmniGPUModelRunner(GPUModelRunner):
                 decode_batch_items.clear()
 
             preprocess_input_ids = input_ids if input_ids is not None else self.input_ids.gpu[:num_input_tokens]
+            # Per-request writes land on disjoint rows and are only read after the
+            # loop. Models whose preprocess outputs stay valid for the whole step
+            # can have them go out as one multi-tensor copy instead of one per request.
+            defer_copies = getattr(self.model, "preprocess_outputs_stable_within_step", False)
+            copy_targets: list[torch.Tensor] = []
+            copy_sources: list[torch.Tensor] = []
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
@@ -1807,9 +1813,25 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 # update the inputs_embeds and input_ids
                 seg_len = min(span_len, req_embeds.shape[0])
-                inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
-                if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
-                    preprocess_input_ids[s : s + seg_len] = req_input_ids
+                target_ids = preprocess_input_ids[s : s + seg_len]
+                # Models that pass their input id slice through need no copy.
+                copy_ids = (
+                    isinstance(req_input_ids, torch.Tensor)
+                    and req_input_ids.numel() == seg_len
+                    and req_input_ids.data_ptr() != target_ids.data_ptr()
+                )
+                if defer_copies:
+                    copy_targets.append(inputs_embeds[s : s + seg_len])
+                    copy_sources.append(req_embeds[:seg_len])
+                    if copy_ids:
+                        copy_targets.append(target_ids)
+                        copy_sources.append(req_input_ids.reshape(target_ids.shape).to(target_ids.dtype))
+                else:
+                    inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
+                    if copy_ids:
+                        target_ids[:] = req_input_ids
+            if copy_targets:
+                torch._foreach_copy_(copy_targets, copy_sources)
             if input_ids is None:
                 input_ids = preprocess_input_ids
 

@@ -370,6 +370,8 @@ class DuplexIOForConditionalGeneration(
     async_omni_output_without_async_chunk = True
     eager_omni_postprocess_before_async_output = True
     omni_async_output_build_in_background = False
+    # Per-request embeddings are views of one packed step tensor.
+    preprocess_outputs_stable_within_step = True
     has_preprocess = True
     decode_query_len = DUPLEXIO_NUM_CELLS
     has_postprocess = True
