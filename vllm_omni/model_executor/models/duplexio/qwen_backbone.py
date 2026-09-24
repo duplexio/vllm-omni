@@ -56,7 +56,6 @@ from vllm.v1.attention.backends.flex_attention import (
     FlexAttentionMetadata,
     FlexAttentionMetadataBuilder,
     physical_to_logical_mapping,
-    unique_static_unsorted,
 )
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -93,13 +92,25 @@ from vllm_omni.model_executor.models.duplexio.stream_gdn import (
     prepare_gdn_inputs,
 )
 
-# Flex tiles the 1024-key cache pages; 16x64 keeps the six-cell query tile and
-# the masked-out ring pages cheap.
+# Grouped query heads are packed into query rows, so a 16-row query block holds
+# 16 // groups tokens and reads each KV tile once for all of their heads.
+QUERY_BLOCK_ROWS = 16
+KV_TILE = 64
 KERNEL_OPTIONS: dict[str, int | bool] = {
     "FORCE_USE_FLEX_ATTENTION": True,
-    "BLOCK_M": 16,
-    "BLOCK_N": 64,
+    "BLOCK_M": QUERY_BLOCK_ROWS,
+    "BLOCK_N": KV_TILE,
 }
+# A decode step has too few query blocks to fill the GPU, so each block's tiles
+# are split until tokens times splits reaches this many; the merge re-joins them.
+SPLIT_KV_TOKENS = 1536
+MAX_KV_SPLITS = 8
+
+
+def kv_splits(tokens: int) -> int:
+    """Return the power-of-two split count for a step of ``tokens`` queries."""
+    share = max(SPLIT_KV_TOKENS // max(tokens, 1), 1)
+    return min(1 << (share.bit_length() - 1), MAX_KV_SPLITS)
 
 
 class DuplexIORotaryEmbedding(nn.Module):
@@ -232,27 +243,21 @@ def physical_slots(
 
 
 @torch.compile(dynamic=True, fullgraph=True)
-def step_block_mask_tables(
+def step_paged_tables(
     query_start_loc: Tensor,
     seq_lens: Tensor,
     block_table: Tensor,
     doc_ids: Tensor,
     physical_to_logical: Tensor,
-    kv_indices: Tensor,
-    kv_num_blocks: Tensor,
     decode_offset: Tensor,
     block_size: int,
-    q_block_size: int,
-    num_pages: int,
     num_blocks: int,
 ) -> Tensor:
-    """Write every index table a paged FlexAttention step reads, in one pass.
+    """Write the tables upstream's paged mask reads, in one pass.
 
-    This is upstream's direct block-mask build for a mask with no causal or
-    window pruning - each query block lists the unique pages of the requests
-    it holds - but doc ids come from the query offsets already on the device,
-    so nothing is uploaded. Each query's logical index starts at its batch
-    offset, so it indexes this step's cells. Returns the page count per request.
+    Doc ids come from the query offsets already on the device, so nothing is
+    uploaded. Each query's logical index starts at its batch offset, so it
+    indexes this step's cells. Returns the page count per request.
     """
     tokens = doc_ids.shape[0]
     token_ids = torch.arange(tokens, dtype=query_start_loc.dtype, device=doc_ids.device)
@@ -262,27 +267,78 @@ def step_block_mask_tables(
     physical_to_logical.copy_(
         physical_to_logical_mapping(block_table, seq_lens, block_size, num_blocks)
     )
-    pages_per_seq = cdiv(seq_lens, block_size)
-    used_pages = block_table[doc_ids, :num_pages]
-    past_seq = torch.arange(num_pages, device=doc_ids.device)[None, :] >= pages_per_seq[doc_ids][:, None]
-    groups = kv_num_blocks.shape[0]
-    used_pages = F.pad(used_pages.masked_fill(past_seq, 0), (0, 0, 0, groups * q_block_size - tokens))
-    packed = unique_static_unsorted(
-        used_pages.reshape(groups, -1).long(), M=num_blocks
-    ).to(torch.int32)
-    kv_indices.copy_(packed)
-    kv_num_blocks.copy_((packed >= 0).sum(dim=-1))
     decode_offset.copy_(query_start_loc[: decode_offset.shape[0]])
-    return pages_per_seq
+    return cdiv(seq_lens, block_size)
+
+
+@torch.compile(dynamic=True, fullgraph=True)
+def step_kv_tiles(
+    visible: Callable[[Tensor, Tensor, Tensor, Tensor], Tensor],
+    doc_ids: Tensor,
+    seq_lens: Tensor,
+    block_table: Tensor,
+    kv_num_blocks: Tensor,
+    kv_indices: Tensor,
+    query_block_tokens: int,
+    block_size: int,
+) -> None:
+    """List, per query block, only the KV tiles holding a key it can see.
+
+    Reserved audio and prompt pages are mostly unwritten or outside the window,
+    so a page-granular list makes the kernel scan masked tiles. ``visible`` is
+    evaluated over each token's whole compact slot space and reduced per tile,
+    so a tile is skipped only if the paged mask rejects all of its keys. A block
+    lists a request's tile once, and split ``s`` takes every ``splits``-th tile.
+    Needs this step's frame, so it runs at forward time, not in the build.
+    """
+    splits, groups, width = kv_indices.shape
+    tokens = doc_ids.shape[0]
+    device = doc_ids.device
+    tiles_per_page = block_size // KV_TILE
+    tiles = block_table.shape[1] * tiles_per_page
+    requests = doc_ids.long()
+    slots = torch.arange(tiles * KV_TILE, device=device)
+    queries = torch.arange(tokens, device=device)
+    zero = torch.zeros((), dtype=torch.long, device=device)
+    seen = visible(zero, zero, queries[:, None], slots) & (slots < seq_lens[requests][:, None])
+    tile = torch.arange(tiles, device=device)
+    pages = block_table[requests][:, tile // tiles_per_page]
+    needed = seen.view(tokens, tiles, KV_TILE).any(-1) & (pages != 0)
+    physical = pages * tiles_per_page + tile % tiles_per_page
+
+    padding = groups * query_block_tokens - tokens
+    needed = F.pad(needed, (0, 0, 0, padding)).view(groups, query_block_tokens, tiles)
+    physical = F.pad(physical, (0, 0, 0, padding)).view(groups, -1)
+    owner = F.pad(requests, (0, padding), value=-1).view(groups, query_block_tokens)
+    same = owner[:, :, None] == owner[:, None, :]
+    first = torch.ones_like(owner, dtype=torch.bool)
+    first[:, 1:] = owner[:, 1:] != owner[:, :-1]
+    needed = ((same[..., None] & needed[:, None]).any(2) & first[..., None]).view(groups, -1)
+    # A stable sort left-packs the needed tiles in slot order.
+    order = torch.sort((~needed).to(torch.uint8), dim=-1, stable=True).indices
+    listed = F.pad(physical.gather(1, order), (0, splits * width - order.shape[1]))
+    kv_indices.copy_(listed.view(groups, width, splits).permute(2, 0, 1))
+    split = torch.arange(splits, device=device)[:, None]
+    kv_num_blocks.copy_(torch.div(needed.sum(-1) - split + splits - 1, splits, rounding_mode="floor"))
 
 
 @dataclass
 class DuplexIOFlexAttentionMetadata(FlexAttentionMetadata):
-    """Upstream metadata whose doc ids arrive already built on the device."""
+    """Upstream metadata whose doc ids arrive already built on the device.
+
+    Its block mask addresses GQA-packed query rows, and its tile lists are
+    written by the first layer that runs, once the step's frame is installed.
+    """
+
+    kv_groups: int = 1
+    kv_tiles_planned: bool = False
 
     def __post_init__(self) -> None:
         self.num_blocks = self.total_cache_tokens // self.block_size
         self.mask_mod = self.get_mask_mod()
+
+    def packed_mask_mod(self, batch: Tensor, head: Tensor, row: Tensor, key: Tensor) -> Tensor:
+        return self.mask_mod(batch, head, torch.div(row, self.kv_groups, rounding_mode="floor"), key)
 
 
 class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
@@ -291,8 +347,8 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
     Slots are addressed by role - an audio ring, then a persistent text region -
     so the only backend-visible differences are the sequence bound (how many
     pages a step scans) and the mask (row causality plus the audio window,
-    instead of token causality). The block mask is upstream's direct build over
-    its persistent index buffers, written by one compiled pass per step.
+    instead of token causality). The block mask lists 64-key tiles over
+    persistent index buffers, split along its batch dimension for small steps.
     """
 
     def __init__(
@@ -303,12 +359,8 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        if not self.direct_build:
-            raise ValueError(
-                "DuplexIO needs FlexAttention's direct block-mask build, which "
-                f"requires the kv block size ({self.kv_block_size}) to equal the "
-                f"cache block size ({self.block_size})"
-            )
+        if self.block_size % KV_TILE:
+            raise ValueError(f"DuplexIO pages ({self.block_size}) must hold whole {KV_TILE}-key tiles")
         if kv_cache_spec.sliding_window is not None or self.rswa_window is not None:
             raise ValueError("DuplexIO applies its audio window in the mask, not a sliding window")
         self.layout = kv_cache_spec.layout
@@ -321,7 +373,10 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
             )
         # Every full-attention layer shares one frame, so one mask serves them all.
         self.duplexio_mask = self._maybe_get_custom_mask_mod(layers)
-        self.max_num_kv_indices = self.q_block_size * self.layout.max_blocks
+        self.kv_groups = self.num_heads_q // self.num_heads_kv
+        if QUERY_BLOCK_ROWS % self.kv_groups:
+            raise ValueError(f"{self.kv_groups} grouped heads do not tile {QUERY_BLOCK_ROWS}-row query blocks")
+        self.query_block_tokens = QUERY_BLOCK_ROWS // self.kv_groups
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.compact_seq_lens = torch.empty(max_num_seqs, dtype=torch.int32, device=device)
         # Written every step and read inside CUDA graphs, so the address is kept.
@@ -332,6 +387,13 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
             device=device,
         )
         self.page_ids = torch.arange(self.layout.max_blocks, dtype=torch.int32, device=device)
+        # A query block can list every tile of each of its tokens' requests.
+        self.max_listed_tiles = self.query_block_tokens * self.layout.max_blocks * (self.block_size // KV_TILE)
+        max_query_blocks = cdiv(vllm_config.scheduler_config.max_num_batched_tokens, self.query_block_tokens)
+        self.tile_indices = torch.zeros(
+            max_query_blocks * (self.max_listed_tiles + MAX_KV_SPLITS), dtype=torch.int32, device=device
+        )
+        self.tile_counts = torch.zeros(max_query_blocks * MAX_KV_SPLITS, dtype=torch.int32, device=device)
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -352,33 +414,27 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
         layout = self.layout
         requests = common.seq_lens.shape[0]
         tokens = int(common.query_start_loc_cpu[-1])
-        groups = cdiv(tokens, self.q_block_size)
-        num_pages = cdiv(layout.max_compact_slots, self.block_size)
         num_blocks = self.cache_config.num_gpu_blocks
         assert num_blocks is not None, "FlexAttention requires num_gpu_blocks to be set"
-        if self.persistent_kv_indices is None:
-            self.persistent_kv_indices = torch.empty(
-                self.max_num_query_groups,
-                self.max_num_kv_indices,
-                dtype=torch.int32,
-                device=self.device,
-            )
+        if self.persistent_physical_to_logical is None:
             self.persistent_physical_to_logical = torch.empty(
                 self.vllm_config.scheduler_config.max_num_seqs,
                 num_blocks,
                 dtype=torch.long,
                 device=self.device,
             )
-        assert self.persistent_physical_to_logical is not None
         # Every slice keeps its address across steps of one batch size, which
         # the paged mask closure and CUDA-graph replay both rely on.
         seq_lens = self.compact_seq_lens[:requests]
         block_table = self.touched_block_table[:requests]
         doc_ids = self.persistent_doc_ids[:tokens]
         physical_to_logical = self.persistent_physical_to_logical[:requests]
-        kv_indices = self.persistent_kv_indices[:groups, : self.q_block_size * num_pages]
-        kv_num_blocks = self.persistent_kv_num_blocks[:groups]
         decode_offset = self.persistent_offset_tensor[:requests]
+        groups = cdiv(tokens, self.query_block_tokens)
+        splits = kv_splits(tokens)
+        width = cdiv(self.max_listed_tiles, splits)
+        kv_num_blocks = self.tile_counts[: splits * groups].view(splits, 1, groups)
+        kv_indices = self.tile_indices[: splits * groups * width].view(splits, 1, groups, width)
         step_page_bounds(
             common.seq_lens,
             common.block_table_tensor,
@@ -387,18 +443,14 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
             block_table,
             layout,
         )
-        pages_per_seq = step_block_mask_tables(
+        pages_per_seq = step_paged_tables(
             common.query_start_loc,
             seq_lens,
             block_table,
             doc_ids,
             physical_to_logical,
-            kv_indices,
-            kv_num_blocks,
             decode_offset,
             self.block_size,
-            self.q_block_size,
-            num_pages,
             num_blocks,
         )
         metadata = DuplexIOFlexAttentionMetadata(
@@ -423,21 +475,22 @@ class DuplexIOFlexAttentionMetadataBuilder(FlexAttentionMetadataBuilder):
             physical_to_logical=physical_to_logical,
             decode_offset=decode_offset,
             num_blocks_per_seq=pages_per_seq,
-            persistent_kv_indices=self.persistent_kv_indices,
-            persistent_kv_num_blocks=self.persistent_kv_num_blocks,
+            persistent_kv_indices=self.tile_indices,
+            persistent_kv_num_blocks=self.tile_counts,
             persistent_doc_ids=self.persistent_doc_ids,
             logical_mask_mod=self.duplexio_mask,
             doc_ids=doc_ids,
-            q_block_size=self.q_block_size,
-            kv_block_size=self.kv_block_size,
+            q_block_size=QUERY_BLOCK_ROWS,
+            kv_block_size=KV_TILE,
             mm_prefix_range=common.mm_req_doc_ranges,
+            kv_groups=self.kv_groups,
         )
         metadata.block_mask = BlockMask.from_kv_blocks(
-            kv_num_blocks[None, None],
-            kv_indices[None, None],
-            BLOCK_SIZE=(self.q_block_size, self.kv_block_size),
-            mask_mod=metadata.mask_mod,
-            seq_lengths=(common.num_actual_tokens, metadata.total_cache_tokens),
+            kv_num_blocks,
+            kv_indices,
+            BLOCK_SIZE=(QUERY_BLOCK_ROWS, KV_TILE),
+            mask_mod=metadata.packed_mask_mod,
+            seq_lengths=(common.num_actual_tokens * self.kv_groups, metadata.total_cache_tokens),
             compute_q_blocks=False,
         )
         return metadata
@@ -462,10 +515,27 @@ class DuplexIOFlexAttentionImpl(FlexAttentionImpl):
             raise NotImplementedError("DuplexIO attention does not support output quantization")
         if attn_metadata is None:
             return output.fill_(0)
+        assert isinstance(attn_metadata, DuplexIOFlexAttentionMetadata)
         tokens = attn_metadata.num_actual_tokens
         query, key, value = query[:tokens], key[:tokens], value[:tokens]
         frame = layer.frame
         assert attn_metadata.doc_ids is not None
+        block_mask = attn_metadata.block_mask
+        assert block_mask is not None
+        # Every layer shares the step's metadata, so the first to run plans
+        # the tiles for all of them, inside the CUDA graph when one is captured.
+        if not attn_metadata.kv_tiles_planned:
+            step_kv_tiles(
+                layer.logical_mask_mod,
+                attn_metadata.doc_ids[:tokens],
+                attn_metadata.seq_lens,
+                attn_metadata.block_table,
+                block_mask.kv_num_blocks[:, 0],
+                block_mask.kv_indices[:, 0],
+                QUERY_BLOCK_ROWS // attn_metadata.kv_groups,
+                attn_metadata.block_size,
+            )
+            attn_metadata.kv_tiles_planned = True
         self.do_kv_cache_update(
             layer,
             key,
@@ -486,9 +556,8 @@ class DuplexIOFlexAttentionImpl(FlexAttentionImpl):
             query,
             keys.view(-1, self.num_kv_heads, self.head_size),
             values.view(-1, self.num_kv_heads, self.head_size),
-            attn_metadata.block_mask,
+            block_mask,
             self.scale,
-            self.num_kv_heads != self.num_heads,
             KERNEL_OPTIONS,
         )
         output[:tokens].copy_(

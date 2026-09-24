@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import Tensor, nn
+from torch.nn.attention.flex_attention import AuxRequest, flex_attention
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.flex_attention import FlexAttentionMetadata, FlexAttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -20,10 +21,14 @@ from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
     make_duplexio_kv_cache_spec,
 )
 from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
+    KV_TILE,
+    QUERY_BLOCK_ROWS,
     DuplexIOFlexAttentionImpl,
     DuplexIOFlexAttentionMetadataBuilder,
     DuplexIOPagedAttention,
+    kv_splits,
     physical_slots,
+    step_kv_tiles,
     step_page_bounds,
 )
 from vllm_omni.model_executor.models.duplexio.row_semantics import (
@@ -31,6 +36,7 @@ from vllm_omni.model_executor.models.duplexio.row_semantics import (
     DUPLEXIO_NUM_TEXT_CELLS,
     duplexio_attention_visible,
 )
+from vllm_omni.model_executor.models.duplexio.stream_attention import merge_self_attention
 
 WINDOW = 2
 # FlexAttention tiles a page with BLOCK_N, so a page cannot be smaller than it.
@@ -455,8 +461,7 @@ def test_only_pages_a_step_can_touch_are_listed(rows: int, prompt_frames: int) -
     assert {int(slot) // BLOCK_SIZE for slot in written[written >= 0]} <= expected
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged cache")
-@pytest.mark.parametrize(
+PAGED_STEPS = pytest.mark.parametrize(
     "sizes,rows",
     [
         ([6], [1]),
@@ -466,11 +471,13 @@ def test_only_pages_a_step_can_touch_are_listed(rows: int, prompt_frames: int) -
         ([6] * 17, list(range(5, 90, 5))),
     ],
 )
-@torch.inference_mode()
-def test_block_mask_tables_match_upstream_direct_build(sizes: list[int], rows: list[int]) -> None:
+
+
+def paged_step(sizes: list[int], rows: list[int], heads: int = 4, kv_heads: int = 2):
+    """Build one step's metadata over live frames, with a shuffled block table."""
     device = torch.device("cuda")
     spec = make_duplexio_kv_cache_spec(
-        FullAttentionSpec(block_size=BLOCK_SIZE, num_kv_heads=2, head_size=64, head_size_v=64, dtype=torch.bfloat16),
+        FullAttentionSpec(block_size=BLOCK_SIZE, num_kv_heads=kv_heads, head_size=64, head_size_v=64, dtype=torch.bfloat16),
         audio_window_frames=WINDOW,
         voice_prompt_frames=2,
         max_model_len=100 * DUPLEXIO_NUM_CELLS,
@@ -479,17 +486,32 @@ def test_block_mask_tables_match_upstream_direct_build(sizes: list[int], rows: l
     requests = len(sizes)
     pages = layout.max_blocks * requests
     frame = DuplexIOFrameMetadata(layout, sum(sizes), device)
-    _, builder, _ = paged_backend(spec, frame, 4, requests, pages + 1)
+    fields = [
+        session_fields(*session_activity(row, 3, request), 2) for request, row in enumerate(rows)
+    ]
+    frame.update(**{
+        name: torch.cat([field[name][field[name].shape[0] - size:] for field, size in zip(fields, sizes)]).to(device)
+        for name in FRAME_FIELDS
+    })
+    layer, builder, impl = paged_backend(spec, frame, heads, requests, pages + 1)
     block_table = (torch.randperm(pages, device=device, dtype=torch.int32) + 1).view(requests, layout.max_blocks)
     seq_lens = [row * DUPLEXIO_NUM_CELLS for row in rows]
+    return layer, builder, impl, block_table, seq_lens
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged cache")
+@PAGED_STEPS
+@torch.inference_mode()
+def test_paged_tables_match_upstream_direct_build(sizes: list[int], rows: list[int]) -> None:
+    _, builder, _, block_table, seq_lens = paged_step(sizes, rows)
+    layout = builder.layout
+    requests = len(sizes)
     metadata = step_metadata(builder, sizes, seq_lens, block_table)
     tables = {name: getattr(metadata, name).clone() for name in UPSTREAM_TABLES}
-    mask = metadata.block_mask
-    mask_tables = {name: getattr(mask, name).clone() for name in ("kv_num_blocks", "kv_indices")}
 
-    # The upstream direct build over the same compact inputs, as the builder
-    # used to run it.
+    # The upstream direct build over the same compact inputs. It sizes its
+    # index table by max_model_len, which the compact layout outgrows.
+    builder.max_num_kv_indices = builder.q_block_size * layout.max_blocks
     common = step_common(sizes, seq_lens, block_table)
     step_page_bounds(
         common.seq_lens,
@@ -513,9 +535,156 @@ def test_block_mask_tables_match_upstream_direct_build(sizes: list[int], rows: l
 
     for name in UPSTREAM_TABLES:
         torch.testing.assert_close(tables[name], getattr(upstream, name), rtol=0, atol=0, msg=name)
-    assert mask.seq_lengths == upstream.block_mask.seq_lengths
-    assert mask.BLOCK_SIZE == upstream.block_mask.BLOCK_SIZE
-    for name, table in mask_tables.items():
-        ours, theirs = getattr(mask, name), getattr(upstream.block_mask, name)
-        assert (ours.data_ptr(), ours.shape, ours.stride()) == (theirs.data_ptr(), theirs.shape, theirs.stride()), name
-        torch.testing.assert_close(table, theirs, rtol=0, atol=0, msg=name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged cache")
+@PAGED_STEPS
+@pytest.mark.parametrize("heads", [4, 8])
+@torch.inference_mode()
+def test_kv_tiles_are_exactly_those_with_a_visible_key(sizes: list[int], rows: list[int], heads: int) -> None:
+    """Each query block lists every tile its packed rows can see, once, and no other."""
+    layer, builder, _, block_table, seq_lens = paged_step(sizes, rows, heads)
+    metadata = step_metadata(builder, sizes, seq_lens, block_table)
+    mask = metadata.block_mask
+    tokens = sum(sizes)
+    step_kv_tiles(
+        layer.logical_mask_mod,
+        metadata.doc_ids,
+        metadata.seq_lens,
+        metadata.block_table,
+        mask.kv_num_blocks[:, 0],
+        mask.kv_indices[:, 0],
+        QUERY_BLOCK_ROWS // metadata.kv_groups,
+        BLOCK_SIZE,
+    )
+
+    packed_rows = tokens * metadata.kv_groups
+    assert mask.seq_lengths == (packed_rows, metadata.total_cache_tokens)
+    device = block_table.device
+    zero = torch.zeros((), dtype=torch.long, device=device)
+    seen = metadata.packed_mask_mod(
+        zero, zero, torch.arange(packed_rows, device=device)[:, None],
+        torch.arange(metadata.total_cache_tokens, device=device)[None],
+    )
+    blocks = -(-packed_rows // QUERY_BLOCK_ROWS)
+    seen = torch.nn.functional.pad(seen, (0, 0, 0, blocks * QUERY_BLOCK_ROWS - packed_rows))
+    visible_tiles = seen.view(blocks, QUERY_BLOCK_ROWS, -1, KV_TILE).any(-1).any(1)
+    counts = mask.kv_num_blocks[:, 0]
+    assert counts.shape == (kv_splits(tokens), blocks)
+    assert (counts.amax(0) - counts.amin(0) <= 1).all()
+    assert bool(visible_tiles.any()) == (max(rows) > 1)
+    for block in range(blocks):
+        listed = torch.cat([mask.kv_indices[split, 0, block, :count] for split, count in enumerate(counts[:, block].tolist())])
+        assert listed.unique().numel() == listed.numel()
+        assert set(listed.tolist()) == set(visible_tiles[block].nonzero()[:, 0].tolist())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged cache")
+@torch.inference_mode()
+def test_tiled_split_kv_matches_the_page_granular_kernel() -> None:
+    """Rollout-shaped decode: 1024-key pages, a wrapped 2048-frame window, a pinned prompt.
+
+    The page-granular path runs upstream's direct block mask with per-head
+    query rows and one KV pass. Both see the same keys through the same bf16
+    kernel arithmetic; the tiled path only reorders the reduction into splits
+    and rounds each split to bf16 before the FP32 merge. So both stay within
+    bf16 noise of an FP32 reference, and of each other.
+    """
+    # A second layout in one process turns its constants symbolic, which
+    # Inductor's flex lowering cannot take. Serving builds a single layout.
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    heads, kv_heads, dim = 16, 4, 64
+    spec = make_duplexio_kv_cache_spec(
+        FullAttentionSpec(block_size=1024, num_kv_heads=kv_heads, head_size=dim, head_size_v=dim, dtype=torch.bfloat16),
+        audio_window_frames=2048,
+        voice_prompt_frames=125,
+        max_model_len=2400 * DUPLEXIO_NUM_CELLS,
+    )
+    layout = spec.layout
+    frames = [126, 700, 1500, 2150, 2600, 3300]
+    requests, tokens = len(frames), len(frames) * DUPLEXIO_NUM_CELLS
+    texts = [400 + frame // 3 for frame in frames]
+    frame = DuplexIOFrameMetadata(layout, tokens, device)
+
+    def per_row(values: list[int]) -> Tensor:
+        return cells(torch.tensor(values, dtype=torch.int32, device=device))
+
+    frame.update(
+        key_active=torch.ones(tokens, dtype=torch.bool, device=device),
+        text_ordinal=torch.zeros(tokens, dtype=torch.int32, device=device),
+        text_last=per_row(texts),
+        audio_first=per_row([max(value - 2048, 1) for value in frames]),
+        audio_last=per_row([value - 1 for value in frames]),
+        prompt_ordinal=torch.zeros(tokens, dtype=torch.int32, device=device),
+        prompt_last=per_row([125] * requests),
+    )
+    pages = layout.max_blocks * requests
+    layer, builder, impl = paged_backend(spec, frame, heads, requests, pages + 1)
+    cache = torch.randn(pages + 1, 1024, kv_heads, 2 * dim, device=device, dtype=torch.bfloat16).transpose(1, 2)
+    cache[0].fill_(torch.nan)
+    block_table = (torch.randperm(pages, device=device, dtype=torch.int32) + 1).view(requests, layout.max_blocks)
+    sizes = [DUPLEXIO_NUM_CELLS] * requests
+    seq_lens = [(-(-text // DUPLEXIO_NUM_TEXT_CELLS) + 1) * DUPLEXIO_NUM_CELLS for text in texts]
+    query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(tokens, kv_heads, dim, device=device, dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    scale = dim**-0.5
+
+    metadata = step_metadata(builder, sizes, seq_lens, block_table)
+    assert metadata.block_mask.kv_num_blocks.shape[0] > 1
+    tiled = impl.forward(layer, query, key, value, cache, metadata, torch.empty_like(query))
+
+    builder.max_num_kv_indices = builder.q_block_size * layout.max_blocks
+    common = step_common(sizes, seq_lens, block_table)
+    upstream = FlexAttentionMetadataBuilder.build(
+        builder,
+        0,
+        common.replace(
+            causal=False,
+            seq_lens=metadata.seq_lens,
+            max_seq_len=layout.max_compact_slots,
+            block_table_tensor=metadata.block_table,
+        ),
+    )
+    upstream.decode_offset.copy_(common.query_start_loc[:requests])
+    keys, values = cache.transpose(1, 2).split(dim, dim=-1)
+    keys, values = keys.reshape(-1, kv_heads, dim), values.reshape(-1, kv_heads, dim)
+    history, auxiliary = torch.compile(flex_attention, fullgraph=True)(
+        query.transpose(0, 1)[None], keys.transpose(0, 1)[None], values.transpose(0, 1)[None],
+        block_mask=upstream.block_mask, scale=scale, enable_gqa=True, return_aux=AuxRequest(lse=True),
+        kernel_options={"FORCE_USE_FLEX_ATTENTION": True, "BLOCK_M": 16, "BLOCK_N": 64},
+    )
+    by_head = (kv_heads, heads // kv_heads)
+    paged = merge_self_attention(
+        query, key, value,
+        history[0].transpose(0, 1).unflatten(1, by_head)[None],
+        auxiliary.lse[0].transpose(0, 1).unflatten(1, by_head)[None],
+        scale,
+    )
+
+    # FP32 over each request's own pages, the diagonal appended as one more key.
+    zero = torch.zeros((), dtype=torch.long, device=device)
+    reference = []
+    for request in range(requests):
+        slots = (block_table[request].long()[:, None] * 1024 + torch.arange(1024, device=device)).flatten()
+        rows = torch.arange(request * DUPLEXIO_NUM_CELLS, (request + 1) * DUPLEXIO_NUM_CELLS, device=device)
+        seen = torch.cat(
+            (metadata.mask_mod(zero, zero, rows[:, None], slots[None]), torch.ones_like(rows, dtype=torch.bool)[:, None]), -1
+        )
+        row_keys = torch.cat((keys[slots][None].expand(rows.shape[0], -1, -1, -1), key[rows, None]), 1)
+        row_values = torch.cat((values[slots][None].expand(rows.shape[0], -1, -1, -1), value[rows, None]), 1)
+        scores = torch.einsum(
+            "thgd,tshd->thgs", query[rows].float().unflatten(1, by_head), row_keys.float()
+        ).mul(scale).masked_fill(~seen[:, None, None], -torch.inf)
+        reference.append(torch.einsum("thgs,tshd->thgd", scores.softmax(-1), row_values.float()).flatten(1, 2))
+    reference = torch.cat(reference)
+
+    paged_error = (paged.float() - reference).abs().max()
+    tiled_error = (tiled.float() - reference).abs().max()
+    assert tiled_error <= 2 * paged_error
+    # Outputs stay below 0.25, where a bf16 ulp is 2**-10; the paths differ in
+    # reduction order and one rounding per split, so allow two ulps.
+    assert reference.abs().max() < 0.25
+    torch.testing.assert_close(tiled, paged, atol=2**-9, rtol=0)
