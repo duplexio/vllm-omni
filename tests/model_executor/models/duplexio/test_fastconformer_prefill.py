@@ -16,6 +16,7 @@ from transformers import (
 
 from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FRAME_SAMPLES,
+    GRAPH_BATCH_SIZES,
     FastConformerAudioStreamState,
     FastConformerRNNT,
     FastConformerStreamState,
@@ -152,9 +153,13 @@ def test_cached_frontend_matches_upstream_processor(encoder, first, device):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
-def test_encoder_graph_preserves_requests_and_output_ownership(encoder, dtype):
+def test_encoder_graph_preserves_requests_and_output_ownership(encoder, dtype, monkeypatch):
     import copy
 
+    # Eager convolutions may round through TF32; the compiled graph's do not.
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    # BF16 compiled replays round differently from eager, and that compounds through the caches.
+    tolerance = {"atol": 1e-5, "rtol": 1e-4} if dtype == torch.float32 else {"atol": 2e-2, "rtol": 2e-2}
     encoder = encoder.to(device="cuda", dtype=dtype)
     reference = copy.deepcopy(encoder)
     encoder.use_cuda_graph = True
@@ -166,11 +171,11 @@ def test_encoder_graph_preserves_requests_and_output_ownership(encoder, dtype):
         expected, old = reference.encode_audio_batch(waveforms, [expected_states[index] for index in order])
         actual, new = encoder.encode_audio_batch(waveforms, [actual_states[index] for index in order])
         for index, value, target, state, target_state in zip(order, actual, expected, new, old, strict=True):
-            torch.testing.assert_close(value, target, atol=1e-5, rtol=1e-4)
+            torch.testing.assert_close(value, target, **tolerance)
             actual_states[index], expected_states[index] = state, target_state
             retained.append((value, value.clone()))
             for cache, reference_cache in zip(state.encoder.tensors(), target_state.encoder.tensors(), strict=True):
-                torch.testing.assert_close(cache, reference_cache, atol=1e-5, rtol=1e-4)
+                torch.testing.assert_close(cache, reference_cache, **tolerance)
     assert set(encoder.graphs) == {2, 4}
     for value, original in retained:
         torch.testing.assert_close(value, original, atol=0, rtol=0)
@@ -181,6 +186,7 @@ def test_encoder_graph_preserves_requests_and_output_ownership(encoder, dtype):
 def test_encoder_graph_rebatches_groups_without_restacking(encoder, monkeypatch):
     import copy
 
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     encoder = encoder.to(device="cuda")
     reference = copy.deepcopy(encoder)
     encoder.use_cuda_graph = True
@@ -228,6 +234,36 @@ def test_encoder_graph_rebatches_groups_without_restacking(encoder, monkeypatch)
         assert state.encoder.seq_length == target_state.encoder.seq_length
         for cache, reference_cache in zip(state.encoder.tensors(), target_state.encoder.tensors(), strict=True):
             torch.testing.assert_close(cache, reference_cache, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
+@torch.inference_mode()
+def test_graphs_captured_before_serving_cover_every_batch(encoder, monkeypatch):
+    import copy
+
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    encoder = encoder.to("cuda")
+    reference = copy.deepcopy(encoder)
+    encoder.use_cuda_graph = True
+    encoder.capture_graphs()
+    assert set(encoder.graphs) == set(GRAPH_BATCH_SIZES)
+    graphs = dict(encoder.graphs)
+    encoder.capture_graphs()
+    # Serving then neither compiles nor captures, whatever the batch size.
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.duplexio.fastconformer.FastConformerGraph.__init__",
+        lambda *args: pytest.fail("captured a graph while serving"),
+    )
+    actual_states = [FastConformerAudioStreamState() for _ in range(5)]
+    expected_states = copy.deepcopy(actual_states)
+    for order in ([0, 1, 2, 3, 4],) * 12 + ([3], [4, 1, 0], [2, 0, 1, 3, 4]):
+        waveforms = [torch.randn(FRAME_SAMPLES, device="cuda") * 0.1 for _ in order]
+        expected, old = reference.encode_audio_batch(waveforms, [expected_states[index] for index in order])
+        actual, new = encoder.encode_audio_batch(waveforms, [actual_states[index] for index in order])
+        for index, value, target, state, target_state in zip(order, actual, expected, new, old, strict=True):
+            torch.testing.assert_close(value, target, atol=1e-5, rtol=1e-4)
+            actual_states[index], expected_states[index] = state, target_state
+    assert encoder.graphs == graphs
 
 
 @pytest.mark.parametrize("frames", [1, 4, 16])

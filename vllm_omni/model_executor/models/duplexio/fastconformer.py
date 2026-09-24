@@ -6,7 +6,7 @@ import copy
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
-from functools import cached_property
+from functools import cached_property, partial
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -685,7 +685,7 @@ class FastConformerRNNT(nn.Module):
                         pool = next(iter(self.graphs.values())).graph.pool() if self.graphs else None
                         padding = batch_size - len(indices)
                         self.graphs[batch_size] = FastConformerGraph(
-                            self.encode_feature_chunk,
+                            partial(steady_encode, self),
                             torch.cat([features, features[-1:].expand(padding, -1, -1)]),
                             FastConformerStreamState.stack(previous + previous[-1:] * padding),
                             pool,
@@ -701,6 +701,30 @@ class FastConformerRNNT(nn.Module):
                 outputs[index] = encoded[row:row + 1]
                 updated[index].encoder = encoder_state
         return outputs, updated
+
+    @torch.inference_mode()
+    def capture_graphs(self) -> None:
+        """Compile and capture every steady batch size before serving starts.
+
+        Otherwise the first steady window of each size would stall all live
+        streams while it compiles, and allocate graph memory that vLLM's memory
+        profiling never saw.
+        """
+        if not self.use_cuda_graph or self.graphs:
+            return
+        streams = GRAPH_BATCH_SIZES[-1]
+        states = [FastConformerAudioStreamState() for _ in range(streams)]
+        silence = [torch.zeros(FRAME_SAMPLES, device=self.mel_filters.device) for _ in range(streams)]
+        self.use_cuda_graph = False
+        try:
+            while states[0].encoder.cached_frames < self.model.config.encoder_config.sliding_window - 1:
+                _, states = self.encode_audio_batch(silence, states)
+        finally:
+            self.use_cuda_graph = True
+        # Size one specializes; the second size compiles once for all the rest.
+        for size in GRAPH_BATCH_SIZES:
+            _, states[:size] = self.encode_audio_batch(silence[:size], states[:size])
+        assert set(self.graphs) == set(GRAPH_BATCH_SIZES)
 
     def prediction_step(
         self,
@@ -823,3 +847,8 @@ class FastConformerRNNT(nn.Module):
             max_new_tokens=frame_count * self.model.max_symbols_per_step,
             streamer=streamer,
         )[0]
+
+
+# Only captured steady windows compile: their shapes differ in batch alone, and
+# fusing the encoder's elementwise work shortens every replay.
+steady_encode = torch.compile(FastConformerRNNT.encode_feature_chunk, fullgraph=True)

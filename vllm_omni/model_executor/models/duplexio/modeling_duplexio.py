@@ -1548,7 +1548,10 @@ class DuplexIOForConditionalGeneration(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
+        loaded = AutoWeightsLoader(self).load_weights(weights)
+        if any(name.startswith("user_asr.") for name in loaded):
+            self.user_asr.capture_graphs()
+        return loaded
 
     @classmethod
     def get_mamba_state_dtype_from_config(
