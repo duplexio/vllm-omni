@@ -350,7 +350,10 @@ class FastConformerGraph:
     Inputs and outputs are packed: caches come in with one copy per run of rows
     and leave, together with the hidden states, as one flat clone. Graphs of
     every batch size may share one memory ``pool``: replays run one at a time on
-    one stream, and only each graph's packed output outlives its replay.
+    one stream, and only each graph's packed output outlives its replay. They
+    also share a capture ``stream`` of their own: cuBLAS keys its workspace by
+    stream, and graphs captured on torch's default capture stream all bake in
+    one workspace, which a replay beside other graphs would race on.
     """
 
     def __init__(
@@ -359,6 +362,7 @@ class FastConformerGraph:
         features: Tensor,
         state: FastConformerStreamState,
         pool: tuple[int, int] | None = None,
+        stream: torch.cuda.Stream | None = None,
     ) -> None:
         self.features = features.clone()
         self.layout = FlatCacheLayout(state)
@@ -372,14 +376,14 @@ class FastConformerGraph:
             private = [*tensors[:count], *(tensor.clone() for tensor in tensors[count:])]
             return encode(self.features, FastConformerStreamState(*self.layout.containers(private)))
 
-        stream = torch.cuda.Stream(device=features.device)
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
+        self.stream = stream or torch.cuda.Stream(device=features.device)
+        self.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.stream):
             for _ in range(3):
                 run()
-        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.current_stream().wait_stream(self.stream)
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, pool=pool):
+        with torch.cuda.graph(self.graph, pool=pool, stream=self.stream):
             hidden, output_state = run()
             self.output = FlatCacheLayout.pack([hidden, *output_state.tensors()])
         output_layout = FlatCacheLayout(output_state)
@@ -682,13 +686,13 @@ class FastConformerRNNT(nn.Module):
                     batch_size = graph_batch_size(len(indices))
                     if batch_size not in self.graphs:
                         # A pool lives only as long as a graph using it.
-                        pool = next(iter(self.graphs.values())).graph.pool() if self.graphs else None
+                        first = next(iter(self.graphs.values()), None)
                         padding = batch_size - len(indices)
                         self.graphs[batch_size] = FastConformerGraph(
                             partial(steady_encode, self),
                             torch.cat([features, features[-1:].expand(padding, -1, -1)]),
                             FastConformerStreamState.stack(previous + previous[-1:] * padding),
-                            pool,
+                            first and first.graph.pool(), first and first.stream,
                         )
                     encoded, cache = self.graphs[batch_size](features, previous)
                 else:
