@@ -39,4 +39,8 @@ class AudioInputAdapter(nn.Module):
         self.output_proj = nn.Linear(hidden_dim, output_dim, bias=False)
 
     def forward(self, audio_features: Tensor) -> Tensor:
-        return audio_adapter(audio_features, self.gate_up_proj.weight, self.output_proj.weight)
+        # The first projection computes in the weight dtype either way (autocast
+        # or matching inputs); casting first keeps prompt-only FP32 and sampled
+        # BF16 batches on one compiled graph.
+        weight = self.gate_up_proj.weight
+        return audio_adapter(audio_features.to(weight.dtype), weight, self.output_proj.weight)
