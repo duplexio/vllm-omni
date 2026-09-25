@@ -1,4 +1,4 @@
-"""Fused frame construction preserves prefix masks and running text ordinals."""
+"""Fused frame construction preserves prefix masks and running persistent ordinals."""
 
 import pytest
 import torch
@@ -29,8 +29,7 @@ def test_compiled_frame_inputs_preserve_layout() -> None:
         prompt = torch.arange(frames, device="cuda") < prompt_count
         for start in (0, 1, 9, 1057):
             metadata = torch.tensor([
-                (start, start // 4 + (row if live else 0), live,
-                 min(row + 1, prompt_count), row < prompt_count, row)
+                (start, start // 4 + (row if live else 0), live, row < prompt_count, row)
                 for row in range(frames)
             ], dtype=torch.int32, device="cuda")
             # Audio time is frozen on a text-only append, which `live` selects.
@@ -41,21 +40,18 @@ def test_compiled_frame_inputs_preserve_layout() -> None:
             actual = compiled(*arguments)
             for output, reference in zip(actual, expected, strict=True):
                 torch.testing.assert_close(output, reference, rtol=0, atol=0)
-            ordinals = []
+            # Voice-prompt keys and emitted text share one dense ordinal.
+            ordinals, last = [], []
             counter = start
-            for row in ids.tolist():
+            for row, is_prompt in zip(ids.tolist(), prompt.tolist(), strict=True):
+                last.extend([counter] * 6)
                 for token in row:
                     counter += token not in (0, 1)
                     ordinals.append(counter if token not in (0, 1) else 0)
-                ordinals.extend((0, 0))
+                counter += is_prompt
+                ordinals.extend((0, counter if is_prompt else 0))
             assert actual[2].tolist() == ordinals
+            # A row sees only the keys written before it.
+            assert actual[3].tolist() == last
             assert actual[1].view(frames, 6)[:, 4].eq(live).all()
             assert actual[1].view(frames, 6)[:, 5].eq(prompt | live).all()
-            prompt_ordinal = actual[6].view(frames, 6)
-            assert not prompt_ordinal[:, :4].any()
-            expected_ordinals = torch.where(prompt, prompt.cumsum(0), 0)
-            assert prompt_ordinal[:, 4:].eq(expected_ordinals[:, None]).all()
-            # A prompt row sees only the prompt frames before it.
-            assert actual[7].view(frames, 6).eq(
-                (prompt.cumsum(0) - prompt.int())[:, None]
-            ).all()

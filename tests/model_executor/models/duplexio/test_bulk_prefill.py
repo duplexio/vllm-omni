@@ -131,12 +131,12 @@ def test_packed_preprocess_preserves_mixed_request_boundaries() -> None:
     tool_state = request_state(model)
     tool_state.frames_seen = 19
     tool_state.audio_position = 11
-    tool_state.active_text_tokens = 23
+    tool_state.persistent_keys = 23
     tool = input_info(tool_state, [6, 7, 8], system=True)
     live_state = request_state(model)
     live_state.frames_seen = 40
     live_state.audio_position = 30
-    live_state.active_text_tokens = 53
+    live_state.persistent_keys = 53
     live_state.text_input_ids = torch.tensor([2, 9, 12, 2])
     live = {
         "duplexio_model_state": live_state,
@@ -146,6 +146,7 @@ def test_packed_preprocess_preserves_mixed_request_boundaries() -> None:
     # Prefix continuation begins inside the speaker prompt, then crosses into text.
     partial = input_info(request_state(model), [3, 4, 5], system=False)
     partial["duplexio_model_state"].frames_seen = 1
+    partial["duplexio_model_state"].persistent_keys = 1
     partial["duplex_token_offset"] = 6
     infos = dict(zip(("live", "prefix", "tool", "partial"), (live, prefix, tool, partial), strict=True))
     counts = (1, 5, 3, 4)
@@ -165,10 +166,10 @@ def test_packed_preprocess_preserves_mixed_request_boundaries() -> None:
         for field in ("duplexio", "duplexio_replay"):
             for name, value in reference_updates[field].items():
                 torch.testing.assert_close(updates[field][name], value, rtol=0, atol=0)
-        for name in ("frames_seen", "audio_position", "active_text_tokens"):
+        for name in ("frames_seen", "audio_position", "persistent_keys"):
             assert getattr(updates["duplexio_working_state"], name) == getattr(reference_updates["duplexio_working_state"], name)
     assert live_state.frames_seen == 40
-    assert tool_state.active_text_tokens == 23
+    assert tool_state.persistent_keys == 23
 
 
 @torch.inference_mode()
@@ -188,8 +189,8 @@ def test_tool_bulk_and_serial_frames_are_identical() -> None:
         key: []
         for key in (
             "key_active",
-            "text_ordinals",
-            "text_last",
+            "persistent_ordinal",
+            "persistent_last",
             "audio_first",
             "audio_last",
         )
@@ -210,7 +211,7 @@ def test_tool_bulk_and_serial_frames_are_identical() -> None:
 
     state = bulk_update["duplexio_working_state"]
     assert state.frames_seen == serial_state.frames_seen == 8
-    assert state.active_text_tokens == serial_state.active_text_tokens == 3
+    assert state.persistent_keys == serial_state.persistent_keys == 3
     assert state.audio_position == serial_state.audio_position == 0
     assert state.user_asr.next_mel_frame == 0
     assert initial.user_asr.next_mel_frame == 0
@@ -288,8 +289,11 @@ def test_recorded_prefix_encodes_only_the_speaker_prompt() -> None:
     assert state.audio_position == 0
     masks = update["duplexio"]
     assert masks["key_active"].view(5, 6)[:, 4:].tolist() == [[False, True]] * 2 + [[False, False]] * 3
-    assert masks["prompt_ordinal"].view(5, 6)[:, 4].tolist() == [1, 2, 0, 0, 0]
-    assert masks["prompt_last"].view(5, 6)[:, 0].tolist() == [0, 1, 2, 2, 2]
+    # Prompt keys, then the system text, share one dense persistent ordinal.
+    ordinals = masks["persistent_ordinal"].view(5, 6)
+    assert ordinals[:, 5].tolist() == [1, 2, 0, 0, 0]
+    assert ordinals[:, 0].tolist() == [0, 0, 3, 4, 5]
+    assert masks["persistent_last"].view(5, 6)[:, 0].tolist() == [0, 1, 2, 3, 4]
     assert len(model.audio_codec.waveforms) == 1
     torch.testing.assert_close(model.audio_codec.waveforms[0], torch.ones(2 * 1920))
 
@@ -334,7 +338,7 @@ def test_scheduler_chunks_preserve_embeddings_masks_and_replay(system: bool, chu
     for group in ("duplexio", "duplexio_replay"):
         for key, expected in bulk_update[group].items():
             torch.testing.assert_close(torch.cat([update[group][key] for update in updates]), expected)
-    for name in ("frames_seen", "audio_position", "active_text_tokens"):
+    for name in ("frames_seen", "audio_position", "persistent_keys"):
         assert getattr(state, name) == getattr(bulk_update["duplexio_working_state"], name)
     assert state.user_asr.next_mel_frame == bulk_update["duplexio_working_state"].user_asr.next_mel_frame
     assert state.input_mimi.encoder_transformer.position == bulk_update["duplexio_working_state"].input_mimi.encoder_transformer.position
@@ -381,4 +385,4 @@ def test_compacted_scheduler_offsets_do_not_change_model_positions() -> None:
     _, _, update = model.preprocess(torch.zeros(18, dtype=torch.long), None, **info)
     torch.testing.assert_close(update['duplexio']['positions'], torch.arange(300_000, 300_018))
     assert update['duplexio_working_state'].frames_seen == 50_003
-    assert update['duplexio_working_state'].active_text_tokens == 3
+    assert update['duplexio_working_state'].persistent_keys == 3

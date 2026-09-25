@@ -60,14 +60,14 @@ def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
         system_token_ids=(1, 2, 3),
         frames_seen=100_000,
         audio_position=99_000,
-        active_text_tokens=250_000,
+        persistent_keys=250_000,
     )
 
     fork = state.fork()
 
     assert fork.frames_seen == 100_000
     assert fork.audio_position == 99_000
-    assert fork.active_text_tokens == 250_000
+    assert fork.persistent_keys == 250_000
     assert fork.text_input_ids.shape == (4,)
     assert fork.agent_audio_codes.shape == (8,)
     assert fork.agent_delay.previous_acoustic_codes.shape == (7,)

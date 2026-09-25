@@ -21,7 +21,7 @@ def test_frame_projection_graph_matches_independent_requests_and_weight_refresh(
         ids = torch.randint(1, 20, (size, 4), device="cuda")
         ids[:, 0] = model.silence_token_id
         metadata = torch.tensor(
-            [(index * 17, index * 9, True, 2, False, index * 20) for index in range(size)],
+            [(index * 17, index * 9, True, False, index * 20) for index in range(size)],
             dtype=torch.int32, device="cuda",
         )
         user = torch.randn(size, 8, device="cuda")

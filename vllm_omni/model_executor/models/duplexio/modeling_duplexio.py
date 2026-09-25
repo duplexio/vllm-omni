@@ -173,7 +173,8 @@ class DuplexIORequestState:
     tool_call_constraint: ToolCallConstraintState | None = None
     frames_seen: int = 0
     audio_position: int = 0
-    active_text_tokens: int = 0
+    # Keys in the never-expiring cache region: voice prompt, then emitted text.
+    persistent_keys: int = 0
     tool_call_sequence: int = 0
     sampling: RequestSampling | None = None
     # The step whose sampled ids this request still waits for on the host.
@@ -537,12 +538,10 @@ class DuplexIOForConditionalGeneration(
         }
         self.frame.update(
             key_active=cells["key_active"],
-            text_ordinal=cells["text_ordinals"],
-            text_last=cells["text_last"],
+            persistent_ordinal=cells["persistent_ordinal"],
+            persistent_last=cells["persistent_last"],
             audio_first=cells["audio_first"],
             audio_last=cells["audio_last"],
-            prompt_ordinal=cells["prompt_ordinal"],
-            prompt_last=cells["prompt_last"],
         )
         positions = cells["positions"]
         self.frame.positions[:positions.numel()].copy_(positions)
@@ -686,7 +685,7 @@ class DuplexIOForConditionalGeneration(
         audio = self.prepare_audio_requests(requests, device)
         ids = []
         rows = []
-        preceding_text = 0
+        preceding_keys = 0
         for item, (_, info) in zip(audio, requests, strict=True):
             state = item.state
             start, count = item.frame_start, item.frame_count
@@ -707,18 +706,18 @@ class DuplexIOForConditionalGeneration(
                 state.text_input_ids = torch.full_like(state.text_input_ids, self.silence_token_id)
             else:
                 text[:, 0] = self.silence_token_id
-            prompt_written = min(state.frames_seen, state.voice_prompt.numel() // self.config.frame_size)
             # CPU state provides packed-row offsets; no device readback is needed.
             rows.extend(
-                (state.active_text_tokens - preceding_text,
+                (state.persistent_keys - preceding_keys,
                  state.audio_position + (row if live else 0), live,
-                 prompt_written + min(row + 1, item.prompt_chunk_frames),
                  row < item.prompt_chunk_frames, state.frames_seen + row)
                 for row in range(count)
             )
-            emitted = ((text != self.pad_token_id) & (text != self.silence_token_id)).sum().item()
-            state.active_text_tokens += emitted
-            preceding_text += emitted
+            written = item.prompt_chunk_frames + (
+                (text != self.pad_token_id) & (text != self.silence_token_id)
+            ).sum().item()
+            state.persistent_keys += written
+            preceding_keys += written
             state.frames_seen += count
             if live:
                 state.audio_position += count
@@ -739,16 +738,15 @@ class DuplexIOForConditionalGeneration(
                 outputs = self.project_frames(*inputs)
         embeddings, *addressing = outputs
         positions = (
-            metadata[:, 5, None] * DUPLEXIO_NUM_CELLS + torch.arange(DUPLEXIO_NUM_CELLS, device=device)
+            metadata[:, 4, None] * DUPLEXIO_NUM_CELLS + torch.arange(DUPLEXIO_NUM_CELLS, device=device)
         ).flatten()
         packed_cells = dict(zip(
-            ("positions", "key_active", "text_ordinals", "text_last",
-             "audio_first", "audio_last", "prompt_ordinal", "prompt_last"),
+            ("positions", "key_active", "persistent_ordinal", "persistent_last", "audio_first", "audio_last"),
             (positions, *addressing), strict=True,
         ))
         packed_replay = {
             "text_ids": text_ids, "user_features": user_features, "agent_audio": agent_codes,
-            "audio_mask": metadata[:, 2] != 0, "prompt_frames": metadata[:, 4] != 0,
+            "audio_mask": metadata[:, 2] != 0, "prompt_frames": metadata[:, 3] != 0,
         }
         results = []
         offset = 0
@@ -921,10 +919,10 @@ class DuplexIOForConditionalGeneration(
         return OmniOutput(
             text_hidden_states=hidden_states,
             multimodal_outputs=cast(Any, step),
-            # Four text slots per scheduler row; audio and voice KV have fixed
-            # reserved regions. Keep one row to preserve the recurrent-state marker.
+            # Four persistent slots per scheduler row; audio KV has a fixed
+            # reserved ring. Keep one row to preserve the recurrent-state marker.
             streaming_retained_tokens=[
-                max(1, (state.active_text_tokens + 3) // 4) * DUPLEXIO_NUM_CELLS for state in states
+                max(1, (state.persistent_keys + 3) // 4) * DUPLEXIO_NUM_CELLS for state in states
             ],
             streaming_position_budget=[
                 (self.text_config.max_position_embeddings - state.frames_seen) * DUPLEXIO_NUM_CELLS
@@ -1597,28 +1595,28 @@ def frame_inputs(
     silence_token_id: int,
     metadata: Tensor,
     audio_window_frames: int,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Assemble six-cell inputs and cache addressing without changing CPU state.
 
     Besides the flattened embeddings this returns one entry per cell: whether the
-    cell contributes a key, its 1-based text emission ordinal (0 when it emits
-    nothing), how many text keys strictly earlier rows emitted, and the inclusive
-    range of audio frames the cell may attend. Audio frames are numbered from
-    one in audio time, which only advances on frames carrying real audio, so a
-    text-only append leaves the range frozen and writes no audio key.
+    cell contributes a key, its 1-based persistent ordinal (0 when it writes no
+    persistent key), how many persistent keys strictly earlier rows wrote, and
+    the inclusive range of audio frames the cell may attend. Audio frames are
+    numbered from one in audio time, which only advances on frames carrying real
+    audio, so a text-only append leaves the range frozen and writes no audio key.
 
-    A pinned voice-prompt burst is the one frame kind that carries audio without
-    being live: only its agent-audio cell contributes a key; audio time stays frozen and
-    the keys land in the cache's pinned region, which no window expires.
+    Persistent keys are those no window expires: emitted text, and the pinned
+    voice prompt. A prompt burst is the one frame kind that carries audio
+    without being live: only its agent-audio cell contributes a key, and audio
+    time stays frozen.
 
-    Metadata is int32, one row per packed frame: text-cumsum offset, audio
-    position, live flag, total prompt frames seen, prompt flag, absolute frame.
-    The text offset subtracts preceding requests' emissions, isolating the scan.
+    Metadata is int32, one row per packed frame: persistent-cumsum offset, audio
+    position, live flag, prompt flag, absolute frame. The offset subtracts
+    preceding requests' keys, isolating the scan.
     """
     frames, device = text_ids.shape[0], text_ids.device
-    text_offsets, audio_last = metadata[:, 0], metadata[:, 1]
-    audio_active, prompt_frames = metadata[:, 2] != 0, metadata[:, 4] != 0
-    prompt_total = metadata[:, 3]
+    offsets, audio_last = metadata[:, 0], metadata[:, 1]
+    audio_active, prompt_frames = metadata[:, 2] != 0, metadata[:, 3] != 0
     acoustic = (audio_active | prompt_frames)[:, None]
     user_hidden = user_hidden.masked_fill(~acoustic, 0)
     agent_hidden = agent_hidden.masked_fill(~acoustic, 0)
@@ -1627,37 +1625,18 @@ def frame_inputs(
         (text_hidden + channel_embedding, user_hidden.unsqueeze(1), agent_hidden.unsqueeze(1)), dim=1,
     ).flatten(0, 1)
     text_active = (text_ids != pad_token_id) & (text_ids != silence_token_id)
-    audio_shape = (frames, 2)
-    audio_keyed = torch.stack(
-        (audio_active, prompt_frames | audio_active), dim=-1,
-    )
     key_active = torch.cat(
-        (text_active, audio_keyed), dim=1,
+        (text_active, audio_active[:, None], (prompt_frames | audio_active)[:, None]), dim=1,
     ).flatten()
-    ordinals = (
-        text_active.flatten().cumsum(0, dtype=torch.int32).view_as(text_active) + text_offsets[:, None]
+    persistent = torch.cat(
+        (text_active, torch.zeros_like(prompt_frames)[:, None], prompt_frames[:, None]), dim=1,
     )
-    text_ordinals = torch.cat(
-        (torch.where(text_active, ordinals, 0), torch.zeros(audio_shape, dtype=torch.int32, device=device)),
-        dim=1,
-    ).flatten()
-    # A row sees the text its predecessors emitted, never its own siblings'.
-    row_emitted = text_active.sum(1, dtype=torch.int32)
-    text_last = row_emitted.cumsum(0) - row_emitted + text_offsets
+    ordinals = persistent.flatten().cumsum(0, dtype=torch.int32).view_as(persistent) + offsets[:, None]
+    # A row sees the keys its predecessors wrote; its own cell is its self key,
+    # which the mask merges separately, and it never sees its siblings'.
+    row_keys = persistent.sum(1, dtype=torch.int32)
+    persistent_last = row_keys.cumsum(0) - row_keys + offsets
     audio_first = (audio_last + audio_active - audio_window_frames).clamp_min(1)
-    # A prompt row's own pinned key is its self key, which the mask merges
-    # separately, so a row sees only the prompt frames written before it.
-    prompt_ordinal_rows = torch.where(prompt_frames, prompt_total, 0)
-    prompt_last_rows = torch.where(prompt_frames, prompt_total - 1, prompt_total)
-    prompt_ordinal = torch.cat(
-        (
-            torch.zeros(
-                (frames, DUPLEXIO_NUM_TEXT_CELLS), dtype=torch.int32, device=device
-            ),
-            prompt_ordinal_rows[:, None].expand(-1, 2),
-        ),
-        dim=1,
-    ).flatten()
 
     def per_cell(values: Tensor) -> Tensor:
         """Give every cell of a row the row's value."""
@@ -1666,12 +1645,10 @@ def frame_inputs(
     return (
         embeddings,
         key_active,
-        text_ordinals,
-        per_cell(text_last),
+        torch.where(persistent, ordinals, 0).flatten(),
+        per_cell(persistent_last),
         per_cell(audio_first),
         per_cell(audio_last),
-        prompt_ordinal,
-        per_cell(prompt_last_rows),
     )
 
 

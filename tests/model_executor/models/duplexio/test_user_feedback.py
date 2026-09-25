@@ -257,9 +257,12 @@ def test_chunked_context_records_all_rows_and_samples_only_at_boundary():
                 "duplex": {"frame_count": 5, f"duplexio_{context}": True, "decode_audio": False,
                            "duplexio_system_token_ids": [6, 7, 8, 9, 10], "runtime_config": runtime()},
             }
+            keys = state.persistent_keys
             _, _, updates = model.preprocess(torch.zeros(frames * 6, dtype=torch.long), None, **info)
             if context == "system_input":
-                assert updates["duplexio"]["prompt_last"].tolist() == [2] * (frames * 6)
+                # System input sees the pinned prompt and all earlier text.
+                assert keys >= 2
+                assert updates["duplexio"]["persistent_last"][0].item() == keys
             info.update(updates)
             output = model.make_omni_output(
                 torch.randn(frames * 6, 11), model_intermediate_buffer=[info],

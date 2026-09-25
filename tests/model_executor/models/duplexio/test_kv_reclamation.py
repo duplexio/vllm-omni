@@ -33,32 +33,31 @@ def install_row(
     frame: DuplexIOFrameMetadata,
     *,
     text_active: torch.Tensor,
-    emitted_before: int,
+    persistent_before: int,
     audio_frame: int,
     audio_active: bool = True,
-    prompt_ordinal: int = 0,
-    prompt_before: int = 0,
+    pinned: bool = False,
 ) -> None:
     """Install one row, mirroring what ``frame_inputs`` computes for it.
 
     ``audio_frame`` is the one-based audio-time position the row's own audio
     occupies (or, for a frozen row, the last position already recorded) and
-    ``emitted_before`` how many text cells the session emitted before the row.
-    A pinned voice-prompt row sets ``prompt_ordinal`` to its one-based place in
-    the prompt; ``prompt_before`` is how many prompt frames precede the row.
+    ``persistent_before`` how many never-expiring keys the session wrote before
+    the row. A ``pinned`` voice-prompt row writes its agent audio as one such key.
     """
+    persistent = torch.cat((text_active, torch.tensor([False, pinned])))
     ordinals = torch.where(
-        text_active,
-        emitted_before + text_active.cumsum(0, dtype=torch.int32),
-        0,
+        persistent, persistent_before + persistent.cumsum(0, dtype=torch.int32), 0
     )
     window = frame.layout.audio_window_frames
     frame.update(
         key_active=torch.cat(
-            (text_active, torch.tensor([audio_active, audio_active or prompt_ordinal > 0]))
+            (text_active, torch.tensor([audio_active, audio_active or pinned]))
         ),
-        text_ordinal=torch.cat((ordinals, torch.zeros(2, dtype=torch.int32))),
-        text_last=torch.full((DUPLEXIO_NUM_CELLS,), emitted_before, dtype=torch.int32),
+        persistent_ordinal=ordinals,
+        persistent_last=torch.full(
+            (DUPLEXIO_NUM_CELLS,), persistent_before, dtype=torch.int32
+        ),
         audio_first=torch.full(
             (DUPLEXIO_NUM_CELLS,), max(audio_frame - window, 1), dtype=torch.int32
         ),
@@ -67,26 +66,16 @@ def install_row(
             audio_frame - 1 if audio_active else audio_frame,
             dtype=torch.int32,
         ),
-        prompt_ordinal=torch.cat(
-            (
-                torch.zeros(DUPLEXIO_NUM_TEXT_CELLS, dtype=torch.int32),
-                torch.full((2,), prompt_ordinal, dtype=torch.int32),
-            )
-        ),
-        prompt_last=torch.full(
-            (DUPLEXIO_NUM_CELLS,), prompt_before, dtype=torch.int32
-        ),
     )
 
 
 def test_compact_cache_attention_matches_logical_rows_across_audio_eviction() -> None:
     torch.manual_seed(11)
-    # Five ring frames for a two-frame window: the ring wraps every five rows,
-    # so resident keys are both overwritten and outlived by the window.
+    # Three ring frames for a two-frame window: the ring wraps every three
+    # rows, so resident keys are both overwritten and outlived by the window.
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=2,
-        voice_prompt_frames=1,
         max_model_len=5 * DUPLEXIO_NUM_CELLS,
     )
     frame = frame_metadata(layout)
@@ -108,7 +97,7 @@ def test_compact_cache_attention_matches_logical_rows_across_audio_eviction() ->
         install_row(
             frame,
             text_active=text_active,
-            emitted_before=emitted,
+            persistent_before=emitted,
             audio_frame=audio_frame,
         )
         emitted += int(text_active.sum())
@@ -155,7 +144,6 @@ def test_audio_ring_reuses_a_bounded_set_of_slots() -> None:
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=8,
-        voice_prompt_frames=1,
         max_model_len=600_000,
     )
     rows = 500
@@ -164,34 +152,31 @@ def test_audio_ring_reuses_a_bounded_set_of_slots() -> None:
     cells = torch.arange(tokens)
     frame.update(
         key_active=torch.ones(tokens, dtype=torch.bool),
-        text_ordinal=torch.zeros(tokens, dtype=torch.int32),
-        text_last=torch.zeros(tokens, dtype=torch.int32),
+        persistent_ordinal=torch.zeros(tokens, dtype=torch.int32),
+        persistent_last=torch.zeros(tokens, dtype=torch.int32),
         audio_first=torch.ones(tokens, dtype=torch.int32),
         audio_last=torch.div(cells, DUPLEXIO_NUM_CELLS, rounding_mode="floor").int(),
-        prompt_ordinal=torch.zeros(tokens, dtype=torch.int32),
-        prompt_last=torch.zeros(tokens, dtype=torch.int32),
     )
 
     written = frame.write_slots(tokens)
     audio_slots = written[cells % DUPLEXIO_NUM_CELLS >= DUPLEXIO_NUM_TEXT_CELLS]
 
-    assert audio_slots.unique().numel() == 2 * (layout.audio_window_frames + 64)
+    assert audio_slots.unique().numel() == 2 * (layout.audio_window_frames + 1)
     assert int(audio_slots.max()) < layout.audio_slots
-    assert layout.audio_slots <= layout.persistent_text_base
+    assert layout.audio_slots <= layout.persistent_base
 
 
 def test_frozen_audio_rows_write_emitted_text_but_no_audio() -> None:
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=8,
-        voice_prompt_frames=1,
         max_model_len=60,
     )
     frame = frame_metadata(layout)
     install_row(
         frame,
         text_active=torch.tensor([True, False, False, False]),
-        emitted_before=3,
+        persistent_before=3,
         audio_frame=7,
         audio_active=False,
     )
@@ -202,7 +187,7 @@ def test_frozen_audio_rows_write_emitted_text_but_no_audio() -> None:
     # resident at the same audio position.
     assert torch.equal(
         written,
-        torch.tensor([layout.persistent_text_base + 3, -1, -1, -1, -1, -1]),
+        torch.tensor([layout.persistent_base + 3, -1, -1, -1, -1, -1]),
     )
 
 
@@ -210,14 +195,13 @@ def test_live_row_writes_its_own_audio_frame_into_the_ring() -> None:
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=8,
-        voice_prompt_frames=1,
         max_model_len=60,
     )
     frame = frame_metadata(layout)
     install_row(
         frame,
         text_active=torch.zeros(DUPLEXIO_NUM_TEXT_CELLS, dtype=torch.bool),
-        emitted_before=0,
+        persistent_before=0,
         audio_frame=3,
     )
 
@@ -230,14 +214,13 @@ def test_padded_graph_tokens_neither_write_nor_see_a_slot() -> None:
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=2,
-        voice_prompt_frames=1,
         max_model_len=60,
     )
     frame = frame_metadata(layout, rows=2)
     install_row(
         frame,
         text_active=torch.ones(DUPLEXIO_NUM_TEXT_CELLS, dtype=torch.bool),
-        emitted_before=4,
+        persistent_before=4,
         audio_frame=5,
     )
 
@@ -283,7 +266,6 @@ def test_cache_manager_reserves_once_and_releases_every_block_on_teardown() -> N
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=8,
-        voice_prompt_frames=1,
         max_model_len=600,
     )
     pool = _BlockPool()
@@ -338,7 +320,7 @@ def test_cache_spec_registers_native_manager_and_preserves_page_contract() -> No
     )
 
     spec = make_duplexio_kv_cache_spec(
-        base, audio_window_frames=8, voice_prompt_frames=1, max_model_len=600
+        base, audio_window_frames=8, max_model_len=600
     )
 
     assert KVCacheSpecRegistry.get_manager_class(spec) is DuplexIOKVCacheManager
@@ -358,81 +340,73 @@ def test_cache_spec_rejects_pages_flex_cannot_tile() -> None:
 
     with pytest.raises(ValueError, match="power-of-two"):
         make_duplexio_kv_cache_spec(
-            base, audio_window_frames=8, voice_prompt_frames=1, max_model_len=600
+            base, audio_window_frames=8, max_model_len=600
         )
 
 
-def test_pinned_prompt_rows_land_outside_the_ring_and_never_expire() -> None:
+def test_pinned_prompt_and_text_share_one_region_that_never_expires() -> None:
     # One audio frame of window, two pinned prompt frames ahead of the session.
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=1,
-        voice_prompt_frames=2,
         max_model_len=8 * DUPLEXIO_NUM_CELLS,
     )
     frame = frame_metadata(layout)
     silent = torch.zeros(DUPLEXIO_NUM_TEXT_CELLS, dtype=torch.bool)
 
-    prompt_slots = []
-    for ordinal in (1, 2):
+    written = []
+    for before in (0, 1):
         install_row(
             frame,
             text_active=silent,
-            emitted_before=0,
+            persistent_before=before,
             audio_frame=0,
             audio_active=False,
-            prompt_ordinal=ordinal,
-            prompt_before=ordinal - 1,
+            pinned=True,
         )
-        written = frame.write_slots(DUPLEXIO_NUM_CELLS)
-        prompt_slots.append(written[DUPLEXIO_NUM_TEXT_CELLS:].tolist())
-
-    # Prompt frames are dense in their own region: neither collides with the
-    # ring, whose slots start at zero, nor with each other.
-    assert prompt_slots == [
-        [-1, layout.prompt_base],
-        [-1, layout.prompt_base + 1],
-    ]
-    assert layout.audio_slots <= layout.prompt_base
-    assert layout.prompt_base + layout.prompt_slots <= layout.persistent_text_base
-
-    # A live row far past the window still sees both pinned frames, while its own
-    # ring history has expired.
+        written.append(frame.write_slots(DUPLEXIO_NUM_CELLS).tolist())
     install_row(
         frame,
-        text_active=silent,
-        emitted_before=0,
-        audio_frame=40,
-        prompt_before=2,
+        text_active=torch.tensor([True, True, False, False]),
+        persistent_before=2,
+        audio_frame=1,
     )
+    written.append(frame.write_slots(DUPLEXIO_NUM_CELLS).tolist())
+
+    # Prompt keys, then emitted text, dense in write order past the ring.
+    base = layout.persistent_base
+    assert written == [
+        [-1, -1, -1, -1, -1, base],
+        [-1, -1, -1, -1, -1, base + 1],
+        [base + 2, base + 3, -1, -1, 2, 3],
+    ]
+    assert layout.audio_slots <= base
+
+    # A live row far past the window still sees every persistent key, while its
+    # own ring history has expired.
+    install_row(frame, text_active=silent, persistent_before=4, audio_frame=40)
     keys = torch.arange(layout.max_compact_slots)
     query = torch.zeros_like(keys)
     visible = frame.visible(query, query, query, keys)
 
-    pinned = torch.zeros_like(visible)
-    pinned[layout.prompt_base : layout.prompt_base + layout.prompt_slots] = True
-    assert visible[pinned].all()
-    # Nothing was emitted, so no text slot is visible; ring slots are governed by
-    # the window and covered by the eviction tests above.
-    assert not visible[layout.persistent_text_base :].any()
+    assert visible[base : base + 4].all()
+    assert not visible[base + 4 :].any()
 
 
 def test_a_pinned_frame_does_not_see_itself_through_the_cache() -> None:
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=1,
-        voice_prompt_frames=2,
         max_model_len=8 * DUPLEXIO_NUM_CELLS,
     )
     frame = frame_metadata(layout)
     install_row(
         frame,
         text_active=torch.zeros(DUPLEXIO_NUM_TEXT_CELLS, dtype=torch.bool),
-        emitted_before=0,
+        persistent_before=0,
         audio_frame=0,
         audio_active=False,
-        prompt_ordinal=1,
-        prompt_before=0,
+        pinned=True,
     )
     keys = torch.arange(layout.max_compact_slots)
     query = torch.zeros_like(keys)

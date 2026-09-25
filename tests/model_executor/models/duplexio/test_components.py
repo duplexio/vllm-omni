@@ -140,30 +140,27 @@ def test_duplexio_installs_cell_addressing_at_stable_buffers() -> None:
     layout = DuplexIOKVLayout(
         block_size=16,
         audio_window_frames=2,
-        voice_prompt_frames=1,
         max_model_len=120,
     )
     model.frame = DuplexIOFrameMetadata(layout, 12, torch.device("cpu"))
     frame = model.frame
     buffers = (
         frame.key_active,
-        frame.text_ordinal,
-        frame.text_last,
+        frame.persistent_ordinal,
+        frame.persistent_last,
         frame.audio_first,
         frame.audio_last,
-        frame.prompt_ordinal,
-        frame.prompt_last,
+        frame.positions,
     )
     pointers = tuple(buffer.data_ptr() for buffer in buffers)
     info = {
         "duplexio": {
             "key_active": torch.tensor([True, False, False, False, True, True]),
-            "text_ordinals": torch.tensor([7, 0, 0, 0, 0, 0], dtype=torch.int32),
-            "text_last": torch.full((6,), 6, dtype=torch.int32),
+            "persistent_ordinal": torch.tensor([7, 0, 0, 0, 0, 0], dtype=torch.int32),
+            "persistent_last": torch.full((6,), 6, dtype=torch.int32),
             "audio_first": torch.full((6,), 1, dtype=torch.int32),
             "audio_last": torch.full((6,), 4, dtype=torch.int32),
-            "prompt_ordinal": torch.zeros(6, dtype=torch.int32),
-            "prompt_last": torch.zeros(6, dtype=torch.int32),
+            "positions": torch.arange(30, 36),
         }
     }
 

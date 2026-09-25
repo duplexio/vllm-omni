@@ -188,28 +188,21 @@ def step_page_bounds(
 ) -> None:
     """Write this step's compact sequence bound and its page table.
 
-    A frame owns four text slots at most, and only emitted cells claim one, so
-    the bound over-scans into masked-out pages that the emitted count - unknown
-    until preprocessing runs - would tighten.
+    A row writes at most four persistent keys, and the scheduler length counts
+    four per row, so the bound over-scans by at most this step's unwritten
+    slots, which the mask rejects.
 
-    Scheduler length is compacted around text retention, so it cannot bound
-    audio time. Keep the reserved audio and prompt pages; the attention mask
-    excludes unwritten/expired slots. Only text pages use the scheduler bound.
+    Scheduler length is compacted around persistent retention, so it cannot
+    bound audio time. Keep the reserved audio pages; the attention mask excludes
+    unwritten/expired slots. Only persistent pages use the scheduler bound.
     Both outputs keep their address for CUDA-graph replay.
     """
     rows = torch.div(seq_lens, DUPLEXIO_NUM_CELLS, rounding_mode="floor")
-    text_slots = rows * DUPLEXIO_NUM_TEXT_CELLS
-    text_pages = cdiv(text_slots, layout.block_size)[:, None]
-    base = layout.text_base_page
-    prompt_base = layout.prompt_base // layout.block_size
-    prompt_pages = cdiv(layout.prompt_slots, layout.block_size)
-    touched = (page_ids < cdiv(layout.audio_slots, layout.block_size)) | (
-        (page_ids >= base) & (page_ids - base < text_pages)
-    ) | (
-        (page_ids >= prompt_base) & (page_ids - prompt_base < prompt_pages)
-    )
+    persistent_slots = rows * DUPLEXIO_NUM_TEXT_CELLS
+    # Audio pages precede the persistent ones.
+    touched = page_ids < layout.persistent_base_page + cdiv(persistent_slots, layout.block_size)[:, None]
     compact_seq_lens.copy_(
-        (layout.persistent_text_base + text_slots).clamp(max=layout.max_compact_slots)
+        (layout.persistent_base + persistent_slots).clamp(max=layout.max_compact_slots)
     )
     touched_block_table.copy_(block_table * touched)
 
@@ -715,7 +708,6 @@ class DuplexIOPagedAttention(Attention):
         return make_duplexio_kv_cache_spec(
             base,
             audio_window_frames=config.audio_attention_window_frames,
-            voice_prompt_frames=config.voice_prompt_max_frames,
             max_model_len=vllm_config.model_config.max_model_len,
         )
 
@@ -1153,7 +1145,6 @@ class DuplexIOQwenModel(nn.Module):
             DuplexIOKVLayout(
                 block_size=vllm_config.cache_config.block_size,
                 audio_window_frames=vllm_config.model_config.hf_config.audio_attention_window_frames,
-                voice_prompt_frames=vllm_config.model_config.hf_config.voice_prompt_max_frames,
                 max_model_len=vllm_config.model_config.max_model_len,
             ),
             vllm_config.scheduler_config.max_num_batched_tokens,

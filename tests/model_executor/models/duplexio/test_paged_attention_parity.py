@@ -44,12 +44,10 @@ BLOCK_SIZE = 64
 NUM_AUDIO_CELLS = DUPLEXIO_NUM_CELLS - DUPLEXIO_NUM_TEXT_CELLS
 FRAME_FIELDS = (
     "key_active",
-    "text_ordinal",
-    "text_last",
+    "persistent_ordinal",
+    "persistent_last",
     "audio_first",
     "audio_last",
-    "prompt_ordinal",
-    "prompt_last",
 )
 # Paged attention reduces the history in page order and merges the diagonal
 # afterwards, so it does not round like a dense matmul. Bit-exactness with
@@ -75,25 +73,20 @@ def session_fields(audio_active: Tensor, text_active: Tensor, prompt_frames: int
     pinned = torch.arange(rows) < prompt_frames
     text_active = text_active & ~pinned[:, None]
     audio_position = audio_active.cumsum(0, dtype=torch.int32)
-    emitted = text_active.int().flatten().cumsum(0, dtype=torch.int32).view(rows, -1)
-    audio_padding = torch.zeros(rows, NUM_AUDIO_CELLS, dtype=torch.int32)
+    persistent = torch.cat(
+        (text_active, torch.zeros(rows, 1, dtype=torch.bool), pinned[:, None]), 1
+    )
+    ordinal = persistent.int().flatten().cumsum(0, dtype=torch.int32).view(rows, -1)
     return {
         "key_active": torch.cat(
             (text_active, torch.stack((audio_active, audio_active | pinned), -1)), 1
         ).flatten(),
-        "text_ordinal": torch.cat(
-            (torch.where(text_active, emitted, 0), audio_padding), 1
-        ).flatten(),
-        "text_last": cells(
-            torch.cat((torch.zeros(1, dtype=torch.int32), emitted[:-1, -1]))
+        "persistent_ordinal": torch.where(persistent, ordinal, 0).flatten(),
+        "persistent_last": cells(
+            torch.cat((torch.zeros(1, dtype=torch.int32), ordinal[:-1, -1]))
         ),
         "audio_first": cells((audio_position - WINDOW).clamp_min(1)),
         "audio_last": cells(audio_position - audio_active.int()),
-        "prompt_ordinal": torch.cat((
-            torch.zeros(rows, DUPLEXIO_NUM_TEXT_CELLS, dtype=torch.int32),
-            torch.where(pinned, torch.arange(rows, dtype=torch.int32) + 1, 0)[:, None].expand(-1, NUM_AUDIO_CELLS),
-        ), dim=1).flatten(),
-        "prompt_last": cells(torch.arange(rows, dtype=torch.int32).clamp_max(prompt_frames)),
         "pinned": cells(pinned),
         # Audio time, for the dense reference: not a cache-addressing field.
         "audio_position": cells(audio_position),
@@ -266,7 +259,6 @@ def run_session(
             dtype=dtype,
         ),
         audio_window_frames=WINDOW,
-        voice_prompt_frames=max(prompt_frames, 1),
         max_model_len=rows * DUPLEXIO_NUM_CELLS,
     )
     layout = spec.layout
@@ -396,7 +388,7 @@ def test_paged_sessions_with_pinned_voice_and_tool_bursts(training_reference: bo
 @pytest.mark.parametrize("audio_frame", [511, 512, 2112, 2200])
 def test_text_compaction_preserves_audio_pages(audio_frame: int) -> None:
     """Text retention cannot bound the independently advancing audio ring."""
-    layout = DuplexIOKVLayout(1024, 2048, 79, 24576)
+    layout = DuplexIOKVLayout(1024, 2048, 24576)
     table = torch.arange(20, 20 + layout.max_blocks, dtype=torch.int32)[None]
     listed = torch.empty_like(table)
     compact = torch.empty(1, dtype=torch.int32)
@@ -413,16 +405,14 @@ def test_text_compaction_preserves_audio_pages(audio_frame: int) -> None:
     )
 
 
-@pytest.mark.parametrize("rows,prompt_frames", [(1, 125), (30, 1), (70, 125)])
-def test_only_pages_a_step_can_touch_are_listed(rows: int, prompt_frames: int) -> None:
-    """Keep reserved audio/prompt pages and bound only the growing text region."""
+@pytest.mark.parametrize("rows", [1, 30, 70])
+def test_only_pages_a_step_can_touch_are_listed(rows: int) -> None:
+    """Keep the reserved audio pages and bound only the growing persistent region."""
     layout = DuplexIOKVLayout(
         block_size=BLOCK_SIZE,
         audio_window_frames=WINDOW,
-        voice_prompt_frames=prompt_frames,
         max_model_len=600 * DUPLEXIO_NUM_CELLS,
     )
-    text_base = layout.text_base_page
     seq_lens = torch.tensor([rows * DUPLEXIO_NUM_CELLS])
     block_table = torch.arange(1, layout.max_blocks + 1, dtype=torch.int32)[None]
     compact = torch.zeros(1, dtype=torch.int32)
@@ -438,17 +428,12 @@ def test_only_pages_a_step_can_touch_are_listed(rows: int, prompt_frames: int) -
     )
 
     audio_pages = -(-layout.audio_slots // BLOCK_SIZE)
-    text_pages = -(-rows * DUPLEXIO_NUM_TEXT_CELLS // BLOCK_SIZE)
-    prompt_base = layout.prompt_base // BLOCK_SIZE
-    prompt_pages = -(-layout.prompt_slots // BLOCK_SIZE)
-    expected = {
-        *range(audio_pages),
-        *range(prompt_base, prompt_base + prompt_pages),
-        *range(text_base, text_base + text_pages),
-    }
+    persistent_pages = -(-rows * DUPLEXIO_NUM_TEXT_CELLS // BLOCK_SIZE)
+    base = layout.persistent_base_page
+    expected = {*range(audio_pages), *range(base, base + persistent_pages)}
     assert {page for page, entry in enumerate(listed[0].tolist()) if entry} == expected
     assert len(expected) < layout.max_blocks
-    assert int(compact) == layout.persistent_text_base + rows * DUPLEXIO_NUM_TEXT_CELLS
+    assert int(compact) == layout.persistent_base + rows * DUPLEXIO_NUM_TEXT_CELLS
 
     # Whatever the row writes has to be among the pages the step listed.
     frame = DuplexIOFrameMetadata(layout, DUPLEXIO_NUM_CELLS, torch.device("cpu"))
@@ -479,7 +464,6 @@ def paged_step(sizes: list[int], rows: list[int], heads: int = 4, kv_heads: int 
     spec = make_duplexio_kv_cache_spec(
         FullAttentionSpec(block_size=BLOCK_SIZE, num_kv_heads=kv_heads, head_size=64, head_size_v=64, dtype=torch.bfloat16),
         audio_window_frames=WINDOW,
-        voice_prompt_frames=2,
         max_model_len=100 * DUPLEXIO_NUM_CELLS,
     )
     layout = spec.layout
@@ -599,13 +583,13 @@ def test_tiled_split_kv_matches_the_page_granular_kernel() -> None:
     spec = make_duplexio_kv_cache_spec(
         FullAttentionSpec(block_size=1024, num_kv_heads=kv_heads, head_size=dim, head_size_v=dim, dtype=torch.bfloat16),
         audio_window_frames=2048,
-        voice_prompt_frames=125,
         max_model_len=2400 * DUPLEXIO_NUM_CELLS,
     )
     layout = spec.layout
     frames = [126, 700, 1500, 2150, 2600, 3300]
     requests, tokens = len(frames), len(frames) * DUPLEXIO_NUM_CELLS
-    texts = [400 + frame // 3 for frame in frames]
+    # A 125-frame voice prompt, then the emitted text.
+    keys = [125 + 400 + frame // 3 for frame in frames]
     frame = DuplexIOFrameMetadata(layout, tokens, device)
 
     def per_row(values: list[int]) -> Tensor:
@@ -613,23 +597,23 @@ def test_tiled_split_kv_matches_the_page_granular_kernel() -> None:
 
     frame.update(
         key_active=torch.ones(tokens, dtype=torch.bool, device=device),
-        text_ordinal=torch.zeros(tokens, dtype=torch.int32, device=device),
-        text_last=per_row(texts),
+        persistent_ordinal=torch.zeros(tokens, dtype=torch.int32, device=device),
+        persistent_last=per_row(keys),
         audio_first=per_row([max(value - 2048, 1) for value in frames]),
         audio_last=per_row([value - 1 for value in frames]),
-        prompt_ordinal=torch.zeros(tokens, dtype=torch.int32, device=device),
-        prompt_last=per_row([125] * requests),
     )
     pages = layout.max_blocks * requests
     layer, builder, impl = paged_backend(spec, frame, heads, requests, pages + 1)
     cache = torch.randn(pages + 1, 1024, kv_heads, 2 * dim, device=device, dtype=torch.bfloat16).transpose(1, 2)
+    # Halved values keep the outputs below 0.25 (see the tolerance below).
+    cache[..., dim:] *= 0.5
     cache[0].fill_(torch.nan)
     block_table = (torch.randperm(pages, device=device, dtype=torch.int32) + 1).view(requests, layout.max_blocks)
     sizes = [DUPLEXIO_NUM_CELLS] * requests
-    seq_lens = [(-(-text // DUPLEXIO_NUM_TEXT_CELLS) + 1) * DUPLEXIO_NUM_CELLS for text in texts]
+    seq_lens = [(-(-key // DUPLEXIO_NUM_TEXT_CELLS) + 1) * DUPLEXIO_NUM_CELLS for key in keys]
     query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16)
     key = torch.randn(tokens, kv_heads, dim, device=device, dtype=torch.bfloat16)
-    value = torch.randn_like(key)
+    value = torch.randn_like(key) * 0.5
     scale = dim**-0.5
 
     metadata = step_metadata(builder, sizes, seq_lens, block_table)
