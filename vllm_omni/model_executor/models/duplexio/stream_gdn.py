@@ -166,8 +166,9 @@ def append_gdn(
     if q.shape[0] == slots.shape[0] * 6:
         return slot_recurrent_gdn(q, k, v, g, beta, cache, slots, boundaries, has_state)
     initial = initial_gdn_state(cache, slots, has_state)
-    q, k, v, g, beta = (tensor.unsqueeze(0) for tensor in (q, k, v, g, beta))
     # The autograd wrapper ignores precomputed chunks and rebuilds them with a host sync.
+    # Its forward assumes the contiguous layout the wrapper enforces; V is a strided split of QKV.
+    q, k, v, g, beta = (tensor.unsqueeze(0).contiguous() for tensor in (q, k, v, g, beta))
     _, output, _, final, _, _ = chunk_gated_delta_rule_fwd(
         q, k, v, g, beta, k.shape[-1] ** -0.5, initial, True,
         cu_seqlens=boundaries, chunk_indices=chunks,

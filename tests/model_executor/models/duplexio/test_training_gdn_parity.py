@@ -116,6 +116,9 @@ def test_append_gdn_independent_slots_and_reset(prefixes: tuple[int, ...], alias
                 torch.cat([tensor[i, offsets[i] : offsets[i] + size] for i, size in zip(requests, sizes)])
                 for tensor in inputs
             )
+            # V arrives as a strided slice of the packed projection.
+            packed_v = torch.empty(packed[2].shape[0], 4 * 128 + 64, device="cuda", dtype=torch.bfloat16)[:, 64:]
+            packed = (*packed[:2], packed_v.view_as(packed[2]).copy_(packed[2]), *packed[3:])
             boundaries = torch.tensor([0, *torch.tensor(sizes).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
             chunks = torch.tensor(
                 [(i, chunk) for i, size in enumerate(sizes) for chunk in range((size + 63) // 64)],
