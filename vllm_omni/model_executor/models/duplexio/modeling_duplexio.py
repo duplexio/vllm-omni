@@ -4,11 +4,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from functools import partial
+from functools import cached_property, partial
 from typing import Any, cast
 
 import torch
@@ -650,44 +651,59 @@ class DuplexIOForConditionalGeneration(
             index: info["duplex"]["pcm"] for index, (_, info) in enumerate(requests)
             if not (info["duplex"].get("duplexio_prefill", False) or info["duplex"].get("duplexio_system_input", False))
         }
-        if live:
-            # One upload for the step. A blocking one waits for every queued
-            # kernel, including the previous step's; a pageable non_blocking one
-            # stages the bytes and returns at once.
-            pcm = torch.frombuffer(bytearray().join(live.values()), dtype=torch.float32)
-            sizes = [len(chunk) // pcm.element_size() for chunk in live.values()]
-            live = dict(zip(live, pcm.to(device, non_blocking=True).split(sizes), strict=True))
-        acoustic = []
-        user_waveforms = []
-        prompt_indices = []
-        prompt_waveforms = []
-        for index, item in enumerate(prepared):
-            if index in live:
-                waveform = live[index]
-            elif item.prompt_chunk_frames:
-                start = item.frame_start * self.config.frame_size
-                count = item.prompt_chunk_frames * self.config.frame_size
-                prompt_waveform = item.state.voice_prompt[start:start + count]
-                prompt_indices.append(index)
-                prompt_waveforms.append(prompt_waveform)
-                waveform = torch.zeros_like(prompt_waveform)
-            else:
-                continue
-            acoustic.append(index)
-            user_waveforms.append(waveform)
-        if acoustic:
+        # The user encoder reads only this step's audio and its own caches, so on
+        # CUDA it runs on a side stream, overlapping the previous step's backbone.
+        cuda = device.type == "cuda"
+        if cuda and any(item.prompt_chunk_frames for item in prepared):
+            # Voice prompts were uploaded on the main stream.
+            self.user_audio_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(self.user_audio_stream) if cuda else contextlib.nullcontext():
+            if live:
+                # One upload for the step. A blocking one waits for every queued
+                # kernel, including the previous step's; a pageable non_blocking one
+                # stages the bytes and returns at once.
+                pcm = torch.frombuffer(bytearray().join(live.values()), dtype=torch.float32)
+                sizes = [len(chunk) // pcm.element_size() for chunk in live.values()]
+                live = dict(zip(live, pcm.to(device, non_blocking=True).split(sizes), strict=True))
+            acoustic = []
+            user_waveforms = []
+            prompt_indices = []
+            prompt_waveforms = []
+            for index, item in enumerate(prepared):
+                if index in live:
+                    waveform = live[index]
+                elif item.prompt_chunk_frames:
+                    start = item.frame_start * self.config.frame_size
+                    count = item.prompt_chunk_frames * self.config.frame_size
+                    prompt_waveform = item.state.voice_prompt[start:start + count]
+                    prompt_indices.append(index)
+                    prompt_waveforms.append(prompt_waveform)
+                    waveform = torch.zeros_like(prompt_waveform)
+                else:
+                    continue
+                acoustic.append(index)
+                user_waveforms.append(waveform)
             user_features = self.encode_user_audio_batch(
                 user_waveforms, [prepared[index].state for index in acoustic],
-            )
-            for index, features in zip(acoustic, user_features, strict=True):
-                missing = prepared[index].frame_count - features.shape[0]
-                prepared[index].user_features = F.pad(features, (0, 0, 0, missing)) if missing else features
+            ) if acoustic else []
+        if cuda and acoustic:
+            main = torch.cuda.current_stream(device)
+            main.wait_stream(self.user_audio_stream)
+            for features in user_features:
+                features.record_stream(main)
+        for index, features in zip(acoustic, user_features, strict=True):
+            missing = prepared[index].frame_count - features.shape[0]
+            prepared[index].user_features = F.pad(features, (0, 0, 0, missing)) if missing else features
         if prompt_indices:
             states = [prepared[index].state for index in prompt_indices]
             codes = self.encode_agent_audio_batch(prompt_waveforms, states)
             for index, audio in zip(prompt_indices, codes, strict=True):
                 prepared[index].agent_codes = torch.cat((audio, prepared[index].agent_codes[audio.shape[0]:]))
         return prepared
+
+    @cached_property
+    def user_audio_stream(self) -> torch.cuda.Stream:
+        return torch.cuda.Stream()
 
     @torch.inference_mode()
     def preprocess_batch(
