@@ -1349,7 +1349,11 @@ class DuplexIOForConditionalGeneration(
         assert isinstance(prompt_frames, int) and 1 <= prompt_frames <= self.config.voice_prompt_max_frames
         prompt_bytes = prompt_frames * self.config.frame_size * 4
         assert len(reference) >= prompt_bytes and len(reference) % 4 == 0
-        samples = torch.frombuffer(bytearray(reference[:prompt_bytes]), dtype=torch.float32).to(device)
+        samples = torch.frombuffer(bytearray(reference[:prompt_bytes]), dtype=torch.float32)
+        if device.type == "cuda":
+            # A pageable copy would wait for the queued backbone.
+            samples = samples.pin_memory()
+        samples = samples.to(device, non_blocking=True)
         system_tokens = runtime_config.get("duplexio_system_token_ids", ())
         if not isinstance(system_tokens, (list, tuple)) or not all(isinstance(token, int) for token in system_tokens):
             raise ValueError("duplexio_system_token_ids must be integer token IDs")

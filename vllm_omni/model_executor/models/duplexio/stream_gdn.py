@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
 from torch import Tensor
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 
@@ -167,9 +167,10 @@ def append_gdn(
         return slot_recurrent_gdn(q, k, v, g, beta, cache, slots, boundaries, has_state)
     initial = initial_gdn_state(cache, slots, has_state)
     q, k, v, g, beta = (tensor.unsqueeze(0) for tensor in (q, k, v, g, beta))
-    output, final = chunk_gated_delta_rule(
-        q, k, v, g, beta, initial_state=initial,
-        output_final_state=True, cu_seqlens=boundaries, chunk_indices=chunks,
+    # The autograd wrapper ignores precomputed chunks and rebuilds them with a host sync.
+    _, output, _, final, _, _ = chunk_gated_delta_rule_fwd(
+        q, k, v, g, beta, k.shape[-1] ** -0.5, initial, True,
+        cu_seqlens=boundaries, chunk_indices=chunks,
     )
     # Cache views alias vLLM's mixed-dtype allocation; mutate outside compilation.
     cache[slots] = final
