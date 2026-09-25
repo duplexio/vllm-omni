@@ -24,7 +24,6 @@ from vllm_omni.experimental.fullduplex.duplexio.runtime import build_duplexio_da
 from vllm_omni.experimental.fullduplex.engine.contracts import DuplexInputMode
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
-from vllm_omni.model_executor.models.duplexio.text_sampling import content_distribution
 from vllm_omni.outputs.mm_outputs import MultimodalPayload
 
 
@@ -51,9 +50,10 @@ def feedback_model():
     model.agent_emit_head = nn.Linear(66, 1)
     model.tool_call_emit_head = nn.Linear(66, 1)
     model.logits_processor = LocalVocabulary()
-    model.content_distribution = content_distribution
+    model.text_config.vocab_size = 32
     for stream in ("agent", "tool", "user"):
         setattr(model, f"{stream}_suppressed_token_ids", torch.tensor([2]))
+    model.init_text_sampling(32, 4)
     with torch.no_grad():
         model.llm.base_model.lm_head.weight.zero_()
         model.llm.base_model.lm_head.weight[7, 0] = 1

@@ -14,7 +14,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbed
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
 )
-from vllm_omni.model_executor.models.duplexio.text_sampling import content_distribution
 
 
 class LocalVocabulary(nn.Module):
@@ -42,16 +41,27 @@ def head_model(device="cpu"):
     model.agent_emit_head = nn.Linear(6 * 32, 1)
     model.tool_call_emit_head = nn.Linear(6 * 32, 1)
     model.logits_processor = LocalVocabulary()
-    model.content_distribution = content_distribution
+    model.text_config = SimpleNamespace(vocab_size=64)
     model.register_buffer("user_suppressed_token_ids", torch.tensor([0]), persistent=False)
     model.register_buffer("agent_suppressed_token_ids", torch.tensor([0]), persistent=False)
     model.register_buffer("tool_suppressed_token_ids", torch.tensor([0]), persistent=False)
+    model.init_text_sampling(64, 64)
     return model.to(device)
+
+
+def sample_user(model, logits, emissions, infos):
+    """The user stream of a batch draw; other streams wait and extra ids are impossible."""
+    padded = F.pad(logits, (0, 64 - logits.shape[-1]), value=-torch.inf)
+    silent = torch.full_like(emissions, -100.0)
+    sampled = model.sample_text_batch(
+        padded.unsqueeze(1).expand(-1, 3, -1), torch.stack((silent, silent, emissions), dim=1), infos,
+    )
+    return sampled.text_ids[:, 0], sampled.frame_logprobs[:, 4], sampled.frame_logprobs[:, 5]
 
 
 def sampling_info(model, device="cpu", mode="top_k", emit_temperature=0.7):
     info = {
-        "duplexio_working_state": SimpleNamespace(),
+        "duplexio_working_state": SimpleNamespace(tool_call_constraint=None),
         "duplex": {
             "runtime_config": {
                 "duplexio_text_sampling": {"temperature": 0.6, "top_k": 4, "top_p": 0.8},
@@ -85,12 +95,7 @@ def test_user_behavior_probabilities_include_waits_and_actual_truncation(mode, t
     infos = [sampling_info(model, device=device, mode=mode, emit_temperature=temperature) for _ in range(64)]
     logits = torch.tensor([[100.0, 0.2, 0.4, 1.0, 1.2, 1.4]], device=device).expand(64, -1)
     emissions = torch.linspace(-2, 2, 64, device=device)
-    ids, emit_logprobs, token_logprobs = model.sample_stream_tokens(
-        logits,
-        emissions,
-        infos,
-        stream="user",
-    )
+    ids, emit_logprobs, token_logprobs = sample_user(model, logits, emissions, infos)
     emitted = ids != 0
     assert emitted.any() and (~emitted).any()
     for row, (token, emit_logprob, token_logprob) in enumerate(zip(ids, emit_logprobs, token_logprobs, strict=True)):
@@ -117,11 +122,8 @@ def test_user_behavior_probabilities_include_waits_and_actual_truncation(mode, t
 
 def test_saturated_bernoulli_probabilities_are_recorded_exactly():
     model = head_model()
-    ids, emit_logprobs, _ = model.sample_stream_tokens(
-        torch.ones(2, 6),
-        torch.tensor([100.0, -100.0]),
-        [sampling_info(model), sampling_info(model)],
-        stream="user",
+    ids, emit_logprobs, _ = sample_user(
+        model, torch.ones(2, 6), torch.tensor([100.0, -100.0]), [sampling_info(model), sampling_info(model)],
     )
     assert ids[0].item() != 0 and ids[1].item() == 0
     assert emit_logprobs.tolist() == [0.0, 0.0]

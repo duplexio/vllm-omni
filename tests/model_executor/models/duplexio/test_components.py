@@ -603,6 +603,7 @@ def test_vocabulary_suppression_is_model_owned_and_sampling_temperature_stays_dy
     model.agent_suppressed_token_ids = suppressed
     model.tool_suppressed_token_ids = torch.tensor(tool_ids)
     model.user_suppressed_token_ids = suppressed
+    model.text_config = SimpleNamespace(vocab_size=20)
     options = {"temperature": 0.3, "top_k": 5, "top_p": 1.0}
     runtime = {"duplexio_text_sampling": options, "duplexio_user_sampling": {"content": options},
                "duplexio_emit_temperatures": {"user": 1.0, "agent": 1.0, "tool_call": 1.0}}

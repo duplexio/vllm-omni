@@ -1,6 +1,7 @@
 """Batch every stream's draws and read tool starts once, after all sampling is queued."""
 from concurrent.futures import Future
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
+    FrameInputGraph,
     _sample_emit,
     _sample_factorized_text_ids,
     sample_tool_token,
@@ -35,7 +37,8 @@ def fixture(device: str, *, mixed: bool):
     model.agent_suppressed_token_ids = torch.tensor([0], device=device)
     model.user_suppressed_token_ids = model.agent_suppressed_token_ids
     model.tool_suppressed_token_ids = model.agent_suppressed_token_ids
-    model.content_distribution = content_distribution
+    model.text_config = SimpleNamespace(vocab_size=len(vocab))
+    model.init_text_sampling(len(vocab), 8)
     model.tool_call_compiler = object.__new__(ToolCallConstraintCompiler)
     infos = []
     for index in range(8):
@@ -116,16 +119,21 @@ def decided_inputs(rows, vocab, device, generator):
 @pytest.mark.parametrize("device", ["cpu", pytest.param(
     "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 )])
-@pytest.mark.parametrize("compile_filter", [False, True])
-def test_batched_tool_sampling_matches_per_request_tokens_and_calls(device, compile_filter):
-    if compile_filter and device == "cpu":
-        pytest.skip("compiled deployment uses CUDA")
+@pytest.mark.parametrize("graph", [False, True])
+def test_batched_tool_sampling_matches_per_request_tokens_and_calls(device, graph):
+    if graph and device == "cpu":
+        pytest.skip("serving captures the draws on CUDA")
     model, infos, vocab = fixture(device, mixed=True)
-    if compile_filter:
-        model.content_distribution = torch.compile(
-            content_distribution, fullgraph=True, dynamic=True,
-            options={"emulate_precision_casts": True, "triton.cudagraphs": True},
-        )
+    if graph:
+        # As served: the draws replay from one graph per top-k width.
+        eager, graphs = model.sample_text, {}
+
+        def graphed(*tensors, top_k):
+            if top_k not in graphs:
+                graphs[top_k] = FrameInputGraph(partial(eager, top_k=top_k), tensors)
+            return graphs[top_k](tensors)
+
+        model.sample_text = graphed
     reference, original, _ = fixture(device, mixed=True)
     inputs = torch.Generator(device=device).manual_seed(53)
     calls = 0
@@ -159,14 +167,16 @@ def test_mixed_policies_return_rows_in_request_order(device):
     inputs = torch.Generator(device=device).manual_seed(11)
     for order in ([7, 0, 4, 2, 6, 1, 5, 3], [3, 1, 7], [7, 3]):
         logits, emissions = decided_inputs(8, vocab, device, inputs)
-        actual = model.sample_stream_tokens(
-            logits[order, 2], emissions[order, 2], [infos[index] for index in order], stream="user",
-        )
-        for row, index in enumerate(order):
-            expected = model.sample_stream_tokens(
-                logits[index:index + 1, 2], emissions[index:index + 1, 2], [infos[index]], stream="user",
+
+        def sample(rows):
+            sampling = model.sampling_inputs([infos[index] for index in rows], logits.device)
+            return model.sample_text(
+                logits[rows], emissions[rows], sampling.parameters, sampling.tool_bitmask, top_k=sampling.top_k,
             )
-            for values, target in zip(actual, expected, strict=True):
+
+        actual = sample(order)
+        for row, index in enumerate(order):
+            for values, target in zip(actual, sample([index]), strict=True):
                 torch.testing.assert_close(values[row], target[0])
 
 
@@ -200,44 +210,42 @@ def test_agent_logprobs_match_the_distributions_actually_sampled(device):
     """
     model, infos, vocab = fixture(device, mixed=True)
     inputs = torch.Generator(device=device).manual_seed(97)
-    logits = torch.randn(8, 2, vocab, device=device, generator=inputs)
-    emissions = torch.randn(8, 2, device=device, generator=inputs)
-    # Draws come from the global generator; pin it so at least one row emits.
-    torch.manual_seed(0)
-
-    ids, emit_logprobs, token_logprobs = model.sample_agent_tokens(
-        logits[:, 0], emissions[:, 0], infos
-    )
-
+    logits = torch.randn(8, 3, vocab, device=device, generator=inputs)
+    emissions = torch.randn(8, 3, device=device, generator=inputs)
     checked_emitted = 0
-    for row, info in enumerate(infos):
-        sampling = info["duplexio_working_state"].sampling.agent
-        emit_logprob, token_logprob = emit_logprobs[row], token_logprobs[row]
-        assert emit_logprob.shape == token_logprob.shape == ()
-        assert emit_logprob.dtype == token_logprob.dtype == torch.float32
+    # Draws come from the global generator; draw a few frames so some rows emit.
+    torch.manual_seed(0)
+    for _ in range(4):
+        sampled = model.sample_text_batch(logits, emissions, infos)
+        ids, emit_logprobs, token_logprobs = sampled.text_ids[:, 1], *sampled.frame_logprobs[:, :2].unbind(1)
+        for row, info in enumerate(infos):
+            sampling = info["duplexio_working_state"].sampling.agent
+            emit_logprob, token_logprob = emit_logprobs[row], token_logprobs[row]
+            assert emit_logprob.shape == token_logprob.shape == ()
+            assert emit_logprob.dtype == token_logprob.dtype == torch.float32
 
-        emitted = int(ids[row]) != model.silence_token_id
-        scaled = emissions[row, 0].float() / info["duplexio_working_state"].sampling.emission.agent
-        torch.testing.assert_close(
-            emit_logprob.reshape(()),
-            torch.nn.functional.logsigmoid(scaled if emitted else -scaled),
-            atol=1e-5, rtol=1e-4,
-        )
-        assert float(emit_logprob) < 0.0
+            emitted = int(ids[row]) != model.silence_token_id
+            scaled = emissions[row, 0].float() / info["duplexio_working_state"].sampling.emission.agent
+            torch.testing.assert_close(
+                emit_logprob.reshape(()),
+                torch.nn.functional.logsigmoid(scaled if emitted else -scaled),
+                atol=1e-5, rtol=1e-4,
+            )
+            assert float(emit_logprob) < 0.0
 
-        if not emitted or sampling.temperature == 0:
-            # A content draw discarded by a silent row took no action.
-            assert float(token_logprob) == 0.0
-            continue
-        indices, probabilities = content_distribution(logits[row:row + 1, 0], sampling)
-        position = (indices[0] == int(ids[row])).nonzero().flatten()
-        assert position.numel() == 1, "sampled id must lie in the truncated support"
-        torch.testing.assert_close(
-            token_logprob.reshape(()),
-            probabilities[0, int(position)].float().log(),
-            atol=1e-5, rtol=1e-4,
-        )
-        checked_emitted += 1
+            if not emitted or sampling.temperature == 0:
+                # A content draw discarded by a silent row took no action.
+                assert float(token_logprob) == 0.0
+                continue
+            indices, probabilities = content_distribution(logits[row:row + 1, 0], sampling)
+            position = (indices[0] == int(ids[row])).nonzero().flatten()
+            assert position.numel() == 1, "sampled id must lie in the truncated support"
+            torch.testing.assert_close(
+                token_logprob.reshape(()),
+                probabilities[0, int(position)].float().log(),
+                atol=1e-5, rtol=1e-4,
+            )
+            checked_emitted += 1
 
     assert checked_emitted, "fixture produced no emitted agent row to verify"
 
@@ -259,14 +267,14 @@ def test_tool_emit_logprobs_score_all_decisions_including_forced_emit_and_wait(d
         # Score raw logits, independent of sampling temperature or forced actions.
         signed_logit = emissions[row, 1] if emitted else -emissions[row, 1]
         expected = -torch.logaddexp(torch.zeros_like(signed_logit), -signed_logit)
-        torch.testing.assert_close(sampled.tool_emit_logprobs[row][0], expected)
+        torch.testing.assert_close(sampled.frame_logprobs[row, 2], expected)
         if not emitted or mode == "argmax":
-            assert sampled.tool_token_logprobs[row].item() == 0
+            assert sampled.frame_logprobs[row, 3].item() == 0
         if row < 2:
             assert not emitted
         elif row < 4:
             assert emitted  # active continuation / forced start ignores the negative emit logit
-            assert sampled.tool_emit_logprobs[row].item() == -100
+            assert sampled.frame_logprobs[row, 2].item() == -100
 
 
 def test_session_waits_to_start_a_call_until_its_grammar_compiles():
@@ -281,7 +289,7 @@ def test_session_waits_to_start_a_call_until_its_grammar_compiles():
     sampled = model.sample_text_batch(logits, emissions, infos)
     assert not sampled.tool_starts.any()
     assert (sampled.text_ids[:, 2] == model.silence_token_id).all()
-    torch.testing.assert_close(sampled.tool_emit_logprobs, torch.full((8, 1), -100.0))
+    torch.testing.assert_close(sampled.frame_logprobs[:, 2], torch.full((8,), -100.0))
 
     compiling.set_result(compiled)
     sampled = model.sample_text_batch(logits, emissions, infos)

@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
 
 import torch
 from torch import Tensor, nn
@@ -98,7 +97,7 @@ class FlowMapSampler(nn.Module):
         *,
         inference_steps: int,
         sampling_temperature: float,
-        use_cuda_graph: bool = False,
+        compile: bool = False,
     ) -> None:
         super().__init__()
         self.flow = FlowMap(
@@ -109,24 +108,18 @@ class FlowMapSampler(nn.Module):
             inference_steps=inference_steps,
             sampling_temperature=sampling_temperature,
         )
-        self.use_cuda_graph = use_cuda_graph
+        # Compiled for serving, where the model captures it with text sampling.
         self.sample_function = (
             torch.compile(
                 self.flow.sample, fullgraph=True, dynamic=True,
                 options={"emulate_precision_casts": True},
             )
-            if use_cuda_graph else self.flow.sample
+            if compile else self.flow.sample
         )
-        self.graphs: dict[int, FlowMapGraph] = {}
 
     def sample(self, conditioning: Tensor, noise: Tensor) -> Tensor:
-        """Sample with explicit request-owned noise; return owned latent storage."""
-        if not self.use_cuda_graph:
-            return self.sample_function(conditioning, noise)
-        batch = conditioning.shape[0]
-        if batch not in self.graphs:
-            self.graphs[batch] = FlowMapGraph(self.sample_function, conditioning, noise)
-        return self.graphs[batch](conditioning, noise)
+        """Sample with explicit request-owned noise."""
+        return self.sample_function(conditioning, noise)
 
 
 class FlowMap(nn.Module):
@@ -183,32 +176,3 @@ class FlowMap(nn.Module):
             )
             current = current + self(current, conditioning, s, t) / self.inference_steps
         return current
-
-
-class FlowMapGraph:
-    """Capture the compiled deterministic sampler, leaving RNG with each request."""
-
-    def __init__(
-        self,
-        sample: Callable[[Tensor, Tensor], Tensor],
-        conditioning: Tensor,
-        noise: Tensor,
-    ) -> None:
-        self.conditioning = conditioning.clone()
-        self.noise = noise.clone()
-        stream = torch.cuda.Stream(device=conditioning.device)
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                sample(self.conditioning, self.noise)
-        torch.cuda.current_stream().wait_stream(stream)
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            self.output = sample(self.conditioning, self.noise)
-
-    def __call__(self, conditioning: Tensor, noise: Tensor) -> Tensor:
-        self.conditioning.copy_(conditioning)
-        self.noise.copy_(noise)
-        self.graph.replay()
-        # Request state and asynchronous output consumers outlive this replay.
-        return self.output.clone()

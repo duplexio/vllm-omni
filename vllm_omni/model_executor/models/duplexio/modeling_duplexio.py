@@ -8,6 +8,7 @@ import copy
 import json
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, cast
 
 import torch
@@ -75,11 +76,17 @@ from vllm_omni.model_executor.models.duplexio.row_semantics import (
 )
 from vllm_omni.model_executor.models.duplexio.sampling_config import ContentPolicy
 from vllm_omni.model_executor.models.duplexio.stream_gdn import gdn_cache_dtypes, gdn_cache_shapes
-from vllm_omni.model_executor.models.duplexio.text_sampling import TokenSamplingOptions, content_distribution
+from vllm_omni.model_executor.models.duplexio.text_sampling import (
+    TokenSamplingOptions,
+    content_distribution,
+    sample_streams,
+    sampled_top_k,
+    sampling_parameters,
+)
 from vllm_omni.model_executor.models.duplexio.tool_calling import (
     ToolCallConstraintCompiler,
     ToolCallConstraintState,
-    next_token_bitmasks,
+    token_bitmasks,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -95,24 +102,29 @@ AGENT_AUDIO_CELL = 5
 class TextSamplingResult:
     """Sampled text and log probabilities, batched in request order.
 
-    Each text_ids row holds the user, agent, and tool token IDs. Log probabilities
-    are ``[rows, 1]``, so one row is a request's output value.
+    Each text_ids row holds the user, agent, and tool token IDs.
     """
 
     text_ids: Tensor
-    tool_calls: list[dict[str, Any] | None]
-    agent_emit_logprobs: Tensor
-    agent_token_logprobs: Tensor
-    user_emit_logprobs: Tensor
-    user_token_logprobs: Tensor
-    tool_emit_logprobs: Tensor  # Raw emit-head scores, including forced decisions.
-    tool_token_logprobs: Tensor
-    # Start draws; the host reads them only for idle rows that may start a call.
-    tool_starts: Tensor
+    tool_starts: Tensor  # Idle rows that started a call; the host reads only pending ones.
+    # Emit and token log probabilities of the agent, tool and user streams. The
+    # tool emit is scored with the raw head, including forced decisions.
+    frame_logprobs: Tensor
     pending_tool_starts: list[int]
     # Rows already inside a call, whose sampled token the host must accept.
     tool_rows: list[int]
-    logits: Tensor  # [rows, streams, vocab]
+    tool_calls: list[dict[str, Any] | None]
+
+
+@dataclass
+class SamplingInputs:
+    """A batch's per-row policy and tool state, uploaded before the draws."""
+
+    parameters: Tensor  # [rows, SAMPLING_PARAMETERS], see text_sampling.
+    tool_bitmask: Tensor
+    top_k: int | None
+    pending: list[int]
+    calling: list[int]
 
 
 @dataclass
@@ -259,10 +271,15 @@ class PreparedFrames:
 
 
 class FrameInputGraph:
-    """Capture packed projections; CPU request state remains outside the graph."""
+    """Capture a tensor-only function; CPU request state remains outside the graph.
+
+    Graphs may share a memory ``pool``: replays run one at a time on one stream,
+    and only the cloned outputs outlive a replay.
+    """
 
     def __init__(
         self, project: Callable[..., tuple[Tensor, ...]], inputs: tuple[Tensor, ...],
+        pool: tuple[int, int] | None = None,
     ) -> None:
         self.inputs = tuple(value.clone() for value in inputs)
         stream = torch.cuda.Stream(device=inputs[0].device)
@@ -272,7 +289,7 @@ class FrameInputGraph:
                 project(*self.inputs)
         torch.cuda.current_stream().wait_stream(stream)
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
+        with torch.cuda.graph(self.graph, pool=pool):
             self.outputs = project(*self.inputs)
 
     def __call__(self, inputs: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
@@ -309,6 +326,7 @@ class RequestSampling:
     user: TokenSamplingOptions
     emission: EmitSamplingTemperatures
     depth: DepthSamplingOptions | None
+    parameters: tuple[float, ...]  # The row sample_streams reads, without the tool state.
 
 
 class _DuplexIOBaseModel(nn.Module):
@@ -395,20 +413,12 @@ class DuplexIOForConditionalGeneration(
             vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
             and not vllm_config.model_config.enforce_eager
         )
-        # Automatic graph-tree warmup clears cuBLAS workspaces that vLLM's
-        # already captured backbone graphs may still reference.
-        self.content_distribution = (
-            torch.compile(
-                content_distribution, fullgraph=True, dynamic=True,
-                options={"emulate_precision_casts": True, "triton.cudagraphs": False},
-            )
-            if self.full_cudagraph_enabled else content_distribution
-        )
         self.frame_inputs = (
             torch.compile(frame_inputs, fullgraph=True, dynamic=True, options={"emulate_precision_casts": True})
             if self.full_cudagraph_enabled else frame_inputs
         )
         self.frame_input_graphs: dict[int, FrameInputGraph] = {}
+        self.sampling_graphs: dict[tuple[int, int | None], FrameInputGraph] = {}
         # Addressing and replay inputs are PackedRows, which the runner holds by
         # reference; nothing needs a per-request device copy.
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = set()
@@ -448,7 +458,7 @@ class DuplexIOForConditionalGeneration(
                 config.flowmap_config["mlp_depth"],
                 inference_steps=config.flowmap_config["inference_steps"],
                 sampling_temperature=config.flowmap_config["sampling_temperature"],
-                use_cuda_graph=self.full_cudagraph_enabled,
+                compile=self.full_cudagraph_enabled,
             )
         else:
             quantized = config.quantized_audio_config
@@ -516,9 +526,30 @@ class DuplexIOForConditionalGeneration(
             torch.tensor([self.silence_token_id], dtype=torch.long, device=self.llm.channel_emb.device),
             persistent=False,
         )
-        self.tool_call_compiler = ToolCallConstraintCompiler(self.tokenizer, self.text_config.vocab_size)
+        vocab_size = self.text_config.vocab_size
+        self.init_text_sampling(vocab_size, vllm_config.scheduler_config.max_num_seqs)
+        self.tool_call_compiler = ToolCallConstraintCompiler(self.tokenizer, vocab_size)
         self.set_custom_preprocess(self.preprocess)
         self.set_custom_postprocess(self.postprocess)
+
+    def init_text_sampling(self, vocab_size: int, max_rows: int) -> None:
+        """Device constants of ``sample_text``, from the suppressed-id buffers."""
+        streams = (self.agent_suppressed_token_ids, self.tool_suppressed_token_ids, self.user_suppressed_token_ids)
+        device = streams[0].device
+        suppressed = torch.zeros(len(streams), vocab_size, dtype=torch.bool, device=device)
+        for stream, ids in enumerate(streams):
+            suppressed[stream, ids] = True
+        # Rows in logits order (agent, tool, user).
+        self.register_buffer("suppressed_token_mask", suppressed, persistent=False)
+        self.register_buffer(
+            "bitmask_shifts", torch.arange(32, dtype=torch.int32, device=device), persistent=False,
+        )
+        # Batches without a tool grammar replay with this mask.
+        self.register_buffer(
+            "allow_all_bitmask",
+            torch.full(xgr.get_bitmask_shape(max_rows, vocab_size), -1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
 
     def embed_input_ids(self, input_ids: Tensor) -> Tensor:
         return self.llm.base_model.model.embed_input_ids(input_ids)
@@ -880,10 +911,7 @@ class DuplexIOForConditionalGeneration(
                 "tool_starts": [text.tool_starts],
                 "audio": [batch.audio.detach()],
                 "waveforms": [waveform.detach() for waveform in waveforms],
-                "frame_logprobs": [torch.cat([
-                    text.agent_emit_logprobs, text.agent_token_logprobs, text.tool_emit_logprobs,
-                    text.tool_token_logprobs, text.user_emit_logprobs, text.user_token_logprobs,
-                ], dim=-1).float()],
+                "frame_logprobs": [text.frame_logprobs],
             }
             if any(record_hiddens[index] for index in batch.indices):
                 sampled["predictor_hiddens"] = [batch.hiddens.detach()]
@@ -1047,24 +1075,49 @@ class DuplexIOForConditionalGeneration(
             rows = hidden_states[: ends[-1]].unflatten(0, (len(ends), DUPLEXIO_NUM_CELLS))
         else:
             rows = torch.stack([hidden_states[end - DUPLEXIO_NUM_CELLS : end] for end in ends])
+        sample_infos = [infos[index] for index in indices]
+        inputs = self.sampling_inputs(sample_infos, rows.device)
+        tensors = (rows, inputs.parameters, inputs.tool_bitmask)
+        sample = partial(self.sample_rows, top_k=inputs.top_k)
+        if self.full_cudagraph_enabled:
+            key = (len(indices), inputs.top_k)
+            if key not in self.sampling_graphs:
+                pool = next(iter(self.sampling_graphs.values())).graph.pool() if self.sampling_graphs else None
+                self.sampling_graphs[key] = FrameInputGraph(sample, tensors, pool)
+            text_ids, tool_starts, frame_logprobs, *audio = self.sampling_graphs[key](tensors)
+        else:
+            text_ids, tool_starts, frame_logprobs, *audio = sample(*tensors)
+        text = TextSamplingResult(
+            text_ids, tool_starts, frame_logprobs, inputs.pending, inputs.calling, [None] * len(indices),
+        )
+        if not audio:
+            with torch.profiler.record_function("duplexio.audio_sampling"), self.autocast(rows):
+                audio = [self.sample_depth_audio(rows, text_ids[:, 1], sample_infos)]
+        return FrameBatch(indices=indices, text=text, audio=audio[0], hiddens=rows)
+
+    def autocast(self, value: Tensor) -> torch.autocast:
+        dtype = self.vllm_config.model_config.dtype
+        return torch.autocast(value.device.type, dtype=dtype, enabled=value.is_cuda and dtype != torch.float32)
+
+    def sample_rows(
+        self, rows: Tensor, parameters: Tensor, tool_bitmask: Tensor, *, top_k: int | None,
+    ) -> tuple[Tensor, ...]:
+        """Tensor-only draws after the backbone, captured once per batch size.
+
+        Returns the text ids, tool starts and frame log probabilities, and FlowMap
+        audio; the depth sampler's per-request groups run outside.
+        """
         with torch.profiler.record_function("duplexio.text_projection"):
-            text_logits, emit_logits = self.project_text(rows)
+            logits, emit_logits = self.project_text(rows)
         with torch.profiler.record_function("duplexio.text_sampling"):
-            sample_infos = [infos[index] for index in indices]
-            text = self.queue_text_batch(text_logits, emit_logits, sample_infos)
-        with torch.profiler.record_function("duplexio.audio_sampling"), torch.autocast(
-            rows.device.type, dtype=self.vllm_config.model_config.dtype,
-            enabled=rows.is_cuda and self.vllm_config.model_config.dtype != torch.float32,
-        ):
-            if isinstance(self.audio_sampler, FlowMapSampler):
-                noise = torch.randn(
-                    len(indices), self.audio_representation.embedding_dim,
-                    device=rows.device, dtype=torch.float32,
-                )
-                audio = self.audio_sampler.sample(rows[:, AGENT_AUDIO_CELL].float(), noise)
-            else:
-                audio = self.sample_depth_audio(rows, text.text_ids[:, 1], sample_infos)
-        return FrameBatch(indices=indices, text=text, audio=audio, hiddens=rows)
+            sampled = self.sample_text(logits, emit_logits, parameters, tool_bitmask, top_k=top_k)
+        if not isinstance(self.audio_sampler, FlowMapSampler):
+            return sampled
+        with torch.profiler.record_function("duplexio.audio_sampling"), self.autocast(rows):
+            noise = torch.randn(
+                rows.shape[0], self.audio_representation.embedding_dim, device=rows.device, dtype=torch.float32,
+            )
+            return (*sampled, self.audio_sampler.sample(rows[:, AGENT_AUDIO_CELL].float(), noise))
 
     def sample_depth_audio(self, rows: Tensor, agent_ids: Tensor, infos: list[dict[str, Any]]) -> Tensor:
         groups: dict[tuple[float, int | None], list[int]] = {}
@@ -1115,80 +1168,68 @@ class DuplexIOForConditionalGeneration(
         infos: list[dict[str, Any]],
     ) -> TextSamplingResult:
         """Sample agent/tool/user decisions and apply the host's tool decisions."""
-        text = self.queue_text_batch(logits, emit_logits, infos)
-        host_ids = text.text_ids.tolist()
-        self.finish_text_batch(text, infos, host_ids, text.tool_starts.tolist())
+        inputs = self.sampling_inputs(infos, logits.device)
+        text_ids, tool_starts, frame_logprobs = self.sample_text(
+            logits, emit_logits, inputs.parameters, inputs.tool_bitmask, top_k=inputs.top_k,
+        )
+        text = TextSamplingResult(
+            text_ids, tool_starts, frame_logprobs, inputs.pending, inputs.calling, [None] * len(infos),
+        )
+        self.finish_text_batch(text, infos, text_ids.tolist(), tool_starts.tolist())
         return text
 
-    def queue_text_batch(
-        self,
-        logits: Tensor,
-        emit_logits: Tensor,
-        infos: list[dict[str, Any]],
-    ) -> TextSamplingResult:
-        """Queue every stream's draws; tool starts wait for finish_text_batch."""
-        for info in infos:
+    def sampling_inputs(self, infos: list[dict[str, Any]], device: torch.device) -> SamplingInputs:
+        """Resolve each row's policy and tool state on the host, with one upload each."""
+        vocab_size = self.text_config.vocab_size
+        parameters: list[tuple[float, ...]] = []
+        constraints: list[ToolCallConstraintState | None] = []
+        streams: list[TokenSamplingOptions] = []
+        pending: list[int] = []
+        calling: list[int] = []
+        for row, info in enumerate(infos):
             state = info["duplexio_working_state"]
             runtime = info["duplex"]["runtime_config"]
             if state.sampling is None or state.sampling.source != sampling_source(runtime):
                 state.sampling = self.resolve_sampling(runtime)
-        agent_ids, agent_emit_logprobs, agent_token_logprobs = self.sample_agent_tokens(
-            logits[:, 0], emit_logits[:, 0], infos
+            # Rows inside a call, or forced to start one, sample under its grammar.
+            # Idle rows draw a start decision and, speculatively, the call's first
+            # token, so the host only commits what the device already chose.
+            constraint = state.tool_call_constraint
+            tool_state = 0
+            if constraint is not None and constraint.enabled:
+                if constraint.active or constraint.force_next_call:
+                    if not constraint.active:
+                        constraint.begin()
+                    tool_state = 1
+                    calling.append(row)
+                elif constraint.compiled:
+                    # A session whose grammar is still compiling waits to start a call.
+                    tool_state = 2
+                    pending.append(row)
+            constraints.append(constraint if tool_state else None)
+            parameters.append((*state.sampling.parameters, tool_state))
+            streams += (state.sampling.agent, state.sampling.user)
+        return SamplingInputs(
+            parameters=_to_device(parameters, torch.float32, device),
+            tool_bitmask=(
+                token_bitmasks(constraints, vocab_size, device) if pending or calling
+                else self.allow_all_bitmask[: len(infos)]
+            ),
+            top_k=sampled_top_k(streams, vocab_size),
+            pending=pending,
+            calling=calling,
         )
-        user_ids, user_emit_logprobs, user_token_logprobs = self.sample_stream_tokens(
-            logits[:, 2], emit_logits[:, 2], infos, stream="user",
-        )
-        # Rows inside a call, or forced to start one, sample now. Idle rows draw
-        # a start decision and, speculatively, the call's first token, so the
-        # host only commits what the device already chose.
-        rows = len(infos)
-        tool_ids = torch.full((rows,), self.silence_token_id, dtype=torch.long, device=logits.device)
-        tool_token_logprobs = torch.zeros(rows, 1, dtype=torch.float32, device=logits.device)
-        emitting = [False] * rows
-        pending: list[int] = []
-        calling: list[int] = []
-        for row, info in enumerate(infos):
-            constraint = info["duplexio_working_state"].tool_call_constraint
-            if constraint is None or not constraint.enabled:
-                continue
-            if constraint.active or constraint.force_next_call:
-                emitting[row] = True
-                calling.append(row)
-            elif constraint.compiled:
-                # A session whose grammar is still compiling waits to start a call.
-                pending.append(row)
-        if calling:
-            self._sample_tool_rows(logits[:, 1], infos, calling, tool_ids, tool_token_logprobs)
-        start_logits = emit_logits[:, 1].float()
-        if pending:
-            tool_starts, _ = _sample_emits(
-                start_logits, [info["duplexio_working_state"].sampling.emission.tool_call for info in infos],
-            )
-            self._sample_tool_starts(logits[:, 1], infos, pending, tool_starts, tool_ids, tool_token_logprobs)
-        else:
-            tool_starts = torch.zeros(rows, dtype=torch.bool, device=logits.device)
-        # Score the chosen decision with the raw head, even when serving forced it.
-        if len(pending) == rows:
-            tool_emitted = tool_starts
-        else:
-            tool_emitted = _to_device(emitting, torch.bool, logits.device)
-            if pending:
-                is_pending = _to_device([row in pending for row in range(rows)], torch.bool, logits.device)
-                tool_emitted = torch.where(is_pending, tool_starts, tool_emitted)
-        tool_emit_logprobs = F.logsigmoid(torch.where(tool_emitted, start_logits, -start_logits))
-        return TextSamplingResult(
-            text_ids=torch.stack((user_ids, agent_ids, tool_ids), dim=1),
-            tool_calls=[None] * rows,
-            agent_emit_logprobs=agent_emit_logprobs.unsqueeze(-1),
-            agent_token_logprobs=agent_token_logprobs.unsqueeze(-1),
-            user_emit_logprobs=user_emit_logprobs.unsqueeze(-1),
-            user_token_logprobs=user_token_logprobs.unsqueeze(-1),
-            tool_emit_logprobs=tool_emit_logprobs.unsqueeze(-1),
-            tool_token_logprobs=tool_token_logprobs,
-            tool_starts=tool_starts,
-            pending_tool_starts=pending,
-            tool_rows=[row for row in range(rows) if emitting[row]],
-            logits=logits,
+
+    def sample_text(
+        self, logits: Tensor, emit_logits: Tensor, parameters: Tensor, tool_bitmask: Tensor, *, top_k: int | None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Draw every stream, masking the tool stream with each row's grammar."""
+        vocab_size = logits.shape[-1]
+        allowed = (tool_bitmask.unsqueeze(-1) >> self.bitmask_shifts).bitwise_and(1).flatten(1)[:, :vocab_size]
+        suppressed = self.suppressed_token_mask.unsqueeze(0).expand(logits.shape[0], -1, -1)
+        blocked = torch.stack((suppressed[:, 0], suppressed[:, 1] | (allowed == 0), suppressed[:, 2]), dim=1)
+        return sample_streams(
+            logits, emit_logits, parameters, blocked, top_k=top_k, silence_token_id=self.silence_token_id,
         )
 
     def finish_text_batch(
@@ -1212,123 +1253,31 @@ class DuplexIOForConditionalGeneration(
                 text.tool_calls[row] = self.tool_call_compiler.take_completed_call(constraint)
         return started
 
-    def _sample_tool_starts(
-        self, logits: Tensor, infos: list[dict[str, Any]], pending: list[int],
-        starts: Tensor, tool_ids: Tensor, logprobs: Tensor,
-    ) -> None:
-        """Draw every idle row's would-be first call token; keep it where a call starts."""
-        vocab_size = logits.shape[-1]
-        if len(pending) == len(infos):
-            index = None
-            # A copy: the grammar mask is applied in place.
-            constrained = logits.clone(memory_format=torch.contiguous_format)
-        else:
-            index = _to_device(pending, torch.long, logits.device)
-            constrained = logits.index_select(0, index)
-        constraints = [infos[row]["duplexio_working_state"].tool_call_constraint for row in pending]
-        bitmask = torch.cat([constraint.first_token_bitmask(vocab_size, logits.device) for constraint in constraints])
-        xgr.apply_token_bitmask_inplace(constrained, bitmask, vocab_size=vocab_size)
-        ids, values = self._sample_grouped(
-            constrained, [infos[row]["duplexio_working_state"].sampling.tool for row in pending],
-        )
-        if index is None:
-            tool_ids.copy_(torch.where(starts, ids, tool_ids))
-            logprobs[:, 0].copy_(torch.where(starts, values, logprobs[:, 0]))
-        else:
-            started = starts.index_select(0, index)
-            tool_ids.index_copy_(0, index, torch.where(started, ids, tool_ids.index_select(0, index)))
-            logprobs[:, 0].index_copy_(0, index, torch.where(started, values, logprobs[:, 0].index_select(0, index)))
-
-    def _sample_tool_rows(
-        self, logits: Tensor, infos: list[dict[str, Any]], rows: list[int], tool_ids: Tensor, logprobs: Tensor,
-    ) -> None:
-        """Draw the next token of every row inside a call, or forced to start one."""
-        constraints = [infos[row]["duplexio_working_state"].tool_call_constraint for row in rows]
-        for constraint in constraints:
-            if not constraint.active:
-                constraint.begin()
-        vocab_size = logits.shape[-1]
-        index = _to_device(rows, torch.long, logits.device)
-        # A copy: the grammar mask is applied in place.
-        constrained = logits.index_select(0, index)
-        xgr.apply_token_bitmask_inplace(
-            constrained, next_token_bitmasks(constraints, vocab_size, logits.device), vocab_size=vocab_size,
-        )
-        ids, values = self._sample_grouped(
-            constrained, [infos[row]["duplexio_working_state"].sampling.tool for row in rows],
-        )
-        tool_ids.index_copy_(0, index, ids)
-        logprobs[:, 0].index_copy_(0, index, values)
-
-    def _sample_grouped(self, logits: Tensor, samplings: list[TokenSamplingOptions]) -> tuple[Tensor, Tensor]:
-        """Sample each row with its own options, one draw per distinct setting."""
-        groups: dict[tuple[float, int | None, float | None], list[int]] = {}
-        for row, sampling in enumerate(samplings):
-            groups.setdefault((sampling.temperature, sampling.top_k, sampling.top_p), []).append(row)
-        if len(groups) == 1:
-            return self._sample_content(logits, samplings[0])
-        ids = torch.empty(len(samplings), dtype=torch.long, device=logits.device)
-        values = torch.empty(len(samplings), dtype=torch.float32, device=logits.device)
-        for rows in groups.values():
-            index = _to_device(rows, torch.long, logits.device)
-            group_ids, group_values = self._sample_content(logits.index_select(0, index), samplings[rows[0]])
-            ids.index_copy_(0, index, group_ids)
-            values.index_copy_(0, index, group_values)
-        return ids, values
-
-    def sample_agent_tokens(
-        self, logits: Tensor, emit_logits: Tensor, infos: list[dict[str, Any]]
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        return self.sample_stream_tokens(
-            logits, emit_logits, infos, stream="agent",
-        )
-
-    def sample_stream_tokens(
-        self, logits: Tensor, emit_logits: Tensor, infos: list[dict[str, Any]],
-        *, stream: str,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Sample one stream for all rows with one random draw per decision.
-
-        Returns the sampled ids and, per row, the log probability of the emit decision
-        and of the content draw. Both come from the distributions already materialized
-        for sampling, so nothing is recomputed.
-        """
-        policies = [info["duplexio_working_state"].sampling for info in infos]
-        samplings = [policy.user if stream == "user" else policy.agent for policy in policies]
-        emitted, emit_logprobs = _sample_emits(
-            emit_logits.float(),
-            [policy.emission.user if stream == "user" else policy.emission.agent for policy in policies],
-        )
-        content, content_logprobs = self._sample_grouped(logits, samplings)
-        content = torch.where(emitted, content, self.silence_token_id)
-        # A discarded content draw on a wait frame is not an action.
-        content_logprobs = torch.where(emitted, content_logprobs, 0)
-        return content, emit_logprobs, content_logprobs
-
-    def _sample_content(self, logits: Tensor, sampling: TokenSamplingOptions) -> tuple[Tensor, Tensor]:
-        if sampling.temperature == 0:
-            content = _sample_content_token_ids(logits, sampling)
-            return content, torch.zeros(content.shape, dtype=torch.float32, device=content.device)
-        indices, probabilities = self.content_distribution(logits, sampling)
-        selected = _exponential_race(probabilities).unsqueeze(-1)
-        return (
-            indices.gather(-1, selected).squeeze(-1),
-            probabilities.gather(-1, selected).squeeze(-1).float().log(),
-        )
-
     def resolve_sampling(self, runtime: Mapping[str, Any]) -> RequestSampling:
         """Validate new or updated wire settings once before sampling a request."""
         source = sampling_source(runtime)
         agent_config, user_config, emission_config, depth_config = source
-        agent = ContentPolicy.model_validate(agent_config)
-        user = ContentPolicy.model_validate(user_config)
+        agent_policy = ContentPolicy.model_validate(agent_config)
+        user_policy = ContentPolicy.model_validate(user_config)
+        agent = TokenSamplingOptions(
+            agent_policy.temperature, agent_policy.top_k, agent_policy.top_p, self.agent_suppressed_token_ids,
+        )
+        user = TokenSamplingOptions(
+            user_policy.temperature, user_policy.top_k, user_policy.top_p, self.user_suppressed_token_ids,
+        )
+        emission = EmitSamplingTemperatures.model_validate(emission_config)
         return RequestSampling(
             source=copy.deepcopy(source),
-            agent=TokenSamplingOptions(agent.temperature, agent.top_k, agent.top_p, self.agent_suppressed_token_ids),
-            tool=TokenSamplingOptions(agent.temperature, agent.top_k, agent.top_p, self.tool_suppressed_token_ids),
-            user=TokenSamplingOptions(user.temperature, user.top_k, user.top_p, self.user_suppressed_token_ids),
-            emission=EmitSamplingTemperatures.model_validate(emission_config),
+            agent=agent,
+            tool=TokenSamplingOptions(
+                agent_policy.temperature, agent_policy.top_k, agent_policy.top_p, self.tool_suppressed_token_ids,
+            ),
+            user=user,
+            emission=emission,
             depth=DepthSamplingOptions.model_validate(depth_config) if depth_config is not None else None,
+            parameters=sampling_parameters(
+                agent, user, (emission.agent, emission.tool_call, emission.user), self.text_config.vocab_size,
+            ),
         )
 
     def compute_logits(
@@ -1725,25 +1674,6 @@ def _sample_emit(
         torch.sigmoid(emit_logits.float() / temperature),
         generator=generator,
     ).bool()
-
-
-def _sample_emits(emit_logits: Tensor, temperatures: list[float]) -> tuple[Tensor, Tensor]:
-    """Draw every row's emit decision at its temperature; zero thresholds the logit.
-
-    Returns the decisions and the log probability of each; thresholded decisions
-    have probability one.
-    """
-    if len(set(temperatures)) == 1:
-        if temperatures[0] == 0:
-            return emit_logits >= 0, torch.zeros_like(emit_logits)
-        probability = torch.sigmoid(emit_logits / temperatures[0])
-        emitted = torch.rand_like(probability) < probability
-        return emitted, torch.where(emitted, probability, 1 - probability).log()
-    temperature = _to_device(temperatures, emit_logits.dtype, emit_logits.device)
-    thresholded = temperature == 0
-    probability = torch.sigmoid(emit_logits / temperature.masked_fill(thresholded, 1))
-    emitted = torch.where(thresholded, emit_logits >= 0, torch.rand_like(probability) < probability)
-    return emitted, torch.where(emitted, probability, 1 - probability).log().masked_fill(thresholded, 0)
 
 
 def _exponential_race(probabilities: Tensor, generator: torch.Generator | None = None) -> Tensor:

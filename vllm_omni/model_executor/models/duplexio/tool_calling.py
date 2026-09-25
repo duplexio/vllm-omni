@@ -360,7 +360,7 @@ class ToolCallConstraintState:
     matcher: xgr.GrammarMatcher | None = None
     capture: ToolCallCapture | None = None
     completed_call: dict[str, Any] | None = None
-    # The grammar's first-token mask on the device, shared by every fork.
+    # The grammar's first-token mask on the host, shared by every fork.
     start_bitmask: torch.Tensor | None = None
 
     def fork(self) -> ToolCallConstraintState:
@@ -410,16 +410,12 @@ class ToolCallConstraintState:
         self.capture = ToolCallCapture(self.tools)
         self.completed_call = None
 
-    def first_token_bitmask(self, vocab_size: int, device: torch.device) -> torch.Tensor:
-        """The mask a call would start with, without starting one."""
-        if self.start_bitmask is None or self.start_bitmask.device != device:
-            bitmask = xgr.allocate_token_bitmask(1, vocab_size)
+    def first_token_bitmask(self, vocab_size: int) -> torch.Tensor:
+        """The host mask a call would start with, without starting one."""
+        if self.start_bitmask is None:
+            self.start_bitmask = xgr.allocate_token_bitmask(1, vocab_size)
             xgr.GrammarMatcher(self.grammar, terminate_without_stop_token=True).fill_next_token_bitmask(
-                bitmask,
-            )
-            # Pinned, so the upload never waits behind queued device work.
-            self.start_bitmask = (
-                bitmask if device.type == "cpu" else bitmask.pin_memory().to(device, non_blocking=True)
+                self.start_bitmask,
             )
         return self.start_bitmask
 
@@ -444,20 +440,25 @@ class ToolCallConstraintState:
         return completed
 
 
-def next_token_bitmasks(
-    constraints: Sequence[ToolCallConstraintState], vocab_size: int, device: torch.device,
+def token_bitmasks(
+    constraints: Sequence[ToolCallConstraintState | None], vocab_size: int, device: torch.device,
 ) -> torch.Tensor:
-    """Row ``i`` holds active call ``i``'s next-token mask."""
+    """Row ``i`` masks constraint ``i``'s next token: an active call's next one, an
+    idle grammar's first one, or nothing where there is no constraint."""
+    allow_all = torch.full(xgr.get_bitmask_shape(1, vocab_size), -1, dtype=torch.int32)
     # Pinned, so the upload never waits behind queued device work.
     bitmask = torch.empty(
         xgr.get_bitmask_shape(len(constraints), vocab_size), dtype=torch.int32, pin_memory=device.type == "cuda",
     )
+    torch.cat([
+        allow_all if constraint is None or constraint.active else constraint.first_token_bitmask(vocab_size)
+        for constraint in constraints
+    ], out=bitmask)
     # One fill per row: a fill takes microseconds, while BatchGrammarMatcher's
     # thread handoff costs about a millisecond even at 32 rows.
     for row, constraint in enumerate(constraints):
-        if constraint.matcher is None:
-            raise RuntimeError("DuplexIO tool-call grammar is not active")
-        constraint.matcher.fill_next_token_bitmask(bitmask, row)
+        if constraint is not None and constraint.matcher is not None:
+            constraint.matcher.fill_next_token_bitmask(bitmask, row)
     return bitmask.to(device, non_blocking=True)
 
 
