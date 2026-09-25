@@ -578,17 +578,6 @@ class DuplexIOForConditionalGeneration(
         positions = cells["positions"]
         self.frame.positions[:positions.numel()].copy_(positions)
 
-    def supports_cudagraph_replay(
-        self,
-        request_infos: list[dict[str, Any]],
-    ) -> bool:
-        """Replay only ordinary live frames, never context-prefill frames."""
-        return all(
-            not bool(info["duplex"].get("duplexio_prefill", False))
-            and not bool(info["duplex"].get("duplexio_system_input", False))
-            for info in request_infos
-        )
-
     def prepare_audio_request(self, tokens: int, info: dict[str, Any], device: torch.device) -> PreparedAudio:
         """Validate framing and fork state at the model's input boundary."""
         duplex = info.get("duplex")

@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed import (
@@ -830,6 +831,12 @@ class DuplexIOQwenAttention(nn.Module):
         return output
 
 
+@eager_break_during_capture
+def gdn_attention_core(mixed_qkv: Tensor, b: Tensor, a: Tensor, output: Tensor, layer_name: str) -> None:
+    """Variable-length GDN appends run eagerly between piecewise graph segments."""
+    torch.ops.vllm.qwen_gdn_attention_core(mixed_qkv, b, a, output, layer_name=layer_name)
+
+
 class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     """Qwen GDN with six independent causal-convolution histories."""
 
@@ -994,13 +1001,7 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             self.num_v_heads // self.tp_size,
             self.head_v_dim,
         )
-        torch.ops.vllm.qwen_gdn_attention_core(
-            mixed_qkv,
-            beta_logits,
-            decay_logits,
-            core_output,
-            layer_name=_encode_layer_name(self.prefix),
-        )
+        gdn_attention_core(mixed_qkv, beta_logits, decay_logits, core_output, _encode_layer_name(self.prefix))
         normalized = call_compiled_function(
             self.norm, core_output.reshape(-1, self.head_v_dim), output_gate.reshape(-1, self.head_v_dim),
         ).view(num_tokens, -1)

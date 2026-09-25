@@ -180,16 +180,6 @@ def test_duplexio_installs_cell_addressing_at_stable_buffers() -> None:
     assert pointers == tuple(buffer.data_ptr() for buffer in buffers)
 
 
-def test_duplexio_graph_replays_only_live_frames() -> None:
-    model = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
-
-    assert model.supports_cudagraph_replay([{"duplex": {}}])
-    assert not model.supports_cudagraph_replay([{"duplex": {"duplexio_prefill": True}}])
-    assert not model.supports_cudagraph_replay(
-        [{"duplex": {"duplexio_system_input": True}}]
-    )
-
-
 def test_duplexio_config_rejects_pre_v4_export() -> None:
     config = _config().to_dict()
     config["duplexio_export_version"] = 3
