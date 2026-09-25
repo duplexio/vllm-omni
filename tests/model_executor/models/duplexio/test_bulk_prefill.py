@@ -96,7 +96,7 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
 
 def request_state(model: DuplexIOForConditionalGeneration) -> DuplexIORequestState:
     return DuplexIORequestState(
-        text_input_ids=torch.full((4,), 2, dtype=torch.long),
+        text_input_ids=(2, 2, 2, 2),
         agent_audio_codes=model.initial_agent_audio(1)[0],
         user_asr=FastConformerAudioStreamState(),
         agent_delay=model.audio_representation.new_state(device=torch.device("cpu")),
@@ -137,7 +137,7 @@ def test_packed_preprocess_preserves_mixed_request_boundaries() -> None:
     live_state.frames_seen = 40
     live_state.audio_position = 30
     live_state.persistent_keys = 53
-    live_state.text_input_ids = torch.tensor([2, 9, 12, 2])
+    live_state.text_input_ids = (2, 9, 12, 2)
     live = {
         "duplexio_model_state": live_state,
         "duplex_token_offset": 240, "duplex_prompt_len": 246,
@@ -227,8 +227,7 @@ def test_tool_bulk_and_serial_frames_are_identical() -> None:
 def test_live_audio_advances_encoder_and_inserts_generated_feedback() -> None:
     model = model_fixture()
     state = request_state(model)
-    state.text_input_ids[1] = 9
-    state.text_input_ids[2] = 12
+    state.text_input_ids = (2, 9, 12, 2)
     state.agent_audio_codes = torch.tensor([3, 4, 5])
     user_features = torch.ones(1, 8)  # First frame of the counting encoder.
     info = dict(

@@ -219,7 +219,7 @@ def test_feedback_actions_and_versions_span_staging_then_commit(monkeypatch):
 def test_raw_audio_keeps_encoder_features_without_transcript_commits():
     model = feedback_model()
     state = request_state(model)
-    state.text_input_ids[1] = 7
+    state.text_input_ids = (state.text_input_ids[0], 7, *state.text_input_ids[2:])
     prompt = build_duplexio_data_plane_prompt(
         request_id="raw-frame", fence=DuplexFence("session"),
         session_config={}, runtime_config=runtime(), seq=1, turn_seq=1,

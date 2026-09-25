@@ -173,7 +173,7 @@ class DuplexIOStepOutput:
 class DuplexIORequestState:
     """Request-owned state; Qwen KV/GDN caches belong to the native runner."""
 
-    text_input_ids: Tensor  # CPU feedback, also used for scheduler text counts.
+    text_input_ids: tuple[int, ...]  # Host feedback: the ids the next frame feeds back.
     agent_audio_codes: Tensor
     user_asr: FastConformerAudioStreamState
     input_mimi: ContinuousMimiState | MimiStreamingState
@@ -215,7 +215,7 @@ class PreparedAudio:
     frame_count: int
     prompt_count: int
     prompt_chunk_frames: int
-    user_features: Tensor
+    user_features: Tensor | None  # Rows without acoustic input are zero.
     agent_codes: Tensor
 
 
@@ -637,8 +637,7 @@ class DuplexIOForConditionalGeneration(
             raise ValueError("DuplexIO prefill must contain the complete speaker and system prefix exactly once")
         prompt_chunk_frames = max(0, min(frame_end, prompt_count) - frame_start)
         return PreparedAudio(
-            state, frame_start, frame_count, prompt_count, prompt_chunk_frames,
-            self.llm.channel_emb.new_zeros(frame_count, self.user_asr.output_dim),
+            state, frame_start, frame_count, prompt_count, prompt_chunk_frames, None,
             state.agent_audio_codes.unsqueeze(0) if is_live else self.initial_agent_audio(frame_count),
         )
 
@@ -647,19 +646,24 @@ class DuplexIOForConditionalGeneration(
         self, requests: list[tuple[int, dict[str, Any]]], device: torch.device,
     ) -> list[PreparedAudio]:
         prepared = [self.prepare_audio_request(tokens, info, device) for tokens, info in requests]
+        live = {
+            index: info["duplex"]["pcm"] for index, (_, info) in enumerate(requests)
+            if not (info["duplex"].get("duplexio_prefill", False) or info["duplex"].get("duplexio_system_input", False))
+        }
+        if live:
+            # One upload for the step. A blocking one waits for every queued
+            # kernel, including the previous step's; a pageable non_blocking one
+            # stages the bytes and returns at once.
+            pcm = torch.frombuffer(bytearray().join(live.values()), dtype=torch.float32)
+            sizes = [len(chunk) // pcm.element_size() for chunk in live.values()]
+            live = dict(zip(live, pcm.to(device, non_blocking=True).split(sizes), strict=True))
         acoustic = []
         user_waveforms = []
         prompt_indices = []
         prompt_waveforms = []
-        for index, (item, (_, info)) in enumerate(zip(prepared, requests, strict=True)):
-            duplex = info["duplex"]
-            if not (duplex.get("duplexio_prefill", False) or duplex.get("duplexio_system_input", False)):
-                # A blocking upload waits for every queued kernel, including the
-                # previous step's; a pageable non_blocking one stages the bytes
-                # and returns at once.
-                waveform = torch.frombuffer(
-                    bytearray(duplex["pcm"]), dtype=torch.float32,
-                ).to(device, non_blocking=True)
+        for index, item in enumerate(prepared):
+            if index in live:
+                waveform = live[index]
             elif item.prompt_chunk_frames:
                 start = item.frame_start * self.config.frame_size
                 count = item.prompt_chunk_frames * self.config.frame_size
@@ -676,9 +680,8 @@ class DuplexIOForConditionalGeneration(
                 user_waveforms, [prepared[index].state for index in acoustic],
             )
             for index, features in zip(acoustic, user_features, strict=True):
-                prepared[index].user_features = F.pad(
-                    features, (0, 0, 0, prepared[index].frame_count - features.shape[0]),
-                )
+                missing = prepared[index].frame_count - features.shape[0]
+                prepared[index].user_features = F.pad(features, (0, 0, 0, missing)) if missing else features
         if prompt_indices:
             states = [prepared[index].state for index in prompt_indices]
             codes = self.encode_agent_audio_batch(prompt_waveforms, states)
@@ -714,7 +717,9 @@ class DuplexIOForConditionalGeneration(
     ) -> list[PreparedFrames]:
         """Pack scheduled frames once; request boundaries own all running counters."""
         audio = self.prepare_audio_requests(requests, device)
-        ids = []
+        silence = self.silence_token_id
+        quiet = (silence,) * (len(TEXT_STREAM_NAMES) - 1)
+        # One row per packed frame: the text ids, then frame_inputs' metadata.
         rows = []
         preceding_keys = 0
         for item, (_, info) in zip(audio, requests, strict=True):
@@ -724,38 +729,38 @@ class DuplexIOForConditionalGeneration(
             prefill = duplex.get("duplexio_prefill", False)
             system = duplex.get("duplexio_system_input", False)
             live = not (prefill or system)
-            text = state.text_input_ids.expand(count, -1).clone()
             if prefill:
-                text.fill_(self.silence_token_id)
-                text[item.prompt_chunk_frames:, 0] = torch.tensor(
-                    state.system_token_ids[max(0, start - item.prompt_count):max(0, start + count - item.prompt_count)],
-                    dtype=torch.long,
-                )
+                system_ids = state.system_token_ids[
+                    max(0, start - item.prompt_count):max(0, start + count - item.prompt_count)
+                ]
+                text = [(silence, *quiet)] * item.prompt_chunk_frames + [(token, *quiet) for token in system_ids]
             elif system:
-                text.fill_(self.silence_token_id)
-                text[:, 0] = torch.tensor(duplex["duplexio_system_token_ids"][start:start + count], dtype=torch.long)
-                state.text_input_ids = torch.full_like(state.text_input_ids, self.silence_token_id)
+                text = [(token, *quiet) for token in duplex["duplexio_system_token_ids"][start:start + count]]
+                state.text_input_ids = (silence, *quiet)
             else:
-                text[:, 0] = self.silence_token_id
-            # CPU state provides packed-row offsets; no device readback is needed.
+                text = [(silence, *state.text_input_ids[1:])] * count
+            assert len(text) == count
             rows.extend(
-                (state.persistent_keys - preceding_keys,
+                (*ids, state.persistent_keys - preceding_keys,
                  state.audio_position + (row if live else 0), live,
                  row < item.prompt_chunk_frames, state.frames_seen + row)
-                for row in range(count)
+                for row, ids in enumerate(text)
             )
-            written = item.prompt_chunk_frames + (
-                (text != self.pad_token_id) & (text != self.silence_token_id)
-            ).sum().item()
+            written = item.prompt_chunk_frames + sum(
+                token != self.pad_token_id and token != silence for ids in text for token in ids
+            )
             state.persistent_keys += written
             preceding_keys += written
             state.frames_seen += count
             if live:
                 state.audio_position += count
-            ids.append(text)
-        text_ids = torch.cat(ids).to(device, non_blocking=True)
-        metadata = torch.tensor(rows, dtype=torch.int32).to(device, non_blocking=True)
-        user_features = torch.cat([item.user_features for item in audio])
+        packed = torch.tensor(rows, dtype=torch.long).to(device, non_blocking=True)
+        text_ids, metadata = packed[:, :len(TEXT_STREAM_NAMES)], packed[:, len(TEXT_STREAM_NAMES):]
+        user_features = torch.cat([
+            self.llm.channel_emb.new_zeros(item.frame_count, self.user_asr.output_dim)
+            if item.user_features is None else item.user_features
+            for item in audio
+        ])
         agent_codes = torch.cat([item.agent_codes for item in audio])
         with torch.profiler.record_function("duplexio.frame_inputs"):
             inputs = (text_ids, metadata, user_features, agent_codes)
@@ -768,23 +773,20 @@ class DuplexIOForConditionalGeneration(
             else:
                 outputs = self.project_frames(*inputs)
         embeddings, *addressing = outputs
-        positions = (
-            metadata[:, 4, None] * DUPLEXIO_NUM_CELLS + torch.arange(DUPLEXIO_NUM_CELLS, device=device)
-        ).flatten()
         packed_cells = dict(zip(
             ("positions", "key_active", "persistent_ordinal", "persistent_last", "audio_first", "audio_last"),
-            (positions, *addressing), strict=True,
+            addressing, strict=True,
         ))
+        records = [info["duplex"]["runtime_config"].get("duplexio_record_inputs", False) for _, info in requests]
         packed_replay = {
             "text_ids": text_ids, "user_features": user_features, "agent_audio": agent_codes,
             "audio_mask": metadata[:, 2] != 0, "prompt_frames": metadata[:, 3] != 0,
-        }
+        } if any(records) else {}
         results = []
         offset = 0
-        for item, (_, info) in zip(audio, requests, strict=True):
+        for item, record in zip(audio, records, strict=True):
             end = offset + item.frame_count
             cells = slice(offset * DUPLEXIO_NUM_CELLS, end * DUPLEXIO_NUM_CELLS)
-            record = info["duplex"]["runtime_config"].get("duplexio_record_inputs", False)
             results.append(PreparedFrames(embeddings[cells], {
                 "duplexio_working_state": item.state,
                 "duplexio_replay": PackedRows(packed_replay, slice(offset, end)) if record else {},
@@ -807,11 +809,13 @@ class DuplexIOForConditionalGeneration(
         text_hidden = self.llm.base_model.model.embed_input_ids(text_ids.flatten()).view(
             text_ids.shape[0], len(TEXT_STREAM_NAMES), -1
         )
-        return self.frame_inputs(
+        embeddings, *addressing = self.frame_inputs(
             text_ids, text_hidden, self.llm.channel_emb, user_hidden, agent_hidden,
             self.pad_token_id, self.silence_token_id,
             metadata, self.config.audio_attention_window_frames,
         )
+        positions = metadata[:, 4, None] * DUPLEXIO_NUM_CELLS + torch.arange(DUPLEXIO_NUM_CELLS, device=metadata.device)
+        return embeddings, positions.flatten(), *addressing
 
     def forward(
         self,
@@ -1027,9 +1031,7 @@ class DuplexIOForConditionalGeneration(
                 user_token_id, agent_token_id, tool_token_id = host_ids[row]
                 policy_version = step.policy_version
                 tool_call = batch.text.tool_calls[row]
-                state.text_input_ids = torch.tensor(
-                    [silence, *host_ids[row]], dtype=torch.long, device="cpu",
-                )
+                state.text_input_ids = (silence, *host_ids[row])
                 audio_outputs.append(decoded.get(row, empty_audio))
                 chunk["agent_audio_token_ids"].append(host_rows["audio"][row])
                 if tool_call is not None:
@@ -1349,12 +1351,7 @@ class DuplexIOForConditionalGeneration(
             None if continuous else self.audio_representation.new_state(device=device)
         )
         return DuplexIORequestState(
-            text_input_ids=torch.full(
-                (len(TEXT_STREAM_NAMES),),
-                self.silence_token_id,
-                dtype=torch.long,
-                device="cpu",
-            ),
+            text_input_ids=(self.silence_token_id,) * len(TEXT_STREAM_NAMES),
             agent_audio_codes=self.initial_agent_audio(1)[0],
             user_asr=FastConformerAudioStreamState(),
             input_mimi=self.audio_codec.new_state(1) if continuous else self.audio_codec.new_streaming_state(),
@@ -1559,7 +1556,7 @@ def frame_inputs(
     without being live: only its agent-audio cell contributes a key, and audio
     time stays frozen.
 
-    Metadata is int32, one row per packed frame: persistent-cumsum offset, audio
+    Metadata is integer, one row per packed frame: persistent-cumsum offset, audio
     position, live flag, prompt flag, absolute frame. The offset subtracts
     preceding requests' keys, isolating the scan.
     """

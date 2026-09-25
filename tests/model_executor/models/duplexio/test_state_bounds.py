@@ -47,7 +47,7 @@ def test_gdn_request_state_shape_is_fixed_for_the_session_lifetime() -> None:
 
 def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
     state = DuplexIORequestState(
-        text_input_ids=torch.zeros(4, dtype=torch.long),
+        text_input_ids=(0, 0, 0, 0),
         agent_audio_codes=torch.zeros(8, dtype=torch.long),
         user_asr=FastConformerAudioStreamState(),
         input_mimi=MimiStreamingState(),
@@ -68,7 +68,7 @@ def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
     assert fork.frames_seen == 100_000
     assert fork.audio_position == 99_000
     assert fork.persistent_keys == 250_000
-    assert fork.text_input_ids.shape == (4,)
+    assert fork.text_input_ids == (0, 0, 0, 0)
     assert fork.agent_audio_codes.shape == (8,)
     assert fork.agent_delay.previous_acoustic_codes.shape == (7,)
     # The pinned prompt is immutable for the session, so a fork shares it.
