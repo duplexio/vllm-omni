@@ -221,10 +221,28 @@ async def test_failed_config_submission_does_not_mark_generation_delivered() -> 
     from dataclasses import replace
 
     port, pools, states, _, submission = _duplex_stage_port_submission()
+    await port.submit(submission)
     pools[0].submit_update.side_effect = RuntimeError("transport failure")
+    updated = replace(submission, already_submitted=True, context=replace(submission.context, config_generation=1))
+    port.ensure_request(updated.context)
     with pytest.raises(RuntimeError, match="transport failure"):
+        await port.submit(updated)
+    assert states[submission.context.request_id].duplex_sent_config_generations == {0: 0}
+
+
+@pytest.mark.asyncio
+async def test_append_after_abort_is_rejected_instead_of_resubmitted() -> None:
+    from dataclasses import replace
+
+    port, pools, states, _, submission = _duplex_stage_port_submission()
+    await port.submit(submission)
+    # Abort cleanup drops the state; a late append for the bound id re-ensures it.
+    states.pop(submission.context.request_id)
+    port.ensure_request(submission.context)
+    with pytest.raises(RuntimeError, match="aborted"):
         await port.submit(replace(submission, already_submitted=True))
-    assert states[submission.context.request_id].duplex_sent_config_generations == {}
+    pools[0].submit_update.assert_not_called()
+    assert submission.context.request_id not in states
 
 
 @pytest.mark.asyncio

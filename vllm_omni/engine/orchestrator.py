@@ -294,6 +294,12 @@ class _OrchestratorDuplexStagePort:
         request_state = self._request_states.get(context.request_id)
         if request_state is None:
             raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
+        if submission.already_submitted and not request_state.duplex_sent_config_generations:
+            # The session still binds this id, but an abort (barge-in, listen,
+            # disconnect) dropped its state and ensure_request rebuilt it
+            # empty. Resubmitting would start a request with no prefix.
+            self._request_states.pop(context.request_id, None)
+            raise RuntimeError(f"duplex request was aborted: {context.request_id}")
         prompt = dict(submission.prompt)
         if (
             submission.already_submitted
