@@ -21,9 +21,8 @@ stages:
     max_model_len: 73728
     # Scheduler chunks contain whole six-cell frames across all streams.
     max_num_batched_tokens: 6144
-    # FlexAttention tiles pages, so the page must be a power of two. Without
-    # this the hybrid cache would derive 528 tokens per page from the mamba
-    # state size. 1024 spans the same slots in fewer, larger pages.
+    # Without this the hybrid cache would derive 528 tokens per page from the
+    # mamba state size. 1024 spans the same slots in fewer, larger pages.
     block_size: 1024
     # Reserve activation headroom for the session's tool-aware system prefill.
     # The remaining KV cache still exceeds one maximum-length session.

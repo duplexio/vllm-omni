@@ -14,7 +14,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 DEPLOY_DIR = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
 
 
-def test_default_deploy_uses_flexattention_compatible_tiles() -> None:
+def test_default_deploy_pins_the_kv_page_size() -> None:
     assert DUPLEXIO_PIPELINE.default_deploy_config_name == "duplexio.yaml"
     deploy = load_deploy_config(DEPLOY_DIR / "duplexio.yaml")
     stage = deploy.stages[0]
@@ -33,12 +33,11 @@ def test_default_deploy_uses_flexattention_compatible_tiles() -> None:
         "cudagraph_capture_sizes": [6],
         "cudagraph_copy_inputs": True,
     }
-    # FlexAttention tiles pages, so the page size must be a power of two; the
-    # hybrid cache would otherwise derive it from the mamba state size.
+    # The hybrid cache would otherwise derive the page from the mamba state size.
     assert stage.engine_extras["block_size"] == 1024
 
 
-def test_multistream_deploy_uses_batched_flexattention_path() -> None:
+def test_multistream_deploy_batches_two_sessions() -> None:
     deploy = load_deploy_config(DEPLOY_DIR / "duplexio-multistream.yaml")
     stage = deploy.stages[0]
 

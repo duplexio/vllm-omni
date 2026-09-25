@@ -29,6 +29,18 @@ def frame_metadata(layout: DuplexIOKVLayout, rows: int = 1) -> DuplexIOFrameMeta
     return DuplexIOFrameMetadata(layout, rows * DUPLEXIO_NUM_CELLS, torch.device("cpu"))
 
 
+def visible_slots(frame: DuplexIOFrameMetadata, rows: int = 1) -> torch.Tensor:
+    """Compact slots each row reads, as a ``[rows, slots]`` mask."""
+    layout = frame.layout
+    start, end, persistent = frame.row_reads(rows * DUPLEXIO_NUM_CELLS)
+    slots = torch.arange(layout.max_compact_slots)
+    base = layout.persistent_base
+    audio = (slots < base) & (
+        torch.remainder(slots - start[:, None], base) < (end - start)[:, None]
+    )
+    return audio | ((slots >= base) & (slots - base < persistent[:, None]))
+
+
 def install_row(
     frame: DuplexIOFrameMetadata,
     *,
@@ -82,7 +94,6 @@ def test_compact_cache_attention_matches_logical_rows_across_audio_eviction() ->
     dim = 7
     cached_keys = torch.zeros(layout.max_compact_slots, dim)
     cached_values = torch.zeros_like(cached_keys)
-    slots = torch.arange(layout.max_compact_slots)
     logical_keys: list[torch.Tensor] = []
     logical_values: list[torch.Tensor] = []
     logical_active: list[bool] = []
@@ -132,7 +143,7 @@ def test_compact_cache_attention_matches_logical_rows_across_audio_eviction() ->
             logical_scores = query @ all_keys[logical_visible].T
             expected = logical_scores.softmax(-1) @ all_values[logical_visible]
 
-            visible = frame.visible(None, None, torch.tensor(cell), slots)
+            visible = visible_slots(frame)[0]
             # Self K/V comes from the query itself, never from a cache slot.
             compact_keys = torch.cat((cached_keys[visible], keys[cell][None]))
             compact_values = torch.cat((cached_values[visible], values[cell][None]))
@@ -161,8 +172,9 @@ def test_audio_ring_reuses_a_bounded_set_of_slots() -> None:
     written = frame.write_slots(tokens)
     audio_slots = written[cells % DUPLEXIO_NUM_CELLS >= DUPLEXIO_NUM_TEXT_CELLS]
 
-    assert audio_slots.unique().numel() == 2 * (layout.audio_window_frames + 1)
-    assert int(audio_slots.max()) < layout.audio_slots
+    # Frames are laid out linearly modulo the audio pages, so every slot of
+    # them is reused and none outside them is touched.
+    assert audio_slots.unique().numel() == layout.persistent_base
     assert layout.audio_slots <= layout.persistent_base
 
 
@@ -207,7 +219,7 @@ def test_live_row_writes_its_own_audio_frame_into_the_ring() -> None:
 
     written = frame.write_slots(DUPLEXIO_NUM_CELLS)
 
-    assert torch.equal(written, torch.tensor([-1, -1, -1, -1, 6, 7]))
+    assert torch.equal(written, torch.tensor([-1, -1, -1, -1, 4, 5]))
 
 
 def test_padded_graph_tokens_neither_write_nor_see_a_slot() -> None:
@@ -226,13 +238,7 @@ def test_padded_graph_tokens_neither_write_nor_see_a_slot() -> None:
 
     tokens = 2 * DUPLEXIO_NUM_CELLS
     written = frame.write_slots(tokens)
-    padded = torch.arange(DUPLEXIO_NUM_CELLS, tokens)
-    visible = frame.visible(
-        None,
-        None,
-        padded[:, None],
-        torch.arange(layout.max_compact_slots)[None],
-    )
+    visible = visible_slots(frame, rows=2)[1]
 
     assert torch.equal(
         written[DUPLEXIO_NUM_CELLS:], torch.full((DUPLEXIO_NUM_CELLS,), -1)
@@ -329,16 +335,16 @@ def test_cache_spec_registers_native_manager_and_preserves_page_contract() -> No
     assert DuplexIOKVCacheSpec.merge([spec, spec]) is spec
 
 
-def test_cache_spec_rejects_pages_flex_cannot_tile() -> None:
+def test_cache_spec_rejects_pages_flash_attention_cannot_tile() -> None:
     base = FullAttentionSpec(
-        block_size=528,
+        block_size=520,
         num_kv_heads=4,
         head_size=256,
         head_size_v=256,
         dtype=torch.bfloat16,
     )
 
-    with pytest.raises(ValueError, match="power-of-two"):
+    with pytest.raises(ValueError, match="divisible by 16"):
         make_duplexio_kv_cache_spec(
             base, audio_window_frames=8, max_model_len=600
         )
@@ -378,16 +384,14 @@ def test_pinned_prompt_and_text_share_one_region_that_never_expires() -> None:
     assert written == [
         [-1, -1, -1, -1, -1, base],
         [-1, -1, -1, -1, -1, base + 1],
-        [base + 2, base + 3, -1, -1, 2, 3],
+        [base + 2, base + 3, -1, -1, 0, 1],
     ]
     assert layout.audio_slots <= base
 
     # A live row far past the window still sees every persistent key, while its
     # own ring history has expired.
     install_row(frame, text_active=silent, persistent_before=4, audio_frame=40)
-    keys = torch.arange(layout.max_compact_slots)
-    query = torch.zeros_like(keys)
-    visible = frame.visible(query, query, query, keys)
+    visible = visible_slots(frame)[0]
 
     assert visible[base : base + 4].all()
     assert not visible[base + 4 :].any()
@@ -408,9 +412,7 @@ def test_a_pinned_frame_does_not_see_itself_through_the_cache() -> None:
         audio_active=False,
         pinned=True,
     )
-    keys = torch.arange(layout.max_compact_slots)
-    query = torch.zeros_like(keys)
 
     # Its own cells are merged from the incoming K/V, so the cache must not
     # report them: nothing is visible before the first prompt frame is behind us.
-    assert not frame.visible(query, query, query, keys).any()
+    assert not visible_slots(frame).any()

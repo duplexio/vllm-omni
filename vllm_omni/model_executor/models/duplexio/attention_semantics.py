@@ -36,7 +36,7 @@ def key_in_window(
     """Return whether keys fall inside the attention window of the queries.
 
     This predicate is the single source of truth for window semantics; the
-    flex mask_mods, the cached attention mask, and cache eviction all call it.
+    reference attention masks and cache eviction all call it.
     Window distance runs over ``*_window_pos``: audio time for the backbone
     (``window_all_keys=False`` — audio time is a non-decreasing cumsum over
     frames, so inserted non-audio frames such as tool-result token bursts do
@@ -73,8 +73,8 @@ def key_visible(
 ) -> Tensor:
     """Cross-row key visibility: strict row causality, active keys only, and
     the shared attention window. Same-token self visibility is the caller's
-    responsibility (flex adds ``q_idx == kv_idx``; the cached mask adds an
-    identity block over the current cells)."""
+    responsibility (the cached mask adds an identity block over the current
+    cells)."""
     prior_row = k_frame_pos < q_frame_pos
     return (
         prior_row

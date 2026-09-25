@@ -200,8 +200,8 @@ class OmniGPUWorkerBase(GPUWorker):
         # Level 1 offloads the kv_cache pool too (upstream discards it):
         # attention metadata builders are constructed inside the pooled
         # initialize_kv_cache, so the pool holds their persistent constants
-        # (e.g. the DuplexIO flex builder's graph_kv_indices / block offsets
-        # baked into captured FULL cudagraphs). Discarding maps garbage into
+        # (e.g. the DuplexIO builder's row tables baked into captured FULL
+        # cudagraphs). Discarding maps garbage into
         # those constants at wake-up and graph replay reads phantom KV
         # blocks; offloading restores every pool byte exactly.
         offload_tags = ("weights", "kv_cache") if level == 1 else tuple()

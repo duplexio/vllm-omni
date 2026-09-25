@@ -31,11 +31,13 @@ from vllm_omni.model_executor.models.duplexio.row_semantics import (
 class DuplexIOKVLayout:
     """Physical slots owned by one admitted DuplexIO request.
 
-    The first region is a ring for active audio cells. The second holds the
-    keys no window expires, in the order they were written: the pinned voice
-    prompt, then every emitted text cell. It is never reclaimed during the
-    request. Query-local self-attention uses incoming K/V directly and needs no
-    cache slots.
+    The first region is a ring for active audio cells: frame ``f`` (from one)
+    puts cell ``c`` at logical slot ``2 * (f - 1) + c``, stored modulo the
+    region's size, so the window a row reads is one contiguous logical range
+    that wraps whole pages. The second holds the keys no window expires, in the
+    order they were written: the pinned voice prompt, then every emitted text
+    cell. It is never reclaimed during the request. Query-local self-attention
+    uses incoming K/V directly and needs no cache slots.
     """
 
     block_size: int
@@ -64,7 +66,7 @@ class DuplexIOKVLayout:
         return cdiv(self.audio_slots, self.block_size) * self.block_size
 
     @property
-    def persistent_base_page(self) -> int:
+    def audio_ring_pages(self) -> int:
         return self.persistent_base // self.block_size
 
     @property
@@ -82,10 +84,8 @@ class DuplexIOKVLayout:
         return cdiv(self.max_compact_slots, self.block_size)
 
     def audio_slot(self, audio_position: int, audio_cell: int) -> int:
-        assert 0 <= audio_cell < self.num_audio_cells
-        return (
-            audio_position % self.audio_ring_frames
-        ) * self.num_audio_cells + audio_cell
+        assert audio_position >= 1 and 0 <= audio_cell < self.num_audio_cells
+        return ((audio_position - 1) * self.num_audio_cells + audio_cell) % self.persistent_base
 
     def persistent_slot(self, ordinal: int) -> int:
         assert 0 <= ordinal < self.max_persistent_keys
@@ -96,9 +96,10 @@ class DuplexIOFrameMetadata:
     """Per-token cache addressing for one model step.
 
     A cell's slot decides its position, so nothing has to be stored alongside
-    the key: an audio slot is the ring residue of its frame, a persistent slot
-    is dense in write order. One instance is shared by every full-attention
-    layer, which keeps the addressing and the attention mask in one place.
+    the key: an audio slot follows its frame, a persistent slot is dense in
+    write order. What a row reads is therefore two ranges, one per region. One
+    instance is shared by every full-attention layer, which keeps the addressing
+    of writes and reads in one place.
 
     Buffers are sized for the largest batch and keep stable addresses for
     CUDA-graph replay. Whatever the current batch does not cover stays inert,
@@ -166,36 +167,30 @@ class DuplexIOFrameMetadata:
         ordinal = self.persistent_ordinal[:tokens]
         persistent = ordinal > 0
         audio = (cell >= DUPLEXIO_NUM_TEXT_CELLS) & self.key_active[:tokens] & (audio_last >= 0)
-        audio_slot = (
-            torch.remainder(audio_last + 1, layout.audio_ring_frames) * layout.num_audio_cells
-            + cell - DUPLEXIO_NUM_TEXT_CELLS
+        audio_slot = torch.remainder(
+            audio_last * layout.num_audio_cells + cell - DUPLEXIO_NUM_TEXT_CELLS,
+            layout.persistent_base,
         )
         return (
             torch.where(persistent, layout.persistent_base + ordinal - 1, audio_slot)
             .masked_fill(~(persistent | audio), -1)
         )
 
-    def visible(self, batch: Tensor, head: Tensor, query: Tensor, key: Tensor) -> Tensor:
-        """Return whether a query cell sees a compact slot of a prior row.
+    def row_reads(self, tokens: int) -> tuple[Tensor, Tensor, Tensor]:
+        """Return what each row of the step reads from the cache.
 
-        Its own cell is merged separately, so no same-row key is visible here.
-        An audio slot's frame is the most recent one with its ring residue; slots
-        that were never written, or that the window has passed, derive a frame
-        below the query's first visible frame. Persistent slots carry no window:
-        every row after the one that wrote them sees them.
+        Rows are whole frames, and every cell of a row reads the same keys:
+        logical audio slots ``[start, end)`` before the ring modulus, and the
+        first ``persistent`` keys of the persistent region. Audio is frames
+        ``audio_first..audio_last``; a live row writes the frame after its last,
+        and its own cell is merged separately, so nothing a step writes is read
+        back. An inert padded row reads nothing.
         """
-        del batch, head
-        layout = self.layout
-        audio_last = self.audio_last[query]
-        frame = audio_last - torch.remainder(
-            audio_last - torch.div(key, layout.num_audio_cells, rounding_mode="floor"),
-            layout.audio_ring_frames,
-        )
-        audio = (key < layout.audio_slots) & (frame >= self.audio_first[query])
-        persistent = (key >= layout.persistent_base) & (
-            key - layout.persistent_base < self.persistent_last[query]
-        )
-        return audio | persistent
+        cells = self.layout.num_audio_cells
+        audio_last = self.audio_last[:tokens:DUPLEXIO_NUM_CELLS]
+        end = (audio_last * cells).clamp_min(0)
+        start = torch.minimum((self.audio_first[:tokens:DUPLEXIO_NUM_CELLS] - 1) * cells, end)
+        return start, end, self.persistent_last[:tokens:DUPLEXIO_NUM_CELLS]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -320,12 +315,12 @@ def make_duplexio_kv_cache_spec(
 ) -> DuplexIOKVCacheSpec:
     """Convert an Attention-produced full spec to DuplexIO's compact spec."""
     if base.kv_quant_mode != KVQuantMode.NONE:
-        raise ValueError("DuplexIO FlexAttention does not support quantized KV cache")
+        raise ValueError("DuplexIO attention does not support quantized KV cache")
     if max_model_len < DUPLEXIO_NUM_CELLS:
         raise ValueError("DuplexIO max_model_len must fit at least one frame")
-    if base.block_size & (base.block_size - 1):
+    if base.block_size % 16:
         raise ValueError(
-            "DuplexIO paged FlexAttention needs a power-of-two KV block size; "
+            "DuplexIO paged FlashAttention needs a KV block size divisible by 16; "
             f"got {base.block_size}. Pin `block_size` in the deployment config."
         )
     if audio_window_frames < 0:

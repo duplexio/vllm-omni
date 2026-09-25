@@ -37,7 +37,7 @@ from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
 )
 from vllm_omni.model_executor.models.duplexio.pipeline import DUPLEXIO_PIPELINE
 from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
-    DuplexIOFlexAttentionMetadataBuilder,
+    DuplexIOFlashAttentionMetadataBuilder,
     DuplexIOGDNAttentionBackend,
     DuplexIOGDNAttentionMetadataBuilder,
     DuplexIOQwenGatedDeltaNetAttention,
@@ -174,9 +174,8 @@ def test_duplexio_installs_cell_addressing_at_stable_buffers() -> None:
     model.update_graph_inputs([])
 
     assert torch.equal(frame.write_slots(12), torch.full((12,), -1))
-    assert not frame.visible(
-        None, None, torch.arange(12)[:, None], torch.arange(layout.max_compact_slots)
-    ).any()
+    start, end, persistent = frame.row_reads(12)
+    assert torch.equal(start, end) and not persistent.any()
     assert pointers == tuple(buffer.data_ptr() for buffer in buffers)
 
 
@@ -271,7 +270,7 @@ def test_duplexio_cudagraph_supports_uniform_six_cell_batches() -> None:
     # recurrence still needs one graph per batch size.
     for config in (single, multiple):
         assert (
-            DuplexIOFlexAttentionMetadataBuilder.get_cudagraph_support(config, None)
+            DuplexIOFlashAttentionMetadataBuilder.get_cudagraph_support(config, None)
             is AttentionCGSupport.ALWAYS
         )
     assert (

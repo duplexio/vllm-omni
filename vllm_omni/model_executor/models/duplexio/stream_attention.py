@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor
-from torch.nn.attention.flex_attention import AuxRequest, BlockMask, flex_attention
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
+
+from vllm_omni.model_executor.models.duplexio.row_semantics import DUPLEXIO_NUM_CELLS
 
 
 @torch.compile(dynamic=True, fullgraph=True)
@@ -36,76 +37,78 @@ def gated_attention_output(output: Tensor, gate: Tensor) -> Tensor:
     return output * gate.sigmoid()
 
 
-@torch.compile(fullgraph=True)
-def paged_history_attention(
-    query: Tensor,
-    keys: Tensor,
-    values: Tensor,
-    block_mask: BlockMask,
-    scale: float,
-    kernel_options: dict[str, int | bool],
-) -> tuple[Tensor, Tensor]:
-    """Attend to prior rows straight out of paged storage.
-
-    Query is (tokens, heads, dim) and K/V are (slots, kv_heads, dim) spanning the
-    whole cache pool. Each KV head's grouped query heads become consecutive
-    rows of one query block, so a KV tile is loaded once for all of them. The
-    block mask's batch dimension splits each block's tiles; the query is
-    repeated over it. Returns the split histories (splits, tokens, kv_heads,
-    groups, dim) and their natural-log softmax normalizers (splits, tokens,
-    kv_heads, groups), which the caller merges with the query-local diagonal
-    the cache does not hold yet.
-    """
-    tokens, _, dim = query.shape
-    kv_heads = keys.shape[1]
-    splits = block_mask.kv_num_blocks.shape[0]
-    # Inductor cannot lower a flex query broadcast over a symbolic batch, so each
-    # split gets its own copy; it fuses into the packing copy.
-    rows = query.unflatten(1, (kv_heads, -1)).transpose(0, 1).reshape(1, kv_heads, -1, dim)
-    history, auxiliary = flex_attention(
-        rows.expand(splits, -1, -1, -1).contiguous(),
-        keys.transpose(0, 1)[None],
-        values.transpose(0, 1)[None],
-        block_mask=block_mask,
-        scale=scale,
-        return_aux=AuxRequest(lse=True),
-        kernel_options=kernel_options,
-    )
-    assert auxiliary.lse is not None
-    return (
-        history.unflatten(2, (tokens, -1)).transpose(1, 2),
-        auxiliary.lse.unflatten(2, (tokens, -1)).transpose(1, 2),
-    )
-
-
 @torch.compile(dynamic=True, fullgraph=True)
-def merge_self_attention(
+def merge_row_attention(
     query: Tensor,
     self_key: Tensor,
     self_value: Tensor,
-    history: Tensor,
-    lse: Tensor,
+    keys: Tensor,
+    values: Tensor,
+    extra_slots: Tensor,
+    audio: Tensor,
+    audio_lse: Tensor,
+    persistent: Tensor,
+    persistent_lse: Tensor,
+    empty: Tensor,
     scale: float,
 ) -> Tensor:
-    """Add each query's own cell to its split cached history.
+    """Join a row's cached partials with the keys its cache read left out.
 
     Query is (tokens, heads, dim), self K/V (tokens, kv_heads, dim), and
-    ``history``/``lse`` are (splits, tokens, kv_heads, groups[, dim]) partial
-    reductions with their natural-log normalizers. Grouped query heads reduce
-    against their own KV head without expanding it, and the partials merge in
-    FP32. A split with no visible key has ``lse == -inf`` and weight zero, so a
-    query with no history returns its own cell exactly.
+    ``keys``/``values`` (slots, kv_heads, dim) the whole paged cache, read at
+    each row's ``extra_slots`` (two per row, -1 where none). The audio and
+    persistent partials are FlashAttention's packed rows, (rows, kv_heads *
+    cells * groups, dim) with natural-log normalizers (kv_heads * cells *
+    groups, rows), and ``empty`` (rows * 2) flags the rows whose audio or
+    persistent read was empty, whose partials are dropped. Grouped query heads
+    reduce against their own KV head without expanding it, and the partials
+    merge in FP32. A partial with no key has weight zero, so a query with no
+    history returns its own cell exactly.
     """
+    tokens, heads, dim = query.shape
     kv_heads = self_key.shape[1]
-    groups = query.shape[1] // kv_heads
-    grouped = query.unflatten(1, (kv_heads, groups)).float()
-    scores = (grouped * self_key.unsqueeze(2).float()).sum(-1) * scale
-    lse = lse.float()
-    top = torch.maximum(lse.amax(0), scores)
-    weights = torch.exp(lse - top)
-    own = torch.exp(scores - top)
+    groups = heads // kv_heads
+    rows = tokens // DUPLEXIO_NUM_CELLS
+    grouped = query.view(rows, DUPLEXIO_NUM_CELLS, kv_heads, groups, dim).float()
+
+    empty = empty.view(rows, 2)
+
+    def partial(output: Tensor, lse: Tensor, empty: Tensor) -> tuple[Tensor, Tensor]:
+        lse = lse.view(kv_heads, DUPLEXIO_NUM_CELLS, groups, rows).permute(3, 1, 0, 2)
+        output = output.view(rows, kv_heads, DUPLEXIO_NUM_CELLS, groups, dim).transpose(1, 2)
+        empty = empty[:, None, None, None]
+        return (
+            output.float().masked_fill(empty[..., None], 0),
+            lse.masked_fill(empty, -torch.inf),
+        )
+
+    audio, audio_lse = partial(audio, audio_lse, empty[:, 0])
+    persistent, persistent_lse = partial(persistent, persistent_lse, empty[:, 1])
+    own_key = self_key.view(rows, DUPLEXIO_NUM_CELLS, kv_heads, 1, dim).float()
+    own_value = self_value.view(rows, DUPLEXIO_NUM_CELLS, kv_heads, 1, dim).float()
+    own = (grouped * own_key).sum(-1) * scale
+    # (rows, 1, kv_heads, 1, extra, dim)
+    slots = extra_slots.view(rows, -1)
+    # A missing slot reads slot zero, which may hold anything: mask its score
+    # and its value, since zero weight times a stale NaN is still NaN.
+    missing = (slots < 0)[:, :, None, None]
+    extra_key = keys[slots.clamp_min(0)].float()
+    extra_value = values[slots.clamp_min(0)].float().masked_fill(missing, 0)
+    extra_key, extra_value = (
+        tensor.transpose(1, 2)[:, None, :, None] for tensor in (extra_key, extra_value)
+    )
+    extra = ((grouped.unsqueeze(-2) * extra_key).sum(-1) * scale).masked_fill(
+        (slots < 0)[:, None, None, None], -torch.inf
+    )
+    top = torch.maximum(torch.maximum(audio_lse, persistent_lse), torch.maximum(own, extra.amax(-1)))
+    audio_weight = torch.exp(audio_lse - top)
+    persistent_weight = torch.exp(persistent_lse - top)
+    own_weight = torch.exp(own - top)
+    extra_weight = torch.exp(extra - top.unsqueeze(-1))
     merged = (
-        (history.float() * weights.unsqueeze(-1)).sum(0)
-        + self_value.unsqueeze(2).float() * own.unsqueeze(-1)
-    ) / (weights.sum(0) + own).unsqueeze(-1)
-    return merged.flatten(1, 2).to(query.dtype)
+        audio * audio_weight.unsqueeze(-1)
+        + persistent * persistent_weight.unsqueeze(-1)
+        + own_value * own_weight.unsqueeze(-1)
+        + (extra_value * extra_weight.unsqueeze(-1)).sum(-2)
+    ) / (audio_weight + persistent_weight + own_weight + extra_weight.sum(-1)).unsqueeze(-1)
+    return merged.reshape(tokens, heads, dim).to(query.dtype)
