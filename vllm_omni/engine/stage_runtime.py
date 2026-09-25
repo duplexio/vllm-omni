@@ -58,6 +58,7 @@ from vllm_omni.engine.stage_init_utils import (
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
+    stage_runtime_env,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
@@ -368,28 +369,30 @@ class StageRuntime:
             executor_class = None
             engine_args_dict = None
             if base_metadata.stage_type != "diffusion":
-                engine_args_dict = build_engine_args_dict(
-                    stage_cfg,
-                    self._model,
-                    stage_connector_spec=stage_connector_spec,
-                    cli_tokenizer=self._tokenizer,
-                )
-                inject_omni_kv_connector_config(
-                    engine_args_dict,
-                    omni_kv_connector,
-                    stage_id,
-                )
-                _inject_inferred_kv_tp_topology(
-                    engine_args_dict.get("omni_kv_config"),
-                    stage_id,
-                    self._stage_configs,
-                )
-                stage_vllm_config, executor_class = build_vllm_config(
-                    stage_cfg,
-                    self._model,
-                    stage_connector_spec=stage_connector_spec,
-                    engine_args_dict=engine_args_dict,
-                )
+                # Config validation reads env flags (e.g. VLLM_USE_BREAKABLE_CUDAGRAPH), so apply runtime.env first.
+                with stage_runtime_env(stage_id, stage_cfg.runtime):
+                    engine_args_dict = build_engine_args_dict(
+                        stage_cfg,
+                        self._model,
+                        stage_connector_spec=stage_connector_spec,
+                        cli_tokenizer=self._tokenizer,
+                    )
+                    inject_omni_kv_connector_config(
+                        engine_args_dict,
+                        omni_kv_connector,
+                        stage_id,
+                    )
+                    _inject_inferred_kv_tp_topology(
+                        engine_args_dict.get("omni_kv_config"),
+                        stage_id,
+                        self._stage_configs,
+                    )
+                    stage_vllm_config, executor_class = build_vllm_config(
+                        stage_cfg,
+                        self._model,
+                        stage_connector_spec=stage_connector_spec,
+                        engine_args_dict=engine_args_dict,
+                    )
 
             for replica_id in range(num_replicas):
                 replica_cfg = copy.deepcopy(stage_cfg) if replica_id > 0 else stage_cfg
@@ -571,7 +574,7 @@ class StageRuntime:
                 )
             # Serialize engine-core spawning across all LLM replicas to avoid
             # ZMQ port-allocation races and simultaneous CUDA context init.
-            with self._replica_launch_lock:
+            with self._replica_launch_lock, stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
                 with launch_stage_replica(
                     vllm_config=vllm_config,
                     executor_class=executor_class,

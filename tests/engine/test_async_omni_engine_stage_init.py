@@ -366,6 +366,45 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
     assert all(replica.num_replicas == 3 for replica in stage_plans[1].replicas)
 
 
+def test_build_logical_stage_init_plans_applies_runtime_env_to_config_build(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+    from omegaconf import OmegaConf
+
+    runtime = StageRuntime(
+        stage_configs=[
+            types.SimpleNamespace(
+                stage_id=0,
+                stage_type="llm",
+                engine_args={},
+                runtime=OmegaConf.create({"devices": "0", "env": {"VLLM_OMNI_TEST_STAGE_ENV": "1"}}),
+            ),
+        ],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+    monkeypatch.delenv("VLLM_OMNI_TEST_STAGE_ENV", raising=False)
+    monkeypatch.setattr(runtime_mod, "extract_legacy_stage_metadata", lambda cfg: _make_llm_metadata(cfg.stage_id))
+    monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
+    monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
+    monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
+    # vLLM validates env-gated modes (e.g. breakable CUDA graphs) while building the config.
+    seen = []
+
+    def build_vllm_config(*_args, **_kwargs):
+        seen.append(os.environ.get("VLLM_OMNI_TEST_STAGE_ENV"))
+        return None, object
+
+    monkeypatch.setattr(runtime_mod, "build_vllm_config", build_vllm_config)
+
+    runtime._build_logical_stage_init_plans(omni_transfer_config=None, replicas_per_stage=[1], replica_devices_map={})
+
+    assert seen == ["1"]
+    assert "VLLM_OMNI_TEST_STAGE_ENV" not in os.environ
+
+
 def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monkeypatch):
     runtime = StageRuntime(
         stage_configs=[],
