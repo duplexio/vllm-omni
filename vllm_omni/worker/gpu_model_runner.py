@@ -956,10 +956,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             if num_tokens % max_query_len != 0:
                 num_scheduled_tokens_list[-1] = num_tokens % max_query_len
         else:
-            num_reqs = min(num_tokens, max_num_reqs)
-            min_tokens_per_req = num_tokens // num_reqs
+            # Frame models schedule whole frames of decode_query_len cells.
+            unit = getattr(self.get_model(), "decode_query_len", 1)
+            unit = unit if num_tokens % unit == 0 else 1
+            num_reqs = min(num_tokens // unit, max_num_reqs)
+            min_tokens_per_req = num_tokens // unit // num_reqs * unit
             num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
-            num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+            num_scheduled_tokens_list[-1] += num_tokens - min_tokens_per_req * num_reqs
 
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs

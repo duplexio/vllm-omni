@@ -65,9 +65,12 @@ def prepare_gdn_inputs(
     return q, k, v, g, beta
 
 
-@torch.compile(dynamic=True, fullgraph=True)
 def initial_gdn_state(cache: Tensor, slots: Tensor, has_state: Tensor) -> Tensor:
-    """Ignore unowned cache bytes when a request starts or reuses a slot."""
+    """Ignore unowned cache bytes when a request starts or reuses a slot.
+
+    Eager: its row count is the step's request count, which a compiled
+    version would specialize on (one prefilling request is common).
+    """
     return torch.where(has_state[:, None, None, None], cache[slots], 0)
 
 

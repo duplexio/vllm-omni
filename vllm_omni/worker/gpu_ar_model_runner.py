@@ -524,7 +524,40 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def capture_model(self) -> int:
         result = super().capture_model()
         self._capture_talker_mtp_graphs()
+        self._replay_breakable_graphs()
+        # Model-owned graphs, captured under serving's default dtype.
+        capture_frame_graphs = getattr(self.get_model(), "capture_frame_graphs", None)
+        if capture_frame_graphs is not None:
+            capture_frame_graphs()
         return result
+
+    @torch.inference_mode()
+    def _replay_breakable_graphs(self) -> None:
+        """Replay each mixed-step graph once, with attention, before serving starts.
+
+        Breakable graphs defer their eager attention to replay, where it receives
+        weak references to the graph's tensors: different dispatch keys and
+        storage offsets than the warm-up runs gave it. Compiled code inside it
+        would otherwise recompile at the first mixed step, stalling live streams.
+        """
+        from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+
+        if not is_breakable_cudagraph_enabled():
+            return
+        for runtime_mode, batch_descs in self.cudagraph_dispatcher.get_capture_descs():
+            if runtime_mode != CUDAGraphMode.PIECEWISE:
+                continue
+            for desc in batch_descs:
+                self._dummy_run(
+                    desc.num_tokens,
+                    cudagraph_runtime_mode=runtime_mode,
+                    force_attention=True,
+                    uniform_decode=desc.uniform,
+                    skip_eplb=True,
+                    remove_lora=False,
+                    num_active_loras=desc.num_active_loras,
+                )
+        torch.accelerator.synchronize()
 
     def shutdown(self) -> None:
         """Release omni-specific GPU resources before upstream shutdown.

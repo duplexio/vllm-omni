@@ -768,13 +768,10 @@ class DuplexIOForConditionalGeneration(
         ])
         agent_codes = torch.cat([item.agent_codes for item in audio])
         with torch.profiler.record_function("duplexio.frame_inputs"):
-            inputs = (text_ids, metadata, user_features, agent_codes)
+            inputs = (packed, user_features, agent_codes)
             # Capture bounded one-frame batches; variable-length prefixes stay packed.
             if self.full_cudagraph_enabled and all(item.frame_count == 1 for item in audio):
-                size = len(audio)
-                if size not in self.frame_input_graphs:
-                    self.frame_input_graphs[size] = FrameInputGraph(self.project_frames, inputs)
-                outputs = self.frame_input_graphs[size](inputs)
+                outputs = self.frame_input_graph(inputs)(inputs)
             else:
                 outputs = self.project_frames(*inputs)
         embeddings, *addressing = outputs
@@ -800,10 +797,50 @@ class DuplexIOForConditionalGeneration(
             offset = end
         return results
 
-    def project_frames(
-        self, text_ids: Tensor, metadata: Tensor, user_features: Tensor, agent_codes: Tensor,
-    ) -> tuple[Tensor, ...]:
+    def frame_input_graph(self, inputs: tuple[Tensor, ...]) -> FrameInputGraph:
+        """The one-frame graph for this batch size, captured on first use into the shared pool."""
+        size = inputs[0].shape[0]
+        if size not in self.frame_input_graphs:
+            pool = next(iter(self.frame_input_graphs.values())).graph.pool() if self.frame_input_graphs else None
+            self.frame_input_graphs[size] = FrameInputGraph(self.project_frames, inputs, pool)
+        return self.frame_input_graphs[size]
+
+    @torch.inference_mode()
+    def capture_frame_graphs(self) -> None:
+        """Compile and capture frame construction for every batch size before serving starts.
+
+        Otherwise the first batch of each size would stall all live streams while
+        it compiles. The runner calls this after its own capture, under the
+        default dtype that serving runs with (weight loading changes it, which
+        compiled code guards on). Sampling graphs also key on the batch's top-k,
+        which only requests know, so here only their compiled FlowMap warms, at
+        one and two rows (every larger batch shares the second).
+        """
+        if not self.full_cudagraph_enabled or self.frame_input_graphs:
+            return
+        device = self.llm.channel_emb.device
+        max_rows = self.vllm_config.scheduler_config.max_num_seqs
+        # Silent live frames: text ids, then frame_inputs' metadata.
+        silence = (self.silence_token_id,) * len(TEXT_STREAM_NAMES)
+        packed = torch.tensor([(*silence, 0, 1, 1, 0, 0)] * max_rows, dtype=torch.long, device=device)
+        user_features = self.llm.channel_emb.new_zeros(max_rows, self.user_asr.output_dim)
+        agent_codes = self.initial_agent_audio(max_rows)
+        for size in range(1, max_rows + 1):
+            self.frame_input_graph((packed[:size], user_features[:size], agent_codes[:size]))
+        if isinstance(self.audio_sampler, FlowMapSampler):
+            options = TokenSamplingOptions(1.0, None, None, self.agent_suppressed_token_ids)
+            vocab_size = self.text_config.vocab_size
+            parameters = torch.tensor(
+                [(*sampling_parameters(options, options, (1.0, 1.0, 1.0), vocab_size), 0)] * 2, device=device,
+            )
+            hidden = self.llm.channel_emb.new_zeros(2, DUPLEXIO_NUM_CELLS, self.text_config.hidden_size)
+            for size in (1, 2):
+                self.sample_rows(hidden[:size], parameters[:size], self.allow_all_bitmask[:size], top_k=None)
+
+    def project_frames(self, packed: Tensor, user_features: Tensor, agent_codes: Tensor) -> tuple[Tensor, ...]:
         """Tensor-only packed projections and frame construction, shared by all requests."""
+        # Split here, so eager and captured calls hand frame_inputs the same strides.
+        text_ids, metadata = packed[:, :len(TEXT_STREAM_NAMES)], packed[:, len(TEXT_STREAM_NAMES):]
         with torch.autocast(
             device_type=text_ids.device.type,
             dtype=self.vllm_config.model_config.dtype,

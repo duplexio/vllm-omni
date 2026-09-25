@@ -22,22 +22,22 @@ def test_frame_projection_graph_matches_independent_requests_and_weight_refresh(
         ids[:, 0] = model.silence_token_id
         metadata = torch.tensor(
             [(index * 17, index * 9, True, False, index * 20) for index in range(size)],
-            dtype=torch.int32, device="cuda",
+            dtype=torch.long, device="cuda",
         )
         user = torch.randn(size, 8, device="cuda")
         agent = torch.randint(0, 64, (size, 3), device="cuda")
-        references = [model.project_frames(ids[i:i+1], metadata[i:i+1], user[i:i+1], agent[i:i+1])
+        references = [model.project_frames(torch.cat((ids, metadata), 1)[i:i+1], user[i:i+1], agent[i:i+1])
                       for i in range(size)]
         preceding = ((ids != 1) & (ids != 2)).sum(1).cumsum(0)
         metadata[1:, 0] -= preceding[:-1]
-        inputs = (ids, metadata, user, agent)
+        inputs = (torch.cat((ids, metadata), 1), user, agent)
         graph = FrameInputGraph(model.project_frames, inputs)
         actual = graph(inputs)
         expected = [torch.cat(parts) for parts in zip(*references, strict=True)]
         for index, (output, reference) in enumerate(zip(actual, expected, strict=True)):
             torch.testing.assert_close(output, reference, rtol=0.02 if index == 0 else 0, atol=0.02 if index == 0 else 0)
         saved = tuple(value.clone() for value in actual)
-        ids[:, 1] = 21
+        inputs[0][:, 1] = 21
         user.mul_(2)
         model.user_audio_input_adapter.output_proj.weight.mul_(0.75)
         refreshed = graph(inputs)
