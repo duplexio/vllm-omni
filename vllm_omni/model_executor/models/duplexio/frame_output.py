@@ -27,6 +27,7 @@ FRAME_FIELDS = (
     "predicted",
     "model_listen",
     "tool_call_complete",
+    "tool_emit_sampled",
     "user_emit",
     "user_token_id",
     "agent_token_id",
@@ -37,8 +38,11 @@ FRAME_FIELDS = (
 FRAME_INDEX = {name: index for index, name in enumerate(FRAME_FIELDS)}
 FRAME_FLAGS = frozenset({
     "duplex_prefill", "duplex_prefill_complete", "duplex_system_input", "duplex_system_input_complete",
-    "end_of_turn", "predicted", "model_listen", "tool_call_complete", "user_emit",
+    "end_of_turn", "predicted", "model_listen", "tool_call_complete",
+    "tool_emit_sampled", "user_emit",
 })
+# ``tool_emit_sampled`` marks frames whose tool emit was drawn; inside a call or
+# without a grammar it is forced, and its logprob is only the raw head's score.
 # Columns of ``frame_logprobs``.
 FRAME_LOGPROBS = (
     "agent_emit_logprob", "agent_token_logprob", "tool_emit_logprob", "tool_token_logprob",

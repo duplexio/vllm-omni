@@ -125,13 +125,14 @@ def test_batched_tool_sampling_matches_per_request_tokens_and_calls(device, grap
         pytest.skip("serving captures the draws on CUDA")
     model, infos, vocab = fixture(device, mixed=True)
     if graph:
-        # As served: the draws replay from one graph per top-k width.
+        # As served: the draws replay from one graph per top-k and support width.
         eager, graphs = model.sample_text, {}
 
-        def graphed(*tensors, top_k):
-            if top_k not in graphs:
-                graphs[top_k] = FrameInputGraph(partial(eager, top_k=top_k), tensors)
-            return graphs[top_k](tensors)
+        def graphed(*tensors, top_k, support_width):
+            key = (top_k, support_width)
+            if key not in graphs:
+                graphs[key] = FrameInputGraph(partial(eager, top_k=top_k, support_width=support_width), tensors)
+            return graphs[key](tensors)
 
         model.sample_text = graphed
     reference, original, _ = fixture(device, mixed=True)
@@ -172,11 +173,17 @@ def test_mixed_policies_return_rows_in_request_order(device):
             sampling = model.sampling_inputs([infos[index] for index in rows], logits.device)
             return model.sample_text(
                 logits[rows], emissions[rows], sampling.parameters, sampling.tool_bitmask, top_k=sampling.top_k,
+                support_width=sampling.support_width,
             )
 
         actual = sample(order)
         for row, index in enumerate(order):
             for values, target in zip(actual, sample([index]), strict=True):
+                if values.dim() == 3:
+                    # Supports pad to the batch's widest top-k; a lone row may be narrower.
+                    width = target.shape[-1]
+                    assert (values[row, :, width:] == -1).all()
+                    values = values[..., :width]
                 torch.testing.assert_close(values[row], target[0])
 
 
@@ -233,11 +240,24 @@ def test_agent_logprobs_match_the_distributions_actually_sampled(device):
             )
             assert float(emit_logprob) < 0.0
 
+            support = sampled.support_ids[row, 0]
+            support = support[support >= 0]
+            if sampling.temperature == 0:
+                mode = content_distribution(logits[row:row + 1, 0], replace(sampling, temperature=1.0))[0][0, 0]
+                assert support.tolist() == [int(mode)]
+            else:
+                # The recorded support is exactly the truncated distribution's.
+                indices, probabilities = content_distribution(logits[row:row + 1, 0], sampling)
+                assert support.tolist() == indices[0, probabilities[0] > 0].tolist()
             if not emitted or sampling.temperature == 0:
                 # A content draw discarded by a silent row took no action.
                 assert float(token_logprob) == 0.0
                 continue
-            indices, probabilities = content_distribution(logits[row:row + 1, 0], sampling)
+            # Renormalizing the logits over the support recovers the behavior log-prob.
+            renormalized = torch.log_softmax(logits[row, 0, support].float() / sampling.temperature, dim=-1)
+            torch.testing.assert_close(
+                token_logprob.reshape(()), renormalized[support == int(ids[row])].reshape(()), atol=1e-5, rtol=1e-4,
+            )
             position = (indices[0] == int(ids[row])).nonzero().flatten()
             assert position.numel() == 1, "sampled id must lie in the truncated support"
             torch.testing.assert_close(
@@ -270,6 +290,8 @@ def test_tool_emit_logprobs_score_all_decisions_including_forced_emit_and_wait(d
         torch.testing.assert_close(sampled.frame_logprobs[row, 2], expected)
         if not emitted or mode == "argmax":
             assert sampled.frame_logprobs[row, 3].item() == 0
+        # Only idle rows draw their tool emit; the rest are forced and flagged so.
+        assert (row in sampled.pending_tool_starts) == (row >= 4)
         if row < 2:
             assert not emitted
         elif row < 4:

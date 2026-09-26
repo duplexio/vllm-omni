@@ -83,6 +83,7 @@ from vllm_omni.model_executor.models.duplexio.text_sampling import (
     sample_streams,
     sampled_top_k,
     sampling_parameters,
+    support_width,
 )
 from vllm_omni.model_executor.models.duplexio.tool_calling import (
     ToolCallConstraintCompiler,
@@ -111,6 +112,8 @@ class TextSamplingResult:
     # Emit and token log probabilities of the agent, tool and user streams. The
     # tool emit is scored with the raw head, including forced decisions.
     frame_logprobs: Tensor
+    support_ids: Tensor  # [rows, 2, width] agent and tool content supports, see sample_streams.
+    # Idle rows, the only ones whose tool emit was drawn rather than forced.
     pending_tool_starts: list[int]
     # Rows already inside a call, whose sampled token the host must accept.
     tool_rows: list[int]
@@ -124,6 +127,7 @@ class SamplingInputs:
     parameters: Tensor  # [rows, SAMPLING_PARAMETERS], see text_sampling.
     tool_bitmask: Tensor
     top_k: int | None
+    support_width: int
     pending: list[int]
     calling: list[int]
 
@@ -958,6 +962,7 @@ class DuplexIOForConditionalGeneration(
                 "audio": [batch.audio.detach()],
                 "waveforms": [waveform.detach() for waveform in waveforms],
                 "frame_logprobs": [text.frame_logprobs],
+                "support_ids": [text.support_ids],
             }
             if any(record_hiddens[index] for index in batch.indices):
                 sampled["predictor_hiddens"] = [batch.hiddens.detach()]
@@ -1035,13 +1040,15 @@ class DuplexIOForConditionalGeneration(
         empty_audio = torch.empty(0, dtype=torch.float32)
         empty_codes = torch.empty(0, dtype=torch.long)
         no_logprobs = torch.empty(0, dtype=torch.float32)
+        no_support = torch.empty(0, dtype=torch.int32)
+        drawn_tool_emits = set() if batch is None else set(batch.text.pending_tool_starts)
         no_tool_call = torch.empty(0, dtype=torch.uint8)
         silence = self.silence_token_id
         record_hiddens = any(step.record_hiddens)
         frames: list[list[int]] = []
         chunk: dict[str, list[Tensor]] = {
             name: [] for name in (
-                "frame_logprobs", "agent_audio_token_ids", "tool_call_json",
+                "frame_logprobs", "frame_support_ids", "agent_audio_token_ids", "tool_call_json",
                 *(("predictor_hiddens",) if record_hiddens else ()),
             )
         }
@@ -1058,6 +1065,7 @@ class DuplexIOForConditionalGeneration(
                 user_token_id = agent_token_id = tool_token_id = silence
                 policy_version, tool_call = -1, None
                 chunk["frame_logprobs"].append(no_logprobs)
+                chunk["frame_support_ids"].append(no_support)
                 if record_hiddens:
                     chunk["predictor_hiddens"].append(empty)
                 audio_outputs.append(empty_audio)
@@ -1066,6 +1074,7 @@ class DuplexIOForConditionalGeneration(
             else:
                 # Return sampling probabilities alongside each prediction.
                 chunk["frame_logprobs"].append(host_rows["frame_logprobs"][row])
+                chunk["frame_support_ids"].append(host_rows["support_ids"][row])
                 if record_hiddens:
                     chunk["predictor_hiddens"].append(
                         host_rows["predictor_hiddens"][row] if step.record_hiddens[request_index] else empty
@@ -1086,7 +1095,7 @@ class DuplexIOForConditionalGeneration(
                 is_system_input and not predicting, is_system_input and predicting,
                 bool(duplex.get("final", False)), predicting,
                 predicting and agent_token_id == silence and tool_token_id == silence,
-                tool_call is not None, predicting and user_token_id != silence,
+                tool_call is not None, row in drawn_tool_emits, predicting and user_token_id != silence,
                 user_token_id, agent_token_id, tool_token_id, policy_version, self.config.sample_rate,
             ])
 
@@ -1122,17 +1131,17 @@ class DuplexIOForConditionalGeneration(
         sample_infos = [infos[index] for index in indices]
         inputs = self.sampling_inputs(sample_infos, rows.device)
         tensors = (rows, inputs.parameters, inputs.tool_bitmask)
-        sample = partial(self.sample_rows, top_k=inputs.top_k)
+        sample = partial(self.sample_rows, top_k=inputs.top_k, support_width=inputs.support_width)
         if self.full_cudagraph_enabled:
-            key = (len(indices), inputs.top_k)
+            key = (len(indices), inputs.top_k, inputs.support_width)
             if key not in self.sampling_graphs:
                 pool = next(iter(self.sampling_graphs.values())).graph.pool() if self.sampling_graphs else None
                 self.sampling_graphs[key] = FrameInputGraph(sample, tensors, pool)
-            text_ids, tool_starts, frame_logprobs, *audio = self.sampling_graphs[key](tensors)
+            text_ids, tool_starts, frame_logprobs, support_ids, *audio = self.sampling_graphs[key](tensors)
         else:
-            text_ids, tool_starts, frame_logprobs, *audio = sample(*tensors)
+            text_ids, tool_starts, frame_logprobs, support_ids, *audio = sample(*tensors)
         text = TextSamplingResult(
-            text_ids, tool_starts, frame_logprobs, inputs.pending, inputs.calling, [None] * len(indices),
+            text_ids, tool_starts, frame_logprobs, support_ids, inputs.pending, inputs.calling, [None] * len(indices),
         )
         if not audio:
             with torch.profiler.record_function("duplexio.audio_sampling"), self.autocast(rows):
@@ -1144,17 +1153,19 @@ class DuplexIOForConditionalGeneration(
         return torch.autocast(value.device.type, dtype=dtype, enabled=value.is_cuda and dtype != torch.float32)
 
     def sample_rows(
-        self, rows: Tensor, parameters: Tensor, tool_bitmask: Tensor, *, top_k: int | None,
+        self, rows: Tensor, parameters: Tensor, tool_bitmask: Tensor, *, top_k: int | None, support_width: int = 0,
     ) -> tuple[Tensor, ...]:
         """Tensor-only draws after the backbone, captured once per batch size.
 
-        Returns the text ids, tool starts and frame log probabilities, and FlowMap
-        audio; the depth sampler's per-request groups run outside.
+        Returns the text ids, tool starts, frame log probabilities and content
+        supports, and FlowMap audio; the depth sampler's per-request groups run outside.
         """
         with torch.profiler.record_function("duplexio.text_projection"):
             logits, emit_logits = self.project_text(rows)
         with torch.profiler.record_function("duplexio.text_sampling"):
-            sampled = self.sample_text(logits, emit_logits, parameters, tool_bitmask, top_k=top_k)
+            sampled = self.sample_text(
+                logits, emit_logits, parameters, tool_bitmask, top_k=top_k, support_width=support_width,
+            )
         if not isinstance(self.audio_sampler, FlowMapSampler):
             return sampled
         with torch.profiler.record_function("duplexio.audio_sampling"), self.autocast(rows):
@@ -1213,11 +1224,12 @@ class DuplexIOForConditionalGeneration(
     ) -> TextSamplingResult:
         """Sample agent/tool/user decisions and apply the host's tool decisions."""
         inputs = self.sampling_inputs(infos, logits.device)
-        text_ids, tool_starts, frame_logprobs = self.sample_text(
+        text_ids, tool_starts, frame_logprobs, support_ids = self.sample_text(
             logits, emit_logits, inputs.parameters, inputs.tool_bitmask, top_k=inputs.top_k,
+            support_width=inputs.support_width,
         )
         text = TextSamplingResult(
-            text_ids, tool_starts, frame_logprobs, inputs.pending, inputs.calling, [None] * len(infos),
+            text_ids, tool_starts, frame_logprobs, support_ids, inputs.pending, inputs.calling, [None] * len(infos),
         )
         self.finish_text_batch(text, infos, text_ids.tolist(), tool_starts.tolist())
         return text
@@ -1253,27 +1265,31 @@ class DuplexIOForConditionalGeneration(
             constraints.append(constraint if tool_state else None)
             parameters.append((*state.sampling.parameters, tool_state))
             streams += (state.sampling.agent, state.sampling.user)
+        top_k = sampled_top_k(streams, vocab_size)
         return SamplingInputs(
             parameters=_to_device(parameters, torch.float32, device),
             tool_bitmask=(
                 token_bitmasks(constraints, vocab_size, device) if pending or calling
                 else self.allow_all_bitmask[: len(infos)]
             ),
-            top_k=sampled_top_k(streams, vocab_size),
+            top_k=top_k,
+            support_width=support_width(streams[0::2], top_k),
             pending=pending,
             calling=calling,
         )
 
     def sample_text(
         self, logits: Tensor, emit_logits: Tensor, parameters: Tensor, tool_bitmask: Tensor, *, top_k: int | None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        support_width: int = 0,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Draw every stream, masking the tool stream with each row's grammar."""
         vocab_size = logits.shape[-1]
         allowed = (tool_bitmask.unsqueeze(-1) >> self.bitmask_shifts).bitwise_and(1).flatten(1)[:, :vocab_size]
         suppressed = self.suppressed_token_mask.unsqueeze(0).expand(logits.shape[0], -1, -1)
         blocked = torch.stack((suppressed[:, 0], suppressed[:, 1] | (allowed == 0), suppressed[:, 2]), dim=1)
         return sample_streams(
-            logits, emit_logits, parameters, blocked, top_k=top_k, silence_token_id=self.silence_token_id,
+            logits, emit_logits, parameters, blocked, top_k=top_k, support_width=support_width,
+            silence_token_id=self.silence_token_id,
         )
 
     def finish_text_batch(

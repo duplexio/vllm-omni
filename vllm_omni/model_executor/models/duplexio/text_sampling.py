@@ -69,10 +69,22 @@ def sampled_top_k(streams: list[TokenSamplingOptions], vocab_size: int) -> int |
     return min(vocab_size, max(options.top_k or vocab_size for options in sampled))
 
 
+def support_width(agents: list[TokenSamplingOptions], top_k: int | None) -> int:
+    """Width of the agent and tool content supports a batch records; 0 records none.
+
+    Supports are recorded only when every sampled agent stream is top-k truncated,
+    so each fits the widest one. A greedy stream's support is its argmax.
+    """
+    sampled = [options for options in agents if options.temperature != 0]
+    if top_k is None or any(options.top_k is None for options in sampled):
+        return 0
+    return min(top_k, max((options.top_k for options in sampled), default=1))
+
+
 def sample_streams(
     logits: Tensor, emit_logits: Tensor, parameters: Tensor, blocked: Tensor, *, top_k: int | None,
-    silence_token_id: int,
-) -> tuple[Tensor, Tensor, Tensor]:
+    support_width: int, silence_token_id: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Draw every row's three emit decisions and content tokens in one pass.
 
     ``logits`` is ``[rows, 3, vocab]`` and ``emit_logits`` ``[rows, 3]``, in stream order
@@ -80,7 +92,11 @@ def sample_streams(
     brings its own settings in ``parameters``; only the widest ``top_k`` is shared.
 
     Returns the ``[rows, 3]`` ids in text-input order (user, agent, tool), the idle rows
-    that started a call, and the six ``[rows, 6]`` frame log probabilities.
+    that started a call, the six ``[rows, 6]`` frame log probabilities, and the
+    ``[rows, 2, support_width]`` agent and tool content supports: the ids the draw
+    could pick, best first and padded with -1. A learner that renormalizes over a
+    recorded support scores exactly the distribution sampled, even where its own
+    logits would move a top-p or top-k boundary.
     """
     temperature, emit_temperature = parameters[:, TEMPERATURE], parameters[:, EMIT_TEMPERATURE]
     greedy = temperature == 0
@@ -102,6 +118,12 @@ def sample_streams(
     selected = torch.where(greedy, probabilities.argmax(dim=-1), raced).unsqueeze(-1)
     token_logprobs = probabilities.gather(-1, selected).squeeze(-1).log().masked_fill(greedy, 0)
     content = selected.squeeze(-1) if indices is None else indices.gather(-1, selected).squeeze(-1)
+    if indices is None or not support_width:
+        support = torch.full((logits.shape[0], 2, 0), -1, dtype=torch.int32, device=logits.device)
+    else:
+        kept = probabilities[:, :2, :support_width] > 0
+        kept[..., 1:] &= ~greedy[:, :2, None]
+        support = indices[:, :2, :support_width].masked_fill(~kept, -1).int()
 
     emit_logits = emit_logits.float()
     emit_greedy = emit_temperature == 0
@@ -123,5 +145,5 @@ def sample_streams(
     token_logprobs = torch.where(emitted, token_logprobs, 0)
     return (
         torch.stack((ids[:, 2], ids[:, 0], ids[:, 1]), dim=1), tool_starts,
-        torch.stack((emit_logprobs, token_logprobs), dim=-1).flatten(1),
+        torch.stack((emit_logprobs, token_logprobs), dim=-1).flatten(1), support,
     )
