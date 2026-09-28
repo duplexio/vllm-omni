@@ -357,6 +357,8 @@ class SnapshotModelServer:
     def start_and_sleep(self) -> None:
         check_model_present()
         self.backend = start_backend(enable_sleep_mode=True)
+        # Decode frames compile and initialize lazily on first use; run them now
+        # so every restore starts from a warm snapshot.
         prewarm_backend()
         control_backend(
             "/v1/omni/sleep",
@@ -372,12 +374,7 @@ class SnapshotModelServer:
             {"stage_ids": SNAPSHOT_STAGE_IDS},
         )
         wait_for_backend(self.backend)
-        # Restored frames run slowly at first; spend that on a warmup session
-        # instead of the first user's.
-        prewarm_backend()
-        print(
-            f"[snapshot] engine woke and warmed in {time.monotonic() - wake_started:.1f}s"
-        )
+        print(f"[snapshot] engine woke in {time.monotonic() - wake_started:.1f}s")
 
     @modal.exit()
     def stop(self) -> None:
