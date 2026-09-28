@@ -29,7 +29,7 @@ SESSION_COOKIE_NAME = "__Host-duplexio_session"
 DEFAULT_SAMPLING = {
     "agent": {
         "emission": {"temperature": 0.8},
-        "content": {"temperature": 0.6, "top_k": 20, "top_p": 0.95},
+        "content": {"temperature": 0.7, "top_k": 20, "top_p": 0.95},
     },
     "user": {
         "emission": {"temperature": 0.0},
@@ -142,6 +142,7 @@ def build_app(
     model: str,
     sample_clips: list[dict[str, str]],
     sample_clip_dir: Path | None,
+    default_voice: str | None = None,
     sampling: dict[str, object],
     tools: list[dict[str, object]] | None = None,
     health_check: Callable[[], bool] | None = None,
@@ -197,6 +198,7 @@ def build_app(
             {
                 "model": model,
                 "sampleClips": sample_clips,
+                "defaultVoice": default_voice,
                 "sampling": sampling,
                 "inputSampleRate": INPUT_SAMPLE_RATE,
                 "realtimePath": "v1/realtime",
@@ -313,6 +315,11 @@ def main() -> None:
         help="Directory of reference clips the page offers beside its upload control.",
     )
     parser.add_argument(
+        "--default-voice",
+        default=None,
+        help="File name of the sample clip the page selects on load.",
+    )
+    parser.add_argument(
         "--tools",
         type=Path,
         default=DEFAULT_TOOLS_PATH,
@@ -324,6 +331,8 @@ def main() -> None:
     if not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools):
         parser.error("--tools must contain a JSON list of tool definitions")
     sample_clips = list_sample_clips(args.sample_clips)
+    if args.default_voice is not None and args.default_voice not in {clip["id"] for clip in sample_clips}:
+        parser.error(f"--default-voice {args.default_voice} is not in --sample-clips")
     sampling = load_sampling_defaults(Path(args.model) / "config.json")
 
     logging.basicConfig(level=logging.INFO)
@@ -333,6 +342,7 @@ def main() -> None:
             model=args.model,
             sample_clips=sample_clips,
             sample_clip_dir=args.sample_clips,
+            default_voice=args.default_voice,
             sampling=sampling,
             tools=tools,
         ),

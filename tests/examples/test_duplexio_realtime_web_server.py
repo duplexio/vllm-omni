@@ -78,6 +78,7 @@ def test_index_exposes_sample_clips() -> None:
         model="checkpoint",
         sample_clips=[{"id": "alice.wav", "label": "alice", "url": "/voices/alice.wav"}],
         sample_clip_dir=None,
+        default_voice="alice.wav",
         sampling={
             "text": {
                 "mode": "top_p",
@@ -95,6 +96,7 @@ def test_index_exposes_sample_clips() -> None:
     assert index.status_code == 200
     assert '"sampleClips"' in index.text
     assert '"url": "/voices/alice.wav"' in index.text
+    assert '"defaultVoice": "alice.wav"' in index.text
     assert '"sampling": {"text": {"mode": "top_p"' in index.text
 
 
@@ -113,7 +115,7 @@ def test_sampling_defaults_apply_serving_temperatures(tmp_path: Path) -> None:
     )
 
     assert server.load_sampling_defaults(config_path) == {
-        "agent": {"emission": {"temperature": 0.8}, "content": {"temperature": 0.6, "top_k": 20, "top_p": 0.95}},
+        "agent": {"emission": {"temperature": 0.8}, "content": {"temperature": 0.7, "top_k": 20, "top_p": 0.95}},
         "user": {"emission": {"temperature": 0.0}, "content": {"temperature": 0.0, "top_k": None, "top_p": None}},
         "audio": {"temperature": 0.7, "top_k": 250},
     }
@@ -135,7 +137,7 @@ def test_sampling_defaults_omit_audio_for_continuous_checkpoint(
     )
 
     assert server.load_sampling_defaults(config_path) == {
-        "agent": {"emission": {"temperature": 0.8}, "content": {"temperature": 0.6, "top_k": 20, "top_p": 0.95}},
+        "agent": {"emission": {"temperature": 0.8}, "content": {"temperature": 0.7, "top_k": 20, "top_p": 0.95}},
         "user": {"emission": {"temperature": 0.0}, "content": {"temperature": 0.0, "top_k": None, "top_p": None}},
     }
 

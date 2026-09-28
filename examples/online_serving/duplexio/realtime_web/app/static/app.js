@@ -149,6 +149,11 @@
       new Option(clips.length ? 'Sample clips…' : 'Upload a clip', ''),
       ...options,
     );
+    const preset = clips.find((clip) => clip.id === config.defaultVoice);
+    if (preset) {
+      voiceSelect.value = preset.url;
+      voiceSelect.dispatchEvent(new Event('change'));
+    }
   }
 
   async function referenceAudioFromBuffer(buffer) {

@@ -2,10 +2,11 @@
 # Launch the native DuplexIO server and its realtime web interface.
 #
 # Usage:
-#   ./examples/online_serving/duplexio/launch_realtime.sh CHECKPOINT
+#   ./examples/online_serving/duplexio/launch_realtime.sh CHECKPOINT [VOICE]
 #
 # CHECKPOINT is a native export. Its prewarm.wav (mono 24 kHz) warms the first
-# session, and its audio clips are offered as voices in the page. DEPLOY_CONFIG,
+# session, and its audio clips are offered as voices in the page; VOICE names the
+# clip selected on load. DEPLOY_CONFIG,
 # WEB_HOST (default 127.0.0.1) and WEB_PORT (default 7862) override the defaults.
 # Ctrl-C stops the web interface and the server.
 
@@ -14,7 +15,8 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "$script_dir/../../.." && pwd)"
 
-checkpoint="${1:?usage: $0 CHECKPOINT}"
+checkpoint="${1:?usage: $0 CHECKPOINT [VOICE]}"
+voice="${2:-}"
 deploy_config="${DEPLOY_CONFIG:-$repo_dir/vllm_omni/deploy/duplexio-realtime.yaml}"
 web_host="${WEB_HOST:-127.0.0.1}"
 web_port="${WEB_PORT:-7862}"
@@ -87,4 +89,5 @@ echo "DuplexIO is ready; web interface on http://$web_host:$web_port"
     --ws-backend ws://127.0.0.1:8099 \
     --model "$checkpoint" \
     --sample-clips "$checkpoint" \
+    ${voice:+--default-voice "$voice"} \
     --tools "$tools"
