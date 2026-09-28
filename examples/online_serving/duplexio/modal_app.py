@@ -188,6 +188,10 @@ def backend_command(*, enable_sleep_mode: bool) -> list[str]:
         # room spent on 16-minute sessions.
         json.dumps({"0": {"kv_cache_memory_bytes": KV_CACHE_MEMORY_BYTES, "max_model_len": 73728}}),
         "--trust-remote-code",
+        # A fresh image loads weights and compiles for longer than the engine's
+        # 600 s default; the container's startup budget is the real limit.
+        "--init-timeout",
+        str(MODEL_STARTUP_TIMEOUT_SECONDS),
         "--host",
         "127.0.0.1",
         "--port",
