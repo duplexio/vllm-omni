@@ -1,10 +1,6 @@
-// Adaptive jitter buffer. Playback starts once the target is queued; each
-// underrun raises the target by one model frame, up to the maximum, and every
-// 30 s without one lowers it again. Audio that arrives in a burst after a
-// network stall would otherwise stay queued as permanent extra latency, so
-// silent frames that arrive while more than the target is queued are dropped.
-const FRAME_MS = 80;
-const RECOVER_SECONDS = 30;
+// Audio that arrives in a burst after a stall would otherwise stay queued as
+// permanent extra latency, so silent frames that arrive while more than the
+// playback buffer is queued are dropped.
 const SILENCE_PEAK = 64;
 
 class DuplexIOPlayback extends AudioWorkletProcessor {
@@ -18,12 +14,8 @@ class DuplexIOPlayback extends AudioWorkletProcessor {
     this.drain = null;
     this.playing = false;
     this.underruns = 0;
-    const { playbackBufferMs, maxPlaybackBufferMs } = options.processorOptions;
-    this.minBufferFrames = Math.round(sampleRate * playbackBufferMs / 1000);
-    this.maxBufferFrames = Math.round(sampleRate * maxPlaybackBufferMs / 1000);
-    this.stepFrames = Math.round(sampleRate * FRAME_MS / 1000);
-    this.bufferFrames = this.minBufferFrames;
-    this.stableFrames = 0;
+    const playbackBufferMs = options.processorOptions.playbackBufferMs;
+    this.bufferFrames = Math.round(sampleRate * playbackBufferMs / 1000);
     this.port.onmessage = (event) => this.handle(event.data || {});
   }
 
@@ -102,17 +94,11 @@ class DuplexIOPlayback extends AudioWorkletProcessor {
     if (this.queue.length === 0 && !this.drain) {
       this.playing = false;
       this.underruns += 1;
-      this.bufferFrames = Math.min(this.maxBufferFrames, this.bufferFrames + this.stepFrames);
-      this.stableFrames = 0;
       this.port.postMessage({
         type: 'buffering',
         responseId: this.responseId,
         underruns: this.underruns,
-        bufferMs: Math.round((this.bufferFrames * 1000) / sampleRate),
       });
-    } else if ((this.stableFrames += output.length) >= RECOVER_SECONDS * sampleRate) {
-      this.bufferFrames = Math.max(this.minBufferFrames, this.bufferFrames - this.stepFrames);
-      this.stableFrames = 0;
     }
     this.notifyDrained();
     return true;

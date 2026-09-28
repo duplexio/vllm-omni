@@ -24,7 +24,7 @@ spec.loader.exec_module(prewarm_module)
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_prewarm_closes_after_prefix_warmup() -> None:
+def test_prewarm_streams_frames_then_closes() -> None:
     messages: list[dict[str, object]] = []
 
     async def scenario() -> None:
@@ -32,7 +32,10 @@ def test_prewarm_closes_after_prefix_warmup() -> None:
             messages.append(json.loads(await websocket.recv()))
             await websocket.send(json.dumps({"type": "session.created"}))
             await websocket.send(json.dumps({"type": "session.updated"}))
-            messages.append(json.loads(await websocket.recv()))
+            while (message := json.loads(await websocket.recv()))["type"] == "input_audio_buffer.append":
+                messages.append(message)
+                await websocket.send(json.dumps({"type": "response.audio.delta", "delta": ""}))
+            messages.append(message)
             await websocket.send(json.dumps({"type": "session.closed"}))
 
         async with websockets.serve(handler, "127.0.0.1", 0) as server:
@@ -42,13 +45,15 @@ def test_prewarm_closes_after_prefix_warmup() -> None:
                 "checkpoint",
                 base64.b64encode(bytes(1_920 * 4)).decode(),
                 [],
+                ["frame-1", "frame-2"],
                 timeout_seconds=5,
             )
 
     asyncio.run(scenario())
 
     assert messages[0]["type"] == "session.update"
-    assert messages[1] == {"type": "session.close"}
+    assert [message.get("audio") for message in messages[1:3]] == ["frame-1", "frame-2"]
+    assert messages[3] == {"type": "session.close"}
 
 
 def test_prewarm_supplies_reference_pcm_instead_of_a_voice_name() -> None:

@@ -208,9 +208,7 @@ def test_playback_worklet_buffers_one_audio_frame() -> None:
         global.registerProcessor = (_name, processor) => { Processor = processor; };
         vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
 
-        const processor = new Processor({
-          processorOptions: { playbackBufferMs: 80, maxPlaybackBufferMs: 80 },
-        });
+        const processor = new Processor({ processorOptions: { playbackBufferMs: 80 } });
         const render = () => {
           const output = new Float32Array(40);
           processor.process([], [[output]]);
@@ -254,7 +252,7 @@ def test_playback_worklet_buffers_one_audio_frame() -> None:
 
 
 
-def test_playback_worklet_adapts_to_network_jitter() -> None:
+def test_playback_worklet_drops_silence_queued_after_a_stall() -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for the AudioWorklet regression test")
@@ -278,9 +276,7 @@ def test_playback_worklet_adapts_to_network_jitter() -> None:
         global.registerProcessor = (_name, processor) => { Processor = processor; };
         vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
 
-        const processor = new Processor({
-          processorOptions: { playbackBufferMs: 80, maxPlaybackBufferMs: 160 },
-        });
+        const processor = new Processor({ processorOptions: { playbackBufferMs: 80 } });
         const render = () => {
           const output = new Float32Array(40);
           processor.process([], [[output]]);
@@ -296,32 +292,20 @@ def test_playback_worklet_adapts_to_network_jitter() -> None:
         };
 
         append(4096);
-        render();
-        render();
-        assert(processor.bufferFrames === 160, 'underrun did not grow the buffer');
-        assert(messages.at(-1).bufferMs === 160, 'underrun did not report the new buffer');
+        assert(render().every((sample) => sample === 0.125), 'playback did not start after one frame');
 
-        append(4096);
-        assert(render().every((sample) => sample === 0), 'playback resumed below the grown buffer');
-        append(4096);
-        assert(render().every((sample) => sample === 0.125), 'playback did not resume at the grown buffer');
-
-        // A burst after a stall: silence beyond the target is dropped, speech is kept.
+        // A burst after a stall: silence beyond the buffer is dropped, speech is kept.
         append(4096);
         append(4096);
         const queued = processor.queuedFrames;
         append(8);
-        assert(processor.queuedFrames === queued, 'silence beyond the target was queued');
+        assert(processor.queuedFrames === queued, 'silence beyond the buffer was queued');
         append(4096);
-        assert(processor.queuedFrames === queued + 80, 'speech beyond the target was dropped');
+        assert(processor.queuedFrames === queued + 80, 'speech beyond the buffer was dropped');
 
-        while (processor.queuedFrames > 160) render();
-        for (let index = 0; index < 375; index += 1) {
-          append(4096);
-          render();
-          render();
-        }
-        assert(processor.bufferFrames === 80, 'buffer did not shrink after stable playback');
+        while (processor.queuedFrames > 80) render();
+        append(8);
+        assert(processor.queuedFrames === 160, 'silence within the buffer was dropped');
         """
     )
     subprocess.run(

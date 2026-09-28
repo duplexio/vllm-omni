@@ -1,4 +1,9 @@
-"""Warm the DuplexIO prefix path before accepting browser sessions."""
+"""Warm the DuplexIO prefix and decode paths before accepting browser sessions.
+
+A prefix alone leaves the first frames of a real session slow (and, after a
+Modal snapshot restore, the first ~10 s of them), so the warmup also streams
+user audio through the model faster than real time.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +18,9 @@ import websockets
 
 SAMPLE_RATE = 24_000
 FRAME_SIZE = 1_920
+STREAM_SECONDS = 20
+# Frames are sent four times faster than real time, which the model outpaces.
+SEND_INTERVAL_SECONDS = FRAME_SIZE / SAMPLE_RATE / 4
 
 
 def realtime_url(backend: str, model: str) -> str:
@@ -56,6 +64,7 @@ async def prewarm(
     model: str,
     reference_audio: str,
     tools: list[dict[str, object]],
+    frames: list[str],
     *,
     timeout_seconds: float,
 ) -> None:
@@ -66,6 +75,22 @@ async def prewarm(
         ) as websocket:
             await websocket.send(json.dumps(session_update(model, reference_audio, tools)))
             await wait_for_event(websocket, {"session.updated"})
+
+            async def send_frames() -> None:
+                for frame in frames:
+                    await websocket.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": frame,
+                        "format": "pcm_f32le",
+                        "sample_rate_hz": SAMPLE_RATE,
+                    }))
+                    await asyncio.sleep(SEND_INTERVAL_SECONDS)
+
+            # The model answers every user frame with one audio frame.
+            sender = asyncio.create_task(send_frames())
+            for _ in frames:
+                await wait_for_event(websocket, {"response.audio.delta"})
+            await sender
             await websocket.send(json.dumps({"type": "session.close"}))
             await wait_for_event(websocket, {"session.closed"})
 
@@ -84,7 +109,18 @@ def main() -> None:
     samples, rate = sf.read(args.ref_audio, dtype="float32")
     if rate != SAMPLE_RATE or samples.ndim != 1 or samples.size < FRAME_SIZE:
         parser.error("--ref-audio must contain at least 80 ms of mono 24 kHz audio")
-    reference_audio = base64.b64encode(samples.astype("<f4", copy=False).tobytes()).decode()
+    samples = samples.astype("<f4", copy=False)
+    reference_audio = base64.b64encode(samples.tobytes()).decode()
+    # The user says the reference clip after a second of silence.
+    import numpy as np
+
+    stream = np.zeros(STREAM_SECONDS * SAMPLE_RATE, "<f4")
+    speech = samples[: stream.size - SAMPLE_RATE]
+    stream[SAMPLE_RATE : SAMPLE_RATE + speech.size] = speech
+    frames = [
+        base64.b64encode(stream[offset : offset + FRAME_SIZE].tobytes()).decode()
+        for offset in range(0, stream.size, FRAME_SIZE)
+    ]
 
     tools = json.loads(args.tools.read_text(encoding="utf-8"))
     if not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools):
@@ -95,6 +131,7 @@ def main() -> None:
             args.model,
             reference_audio,
             tools,
+            frames,
             timeout_seconds=args.timeout_seconds,
         )
     )

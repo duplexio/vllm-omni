@@ -372,8 +372,11 @@ class SnapshotModelServer:
             {"stage_ids": SNAPSHOT_STAGE_IDS},
         )
         wait_for_backend(self.backend)
+        # Restored frames run slowly at first; spend that on a warmup session
+        # instead of the first user's.
+        prewarm_backend()
         print(
-            f"[snapshot] engine woke in {time.monotonic() - wake_started:.1f}s"
+            f"[snapshot] engine woke and warmed in {time.monotonic() - wake_started:.1f}s"
         )
 
     @modal.exit()

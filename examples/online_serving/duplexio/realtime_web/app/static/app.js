@@ -5,7 +5,6 @@
   const inputRate = Number(config.inputSampleRate || 24000);
   const outputRate = 24000;
   const playbackBufferMs = 160;
-  const maxPlaybackBufferMs = 480;
   const sendIntervalMs = 80;
   const tools = Array.isArray(config.tools) ? config.tools : [];
 
@@ -630,14 +629,14 @@
       playbackContext.audioWorklet.addModule(assetUrl('static/recording_worklet.js')),
     ]);
     playbackNode = new AudioWorkletNode(playbackContext, 'duplexio-playback', {
-      processorOptions: { playbackBufferMs, maxPlaybackBufferMs },
+      processorOptions: { playbackBufferMs },
     });
     playbackNode.port.onmessage = (event) => {
       const message = event.data || {};
       if (message.type === 'started') detailElement.textContent = 'Speaking';
       if (message.type === 'buffering') {
         detailElement.textContent = 'Buffering audio';
-        log(`playback underrun ${message.underruns}; buffering ${message.bufferMs} ms`);
+        log(`playback underrun ${message.underruns}; buffering ${playbackBufferMs} ms`);
       }
       if (message.type === 'drained') {
         if (socket && socket.readyState === WebSocket.OPEN && message.responseId) {
