@@ -129,8 +129,10 @@ model_image = (
 frontend_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
+        "av==17.0.1",
         "bcrypt==4.3.0",
         "fastapi==0.136.3",
+        "numpy==2.2.6",
         "uvicorn==0.52.1",
         "websockets==17.0.1",
     )

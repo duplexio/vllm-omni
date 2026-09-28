@@ -6,6 +6,11 @@
   const outputRate = 24000;
   const playbackBufferMs = 160;
   const sendIntervalMs = 80;
+  // Audio travels to the page's proxy as Opus, about 20x less than PCM; the
+  // proxy converts to and from the PCM the model uses. Browsers without
+  // WebCodecs Opus send PCM.
+  const opusEncoderConfig = { codec: 'opus', sampleRate: inputRate, numberOfChannels: 1, bitrate: 48000 };
+  const opusDecoderConfig = { codec: 'opus', sampleRate: outputRate, numberOfChannels: 1 };
   const tools = Array.isArray(config.tools) ? config.tools : [];
 
   const startButton = document.getElementById('start');
@@ -49,6 +54,9 @@
   let playbackRate = outputRate;
   let captureChunks = [];
   let sendTimer = null;
+  let opusEncoder = null;
+  let opusDecoder = null;
+  let opusTimestamp = 0;
   let running = false;
   let muted = false;
   let responseId = null;
@@ -600,6 +608,7 @@
     url.searchParams.set('duplex', '1');
     url.searchParams.set('model', config.model);
     url.searchParams.set('autostart', '0');
+    if (opusEncoder) url.searchParams.set('codec', 'opus');
     return url.toString();
   }
 
@@ -607,6 +616,20 @@
     if (!running || muted || !socket || socket.readyState !== WebSocket.OPEN) return;
     if (captureChunks.length === 0) return;
     const pcm = resampleInt16(mergeCaptureChunks(), captureRate, inputRate);
+    if (opusEncoder) {
+      const data = new AudioData({
+        format: 's16',
+        sampleRate: inputRate,
+        numberOfFrames: pcm.length,
+        numberOfChannels: 1,
+        timestamp: opusTimestamp,
+        data: pcm,
+      });
+      opusTimestamp += Math.round(pcm.length * 1e6 / inputRate);
+      opusEncoder.encode(data);
+      data.close();
+      return;
+    }
     socket.send(JSON.stringify({
       type: 'input_audio_buffer.append',
       audio: int16ToFloat32Base64(pcm),
@@ -725,6 +748,66 @@
     };
   }
 
+  async function opusSupported() {
+    if (!window.AudioEncoder || !window.AudioDecoder) return false;
+    try {
+      const [encoder, decoder] = await Promise.all([
+        AudioEncoder.isConfigSupported(opusEncoderConfig),
+        AudioDecoder.isConfigSupported(opusDecoderConfig),
+      ]);
+      return Boolean(encoder.supported && decoder.supported);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function openOpus() {
+    opusTimestamp = 0;
+    opusEncoder = new AudioEncoder({
+      output: (chunk) => {
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        const bytes = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(bytes);
+        socket.send(JSON.stringify({
+          type: 'input_audio_buffer.append',
+          audio: base64FromBytes(bytes),
+          format: 'opus',
+        }));
+      },
+      error: (error) => log(`opus encoder failed: ${error.message}`),
+    });
+    opusEncoder.configure(opusEncoderConfig);
+    opusDecoder = new AudioDecoder({
+      output: (data) => {
+        const samples = new Float32Array(data.numberOfFrames);
+        data.copyTo(samples, { planeIndex: 0, format: 'f32-planar' });
+        const sourceRate = data.sampleRate;
+        data.close();
+        playPcm(float32BytesToInt16(new Uint8Array(samples.buffer)), sourceRate);
+      },
+      error: (error) => log(`opus decoder failed: ${error.message}`),
+    });
+    opusDecoder.configure(opusDecoderConfig);
+  }
+
+  function closeOpus() {
+    for (const codec of [opusEncoder, opusDecoder]) {
+      if (codec && codec.state !== 'closed') codec.close();
+    }
+    opusEncoder = null;
+    opusDecoder = null;
+  }
+
+  function playPcm(pcm, sourceRate) {
+    if (!playbackNode) return;
+    const playbackPcm = resampleInt16(pcm, sourceRate, playbackRate);
+    playbackNode.port.postMessage({
+      type: 'audio',
+      pcm: playbackPcm,
+      responseId,
+    }, [playbackPcm.buffer]);
+  }
+
   function openSocket() {
     return new Promise((resolve, reject) => {
       const url = realtimeUrl();
@@ -805,16 +888,15 @@
       responseId = event.response_id || responseId;
       const bytes = bytesFromBase64(encoded);
       const format = String(event.format || event.audio_format || '').toLowerCase();
+      if (format === 'opus') {
+        if (opusDecoder) opusDecoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: 0, data: bytes }));
+        return;
+      }
       const sourceRate = Number(event.sample_rate_hz || event.sample_rate || outputRate);
       const pcm = format.includes('f32')
         ? float32BytesToInt16(bytes)
         : int16BytesToInt16(bytes);
-      const playbackPcm = resampleInt16(pcm, sourceRate, playbackRate);
-      playbackNode.port.postMessage({
-        type: 'audio',
-        pcm: playbackPcm,
-        responseId,
-      }, [playbackPcm.buffer]);
+      playPcm(pcm, sourceRate);
       return;
     }
     if (event.type === 'response.audio_transcript.delta') {
@@ -871,6 +953,7 @@
     captureChunks = [];
     if (sendTimer !== null) clearInterval(sendTimer);
     sendTimer = null;
+    closeOpus();
     if (recording) await stopRecording();
     if (closingSocket && closingSocket.readyState === WebSocket.OPEN) {
       closingSocket.onclose = null;
@@ -926,6 +1009,8 @@
     resetConversation();
     try {
       await openAudio();
+      if (await opusSupported()) openOpus();
+      log(`sending ${opusEncoder ? 'Opus' : 'PCM'} audio`);
       await openSocket();
       if (recordingArmed) startRecording();
       running = true;

@@ -1,8 +1,12 @@
+import asyncio
+import base64
 import importlib.util
 import json
 import sys
 from pathlib import Path
 
+import av
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -309,3 +313,139 @@ def test_session_cookie_survives_frontend_restart(monkeypatch: pytest.MonkeyPatc
     )
 
     assert response.status_code == 200
+
+
+def opus_packets(samples: np.ndarray, frame_ms: int) -> list[bytes]:
+    encoder = av.CodecContext.create("libopus", "w")
+    encoder.sample_rate = server.INPUT_SAMPLE_RATE
+    encoder.layout = "mono"
+    encoder.format = "s16"
+    encoder.bit_rate = server.OPUS_BITRATE
+    encoder.options = {"frame_duration": str(frame_ms)}
+    encoder.open()
+    packets = []
+    for offset in range(0, samples.size, encoder.frame_size):
+        frame = av.AudioFrame.from_ndarray(
+            samples[None, offset : offset + encoder.frame_size], format="s16", layout="mono"
+        )
+        frame.sample_rate = server.INPUT_SAMPLE_RATE
+        frame.pts = offset
+        packets += [bytes(packet) for packet in encoder.encode(frame)]
+    return packets
+
+
+def decode_opus(packets: list[bytes]) -> np.ndarray:
+    decoder = av.CodecContext.create("opus", "r")
+    resampler = av.AudioResampler(format="flt", layout="mono", rate=server.INPUT_SAMPLE_RATE)
+    return np.concatenate([
+        frame.to_ndarray().reshape(-1)
+        for packet in packets
+        for decoded in decoder.decode(av.Packet(packet))
+        for frame in resampler.resample(decoded)
+    ])
+
+
+def tone(seconds: float) -> np.ndarray:
+    time = np.arange(int(seconds * server.INPUT_SAMPLE_RATE)) / server.INPUT_SAMPLE_RATE
+    return (0.3 * 32767 * np.sin(2 * np.pi * 440 * time)).astype(np.int16)
+
+
+def matches_tone(pcm: np.ndarray, reference: np.ndarray) -> bool:
+    # Opus delays audio by its lookahead; compare after aligning on the best lag.
+    lags = range(0, 400)
+    scores = [np.corrcoef(pcm[lag : lag + 4_000], reference[:4_000])[0, 1] for lag in lags]
+    return max(scores) > 0.99
+
+
+def test_opus_microphone_packets_reach_the_backend_as_pcm() -> None:
+    transcoder = server.OpusTranscoder()
+    reference = tone(0.4)
+    appends = [
+        json.loads(transcoder.to_backend(json.dumps({
+            "type": "input_audio_buffer.append",
+            "audio": base64.b64encode(packet).decode(),
+            "format": "opus",
+        })))
+        for packet in opus_packets(reference, frame_ms=20)
+    ]
+
+    assert {(event["format"], event["sample_rate_hz"]) for event in appends} == {("pcm_f32le", 24_000)}
+    pcm = np.concatenate([np.frombuffer(base64.b64decode(event["audio"]), "<f4") for event in appends])
+    assert abs(pcm.size - reference.size) < 480
+    assert matches_tone(pcm, reference / 32768)
+    other = '{"type":"session.update"}'
+    assert transcoder.to_backend(other) == other
+
+
+def test_model_audio_reaches_the_page_as_opus_packets() -> None:
+    transcoder = server.OpusTranscoder()
+    reference = tone(0.4)
+    events = []
+    for offset in range(0, 1_920 * 4, 1_920):
+        events += transcoder.to_client(json.dumps({
+            "type": "response.audio.delta",
+            "response_id": "resp_1",
+            "delta": base64.b64encode(reference[offset : offset + 1_920].tobytes()).decode(),
+            "format": "pcm_s16le",
+            "sample_rate_hz": 24_000,
+            "metadata": {"playback": {"generated_ms": 80}},
+        }))
+    # A trailing partial frame is flushed, padded, ahead of the done event.
+    events += transcoder.to_client(json.dumps({
+        "type": "response.audio.delta",
+        "response_id": "resp_1",
+        "delta": base64.b64encode(reference[1_920 * 4 :].tobytes()).decode(),
+    }))
+    events += transcoder.to_client('{"type":"response.audio.done","response_id":"resp_1"}')
+
+    deltas = [json.loads(event) for event in events[:-1]]
+    assert [delta["type"] for delta in deltas] == ["response.audio.delta"] * 5
+    assert {(delta["format"], delta["response_id"]) for delta in deltas} == {("opus", "resp_1")}
+    assert not any("metadata" in delta for delta in deltas)
+    assert json.loads(events[-1])["type"] == "response.audio.done"
+    pcm = decode_opus([base64.b64decode(delta["delta"]) for delta in deltas])
+    assert matches_tone(pcm, reference / 32768)
+
+
+def test_proxy_transcodes_only_sessions_that_ask_for_opus(monkeypatch: pytest.MonkeyPatch) -> None:
+    class RecordingBackend(SingleMessageBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sent: list[str] = []
+
+        async def __anext__(self) -> str:
+            if self.message_sent:
+                raise StopAsyncIteration
+            self.message_sent = True
+            await asyncio.sleep(0.2)
+            return json.dumps({
+                "type": "response.audio.delta",
+                "delta": base64.b64encode(tone(0.08).tobytes()).decode(),
+            })
+
+        async def send(self, message: str) -> None:
+            self.sent.append(message)
+
+    backend = RecordingBackend()
+    urls = []
+
+    def connect(url: str, **kwargs: object) -> BackendConnection:
+        urls.append(url)
+        return BackendConnection(backend)
+
+    monkeypatch.setattr(server.websockets, "connect", connect)
+    app = server.build_app(
+        ws_backend="ws://backend", model="checkpoint", sample_clips=[], sample_clip_dir=None, sampling={}
+    )
+    packet = opus_packets(tone(0.02), frame_ms=20)[0]
+    with TestClient(app).websocket_connect("/v1/realtime?duplex=1&codec=opus") as websocket:
+        websocket.send_text(json.dumps({
+            "type": "input_audio_buffer.append",
+            "audio": base64.b64encode(packet).decode(),
+            "format": "opus",
+        }))
+        delta = json.loads(websocket.receive_text())
+
+    assert urls == ["ws://backend/v1/realtime?duplex=1"]
+    assert json.loads(backend.sent[0])["format"] == "pcm_f32le"
+    assert delta["format"] == "opus"
