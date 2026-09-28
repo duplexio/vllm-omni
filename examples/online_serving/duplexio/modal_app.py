@@ -2,7 +2,8 @@
 
 Upload the exported checkpoint and a mono 24 kHz ``prewarm.wav`` into
 ``MODEL_NAME`` on the ``duplexio-vllm-models`` volume. The startup clip warms
-inference; users upload their own reference voice clip in the browser.
+inference. Clips in its ``voices/`` subdirectory are offered in the browser
+(``DEFAULT_VOICE`` preselected); users can also upload their own.
 """
 
 from __future__ import annotations
@@ -29,14 +30,17 @@ SUFFIX = f"-{VARIANT}" if VARIANT else ""
 VARIANT_ENV = {"DUPLEXIO_MODAL_VARIANT": VARIANT} if VARIANT else {}
 APP_NAME = f"duplexio-vllm-omni{SUFFIX}"
 MODEL_VOLUME_NAME = "duplexio-vllm-models"
-MODEL_NAME = "run508723_step28000_v7"
+MODEL_NAME = "run514428_step5000_v7_steps8"
 MODEL_PATH = Path("/models") / MODEL_NAME
 # Upload a mono 24 kHz clip alongside the model for startup warmup.
 # Browser sessions send their own uploaded reference audio.
 PREWARM_AUDIO_PATH = MODEL_PATH / "prewarm.wav"
+# Voices sit in their own directory so the page offers them and not prewarm.wav.
+VOICE_DIR = MODEL_PATH / "voices"
+DEFAULT_VOICE = "maya.wav"
 APP_ROOT = Path("/app/vllm-omni")
 FRONTEND_ROOT = Path("/app/realtime_web")
-DEPLOY_CONFIG_NAME = "duplexio.yaml"
+DEPLOY_CONFIG_NAME = "duplexio-realtime.yaml"
 KV_CACHE_MEMORY_BYTES = 19_947_344_692
 MODEL_STARTUP_TIMEOUT_SECONDS = 15 * 60
 BACKEND_PORT = 8099
@@ -56,44 +60,21 @@ BACKEND_HEALTH_URL = f"https://duplexio--{MODEL_WEB_LABEL}.modal.run/healthz"
 repo_root = Path(__file__).resolve().parents[3] if modal.is_local() else APP_ROOT
 
 
-def vllm_wheel() -> Path:
-    """Locate the cluster-built vLLM wheel named by DUPLEXIO_VLLM_WHEEL."""
-    setting = os.environ.get("DUPLEXIO_VLLM_WHEEL")
-    if not setting:
-        raise RuntimeError(
-            "Set DUPLEXIO_VLLM_WHEEL to the vLLM wheel built against the "
-            "training compiler stack (duplexio-modal-demo/wheel.sbatch)."
-        )
-    wheel = Path(setting)
-    if not wheel.is_file():
-        raise RuntimeError(f"DUPLEXIO_VLLM_WHEEL is not a file: {wheel}")
-    return wheel
-
-
-# Serving must run the compiler stack training parity was measured on: torch
-# 2.13+cu130 (older torch has no flex-attention AuxRequest), vLLM built from
-# upstream 568afb3a1, and the quack/FLA kernels the model calls directly. vLLM
-# arrives as a wheel because compiling it on a Modal builder takes hours.
-# uv reads the version from the wheel's filename, so the copy keeps its name.
-# Only a local deploy builds the image, so the container-side value is unused.
-VLLM_WHEEL_PATH = f"/wheels/{vllm_wheel().name}" if modal.is_local() else "/wheels"
+# Serving runs the stack the cluster and the RTX 5090 demo serve on: torch
+# 2.11+cu130, the PyPI vLLM 0.26.0 wheel (a CUDA 13 build pinned to that torch),
+# and the quack/FLA kernels the model calls directly.
 model_image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.13"
     )
     .apt_install("git", "ninja-build")
     .uv_pip_install(
-        "torch==2.13.0",
-        "torchvision==0.28.0",
+        "torch==2.11.0",
+        "torchvision==0.26.0",
         "torchaudio==2.11.0",
         extra_index_url="https://download.pytorch.org/whl/cu130",
     )
-    .add_local_file(
-        vllm_wheel() if modal.is_local() else VLLM_WHEEL_PATH,
-        VLLM_WHEEL_PATH,
-        copy=True,
-    )
-    .uv_pip_install(VLLM_WHEEL_PATH)
+    .uv_pip_install("vllm==0.26.0")
     .add_local_dir(
         repo_root,
         str(APP_ROOT),
@@ -122,13 +103,11 @@ model_image = (
     )
     # Last, so the kernel and transformers pins win over any resolution above.
     .uv_pip_install(
-        "nvidia-cutlass-dsl==4.6.0.dev0",
-        "quack-kernels==0.5.3",
+        "nvidia-cutlass-dsl==4.6.0",
+        "quack-kernels==0.6.3",
         "flash-linear-attention==0.5.1",
         "fla-core==0.5.1",
-        "transformers @ git+https://github.com/huggingface/transformers.git"
-        "@b3d7e8c9d4e078a5e6c09a9d67e22dcadc2df4b8",
-        pre=True,
+        "transformers==5.14.1",
     )
     .env(
         {
@@ -203,7 +182,9 @@ def backend_command(*, enable_sleep_mode: bool) -> list[str]:
         "--deploy-config",
         str(APP_ROOT / "vllm_omni" / "deploy" / DEPLOY_CONFIG_NAME),
         "--stage-overrides",
-        json.dumps({"0": {"kv_cache_memory_bytes": KV_CACHE_MEMORY_BYTES}}),
+        # The realtime profile (two sessions, graph replay), with the H100's
+        # room spent on 16-minute sessions.
+        json.dumps({"0": {"kv_cache_memory_bytes": KV_CACHE_MEMORY_BYTES, "max_model_len": 73728}}),
         "--trust-remote-code",
         "--host",
         "127.0.0.1",
@@ -423,6 +404,7 @@ def demo() -> object:
     """Serve authentication and proxy authenticated streams to the GPU."""
     from realtime_web.server import (
         build_app,
+        list_sample_clips,
         load_sampling_defaults,
     )
 
@@ -434,8 +416,9 @@ def demo() -> object:
     return build_app(
         ws_backend=BACKEND_WEBSOCKET_URL,
         model=str(MODEL_PATH),
-        sample_clips=[],
-        sample_clip_dir=None,
+        sample_clips=list_sample_clips(VOICE_DIR),
+        sample_clip_dir=VOICE_DIR,
+        default_voice=DEFAULT_VOICE,
         sampling=load_sampling_defaults(MODEL_PATH / "config.json"),
         tools=json.loads(tools_path.read_text(encoding="utf-8")),
         password_hash=os.environ[AUTH_PASSWORD_HASH_ENV],
