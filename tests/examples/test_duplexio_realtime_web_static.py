@@ -208,7 +208,9 @@ def test_playback_worklet_buffers_one_audio_frame() -> None:
         global.registerProcessor = (_name, processor) => { Processor = processor; };
         vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
 
-        const processor = new Processor({ processorOptions: { playbackBufferMs: 80 } });
+        const processor = new Processor({
+          processorOptions: { playbackBufferMs: 80, maxPlaybackBufferMs: 80 },
+        });
         const render = () => {
           const output = new Float32Array(40);
           processor.process([], [[output]]);
@@ -241,6 +243,85 @@ def test_playback_worklet_buffers_one_audio_frame() -> None:
         appendHalfFrame();
         processor.handle({ type: 'drain', responseId: 'response-1' });
         assert(render().every((sample) => sample === 0.125), 'drain did not flush a short response');
+        """
+    )
+    subprocess.run(
+        [node, "-e", script, str(STATIC_ROOT / "playback_worklet.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+
+def test_playback_worklet_adapts_to_network_jitter() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the AudioWorklet regression test")
+
+    script = textwrap.dedent(
+        """
+        const fs = require('fs');
+        const vm = require('vm');
+
+        const messages = [];
+        global.sampleRate = 1000;
+        global.AudioWorkletProcessor = class {
+          constructor() {
+            this.port = {
+              onmessage: null,
+              postMessage: (message) => messages.push(message),
+            };
+          }
+        };
+        let Processor = null;
+        global.registerProcessor = (_name, processor) => { Processor = processor; };
+        vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
+
+        const processor = new Processor({
+          processorOptions: { playbackBufferMs: 80, maxPlaybackBufferMs: 160 },
+        });
+        const render = () => {
+          const output = new Float32Array(40);
+          processor.process([], [[output]]);
+          return output;
+        };
+        const append = (value) => processor.handle({
+          type: 'audio',
+          pcm: new Int16Array(80).fill(value),
+          responseId: 'response-1',
+        });
+        const assert = (condition, message) => {
+          if (!condition) throw new Error(message);
+        };
+
+        append(4096);
+        render();
+        render();
+        assert(processor.bufferFrames === 160, 'underrun did not grow the buffer');
+        assert(messages.at(-1).bufferMs === 160, 'underrun did not report the new buffer');
+
+        append(4096);
+        assert(render().every((sample) => sample === 0), 'playback resumed below the grown buffer');
+        append(4096);
+        assert(render().every((sample) => sample === 0.125), 'playback did not resume at the grown buffer');
+
+        // A burst after a stall: silence beyond the target is dropped, speech is kept.
+        append(4096);
+        append(4096);
+        const queued = processor.queuedFrames;
+        append(8);
+        assert(processor.queuedFrames === queued, 'silence beyond the target was queued');
+        append(4096);
+        assert(processor.queuedFrames === queued + 80, 'speech beyond the target was dropped');
+
+        while (processor.queuedFrames > 160) render();
+        for (let index = 0; index < 375; index += 1) {
+          append(4096);
+          render();
+          render();
+        }
+        assert(processor.bufferFrames === 80, 'buffer did not shrink after stable playback');
         """
     )
     subprocess.run(
