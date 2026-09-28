@@ -72,6 +72,26 @@ def test_sample_clips_are_listed_for_the_upload_control(tmp_path: Path) -> None:
     assert server.list_sample_clips(None) == []
 
 
+def test_voices_serves_only_listed_clips(tmp_path: Path) -> None:
+    (tmp_path / "shared").mkdir()
+    (tmp_path / "shared" / "alice.wav").write_bytes(b"RIFF")
+    (tmp_path / "export").mkdir()
+    (tmp_path / "export" / "alice.wav").symlink_to(tmp_path / "shared" / "alice.wav")
+    (tmp_path / "export" / "model.safetensors").write_bytes(b"weights")
+    client = TestClient(
+        server.build_app(
+            ws_backend="ws://127.0.0.1:8099",
+            model="checkpoint",
+            sample_clips=server.list_sample_clips(tmp_path / "export"),
+            sample_clip_dir=tmp_path / "export",
+            sampling={},
+        )
+    )
+
+    assert client.get("/voices/alice.wav").content == b"RIFF"
+    assert client.get("/voices/model.safetensors").status_code == 404
+
+
 def test_index_exposes_sample_clips() -> None:
     app = server.build_app(
         ws_backend="ws://127.0.0.1:8099",

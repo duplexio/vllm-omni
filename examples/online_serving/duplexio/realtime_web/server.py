@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlencode
 import uvicorn
 import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -293,12 +293,15 @@ def build_app(
                 await websocket.close(code=1011)
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-    if sample_clip_dir is not None:
-        app.mount(
-            "/voices",
-            StaticFiles(directory=str(sample_clip_dir)),
-            name="voices",
-        )
+    # Only the listed clips are served: the clip directory is usually the
+    # export itself, and its clips may be symlinks into another export.
+    clip_names = {clip["id"] for clip in sample_clips}
+
+    @app.get("/voices/{name}")
+    def voice(name: str) -> Response:
+        if sample_clip_dir is None or name not in clip_names:
+            return Response(status_code=404)
+        return FileResponse(sample_clip_dir / name)
     return app
 
 
