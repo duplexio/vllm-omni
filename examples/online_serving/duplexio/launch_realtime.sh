@@ -1,30 +1,36 @@
 #!/usr/bin/env bash
-# Launch the native DuplexIO server and its local realtime web interface.
+# Launch the native DuplexIO server and its realtime web interface.
 #
 # Usage:
-#   ./examples/online_serving/duplexio/launch_realtime.sh [checkpoint] [voice]
+#   ./examples/online_serving/duplexio/launch_realtime.sh CHECKPOINT
+#
+# CHECKPOINT is a native export. Its prewarm.wav (mono 24 kHz) warms the first
+# session, and its audio clips are offered as voices in the page. DEPLOY_CONFIG,
+# WEB_HOST (default 127.0.0.1) and WEB_PORT (default 7862) override the defaults.
+# Ctrl-C stops the web interface and the server.
 
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "$script_dir/../../.." && pwd)"
 
-checkpoint="${1:-/dcai/users/thuand/duplexio/checkpoints/duplexio-487557-checkpoint-4-vllm-v3}"
-voice="${2:-69f67cf0ae15b9e491cd6b21}"
-deploy_config="$repo_dir/vllm_omni/deploy/duplexio-multistream.yaml"
+checkpoint="${1:?usage: $0 CHECKPOINT}"
+deploy_config="${DEPLOY_CONFIG:-$repo_dir/vllm_omni/deploy/duplexio-realtime.yaml}"
+web_host="${WEB_HOST:-127.0.0.1}"
+web_port="${WEB_PORT:-7862}"
 python="$repo_dir/.venv/bin/python"
 vllm_omni="$repo_dir/.venv/bin/vllm-omni"
 web_server="$script_dir/realtime_web/server.py"
 prewarm="$script_dir/realtime_web/prewarm.py"
 tools="$script_dir/realtime_web/tools.json"
 
-asr_cudnn_lib="/home/anders/repos/duplexio/.venv/lib/python3.13/site-packages/nvidia/cudnn/lib"
+asr_cudnn_lib="$HOME/repos/duplexio/.venv/lib/python3.13/site-packages/nvidia/cudnn/lib"
 cuda_lib="/usr/local/cuda-13.0/lib64"
 export LD_LIBRARY_PATH="$asr_cudnn_lib:$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PYTHONPATH="$repo_dir${PYTHONPATH:+:$PYTHONPATH}"
 
-for port in 8099 7862; do
-    if ss -H -ltn "sport = :$port" | rg -q .; then
+for port in 8099 "$web_port"; do
+    if ss -H -ltn "sport = :$port" | grep -q .; then
         echo "Port $port is already in use; stop the existing realtime server first" >&2
         exit 1
     fi
@@ -40,7 +46,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "Starting DuplexIO from $checkpoint"
-echo "Using voice $voice and deploy config $deploy_config"
+echo "Using deploy config $deploy_config"
 "$vllm_omni" serve "$checkpoint" \
     --omni \
     --deploy-config "$deploy_config" \
@@ -49,7 +55,8 @@ echo "Using voice $voice and deploy config $deploy_config"
     --port 8099 &
 backend_pid=$!
 
-for _ in {1..180}; do
+# Every serving variant is compiled and captured before the server reports healthy.
+for _ in {1..600}; do
     if curl -fsS http://127.0.0.1:8099/health >/dev/null 2>&1; then
         break
     fi
@@ -61,7 +68,7 @@ for _ in {1..180}; do
 done
 
 if ! curl -fsS http://127.0.0.1:8099/health >/dev/null; then
-    echo "DuplexIO did not become healthy within 180 seconds" >&2
+    echo "DuplexIO did not become healthy within 600 seconds" >&2
     exit 1
 fi
 
@@ -69,15 +76,15 @@ echo "Prewarming the DuplexIO realtime path"
 "$python" "$prewarm" \
     --backend ws://127.0.0.1:8099 \
     --model "$checkpoint" \
-    --voice "$voice" \
-    --tools "$tools"
+    --ref-audio "$checkpoint/prewarm.wav" \
+    --tools "$tools" \
+    --timeout-seconds 300
 
-echo "DuplexIO is ready; opening the web interface on http://127.0.0.1:7862"
+echo "DuplexIO is ready; web interface on http://$web_host:$web_port"
 "$python" "$web_server" \
-    --host 127.0.0.1 \
-    --port 7862 \
+    --host "$web_host" \
+    --port "$web_port" \
     --ws-backend ws://127.0.0.1:8099 \
     --model "$checkpoint" \
-    --voice "$voice" \
-    --voice-manifest "$checkpoint/voices.json" \
+    --sample-clips "$checkpoint" \
     --tools "$tools"
