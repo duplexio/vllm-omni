@@ -42,6 +42,10 @@ APP_ROOT = Path("/app/vllm-omni")
 FRONTEND_ROOT = Path("/app/realtime_web")
 DEPLOY_CONFIG_NAME = "duplexio-realtime-h100.yaml"
 MODEL_STARTUP_TIMEOUT_SECONDS = 15 * 60
+# The GPU and the page proxy run next to each other in Europe, where the demo's
+# users are: unpinned, audio crossed the Atlantic twice a frame.
+REGION = "eu"
+ROUTING_REGION = "eu-west"
 BACKEND_PORT = 8099
 BACKEND_HTTP_URL = f"http://127.0.0.1:{BACKEND_PORT}"
 LOCAL_BACKEND_WEBSOCKET_URL = f"ws://127.0.0.1:{BACKEND_PORT}"
@@ -365,6 +369,8 @@ def check_model_present() -> None:
     # server and relay each keep one busy, and every session's audio passes
     # through them.
     cpu=8,
+    region=REGION,
+    routing_region=ROUTING_REGION,
     volumes={"/models": model_volume.with_mount_options(read_only=True)},
     # Sleep level 1 offloads weights (~13 GB) + the kv_cache pool
     # (~15 GB) into host RAM before the snapshot captures it.
@@ -422,6 +428,8 @@ class SnapshotModelServer:
 
 @app.function(
     image=frontend_image,
+    region=REGION,
+    routing_region=ROUTING_REGION,
     volumes={"/models": model_volume.with_mount_options(read_only=True)},
     memory=1024,
     timeout=24 * 60 * 60,
