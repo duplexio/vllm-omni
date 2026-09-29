@@ -289,17 +289,18 @@ def prewarm_backend() -> None:
     )
 
 
-def build_model_app(process: subprocess.Popen[bytes]) -> object:
+def build_model_app(process: subprocess.Popen[bytes], password_hash: str) -> object:
     """Expose engine health, and relay realtime sessions to the engine.
 
-    Only these two routes are public: the engine's own server also serves
+    Only these two routes are reachable: the engine's own server also serves
     sleep and wakeup controls. The page connects here directly, skipping a hop
-    through the demo app, which serves only the page and its login.
+    through the demo app, which serves only the page and its login. A session
+    needs a ticket the demo app issues to signed-in pages.
     """
     import contextlib
 
     import websockets
-    from realtime_relay import backend_query, relay
+    from realtime_relay import backend_query, relay, ticket_is_valid, ticket_key
     from starlette.applications import Starlette
     from starlette.responses import PlainTextResponse
     from starlette.routing import Route, WebSocketRoute
@@ -309,7 +310,13 @@ def build_model_app(process: subprocess.Popen[bytes]) -> object:
         healthy = backend_is_healthy(process)
         return PlainTextResponse("ok" if healthy else "unhealthy", status_code=200 if healthy else 503)
 
+    key = ticket_key(password_hash)
+
     async def realtime(websocket) -> None:
+        if not ticket_is_valid(key, websocket.query_params.get("ticket")):
+            # Refuses the handshake (HTTP 403).
+            await websocket.close(code=1008)
+            return
         await websocket.accept()
         query, opus = backend_query(websocket.query_params.multi_items())
         url = f"{LOCAL_BACKEND_WEBSOCKET_URL}/v1/realtime?{query}"
@@ -343,6 +350,8 @@ def check_model_present() -> None:
     region=REGION,
     routing_region=ROUTING_REGION,
     volumes={"/models": model_volume.with_mount_options(read_only=True)},
+    # The page's password secret signs the session tickets this relay checks.
+    secrets=[modal.Secret.from_name(AUTH_SECRET_NAME)],
     # Sleep level 1 offloads weights (~13 GB) + the kv_cache pool
     # (~15 GB) into host RAM before the snapshot captures it.
     memory=96_000,
@@ -391,11 +400,11 @@ class SnapshotModelServer:
     def stop(self) -> None:
         stop_backend(self.backend)
 
-    # No proxy auth: the demo page and the remote agent-speech gate
-    # connect to this backend directly.
+    # No proxy auth, which a browser cannot send: the relay checks the
+    # demo app's session tickets instead.
     @modal.asgi_app(label=MODEL_WEB_LABEL, requires_proxy_auth=False)
     def web(self) -> object:
-        return build_model_app(self.backend)
+        return build_model_app(self.backend, os.environ[AUTH_PASSWORD_HASH_ENV])
 
 @app.function(
     image=frontend_image,

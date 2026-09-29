@@ -125,6 +125,7 @@ def test_index_exposes_sample_clips() -> None:
     assert '"defaultVoice": "alice.wav"' in index.text
     assert '"sampling": {"text": {"mode": "top_p"' in index.text
     assert '"realtimePath": "v1/realtime"' in index.text
+    assert '"realtimeTicketPath": null' in index.text
 
 
 def test_index_points_the_page_at_a_direct_relay() -> None:
@@ -269,6 +270,48 @@ def test_access_password_protects_page_and_websocket(monkeypatch: pytest.MonkeyP
         headers={"cookie": f"{server.SESSION_COOKIE_NAME}={session_cookie}"},
     ) as websocket:
         assert websocket.receive_text() == '{"type":"session.ready"}'
+
+
+def test_signed_in_pages_get_tickets_for_a_direct_relay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "password_matches", lambda password, password_hash: True)
+    app = server.build_app(
+        ws_backend="ws://127.0.0.1:8099",
+        model="checkpoint",
+        sample_clips=[],
+        sample_clip_dir=None,
+        sampling={},
+        password_hash="test-verifier",
+        realtime_url="wss://engine.example/v1/realtime",
+    )
+    client = TestClient(app, base_url="https://testserver")
+
+    assert client.get("/v1/realtime/ticket").status_code == 401
+    client.post("/login", data={"password": "test-password"}, follow_redirects=False)
+    assert '"realtimeTicketPath": "v1/realtime/ticket"' in client.get("/").text
+    ticket = client.get("/v1/realtime/ticket").json()["ticket"]
+
+    key = realtime_relay.ticket_key("test-verifier")
+    assert realtime_relay.ticket_is_valid(key, ticket)
+    assert not realtime_relay.ticket_is_valid(realtime_relay.ticket_key("other-verifier"), ticket)
+
+
+def test_tickets_expire_and_resist_forgery() -> None:
+    key = realtime_relay.ticket_key("test-verifier")
+    ticket = realtime_relay.issue_ticket(key, now=1_000)
+    expiry, _, signature = ticket.partition(".")
+
+    assert realtime_relay.ticket_is_valid(key, ticket, now=1_000 + realtime_relay.TICKET_LIFETIME_SECONDS - 1)
+    assert not realtime_relay.ticket_is_valid(key, ticket, now=1_000 + realtime_relay.TICKET_LIFETIME_SECONDS)
+    assert not realtime_relay.ticket_is_valid(key, f"{int(expiry) + 3600}.{signature}", now=1_000)
+    for forged in (None, "", "garbage", f"{expiry}."):
+        assert not realtime_relay.ticket_is_valid(key, forged, now=1_000)
+
+
+def test_tickets_and_codec_stay_out_of_the_engine_query() -> None:
+    query, opus = realtime_relay.backend_query([("duplex", "1"), ("codec", "opus"), ("ticket", "1.abc")])
+
+    assert query == "duplex=1"
+    assert opus is not None
 
 
 def test_healthz_remains_public_when_access_password_is_set() -> None:

@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 # Found beside this file: run as a script, the file's directory is on sys.path.
-from realtime_relay import INPUT_SAMPLE_RATE, backend_query, relay
+from realtime_relay import INPUT_SAMPLE_RATE, backend_query, issue_ticket, relay, ticket_key
 
 logger = logging.getLogger(__name__)
 APP_DIR = Path(__file__).parent / "app"
@@ -117,7 +117,9 @@ def build_app(
     """Serve the page and its login, and relay realtime sessions to ``ws_backend``.
 
     The page connects to ``realtime_url``: by default this app's own relay, or
-    an absolute URL of an engine relay it can reach directly.
+    an absolute URL of an engine relay it can reach directly. With a password,
+    the page first fetches a ticket that such a relay checks instead of the
+    login cookie, which only this app sees.
     """
     app = FastAPI(title="duplexio")
     index_path = APP_DIR / "index.html"
@@ -170,6 +172,7 @@ def build_app(
                 "sampling": sampling,
                 "inputSampleRate": INPUT_SAMPLE_RATE,
                 "realtimePath": realtime_url,
+                "realtimeTicketPath": None if password_hash is None else "v1/realtime/ticket",
                 "appVersion": app_version,
                 "tools": tools or [],
             },
@@ -181,6 +184,13 @@ def build_app(
             .replace("__DUPLEXIO_APP_VERSION__", app_version)
         )
         return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+    @app.get("/v1/realtime/ticket")
+    def realtime_ticket(request: Request) -> Response:
+        if password_hash is None or not is_authenticated(request.cookies.get(SESSION_COOKIE_NAME)):
+            return Response(status_code=401)
+        ticket = issue_ticket(ticket_key(password_hash))
+        return Response(json.dumps({"ticket": ticket}), media_type="application/json", headers={"Cache-Control": "no-store"})
 
     @app.get("/login", response_class=HTMLResponse)
     def login_page(request: Request) -> Response:

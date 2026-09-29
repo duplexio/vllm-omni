@@ -597,13 +597,20 @@
     meterFill.style.width = `${Math.min(100, peak / 32768 * 150)}%`;
   }
 
-  function realtimeUrl() {
+  // The GPU relay does not see the login cookie, so a signed-in page brings a
+  // ticket from this server instead.
+  async function realtimeUrl() {
     const url = new URL(config.realtimePath, window.location.href);
     url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     url.searchParams.set('duplex', '1');
     url.searchParams.set('model', config.model);
     url.searchParams.set('autostart', '0');
     if (opusEncoder) url.searchParams.set('codec', 'opus');
+    if (config.realtimeTicketPath) {
+      const response = await fetch(config.realtimeTicketPath, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`could not get a session ticket (HTTP ${response.status}); sign in again`);
+      url.searchParams.set('ticket', (await response.json()).ticket);
+    }
     return url.toString();
   }
 
@@ -810,9 +817,9 @@
     }, [playbackPcm.buffer]);
   }
 
-  function openSocket() {
+  async function openSocket() {
+    const url = await realtimeUrl();
     return new Promise((resolve, reject) => {
-      const url = realtimeUrl();
       const sessionTools = enabledTools();
       const sessionSampling = samplingOptions();
       socket = new WebSocket(url);

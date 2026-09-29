@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hmac
 import json
+import time
 from urllib.parse import urlencode
 
 import av
@@ -21,12 +23,34 @@ INPUT_SAMPLE_RATE = 24_000
 # Opus packets carry the browser leg; one packet holds one 80 ms model frame.
 OPUS_BITRATE = 48_000
 OPUS_FRAME_MS = 80
+# A cold engine holds the connection until it has booted (up to ~15 minutes on
+# Modal) before the relay sees the ticket, so a ticket outlives that.
+TICKET_LIFETIME_SECONDS = 20 * 60
+
+
+def ticket_key(password_hash: str) -> bytes:
+    """The key tickets are signed with: whoever holds the page's secret can issue them."""
+    return hmac.digest(password_hash.encode(), b"duplexio realtime ticket v1", "sha256")
+
+
+def issue_ticket(key: bytes, now: float | None = None) -> str:
+    """A ticket that lets a signed-in page open sessions on an engine relay directly."""
+    expiry = str(int((time.time() if now is None else now) + TICKET_LIFETIME_SECONDS))
+    return f"{expiry}.{hmac.digest(key, expiry.encode(), 'sha256').hex()}"
+
+
+def ticket_is_valid(key: bytes, ticket: str | None, now: float | None = None) -> bool:
+    expiry, _, signature = (ticket or "").partition(".")
+    if not expiry.isdigit():
+        return False
+    expected = hmac.digest(key, expiry.encode(), "sha256").hex()
+    return hmac.compare_digest(signature, expected) and int(expiry) > (time.time() if now is None else now)
 
 
 def backend_query(params: list[tuple[str, str]]) -> tuple[str, OpusTranscoder | None]:
     """The engine's query string, and a transcoder if the page asked for Opus."""
     opus = OpusTranscoder() if ("codec", "opus") in params else None
-    return urlencode([(key, value) for key, value in params if key != "codec"]), opus
+    return urlencode([(key, value) for key, value in params if key not in {"codec", "ticket"}]), opus
 
 
 class OpusTranscoder:
