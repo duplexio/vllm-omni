@@ -75,7 +75,7 @@ from vllm_omni.model_executor.models.duplexio.row_semantics import (
     DUPLEXIO_NUM_TEXT_CELLS,
     duplexio_frame_positions,
 )
-from vllm_omni.model_executor.models.duplexio.sampling_config import ContentPolicy
+from vllm_omni.model_executor.models.duplexio.sampling_config import ContentPolicy, SamplingConfig, sampling_runtime
 from vllm_omni.model_executor.models.duplexio.stream_gdn import gdn_cache_dtypes, gdn_cache_shapes
 from vllm_omni.model_executor.models.duplexio.text_sampling import (
     TokenSamplingOptions,
@@ -817,8 +817,8 @@ class DuplexIOForConditionalGeneration(
         it compiles. The runner calls this after its own capture, under the
         default dtype that serving runs with (weight loading changes it, which
         compiled code guards on). Sampling graphs also key on the batch's top-k,
-        which only requests know, so here only their compiled FlowMap warms, at
-        one and two rows (every larger batch shares the second).
+        which only requests know; they are captured here for the default
+        sampling policy, which the demo page and unconfigured sessions use.
         """
         if not self.full_cudagraph_enabled or self.frame_input_graphs:
             return
@@ -831,15 +831,14 @@ class DuplexIOForConditionalGeneration(
         agent_codes = self.initial_agent_audio(max_rows)
         for size in range(1, max_rows + 1):
             self.frame_input_graph((packed[:size], user_features[:size], agent_codes[:size]))
-        if isinstance(self.audio_sampler, FlowMapSampler):
-            options = TokenSamplingOptions(1.0, None, None, self.agent_suppressed_token_ids)
-            vocab_size = self.text_config.vocab_size
-            parameters = torch.tensor(
-                [(*sampling_parameters(options, options, (1.0, 1.0, 1.0), vocab_size), 0)] * 2, device=device,
-            )
-            hidden = self.llm.channel_emb.new_zeros(2, DUPLEXIO_NUM_CELLS, self.text_config.hidden_size)
-            for size in (1, 2):
-                self.sample_rows(hidden[:size], parameters[:size], self.allow_all_bitmask[:size], top_k=None)
+        sampling = self.resolve_sampling(sampling_runtime(SamplingConfig()))
+        top_k = sampled_top_k((sampling.agent, sampling.user), self.text_config.vocab_size)
+        width = support_width([sampling.agent], top_k)
+        parameters = torch.tensor([(*sampling.parameters, 0)] * max_rows, dtype=torch.float32, device=device)
+        rows = self.llm.channel_emb.new_zeros(max_rows, DUPLEXIO_NUM_CELLS, self.text_config.hidden_size)
+        for size in range(1, max_rows + 1):
+            tensors = (rows[:size], parameters[:size], self.allow_all_bitmask[:size])
+            self.sampling_graph(tensors, top_k, width)
 
     def project_frames(self, packed: Tensor, user_features: Tensor, agent_codes: Tensor) -> tuple[Tensor, ...]:
         """Tensor-only packed projections and frame construction, shared by all requests."""
@@ -1131,15 +1130,13 @@ class DuplexIOForConditionalGeneration(
         sample_infos = [infos[index] for index in indices]
         inputs = self.sampling_inputs(sample_infos, rows.device)
         tensors = (rows, inputs.parameters, inputs.tool_bitmask)
-        sample = partial(self.sample_rows, top_k=inputs.top_k, support_width=inputs.support_width)
         if self.full_cudagraph_enabled:
-            key = (len(indices), inputs.top_k, inputs.support_width)
-            if key not in self.sampling_graphs:
-                pool = next(iter(self.sampling_graphs.values())).graph.pool() if self.sampling_graphs else None
-                self.sampling_graphs[key] = FrameInputGraph(sample, tensors, pool)
-            text_ids, tool_starts, frame_logprobs, support_ids, *audio = self.sampling_graphs[key](tensors)
+            graph = self.sampling_graph(tensors, inputs.top_k, inputs.support_width)
+            text_ids, tool_starts, frame_logprobs, support_ids, *audio = graph(tensors)
         else:
-            text_ids, tool_starts, frame_logprobs, support_ids, *audio = sample(*tensors)
+            text_ids, tool_starts, frame_logprobs, support_ids, *audio = self.sample_rows(
+                *tensors, top_k=inputs.top_k, support_width=inputs.support_width,
+            )
         text = TextSamplingResult(
             text_ids, tool_starts, frame_logprobs, support_ids, inputs.pending, inputs.calling, [None] * len(indices),
         )
@@ -1147,6 +1144,15 @@ class DuplexIOForConditionalGeneration(
             with torch.profiler.record_function("duplexio.audio_sampling"), self.autocast(rows):
                 audio = [self.sample_depth_audio(rows, text_ids[:, 1], sample_infos)]
         return FrameBatch(indices=indices, text=text, audio=audio[0], hiddens=rows)
+
+    def sampling_graph(self, tensors: tuple[Tensor, ...], top_k: int | None, width: int) -> FrameInputGraph:
+        """The sampling graph for this batch size and top-k, captured on first use into the shared pool."""
+        key = (tensors[0].shape[0], top_k, width)
+        if key not in self.sampling_graphs:
+            pool = next(iter(self.sampling_graphs.values())).graph.pool() if self.sampling_graphs else None
+            sample = partial(self.sample_rows, top_k=top_k, support_width=width)
+            self.sampling_graphs[key] = FrameInputGraph(sample, tensors, pool)
+        return self.sampling_graphs[key]
 
     def autocast(self, value: Tensor) -> torch.autocast:
         dtype = self.vllm_config.model_config.dtype
