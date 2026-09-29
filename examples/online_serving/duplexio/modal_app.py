@@ -13,7 +13,6 @@ import os
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -40,6 +39,7 @@ VOICE_DIR = MODEL_PATH / "voices"
 DEFAULT_VOICE = "maya.wav"
 APP_ROOT = Path("/app/vllm-omni")
 FRONTEND_ROOT = Path("/app/realtime_web")
+RELAY_DIR = APP_ROOT / "examples" / "online_serving" / "duplexio" / "realtime_web"
 DEPLOY_CONFIG_NAME = "duplexio-realtime-h100.yaml"
 MODEL_STARTUP_TIMEOUT_SECONDS = 15 * 60
 # The GPU and the page proxy run next to each other in Europe, where the demo's
@@ -52,15 +52,11 @@ LOCAL_BACKEND_WEBSOCKET_URL = f"ws://127.0.0.1:{BACKEND_PORT}"
 SNAPSHOT_STAGE_IDS = [0]
 AUTH_SECRET_NAME = "DEMO_PASSWORD_HASH"
 AUTH_PASSWORD_HASH_ENV = "DEMO_PASSWORD_HASH"
-BACKEND_AUTH_SECRET_NAME = "duplexio-demo-backend-auth"
-BACKEND_KEY_ENV = "DUPLEXIO_BACKEND_MODAL_KEY"
-BACKEND_SECRET_ENV = "DUPLEXIO_BACKEND_MODAL_SECRET"
 MODEL_WEB_LABEL = f"model-snapshot{SUFFIX}"
 DEMO_WEB_LABEL = f"demo{SUFFIX}"
 # A routing region puts the region in every web endpoint's hostname.
 BACKEND_HOST = f"duplexio--{MODEL_WEB_LABEL}.{ROUTING_REGION}.modal.run"
 BACKEND_WEBSOCKET_URL = f"wss://{BACKEND_HOST}"
-BACKEND_HEALTH_URL = f"https://{BACKEND_HOST}/healthz"
 
 repo_root = Path(__file__).resolve().parents[3] if modal.is_local() else APP_ROOT
 
@@ -103,7 +99,8 @@ model_image = (
             "docs",
             "benchmarks",
             # The page and its proxy run in the demo app. Leaving them out keeps
-            # page changes from rebuilding this image and its GPU snapshot.
+            # page changes from rebuilding this image and its GPU snapshot. The
+            # relay they share with this container stays.
             "examples/online_serving/duplexio/realtime_web/app",
             "examples/online_serving/duplexio/realtime_web/server.py",
         ],
@@ -125,7 +122,7 @@ model_image = (
     )
     .env(
         {
-            "PYTHONPATH": str(APP_ROOT),
+            "PYTHONPATH": f"{APP_ROOT}:{RELAY_DIR}",
             # TCP connections do not survive snapshot restore (the container IP
             # changes), so the NCCL monitor thread's periodic flight-recorder
             # dump-flag poll spams "Broken pipe" against the dead rank-0
@@ -155,7 +152,7 @@ frontend_image = (
         remote_path=str(FRONTEND_ROOT),
         copy=True,
     )
-    .env({"PYTHONPATH": "/app", **VARIANT_ENV})
+    .env({"PYTHONPATH": f"/app:{FRONTEND_ROOT}", **VARIANT_ENV})
 )
 model_volume = modal.Volume.from_name(MODEL_VOLUME_NAME, create_if_missing=True)
 app = modal.App(APP_NAME)
@@ -292,33 +289,17 @@ def prewarm_backend() -> None:
     )
 
 
-def wait_for_remote_backend(url: str, headers: dict[str, str]) -> None:
-    deadline = time.monotonic() + MODEL_STARTUP_TIMEOUT_SECONDS
-    last_error: Exception | None = None
-    while time.monotonic() < deadline:
-        request = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=MODEL_STARTUP_TIMEOUT_SECONDS) as response:
-                if response.status == 200:
-                    return
-                last_error = RuntimeError(f"Backend health check returned HTTP {response.status}")
-        except urllib.error.URLError as exc:
-            last_error = exc
-        time.sleep(1)
-    raise TimeoutError(f"Backend did not become ready within {MODEL_STARTUP_TIMEOUT_SECONDS}s") from last_error
-
-
 def build_model_app(process: subprocess.Popen[bytes]) -> object:
-    """Expose engine health and relay realtime sessions to the engine unchanged.
+    """Expose engine health, and relay realtime sessions to the engine.
 
     Only these two routes are public: the engine's own server also serves
-    sleep and wakeup controls. The page, its login and its audio codec live
-    in the demo app.
+    sleep and wakeup controls. The page connects here directly, skipping a hop
+    through the demo app, which serves only the page and its login.
     """
-    import asyncio
     import contextlib
 
     import websockets
+    from realtime_relay import backend_query, relay
     from starlette.applications import Starlette
     from starlette.responses import PlainTextResponse
     from starlette.routing import Route, WebSocketRoute
@@ -330,29 +311,12 @@ def build_model_app(process: subprocess.Popen[bytes]) -> object:
 
     async def realtime(websocket) -> None:
         await websocket.accept()
-        url = f"{LOCAL_BACKEND_WEBSOCKET_URL}/v1/realtime?{websocket.url.query}"
+        query, opus = backend_query(websocket.query_params.multi_items())
+        url = f"{LOCAL_BACKEND_WEBSOCKET_URL}/v1/realtime?{query}"
         async with websockets.connect(url, max_size=64 * 1024 * 1024) as backend:
-
-            async def to_backend() -> None:
-                while (message := await websocket.receive())["type"] != "websocket.disconnect":
-                    await backend.send(message["text"] if message.get("text") is not None else message["bytes"])
-
-            async def to_client() -> None:
-                async for message in backend:
-                    if isinstance(message, bytes):
-                        await websocket.send_bytes(message)
-                    else:
-                        await websocket.send_text(message)
-
-            tasks = [asyncio.create_task(to_backend()), asyncio.create_task(to_client())]
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in tasks:
-                task.cancel()
-            for result in await asyncio.gather(*tasks, return_exceptions=True):
-                if not isinstance(result, (asyncio.CancelledError, WebSocketDisconnect, websockets.ConnectionClosed)):
-                    if isinstance(result, BaseException):
-                        raise result
-        with contextlib.suppress(RuntimeError):
+            await relay(websocket, backend, opus)
+        # The page may have gone first.
+        with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.close()
 
     return Starlette(routes=[Route("/healthz", healthz), WebSocketRoute("/v1/realtime", realtime)])
@@ -427,8 +391,8 @@ class SnapshotModelServer:
     def stop(self) -> None:
         stop_backend(self.backend)
 
-    # No proxy auth: the remote agent-speech gate drives this
-    # backend directly.
+    # No proxy auth: the demo page and the remote agent-speech gate
+    # connect to this backend directly.
     @modal.asgi_app(label=MODEL_WEB_LABEL, requires_proxy_auth=False)
     def web(self) -> object:
         return build_model_app(self.backend)
@@ -442,15 +406,12 @@ class SnapshotModelServer:
     timeout=24 * 60 * 60,
     scaledown_window=60,
     max_containers=1,
-    secrets=[
-        modal.Secret.from_name(AUTH_SECRET_NAME),
-        modal.Secret.from_name(BACKEND_AUTH_SECRET_NAME),
-    ],
+    secrets=[modal.Secret.from_name(AUTH_SECRET_NAME)],
 )
 @modal.concurrent(max_inputs=100)
 @modal.asgi_app(label=DEMO_WEB_LABEL)
 def demo() -> object:
-    """Serve authentication and proxy authenticated streams to the GPU."""
+    """Serve the page and its login; the page streams to the GPU directly."""
     from realtime_web.server import (
         build_app,
         list_sample_clips,
@@ -458,10 +419,6 @@ def demo() -> object:
     )
 
     tools_path = FRONTEND_ROOT / "tools.json"
-    backend_headers = {
-        "Modal-Key": os.environ[BACKEND_KEY_ENV],
-        "Modal-Secret": os.environ[BACKEND_SECRET_ENV],
-    }
     return build_app(
         ws_backend=BACKEND_WEBSOCKET_URL,
         model=str(MODEL_PATH),
@@ -471,10 +428,5 @@ def demo() -> object:
         sampling=load_sampling_defaults(MODEL_PATH / "config.json"),
         tools=json.loads(tools_path.read_text(encoding="utf-8")),
         password_hash=os.environ[AUTH_PASSWORD_HASH_ENV],
-        backend_headers=backend_headers,
-        backend_open_timeout=MODEL_STARTUP_TIMEOUT_SECONDS,
-        backend_ready=lambda: wait_for_remote_backend(
-            BACKEND_HEALTH_URL,
-            backend_headers,
-        ),
+        realtime_url=f"{BACKEND_WEBSOCKET_URL}/v1/realtime",
     )

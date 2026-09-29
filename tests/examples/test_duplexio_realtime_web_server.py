@@ -11,10 +11,12 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-SERVER_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "examples/online_serving/duplexio/realtime_web/server.py"
-)
+REALTIME_WEB = Path(__file__).resolve().parents[2] / "examples/online_serving/duplexio/realtime_web"
+SERVER_PATH = REALTIME_WEB / "server.py"
+# server.py imports the relay from beside itself, as it does when run as a script.
+sys.path.insert(0, str(REALTIME_WEB))
+import realtime_relay  # noqa: E402
+
 spec = importlib.util.spec_from_file_location(
     "duplexio_realtime_web_server_test",
     SERVER_PATH,
@@ -122,6 +124,20 @@ def test_index_exposes_sample_clips() -> None:
     assert '"url": "/voices/alice.wav"' in index.text
     assert '"defaultVoice": "alice.wav"' in index.text
     assert '"sampling": {"text": {"mode": "top_p"' in index.text
+    assert '"realtimePath": "v1/realtime"' in index.text
+
+
+def test_index_points_the_page_at_a_direct_relay() -> None:
+    app = server.build_app(
+        ws_backend="ws://127.0.0.1:8099",
+        model="checkpoint",
+        sample_clips=[],
+        sample_clip_dir=None,
+        sampling={},
+        realtime_url="wss://engine.example/v1/realtime",
+    )
+
+    assert '"realtimePath": "wss://engine.example/v1/realtime"' in TestClient(app).get("/").text
 
 
 def test_sampling_defaults_apply_serving_temperatures(tmp_path: Path) -> None:
@@ -198,12 +214,6 @@ def test_access_password_protects_page_and_websocket(monkeypatch: pytest.MonkeyP
             password == "test-password" and password_hash == "test-verifier"
         ),
     )
-    backend_is_ready = False
-
-    def prepare_backend() -> None:
-        nonlocal backend_is_ready
-        backend_is_ready = True
-
     app = server.build_app(
         ws_backend="ws://127.0.0.1:8099",
         model="checkpoint",
@@ -211,12 +221,6 @@ def test_access_password_protects_page_and_websocket(monkeypatch: pytest.MonkeyP
         sample_clip_dir=None,
         sampling={},
         password_hash="test-verifier",
-        backend_headers={
-            "Modal-Key": "test-key",
-            "Modal-Secret": "test-secret",
-        },
-        backend_open_timeout=900,
-        backend_ready=prepare_backend,
     )
     client = TestClient(app, base_url="https://testserver")
 
@@ -252,12 +256,6 @@ def test_access_password_protects_page_and_websocket(monkeypatch: pytest.MonkeyP
     backend = SingleMessageBackend()
 
     def connect(*args: object, **kwargs: object) -> BackendConnection:
-        assert backend_is_ready
-        assert kwargs["additional_headers"] == {
-            "Modal-Key": "test-key",
-            "Modal-Secret": "test-secret",
-        }
-        assert kwargs["open_timeout"] == 900
         return BackendConnection(backend)
 
     monkeypatch.setattr(
@@ -317,10 +315,10 @@ def test_session_cookie_survives_frontend_restart(monkeypatch: pytest.MonkeyPatc
 
 def opus_packets(samples: np.ndarray, frame_ms: int) -> list[bytes]:
     encoder = av.CodecContext.create("libopus", "w")
-    encoder.sample_rate = server.INPUT_SAMPLE_RATE
+    encoder.sample_rate = realtime_relay.INPUT_SAMPLE_RATE
     encoder.layout = "mono"
     encoder.format = "s16"
-    encoder.bit_rate = server.OPUS_BITRATE
+    encoder.bit_rate = realtime_relay.OPUS_BITRATE
     encoder.options = {"frame_duration": str(frame_ms)}
     encoder.open()
     packets = []
@@ -328,7 +326,7 @@ def opus_packets(samples: np.ndarray, frame_ms: int) -> list[bytes]:
         frame = av.AudioFrame.from_ndarray(
             samples[None, offset : offset + encoder.frame_size], format="s16", layout="mono"
         )
-        frame.sample_rate = server.INPUT_SAMPLE_RATE
+        frame.sample_rate = realtime_relay.INPUT_SAMPLE_RATE
         frame.pts = offset
         packets += [bytes(packet) for packet in encoder.encode(frame)]
     return packets
@@ -336,7 +334,7 @@ def opus_packets(samples: np.ndarray, frame_ms: int) -> list[bytes]:
 
 def decode_opus(packets: list[bytes]) -> np.ndarray:
     decoder = av.CodecContext.create("opus", "r")
-    resampler = av.AudioResampler(format="flt", layout="mono", rate=server.INPUT_SAMPLE_RATE)
+    resampler = av.AudioResampler(format="flt", layout="mono", rate=realtime_relay.INPUT_SAMPLE_RATE)
     return np.concatenate([
         frame.to_ndarray().reshape(-1)
         for packet in packets
@@ -346,7 +344,7 @@ def decode_opus(packets: list[bytes]) -> np.ndarray:
 
 
 def tone(seconds: float) -> np.ndarray:
-    time = np.arange(int(seconds * server.INPUT_SAMPLE_RATE)) / server.INPUT_SAMPLE_RATE
+    time = np.arange(int(seconds * realtime_relay.INPUT_SAMPLE_RATE)) / realtime_relay.INPUT_SAMPLE_RATE
     return (0.3 * 32767 * np.sin(2 * np.pi * 440 * time)).astype(np.int16)
 
 
@@ -358,7 +356,7 @@ def matches_tone(pcm: np.ndarray, reference: np.ndarray) -> bool:
 
 
 def test_opus_microphone_packets_reach_the_backend_as_pcm() -> None:
-    transcoder = server.OpusTranscoder()
+    transcoder = realtime_relay.OpusTranscoder()
     reference = tone(0.4)
     appends = [
         json.loads(transcoder.to_backend(json.dumps({
@@ -378,7 +376,7 @@ def test_opus_microphone_packets_reach_the_backend_as_pcm() -> None:
 
 
 def test_model_audio_reaches_the_page_as_opus_packets() -> None:
-    transcoder = server.OpusTranscoder()
+    transcoder = realtime_relay.OpusTranscoder()
     reference = tone(0.4)
     events = []
     for offset in range(0, 1_920 * 4, 1_920):
