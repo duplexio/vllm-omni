@@ -57,12 +57,56 @@ def test_microphone_upload_waits_for_session_readiness() -> None:
     app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
 
     assert "if (message.type === 'session.updated' && !ready)" in app
-    assert "const sendIntervalMs = 80;" in app
+    assert "const frameMs = 80;" in app
     assert "const playbackBufferMs = 160;" in app
     readiness = app.index("await openSocket();")
     running = app.index("running = true;", readiness)
-    send_timer = app.index("window.setInterval(flushCapture", running)
-    assert readiness < running < send_timer
+    assert readiness < running
+    # Frames go out as the capture worklet posts them, not on a page timer.
+    assert "setInterval" not in app
+    send = app.index("function sendCapture(")
+    assert app.index("if (!running || muted", send) - send < 80
+
+
+def test_capture_worklet_posts_whole_frames() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the AudioWorklet regression test")
+
+    script = textwrap.dedent(
+        """
+        const fs = require('fs');
+        const vm = require('vm');
+
+        const posted = [];
+        global.sampleRate = 1000;
+        global.AudioWorkletProcessor = class {
+          constructor() {
+            this.port = { postMessage: (buffer) => posted.push(new Int16Array(buffer)) };
+          }
+        };
+        let Processor = null;
+        global.registerProcessor = (_name, processor) => { Processor = processor; };
+        vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
+
+        const processor = new Processor({ processorOptions: { frameMs: 80 } });
+        for (let block = 0; block < 5; block += 1) {
+          processor.process([[new Float32Array(35).fill(0.5)]]);
+        }
+        if (posted.length !== 2 || posted.some((frame) => frame.length !== 80)) {
+          throw new Error(`posted ${posted.map((frame) => frame.length)}`);
+        }
+        if (!posted.every((frame) => frame.every((sample) => sample === 16383))) {
+          throw new Error('samples were not converted');
+        }
+        """
+    )
+    subprocess.run(
+        [node, "-e", script, str(STATIC_ROOT / "capture_worklet.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_frontend_registers_tools_and_returns_function_outputs() -> None:
@@ -184,7 +228,7 @@ def test_recording_worklet_preserves_stereo_channels() -> None:
     )
 
 
-def test_playback_worklet_buffers_one_audio_frame() -> None:
+def test_playback_worklet_buffers_a_frame_more_after_each_underrun() -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for the AudioWorklet regression test")
@@ -208,7 +252,9 @@ def test_playback_worklet_buffers_one_audio_frame() -> None:
         global.registerProcessor = (_name, processor) => { Processor = processor; };
         vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
 
-        const processor = new Processor({ processorOptions: { playbackBufferMs: 80 } });
+        const processor = new Processor({
+          processorOptions: { playbackBufferMs: 80, maxPlaybackBufferMs: 160, frameMs: 80 },
+        });
         const render = () => {
           const output = new Float32Array(40);
           processor.process([], [[output]]);
@@ -230,12 +276,17 @@ def test_playback_worklet_buffers_one_audio_frame() -> None:
 
         while (processor.queuedFrames > 0) render();
         assert(!processor.playing, 'empty playback queue did not return to buffering');
-        assert(messages.some((message) => message.type === 'buffering'), 'underrun was not reported');
+        const buffering = messages.filter((message) => message.type === 'buffering');
+        assert(buffering.length === 1 && buffering[0].bufferMs === 160, 'underrun did not grow the buffer');
 
+        for (let half = 0; half < 3; half += 1) appendHalfFrame();
+        assert(render().every((sample) => sample === 0), 'playback resumed below two frames');
         appendHalfFrame();
-        assert(render().every((sample) => sample === 0), 'playback resumed below one frame');
-        appendHalfFrame();
-        assert(render().every((sample) => sample === 0.125), 'playback did not resume after one frame');
+        assert(render().every((sample) => sample === 0.125), 'playback did not resume after two frames');
+
+        while (processor.queuedFrames > 0) render();
+        assert(messages.filter((message) => message.type === 'buffering')[1].bufferMs === 160,
+          'buffer grew past its cap');
 
         processor.handle({ type: 'clear' });
         appendHalfFrame();
@@ -276,7 +327,9 @@ def test_playback_worklet_drops_silence_queued_after_a_stall() -> None:
         global.registerProcessor = (_name, processor) => { Processor = processor; };
         vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
 
-        const processor = new Processor({ processorOptions: { playbackBufferMs: 80 } });
+        const processor = new Processor({
+          processorOptions: { playbackBufferMs: 80, maxPlaybackBufferMs: 160, frameMs: 80 },
+        });
         const render = () => {
           const output = new Float32Array(40);
           processor.process([], [[output]]);

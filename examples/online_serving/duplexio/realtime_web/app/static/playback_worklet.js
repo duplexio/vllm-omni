@@ -14,8 +14,10 @@ class DuplexIOPlayback extends AudioWorkletProcessor {
     this.drain = null;
     this.playing = false;
     this.underruns = 0;
-    const playbackBufferMs = options.processorOptions.playbackBufferMs;
+    const { playbackBufferMs, maxPlaybackBufferMs, frameMs } = options.processorOptions;
     this.bufferFrames = Math.round(sampleRate * playbackBufferMs / 1000);
+    this.maxBufferFrames = Math.round(sampleRate * maxPlaybackBufferMs / 1000);
+    this.growFrames = Math.round(sampleRate * frameMs / 1000);
     this.port.onmessage = (event) => this.handle(event.data || {});
   }
 
@@ -94,10 +96,14 @@ class DuplexIOPlayback extends AudioWorkletProcessor {
     if (this.queue.length === 0 && !this.drain) {
       this.playing = false;
       this.underruns += 1;
+      // Kept for the rest of the session: a connection that stalled once
+      // tends to stall again.
+      this.bufferFrames = Math.min(this.maxBufferFrames, this.bufferFrames + this.growFrames);
       this.port.postMessage({
         type: 'buffering',
         responseId: this.responseId,
         underruns: this.underruns,
+        bufferMs: Math.round((this.bufferFrames * 1000) / sampleRate),
       });
     }
     this.notifyDrained();

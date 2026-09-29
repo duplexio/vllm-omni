@@ -4,8 +4,11 @@
   const config = window.DUPLEXIO_CONFIG || {};
   const inputRate = Number(config.inputSampleRate || 24000);
   const outputRate = 24000;
+  // Playback starts once this much audio is queued; each underrun adds a
+  // frame, up to the cap, so a jittery connection settles at a steadier delay.
   const playbackBufferMs = 160;
-  const sendIntervalMs = 80;
+  const maxPlaybackBufferMs = 480;
+  const frameMs = 80;
   // Audio travels to the page's proxy as Opus, about 20x less than PCM; the
   // proxy converts to and from the PCM the model uses. Browsers without
   // WebCodecs Opus send PCM.
@@ -52,8 +55,12 @@
   let recordingSink = null;
   let captureRate = inputRate;
   let playbackRate = outputRate;
-  let captureChunks = [];
-  let sendTimer = null;
+  // Largest gaps since the last underrun report, to tell a late microphone
+  // frame (this page) from late model audio (the network or the server).
+  let lastSendAt = 0;
+  let lastAudioAt = 0;
+  let sendGapMs = 0;
+  let audioGapMs = 0;
   let opusEncoder = null;
   let opusDecoder = null;
   let opusTimestamp = 0;
@@ -582,18 +589,6 @@
     updateRecordingButton();
   }
 
-  function mergeCaptureChunks() {
-    const length = captureChunks.reduce((total, chunk) => total + chunk.length, 0);
-    const merged = new Int16Array(length);
-    let offset = 0;
-    for (const chunk of captureChunks) {
-      merged.set(chunk, offset);
-      offset += chunk.length;
-    }
-    captureChunks = [];
-    return merged;
-  }
-
   function updateMeter(pcm) {
     let peak = 0;
     for (let index = 0; index < pcm.length; index += 8) {
@@ -612,10 +607,12 @@
     return url.toString();
   }
 
-  function flushCapture() {
+  function sendCapture(capturedPcm) {
     if (!running || muted || !socket || socket.readyState !== WebSocket.OPEN) return;
-    if (captureChunks.length === 0) return;
-    const pcm = resampleInt16(mergeCaptureChunks(), captureRate, inputRate);
+    const now = performance.now();
+    if (lastSendAt) sendGapMs = Math.max(sendGapMs, now - lastSendAt);
+    lastSendAt = now;
+    const pcm = resampleInt16(capturedPcm, captureRate, inputRate);
     if (opusEncoder) {
       const data = new AudioData({
         format: 's16',
@@ -652,14 +649,17 @@
       playbackContext.audioWorklet.addModule(assetUrl('static/recording_worklet.js')),
     ]);
     playbackNode = new AudioWorkletNode(playbackContext, 'duplexio-playback', {
-      processorOptions: { playbackBufferMs },
+      processorOptions: { playbackBufferMs, maxPlaybackBufferMs, frameMs },
     });
     playbackNode.port.onmessage = (event) => {
       const message = event.data || {};
       if (message.type === 'started') detailElement.textContent = 'Speaking';
       if (message.type === 'buffering') {
         detailElement.textContent = 'Buffering audio';
-        log(`playback underrun ${message.underruns}; buffering ${playbackBufferMs} ms`);
+        log(`playback underrun ${message.underruns}; largest gap: microphone ${Math.round(sendGapMs)} ms, `
+          + `model audio ${Math.round(audioGapMs)} ms; buffering ${message.bufferMs} ms`);
+        sendGapMs = 0;
+        audioGapMs = 0;
       }
       if (message.type === 'drained') {
         if (socket && socket.readyState === WebSocket.OPEN && message.responseId) {
@@ -708,11 +708,13 @@
     captureRate = captureContext.sampleRate;
     await captureContext.audioWorklet.addModule(assetUrl('static/capture_worklet.js'));
     const source = captureContext.createMediaStreamSource(mediaStream);
-    captureNode = new AudioWorkletNode(captureContext, 'duplexio-capture');
+    captureNode = new AudioWorkletNode(captureContext, 'duplexio-capture', {
+      processorOptions: { frameMs },
+    });
     captureNode.port.onmessage = (event) => {
       const pcm = new Int16Array(event.data);
       updateMeter(pcm);
-      if (running && !muted) captureChunks.push(pcm);
+      sendCapture(pcm);
     };
     const silentSink = captureContext.createGain();
     silentSink.gain.value = 0;
@@ -886,6 +888,9 @@
       const encoded = event.delta || event.audio || (event.response && event.response.audio);
       if (!encoded || !playbackNode) return;
       responseId = event.response_id || responseId;
+      const now = performance.now();
+      if (lastAudioAt) audioGapMs = Math.max(audioGapMs, now - lastAudioAt);
+      lastAudioAt = now;
       const bytes = bytesFromBase64(encoded);
       const format = String(event.format || event.audio_format || '').toLowerCase();
       if (format === 'opus') {
@@ -950,9 +955,10 @@
     const closingSocket = socket;
     socket = null;
     running = false;
-    captureChunks = [];
-    if (sendTimer !== null) clearInterval(sendTimer);
-    sendTimer = null;
+    lastSendAt = 0;
+    lastAudioAt = 0;
+    sendGapMs = 0;
+    audioGapMs = 0;
     closeOpus();
     if (recording) await stopRecording();
     if (closingSocket && closingSocket.readyState === WebSocket.OPEN) {
@@ -1014,7 +1020,6 @@
       await openSocket();
       if (recordingArmed) startRecording();
       running = true;
-      sendTimer = window.setInterval(flushCapture, sendIntervalMs);
       startButton.textContent = 'End session';
       startButton.classList.add('active');
       muteButton.disabled = false;
@@ -1038,7 +1043,7 @@
   });
   muteButton.addEventListener('click', () => {
     muted = !muted;
-    captureChunks = [];
+    lastSendAt = 0;
     muteButton.textContent = muted ? 'Unmute' : 'Mute';
     log(muted ? 'microphone muted' : 'microphone unmuted');
   });
