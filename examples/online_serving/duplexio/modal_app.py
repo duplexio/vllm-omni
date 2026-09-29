@@ -97,6 +97,11 @@ model_image = (
             "**/*.pt",
             "**/__pycache__",
             "**/.pytest_cache",
+            # Serving never reads these, and any change to the image rebuilds
+            # its GPU snapshot (a ~20 minute cold start).
+            "tests",
+            "docs",
+            "benchmarks",
             # The page and its proxy run in the demo app. Leaving them out keeps
             # page changes from rebuilding this image and its GPU snapshot.
             "examples/online_serving/duplexio/realtime_web/app",
