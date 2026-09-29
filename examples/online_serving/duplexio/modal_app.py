@@ -361,6 +361,10 @@ def check_model_present() -> None:
 @app.cls(
     image=model_image,
     gpu="H100",
+    # The default single core runs out at a few sessions: the engine core, API
+    # server and relay each keep one busy, and every session's audio passes
+    # through them.
+    cpu=8,
     volumes={"/models": model_volume.with_mount_options(read_only=True)},
     # Sleep level 1 offloads weights (~13 GB) + the kv_cache pool
     # (~15 GB) into host RAM before the snapshot captures it.
