@@ -40,8 +40,7 @@ VOICE_DIR = MODEL_PATH / "voices"
 DEFAULT_VOICE = "maya.wav"
 APP_ROOT = Path("/app/vllm-omni")
 FRONTEND_ROOT = Path("/app/realtime_web")
-DEPLOY_CONFIG_NAME = "duplexio-realtime.yaml"
-KV_CACHE_MEMORY_BYTES = 19_947_344_692
+DEPLOY_CONFIG_NAME = "duplexio-realtime-h100.yaml"
 MODEL_STARTUP_TIMEOUT_SECONDS = 15 * 60
 BACKEND_PORT = 8099
 BACKEND_HTTP_URL = f"http://127.0.0.1:{BACKEND_PORT}"
@@ -92,6 +91,10 @@ model_image = (
             "**/*.pt",
             "**/__pycache__",
             "**/.pytest_cache",
+            # The page and its proxy run in the demo app. Leaving them out keeps
+            # page changes from rebuilding this image and its GPU snapshot.
+            "examples/online_serving/duplexio/realtime_web/app",
+            "examples/online_serving/duplexio/realtime_web/server.py",
         ],
     )
     # Installed from inside the image so the requirements file resolves relative
@@ -183,10 +186,6 @@ def backend_command(*, enable_sleep_mode: bool) -> list[str]:
         "--omni",
         "--deploy-config",
         str(APP_ROOT / "vllm_omni" / "deploy" / DEPLOY_CONFIG_NAME),
-        "--stage-overrides",
-        # The realtime profile (two sessions, graph replay), with the H100's
-        # room spent on 16-minute sessions.
-        json.dumps({"0": {"kv_cache_memory_bytes": KV_CACHE_MEMORY_BYTES, "max_model_len": 73728}}),
         "--trust-remote-code",
         # A fresh image loads weights and compiles for longer than the engine's
         # 600 s default; the container's startup budget is the real limit.
@@ -299,28 +298,53 @@ def wait_for_remote_backend(url: str, headers: dict[str, str]) -> None:
 
 
 def build_model_app(process: subprocess.Popen[bytes]) -> object:
-    from examples.online_serving.duplexio.realtime_web.server import (
-        build_app,
-        load_sampling_defaults,
-    )
+    """Expose engine health and relay realtime sessions to the engine unchanged.
 
-    tools_path = (
-        APP_ROOT
-        / "examples"
-        / "online_serving"
-        / "duplexio"
-        / "realtime_web"
-        / "tools.json"
-    )
-    return build_app(
-        ws_backend=LOCAL_BACKEND_WEBSOCKET_URL,
-        model=str(MODEL_PATH),
-        sample_clips=[],
-        sample_clip_dir=None,
-        sampling=load_sampling_defaults(MODEL_PATH / "config.json"),
-        tools=json.loads(tools_path.read_text(encoding="utf-8")),
-        health_check=lambda: backend_is_healthy(process),
-    )
+    Only these two routes are public: the engine's own server also serves
+    sleep and wakeup controls. The page, its login and its audio codec live
+    in the demo app.
+    """
+    import asyncio
+    import contextlib
+
+    import websockets
+    from starlette.applications import Starlette
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route, WebSocketRoute
+    from starlette.websockets import WebSocketDisconnect
+
+    def healthz(request) -> PlainTextResponse:
+        healthy = backend_is_healthy(process)
+        return PlainTextResponse("ok" if healthy else "unhealthy", status_code=200 if healthy else 503)
+
+    async def realtime(websocket) -> None:
+        await websocket.accept()
+        url = f"{LOCAL_BACKEND_WEBSOCKET_URL}/v1/realtime?{websocket.url.query}"
+        async with websockets.connect(url, max_size=64 * 1024 * 1024) as backend:
+
+            async def to_backend() -> None:
+                while (message := await websocket.receive())["type"] != "websocket.disconnect":
+                    await backend.send(message["text"] if message.get("text") is not None else message["bytes"])
+
+            async def to_client() -> None:
+                async for message in backend:
+                    if isinstance(message, bytes):
+                        await websocket.send_bytes(message)
+                    else:
+                        await websocket.send_text(message)
+
+            tasks = [asyncio.create_task(to_backend()), asyncio.create_task(to_client())]
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in tasks:
+                task.cancel()
+            for result in await asyncio.gather(*tasks, return_exceptions=True):
+                if not isinstance(result, (asyncio.CancelledError, WebSocketDisconnect, websockets.ConnectionClosed)):
+                    if isinstance(result, BaseException):
+                        raise result
+        with contextlib.suppress(RuntimeError):
+            await websocket.close()
+
+    return Starlette(routes=[Route("/healthz", healthz), WebSocketRoute("/v1/realtime", realtime)])
 
 
 def check_model_present() -> None:
@@ -339,7 +363,7 @@ def check_model_present() -> None:
     gpu="H100",
     volumes={"/models": model_volume.with_mount_options(read_only=True)},
     # Sleep level 1 offloads weights (~13 GB) + the kv_cache pool
-    # (~20 GB) into host RAM before the snapshot captures it.
+    # (~15 GB) into host RAM before the snapshot captures it.
     memory=96_000,
     timeout=24 * 60 * 60,
     startup_timeout=MODEL_STARTUP_TIMEOUT_SECONDS,
