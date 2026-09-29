@@ -20,7 +20,7 @@ from pathlib import Path
 import modal
 
 # A variant name deploys a parallel app under suffixed web labels
-# (DUPLEXIO_MODAL_VARIANT=paged serves https://duplexio--demo-paged.modal.run).
+# (DUPLEXIO_MODAL_VARIANT=paged serves https://duplexio--demo-paged.eu-west.modal.run).
 # The live demo is unaffected unless the variable is unset at deploy time.
 VARIANT = os.environ.get("DUPLEXIO_MODAL_VARIANT", "")
 SUFFIX = f"-{VARIANT}" if VARIANT else ""
@@ -57,8 +57,10 @@ BACKEND_KEY_ENV = "DUPLEXIO_BACKEND_MODAL_KEY"
 BACKEND_SECRET_ENV = "DUPLEXIO_BACKEND_MODAL_SECRET"
 MODEL_WEB_LABEL = f"model-snapshot{SUFFIX}"
 DEMO_WEB_LABEL = f"demo{SUFFIX}"
-BACKEND_WEBSOCKET_URL = f"wss://duplexio--{MODEL_WEB_LABEL}.modal.run"
-BACKEND_HEALTH_URL = f"https://duplexio--{MODEL_WEB_LABEL}.modal.run/healthz"
+# A routing region puts the region in every web endpoint's hostname.
+BACKEND_HOST = f"duplexio--{MODEL_WEB_LABEL}.{ROUTING_REGION}.modal.run"
+BACKEND_WEBSOCKET_URL = f"wss://{BACKEND_HOST}"
+BACKEND_HEALTH_URL = f"https://{BACKEND_HOST}/healthz"
 
 repo_root = Path(__file__).resolve().parents[3] if modal.is_local() else APP_ROOT
 
