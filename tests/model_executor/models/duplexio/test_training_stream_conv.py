@@ -112,7 +112,7 @@ def test_streaming_matches_packed_training_and_resets_reused_slots(
                          sequence_ids=sequence_ids, activation="silu")[0].T
     expected = torch.cat([part[history_length:] for part in expected.split(reference_lengths)])
     chunks = torch.tensor([[request, chunk] for request, length in enumerate(lengths)
-                           for chunk in range((length + 63) // 64)], device="cuda", dtype=torch.int32)
+                           for chunk in range((length // 6 + 63) // 64)], device="cuda", dtype=torch.int32)
     actual = native.apply_stream_causal_conv(x, state, slots, boundaries, has_state, chunks)
     if capture_graph:
         stream = torch.cuda.Stream()
