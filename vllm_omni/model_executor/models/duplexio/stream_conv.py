@@ -19,7 +19,7 @@ def stream_conv_kernel(
     start, end = tl.load(boundaries + request), tl.load(boundaries + request + 1)
     slot = tl.load(slots + request * slot_stride).to(tl.int64)
     valid_state = tl.load(has_state + request)
-    tokens = start + chunk * 64 + tl.arange(0, 64)
+    tokens = start + (chunk * 64 + tl.arange(0, 64)) * 6 + tl.program_id(2)
     dims = tl.program_id(1) * block_d + tl.arange(0, block_d)
     valid = (tokens[:, None] < end) & (dims[None, :] < channels)
     acc = tl.zeros((64, block_d), tl.float32)
@@ -74,7 +74,7 @@ def stream_causal_conv(
     x: Tensor, weight: Tensor, bias: Tensor | None, state: Tensor, slots: Tensor,
     boundaries: Tensor, has_state: Tensor, chunk_indices: Tensor,
 ) -> Tensor:
-    """Use GDN's existing 64-token chunk index, then advance request-local state.
+    """Use GDN's 64-frame chunk index, then advance request-local state.
 
     ``x`` is packed (tokens, channels); ``weight`` has taps spaced six cells
     apart; ``state`` is (cache_slots, channels, history_cells). State advances
@@ -82,7 +82,7 @@ def stream_causal_conv(
     """
     channels, history = x.shape[1], state.shape[2]
     output = torch.empty_like(x, memory_format=torch.contiguous_format)
-    stream_conv_kernel[(chunk_indices.shape[0], triton.cdiv(channels, 32))](
+    stream_conv_kernel[(chunk_indices.shape[0], triton.cdiv(channels, 32), 6)](
         x, weight, bias, state, slots, boundaries, has_state, chunk_indices, output,
         channels, history, slots.stride(0), *x.stride(), weight.stride(0), *state.stride(), bias is not None, 32,
     )
