@@ -146,23 +146,28 @@ def test_append_gdn_independent_slots_and_reset(prefixes: tuple[int, ...], alias
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("aliased_storage", (False, True))
+@pytest.mark.parametrize("length", (1, 6))
+@pytest.mark.parametrize("inactive", (False, True))
 @torch.inference_mode()
-def test_slot_recurrence_matches_fla_on_gathered_state_bitwise(aliased_storage: bool) -> None:
+def test_slot_recurrence_matches_fla_on_gathered_state(aliased_storage: bool, length: int, inactive: bool) -> None:
     torch.manual_seed(51)
     requests = 5
-    tokens = requests * 6
+    tokens = requests * length
     q = l2_normalize(torch.randn(tokens, 2, 128, device="cuda", dtype=torch.bfloat16))
     k = l2_normalize(torch.randn_like(q))
     # V arrives as a strided slice of the packed projection.
     v = torch.randn(tokens, 4 * 128 + 64, device="cuda", dtype=torch.bfloat16)[:, 64:].view(tokens, 4, 128)
     g = -torch.rand(tokens, 4, device="cuda", dtype=torch.float32)
     beta = torch.rand(tokens, 4, device="cuda", dtype=torch.bfloat16)
+    if inactive:
+        g[:, :2] = 0
+        beta[:, :2] = 0
     state = make_state(aliased_storage, requests + 2)[:, :4]
     state.copy_(torch.randn_like(state))
     reference = state.clone()
     slots = torch.tensor([6, 0, 3, 5, 1], device="cuda", dtype=torch.int32)
     has_state = torch.tensor([True, False, True, True, False], device="cuda")
-    boundaries = torch.arange(0, tokens + 1, 6, device="cuda", dtype=torch.int32)
+    boundaries = torch.arange(0, tokens + 1, length, device="cuda", dtype=torch.int32)
 
     initial = torch.where(has_state[:, None, None, None], reference[slots], 0)
     expected, final = fused_recurrent_gated_delta_rule(
@@ -172,8 +177,8 @@ def test_slot_recurrence_matches_fla_on_gathered_state_bitwise(aliased_storage: 
     reference[slots] = final
     actual = slot_recurrent_gdn(q, k, v, g, beta, state, slots, boundaries, has_state)
 
-    torch.testing.assert_close(actual, expected[0], atol=0, rtol=0)
-    torch.testing.assert_close(state, reference, atol=0, rtol=0)
+    torch.testing.assert_close(actual, expected[0], atol=0.002, rtol=0.02)
+    torch.testing.assert_close(state, reference, atol=2e-6, rtol=2e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")

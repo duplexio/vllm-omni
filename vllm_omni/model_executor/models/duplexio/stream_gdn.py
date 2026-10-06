@@ -80,16 +80,19 @@ def slot_recurrent_gdn_kernel(
     q, k, v, g, beta, o, state, slots, has_state, cu_seqlens, scale,
     stride_q, stride_k, stride_v, stride_slot,
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+    SINGLE_FRAME: tl.constexpr = False,
 ):
     """fla's fused recurrent gated delta rule, reading and writing each request's cache slot in place.
 
-    The arithmetic is fla's (head-wise beta and decay, key-major state), so
-    results match it bit for bit; only the state addressing differs.
+    Keep FP32 key-major state, with value tiles accessing contiguous columns.
     """
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
-    bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+    if SINGLE_FRAME:
+        bos, eos = i_n, i_n + 1
+    else:
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
     o_k = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
     p_q = q + bos * stride_q + i_h * K + o_k
@@ -103,17 +106,21 @@ def slot_recurrent_gdn_kernel(
     mask_h = mask_k[:, None] & mask_v[None, :]
     p_h = state + tl.load(slots + i_n).to(tl.int64) * stride_slot + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    b_h += tl.load(p_h, mask=mask_h & (tl.load(has_state + i_n) != 0), other=0).to(tl.float32)
+    valid_state = tl.load(has_state + i_n) != 0
+    b_h += tl.load(p_h, mask=mask_h & valid_state, other=0).to(tl.float32)
+    state_changed = ~valid_state
     for _ in tl.range(0, eos - bos):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_q = b_q * scale
         b_beta = tl.load(p_beta).to(tl.float32)
         b_g = tl.load(p_g).to(tl.float32)
-        b_h *= tl.exp(b_g)
-        b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
-        b_h += b_k[:, None] * b_v
+        if (b_beta != 0) | (b_g != 0):
+            b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+            b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+            b_h *= tl.exp(b_g)
+            b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
+            b_h += b_k[:, None] * b_v
+            state_changed = True
         b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
         p_q += stride_q
@@ -122,7 +129,8 @@ def slot_recurrent_gdn_kernel(
         p_g += HV
         p_beta += HV
         p_o += HV * V
-    tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h)
+    # Inactive streams still read/query memory, but need not rewrite it.
+    tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h & state_changed)
 
 
 def slot_recurrent_gdn(
@@ -138,13 +146,14 @@ def slot_recurrent_gdn(
         key_dim * value_dim, value_dim, 1,
     )
     output = torch.empty((tokens, value_heads, value_dim), dtype=v.dtype, device=v.device)
-    block_v = min(8, triton.next_power_of_2(value_dim))
+    single_frame = tokens == slots.shape[0]
+    block_v = min(32 if single_frame else 8, triton.next_power_of_2(value_dim))
     grid = (triton.cdiv(value_dim, block_v), slots.shape[0] * value_heads)
     slot_recurrent_gdn_kernel[grid](
         q, k, v, g, beta, output, cache, slots, has_state, boundaries, key_dim ** -0.5,
         q.stride(0), k.stride(0), v.stride(0), cache.stride(0),
         H=heads, HV=value_heads, K=key_dim, V=value_dim, BK=triton.next_power_of_2(key_dim), BV=block_v,
-        num_warps=1, num_stages=3,
+        SINGLE_FRAME=single_frame, num_warps=2 if single_frame else 1, num_stages=3,
     )
     return output
 
