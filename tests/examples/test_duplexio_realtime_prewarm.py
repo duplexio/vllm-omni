@@ -34,7 +34,7 @@ def test_prewarm_streams_frames_then_closes() -> None:
             await websocket.send(json.dumps({"type": "session.updated"}))
             while (message := json.loads(await websocket.recv()))["type"] == "input_audio_buffer.append":
                 messages.append(message)
-                await websocket.send(json.dumps({"type": "response.audio.delta", "delta": ""}))
+                await websocket.send(json.dumps({"type": "response.output_audio.delta", "delta": ""}))
             messages.append(message)
             await websocket.send(json.dumps({"type": "session.closed"}))
 

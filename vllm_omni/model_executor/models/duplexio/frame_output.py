@@ -19,10 +19,9 @@ from torch import Tensor
 FRAME_FIELDS = (
     "duplex_epoch",
     "duplex_turn_id",
-    "duplex_prefill",
-    "duplex_prefill_complete",
-    "duplex_system_input",
-    "duplex_system_input_complete",
+    "prefix",  # The append carried the voice prompt and system tokens.
+    "tool_result",  # The append carried tool-result rows after its live frame,
+    "tool_generation",  # the newest of which had this generation.
     "end_of_turn",
     "predicted",
     "model_listen",
@@ -37,8 +36,7 @@ FRAME_FIELDS = (
 )
 FRAME_INDEX = {name: index for index, name in enumerate(FRAME_FIELDS)}
 FRAME_FLAGS = frozenset({
-    "duplex_prefill", "duplex_prefill_complete", "duplex_system_input", "duplex_system_input_complete",
-    "end_of_turn", "predicted", "model_listen", "tool_call_complete",
+    "prefix", "tool_result", "end_of_turn", "predicted", "model_listen", "tool_call_complete",
     "tool_emit_sampled", "user_emit",
 })
 # ``tool_emit_sampled`` marks frames whose tool emit was drawn; inside a call or

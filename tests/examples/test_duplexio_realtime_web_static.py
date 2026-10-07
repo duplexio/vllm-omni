@@ -36,7 +36,7 @@ def test_frontend_shows_role_grouped_transcript_and_collapsed_logs() -> None:
     assert '<details class="sampling-panel" open>' in index
     assert '<details class="logs-panel">' in index
     assert "activeMessage.role !== role" in app
-    assert "response.audio_transcript.delta" in app
+    assert "response.output_audio_transcript.delta" in app
     assert "conversation.item.input_audio_transcription.delta" in app
     assert '<button id="record"' in index
     assert "microphone left, assistant right" in app

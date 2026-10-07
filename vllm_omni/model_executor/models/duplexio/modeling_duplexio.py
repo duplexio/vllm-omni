@@ -72,7 +72,6 @@ from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
 )
 from vllm_omni.model_executor.models.duplexio.row_semantics import (
     DUPLEXIO_NUM_CELLS,
-    DUPLEXIO_NUM_TEXT_CELLS,
     duplexio_frame_positions,
 )
 from vllm_omni.model_executor.models.duplexio.sampling_config import ContentPolicy, SamplingConfig, sampling_runtime
@@ -213,13 +212,19 @@ class DuplexIORequestState:
 
 @dataclass
 class PreparedAudio:
-    """One scheduled slice, with audio encoded before per-request framing."""
+    """One scheduled slice of an append, with audio encoded before per-request framing.
+
+    An append's rows are ``[voice prompt, system tokens]`` (its first append
+    only), then one live frame, then any tool-result tokens.
+    """
 
     state: DuplexIORequestState
     frame_start: int
     frame_count: int
-    prompt_count: int
-    prompt_chunk_frames: int
+    prompt_count: int  # Voice-prompt rows of the whole append.
+    prefix_count: int  # Voice-prompt and system rows of the whole append.
+    prompt_chunk_frames: int  # Voice-prompt rows in this slice, which lead it.
+    live_row: int | None  # The live frame's row in this slice, if it holds it.
     user_features: Tensor | None  # Rows without acoustic input are zero.
     agent_codes: Tensor
 
@@ -584,15 +589,12 @@ class DuplexIOForConditionalGeneration(
 
     def prepare_audio_request(self, tokens: int, info: dict[str, Any], device: torch.device) -> PreparedAudio:
         """Validate framing and fork state at the model's input boundary."""
-        duplex = info.get("duplex")
-        if not isinstance(duplex, Mapping):
-            raise ValueError("Native DuplexIO accepts only framed duplex appends")
-        append_frames = duplex.get("frame_count")
+        duplex = info["duplex"]
+        append_frames = duplex["frame_count"]
         token_offset = info["duplex_token_offset"]
         prompt_len = info["duplex_prompt_len"]
         if (
-            not isinstance(append_frames, int) or append_frames < 1
-            or tokens == 0 or tokens % DUPLEXIO_NUM_CELLS
+            tokens == 0 or tokens % DUPLEXIO_NUM_CELLS
             or token_offset % DUPLEXIO_NUM_CELLS or prompt_len % DUPLEXIO_NUM_CELLS
         ):
             raise ValueError(
@@ -603,36 +605,34 @@ class DuplexIOForConditionalGeneration(
         frame_start = append_frames - (prompt_len - token_offset) // DUPLEXIO_NUM_CELLS
         frame_end = frame_start + frame_count
         assert 0 <= frame_start < frame_end <= append_frames
-        runtime_config = duplex.get("runtime_config")
-        if not isinstance(runtime_config, Mapping):
-            raise ValueError("DuplexIO append is missing runtime_config")
-        is_prefill = duplex.get("duplexio_prefill", False)
-        is_system_input = duplex.get("duplexio_system_input", False)
+        prefix = duplex["duplexio_prefix"]
         state = info.get("duplexio_model_state")
         if not isinstance(state, DuplexIORequestState):
-            if not is_prefill:
-                raise ValueError("DuplexIO requires a complete prefix before live input")
-            state = self._new_request_state(runtime_config, device)
+            if not prefix:
+                raise ValueError("DuplexIO requires the voice and system prefix before live input")
+            state = self._new_request_state(duplex["runtime_config"], device)
         else:
             if state.pending_output is not None:
                 # Scheduled again before its last step was finalized: its
                 # sampled ids are this frame's inputs, so wait for them here.
                 state.pending_output.finalize(self)
             state = state.fork()
-
-        is_live = not (is_prefill or is_system_input)
-        if append_frames != 1 and is_live:
-            raise ValueError("Native DuplexIO batches only prefix or tool-context frames")
-        prompt_frames = state.voice_prompt.numel() // self.config.frame_size
-        prompt_count = prompt_frames if is_prefill else 0
-        if is_prefill and (
-            state.frames_seen != frame_start or append_frames != prompt_count + len(state.system_token_ids)
-        ):
-            raise ValueError("DuplexIO prefill must contain the complete speaker and system prefix exactly once")
-        prompt_chunk_frames = max(0, min(frame_end, prompt_count) - frame_start)
+        prompt_count = state.voice_prompt.numel() // self.config.frame_size if prefix else 0
+        prefix_count = prompt_count + len(state.system_token_ids) if prefix else 0
+        if append_frames != prefix_count + 1 + len(duplex["duplexio_tool_token_ids"]):
+            raise ValueError("DuplexIO append rows do not match its prefix, live frame and tool result")
+        if prefix and state.frames_seen != frame_start:
+            raise ValueError("DuplexIO prefix must lead the request exactly once")
+        live_row = prefix_count - frame_start if frame_start <= prefix_count < frame_end else None
+        if live_row is not None and frame_count == 1:
+            agent_codes = state.agent_audio_codes.unsqueeze(0)
+        else:
+            agent_codes = self.initial_agent_audio(frame_count)
+            if live_row is not None:
+                agent_codes[live_row] = state.agent_audio_codes
         return PreparedAudio(
-            state, frame_start, frame_count, prompt_count, prompt_chunk_frames, None,
-            state.agent_audio_codes.unsqueeze(0) if is_live else self.initial_agent_audio(frame_count),
+            state, frame_start, frame_count, prompt_count, prefix_count,
+            max(0, min(frame_end, prompt_count) - frame_start), live_row, None, agent_codes,
         )
 
     @torch.inference_mode()
@@ -642,7 +642,7 @@ class DuplexIOForConditionalGeneration(
         prepared = [self.prepare_audio_request(tokens, info, device) for tokens, info in requests]
         live = {
             index: info["duplex"]["pcm"] for index, (_, info) in enumerate(requests)
-            if not (info["duplex"].get("duplexio_prefill", False) or info["duplex"].get("duplexio_system_input", False))
+            if prepared[index].live_row is not None
         }
         # The user encoder reads only this step's audio and its own caches, so on
         # CUDA it runs on a side stream, overlapping the previous step's backbone.
@@ -663,19 +663,21 @@ class DuplexIOForConditionalGeneration(
             prompt_indices = []
             prompt_waveforms = []
             for index, item in enumerate(prepared):
-                if index in live:
-                    waveform = live[index]
-                elif item.prompt_chunk_frames:
+                # Acoustic rows, in stream order: the slice's voice-prompt rows
+                # hear silence, then the live row hears the client.
+                waveforms = []
+                if item.prompt_chunk_frames:
                     start = item.frame_start * self.config.frame_size
                     count = item.prompt_chunk_frames * self.config.frame_size
                     prompt_waveform = item.state.voice_prompt[start:start + count]
                     prompt_indices.append(index)
                     prompt_waveforms.append(prompt_waveform)
-                    waveform = torch.zeros_like(prompt_waveform)
-                else:
-                    continue
-                acoustic.append(index)
-                user_waveforms.append(waveform)
+                    waveforms.append(torch.zeros_like(prompt_waveform))
+                if index in live:
+                    waveforms.append(live[index])
+                if waveforms:
+                    acoustic.append(index)
+                    user_waveforms.append(waveforms[0] if len(waveforms) == 1 else torch.cat(waveforms))
             user_features = self.encode_user_audio_batch(
                 user_waveforms, [prepared[index].state for index in acoustic],
             ) if acoustic else []
@@ -685,14 +687,30 @@ class DuplexIOForConditionalGeneration(
             for features in user_features:
                 features.record_stream(main)
         for index, features in zip(acoustic, user_features, strict=True):
-            missing = prepared[index].frame_count - features.shape[0]
-            prepared[index].user_features = F.pad(features, (0, 0, 0, missing)) if missing else features
+            prepared[index].user_features = self.place_user_features(prepared[index], features)
         if prompt_indices:
             states = [prepared[index].state for index in prompt_indices]
             codes = self.encode_agent_audio_batch(prompt_waveforms, states)
             for index, audio in zip(prompt_indices, codes, strict=True):
                 prepared[index].agent_codes = torch.cat((audio, prepared[index].agent_codes[audio.shape[0]:]))
         return prepared
+
+    def place_user_features(self, item: PreparedAudio, features: Tensor) -> Tensor:
+        """Lay encoder outputs onto the slice's acoustic rows in order; text-only rows and any shortfall are zero."""
+        acoustic = item.prompt_chunk_frames + (item.live_row is not None)
+        if features.shape[0] < acoustic:
+            features = F.pad(features, (0, 0, 0, acoustic - features.shape[0]))
+        if acoustic == item.frame_count:
+            return features
+        voice = item.prompt_chunk_frames
+        if item.live_row is None:
+            return torch.cat((features, features.new_zeros(item.frame_count - voice, features.shape[1])))
+        return torch.cat((
+            features[:voice],
+            features.new_zeros(item.live_row - voice, features.shape[1]),
+            features[voice:],
+            features.new_zeros(item.frame_count - item.live_row - 1, features.shape[1]),
+        ))
 
     @cached_property
     def user_audio_stream(self) -> torch.cuda.Stream:
@@ -733,25 +751,21 @@ class DuplexIOForConditionalGeneration(
         preceding_keys = 0
         for item, (_, info) in zip(audio, requests, strict=True):
             state = item.state
-            start, count = item.frame_start, item.frame_count
             duplex = info["duplex"]
-            prefill = duplex.get("duplexio_prefill", False)
-            system = duplex.get("duplexio_system_input", False)
-            live = not (prefill or system)
-            if prefill:
-                system_ids = state.system_token_ids[
-                    max(0, start - item.prompt_count):max(0, start + count - item.prompt_count)
-                ]
-                text = [(silence, *quiet)] * item.prompt_chunk_frames + [(token, *quiet) for token in system_ids]
-            elif system:
-                text = [(token, *quiet) for token in duplex["duplexio_system_token_ids"][start:start + count]]
-                state.text_input_ids = (silence, *quiet)
-            else:
-                text = [(silence, *state.text_input_ids[1:])] * count
-            assert len(text) == count
+            tool_ids = duplex["duplexio_tool_token_ids"]
+            text = []
+            for frame in range(item.frame_start, item.frame_start + item.frame_count):
+                if frame < item.prompt_count:
+                    text.append((silence, *quiet))
+                elif frame < item.prefix_count:
+                    text.append((state.system_token_ids[frame - item.prompt_count], *quiet))
+                elif frame == item.prefix_count:
+                    text.append((silence, *state.text_input_ids[1:]))
+                else:
+                    text.append((tool_ids[frame - item.prefix_count - 1], *quiet))
             rows.extend(
                 (*ids, state.persistent_keys - preceding_keys,
-                 state.audio_position + (row if live else 0), live,
+                 state.audio_position if row == item.live_row else 0, row == item.live_row,
                  row < item.prompt_chunk_frames, state.frames_seen + row)
                 for row, ids in enumerate(text)
             )
@@ -760,9 +774,9 @@ class DuplexIOForConditionalGeneration(
             )
             state.persistent_keys += written
             preceding_keys += written
-            state.frames_seen += count
-            if live:
-                state.audio_position += count
+            state.frames_seen += item.frame_count
+            if item.live_row is not None:
+                state.audio_position += 1
         packed = torch.tensor(rows, dtype=torch.long).to(device, non_blocking=True)
         text_ids, metadata = packed[:, :len(TEXT_STREAM_NAMES)], packed[:, len(TEXT_STREAM_NAMES):]
         user_features = torch.cat([
@@ -1056,8 +1070,6 @@ class DuplexIOForConditionalGeneration(
             if state.pending_output is step:
                 state.pending_output = None
             duplex = info["duplex"]
-            is_prefill = bool(duplex.get("duplexio_prefill", False))
-            is_system_input = bool(duplex.get("duplexio_system_input", False))
             row = rows.get(request_index)
             predicting = row is not None
             if row is None:
@@ -1090,8 +1102,7 @@ class DuplexIOForConditionalGeneration(
             # Order follows frame_output.FRAME_FIELDS.
             frames.append([
                 duplex.get("epoch", 0), duplex.get("turn_id", 0),
-                is_prefill and not predicting, is_prefill and predicting,
-                is_system_input and not predicting, is_system_input and predicting,
+                duplex["duplexio_prefix"], bool(duplex["duplexio_tool_token_ids"]), duplex["duplexio_tool_generation"],
                 bool(duplex.get("final", False)), predicting,
                 predicting and agent_token_id == silence and tool_token_id == silence,
                 tool_call is not None, row in drawn_tool_emits, predicting and user_token_id != silence,
@@ -1628,7 +1639,6 @@ def frame_inputs(
     position, live flag, prompt flag, absolute frame. The offset subtracts
     preceding requests' keys, isolating the scan.
     """
-    frames, device = text_ids.shape[0], text_ids.device
     offsets, audio_last = metadata[:, 0], metadata[:, 1]
     audio_active, prompt_frames = metadata[:, 2] != 0, metadata[:, 3] != 0
     acoustic = (audio_active | prompt_frames)[:, None]

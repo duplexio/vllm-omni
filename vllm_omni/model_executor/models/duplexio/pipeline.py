@@ -13,15 +13,7 @@ DUPLEXIO_PIPELINE = PipelineConfig(
     model_arch="DuplexIOForConditionalGeneration",
     hf_architectures=("DuplexIOForConditionalGeneration",),
     default_deploy_config_name="duplexio.yaml",
-    duplex_runtime_extension=(
-        "vllm_omni.experimental.fullduplex.duplexio.runtime."
-        "DuplexIORuntimeExtension"
-    ),
-    duplex_serving_adapter=(
-        "vllm_omni.experimental.fullduplex.duplexio.serving_adapter."
-        "DuplexIOServingRuntimeAdapter"
-    ),
-    duplex_control_enabled=True,
+    duplex_plugin="vllm_omni.model_executor.models.duplexio.duplex.plugin.DuplexIODuplexPlugin",
     stages=(
         StagePipelineConfig(
             stage_id=0,

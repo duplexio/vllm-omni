@@ -831,11 +831,11 @@
             model: config.model,
             modalities: ['audio', 'text'],
             response_format: 'pcm',
+            turn_detection: null,
             instructions: systemPrompt.value.trim() || null,
             tools: sessionTools,
             tool_choice: sessionTools.length ? 'auto' : 'none',
             extra_body: {
-              full_duplex: true,
               auto_response: true,
               start_role: startRole.value,
               ref_audio_data: referenceAudio,
@@ -891,7 +891,7 @@
       detailElement.textContent = 'Speaking';
       return;
     }
-    if (event.type === 'response.audio.delta') {
+    if (event.type === 'response.output_audio.delta') {
       const encoded = event.delta || event.audio || (event.response && event.response.audio);
       if (!encoded || !playbackNode) return;
       responseId = event.response_id || responseId;
@@ -911,7 +911,7 @@
       playPcm(pcm, sourceRate);
       return;
     }
-    if (event.type === 'response.audio_transcript.delta') {
+    if (event.type === 'response.output_audio_transcript.delta') {
       appendTranscript('assistant', event.delta || '');
       return;
     }
@@ -935,14 +935,14 @@
       return;
     }
     if (
-      event.type === 'conversation.item.created'
+      (event.type === 'conversation.item.added' || event.type === 'conversation.item.created')
       && event.item
       && event.item.type === 'function_call_output'
     ) {
       appendToolResponse(event.item);
       return;
     }
-    if (event.type === 'response.audio.done') {
+    if (event.type === 'response.output_audio.done') {
       if (playbackNode) playbackNode.port.postMessage({ type: 'drain', responseId });
       return;
     }

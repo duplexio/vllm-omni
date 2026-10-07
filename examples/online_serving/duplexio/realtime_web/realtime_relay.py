@@ -89,7 +89,7 @@ class OpusTranscoder:
     def to_client(self, message: str) -> list[str]:
         event = json.loads(message)
         kind = event.get("type")
-        if kind == "response.audio.delta":
+        if kind == "response.output_audio.delta":
             pcm = base64.b64decode(event["delta"])
             samples = (
                 (np.frombuffer(pcm, "<f4").clip(-1, 1) * 32767).astype(np.int16)
@@ -98,7 +98,7 @@ class OpusTranscoder:
             )
             self._pending = np.concatenate([self._pending, samples])
             return [self._opus_delta(event, packet) for packet in self._encode(event, pad=False)]
-        if kind == "response.audio.done" and self._pending.size:
+        if kind == "response.output_audio.done" and self._pending.size:
             # A partial frame is padded with silence rather than held back.
             return [self._opus_delta(event, packet) for packet in self._encode(event, pad=True)] + [message]
         return [message]
@@ -134,7 +134,7 @@ class OpusTranscoder:
             for key, value in event.items()
             if key not in {"format", "sample_rate_hz", "metadata"}
         }
-        delta.update(type="response.audio.delta", delta=base64.b64encode(packet).decode(), format="opus")
+        delta.update(type="response.output_audio.delta", delta=base64.b64encode(packet).decode(), format="opus")
         return json.dumps(delta)
 
 

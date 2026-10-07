@@ -35,10 +35,10 @@ def session_update(model: str, reference_audio: str, tools: list[dict[str, objec
             "model": model,
             "modalities": ["audio", "text"],
             "response_format": "pcm",
+            "turn_detection": None,
             "tools": tools,
             "tool_choice": "auto" if tools else "none",
             "extra_body": {
-                "full_duplex": True,
                 "auto_response": True,
                 "start_role": "agent",
                 "ref_audio_data": reference_audio,
@@ -89,7 +89,7 @@ async def prewarm(
             # The model answers every user frame with one audio frame.
             sender = asyncio.create_task(send_frames())
             for _ in frames:
-                await wait_for_event(websocket, {"response.audio.delta"})
+                await wait_for_event(websocket, {"response.output_audio.delta"})
             await sender
             await websocket.send(json.dumps({"type": "session.close"}))
             await wait_for_event(websocket, {"session.closed"})

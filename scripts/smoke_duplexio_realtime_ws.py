@@ -5,22 +5,19 @@
 Boots the actual `vllm-omni serve` realtime endpoint, opens a browser-shaped
 session (f32 24 kHz input frames, ``response_format: "pcm"``, agent-first),
 streams silence so the model narrates, and reassembles the emitted
-``response.audio.delta`` chunks EXACTLY the way the web client does
+``response.output_audio.delta`` chunks EXACTLY the way the web client does
 (format/rate fields per event, int16 default). The reassembled waveform is
 then transcribed with offline Whisper (large-v3-turbo) and must fuzzily match
-the session's own ``response.audio_transcript.delta`` text. A duration check
+the session's own ``response.output_audio_transcript.delta`` text. A duration check
 catches duplicated/overlapping chunks that a text-alignment gate cannot see.
 
-Unlike smoke_duplexio_v3.py (which drives the duplex control plane
-in-process), this exercises websocket serialization and the wire audio
-encoding — everything a browser receives.
+It exercises websocket serialization and the wire audio encoding:
+everything a browser receives.
 
 Invocation (1 GPU node):
 
-  cd /dcai/users/thuand/vllm-omni-work && \
-  PYTHONPATH=/dcai/users/thuand/vllm-omni-work \
-  .venv/bin/python scripts/smoke_duplexio_realtime_ws.py \
-    --model /dcai/users/thuand/duplexio/checkpoints/duplexio-489780-checkpoint-1-vllm-v3
+  PYTHONPATH=$PWD .venv/bin/python scripts/smoke_duplexio_realtime_ws.py \\
+    --model /dcai/users/thuand/perf/exports/grpoasropd516200_step300 --voice VOICE_24K.wav
 """
 
 from __future__ import annotations
@@ -31,7 +28,6 @@ import base64
 import json
 import subprocess
 import sys
-import tempfile
 import time
 import traceback
 import urllib.request
@@ -80,6 +76,16 @@ def normalized_words(text: str) -> list[str]:
         c if c.isalnum() or c.isspace() else " " for c in lowered
     )
     return cleaned.split()
+
+
+def reference_audio(path: Path) -> str:
+    """Base64 pcm_f32le of the agent's reference voice."""
+    import soundfile
+
+    samples, rate = soundfile.read(path, dtype="float32", always_2d=True)
+    if rate != SAMPLE_RATE:
+        fail(f"reference voice must be {SAMPLE_RATE} Hz, got {rate} Hz")
+    return base64.b64encode(samples[:, 0].tobytes()).decode()
 
 
 def user_audio_frames(path: Path) -> list[np.ndarray]:
@@ -155,9 +161,9 @@ async def run_client(args: argparse.Namespace) -> None:
                         print(f"[ws] error event: {event}", file=sys.stderr)
                     elif event_type == "session.updated":
                         session_ready.set()
-                    elif event_type == "response.audio.delta":
+                    elif event_type == "response.output_audio.delta":
                         audio_chunks.append(event)
-                    elif event_type == "response.audio_transcript.delta":
+                    elif event_type == "response.output_audio_transcript.delta":
                         transcript_parts.append(event.get("delta") or "")
                     elif event_type == "conversation.item.input_audio_transcription.delta":
                         user_transcript_parts.append(event.get("delta") or "")
@@ -170,14 +176,16 @@ async def run_client(args: argparse.Namespace) -> None:
             "session": {
                 "model": args.model,
                 "modalities": ["audio", "text"],
-                "voice": args.voice,
                 "response_format": "pcm",
+                # The model decides when to speak; server VAD would hold input for commits.
+                "turn_detection": None,
                 "tools": [],
                 "tool_choice": "none",
                 "extra_body": {
-                    "full_duplex": True,
                     "auto_response": True,
                     "start_role": "agent",
+                    "ref_audio_data": reference_audio(args.voice),
+                    "ref_audio_format": "pcm_f32le",
                 },
             },
         }))
@@ -207,7 +215,10 @@ async def run_client(args: argparse.Namespace) -> None:
             delay = target - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
-        await asyncio.sleep(2.0)
+        # The first frames include one-time compilation; wait for the agent to catch up.
+        deadline = time.monotonic() + 180.0
+        while len(audio_chunks) < 0.9 * frames and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
         await ws.send(json.dumps({"type": "session.close"}))
         try:
             await asyncio.wait_for(done.wait(), timeout=10.0)
@@ -223,9 +234,9 @@ async def run_client(args: argparse.Namespace) -> None:
     print(f"[ws] audio.delta chunks: {len(audio_chunks)}")
     print(f"[ws] transcript deltas: {transcript!r}")
     if not audio_chunks:
-        fail("no response.audio.delta events received")
+        fail("no response.output_audio.delta events received")
     if not transcript:
-        fail("no response.audio_transcript.delta text received")
+        fail("no response.output_audio_transcript.delta text received")
     if args.user_audio and not user_transcript:
         fail("user speech produced no input_audio_transcription deltas")
 
@@ -287,7 +298,7 @@ async def run_client(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--voice", default=None)
+    parser.add_argument("--voice", type=Path, required=True, help="Reference voice: a mono 24 kHz wav or flac")
     parser.add_argument("--seconds", type=float, default=15.0)
     parser.add_argument(
         "--user-audio",
@@ -328,22 +339,13 @@ def main() -> None:
         default=900.0,
         help="Websocket open timeout (covers remote cold starts)",
     )
-    parser.add_argument("--deploy-config", type=Path, default=None)
+    parser.add_argument(
+        "--deploy-config", type=Path, default=Path(__file__).parents[1] / "vllm_omni/deploy/duplexio.yaml",
+    )
     parser.add_argument("--out-dir", default=".")
     args = parser.parse_args()
 
-    sys.path.insert(0, str(Path(__file__).parent))
-    from smoke_duplexio_v3 import pick_voice, write_deploy_yaml
-
     if args.url is not None:
-        # Remote endpoint: the served model path is remote; --voice must be
-        # given explicitly or resolvable from a local copy of the export.
-        if args.voice is None:
-            try:
-                args.voice = pick_voice(Path(args.model), None)
-            except SystemExit:
-                fail("remote mode needs --voice when the export is not local")
-        print(f"[ws] voice: {args.voice}")
         try:
             asyncio.run(run_client(args))
         except SystemExit:
@@ -353,77 +355,65 @@ def main() -> None:
             fail("websocket session raised (see traceback above)")
         return
 
-    args.voice = pick_voice(Path(args.model), args.voice)
-    print(f"[ws] voice: {args.voice}")
-
-    with tempfile.TemporaryDirectory(prefix="duplexio-ws-smoke-") as tmp:
-        if args.deploy_config is not None:
-            deploy_yaml = args.deploy_config
-        else:
-            overlay = argparse.Namespace(
-                max_model_len=32_768,
-                gpu_memory_utilization=0.8,
-            )
-            deploy_yaml = write_deploy_yaml(Path(tmp), overlay)
-        command = [
-            sys.executable,
-            "-m",
-            "vllm_omni.entrypoints.cli.main",
-            "serve",
-            args.model,
-            "--omni",
-            "--deploy-config",
-            str(deploy_yaml),
-            "--trust-remote-code",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(args.port),
-        ]
-        if args.sleep_mode:
-            command.append("--enable-sleep-mode")
-        server = subprocess.Popen(command)
-        try:
-            deadline = time.monotonic() + 900
-            while time.monotonic() < deadline:
-                if server.poll() is not None:
-                    fail(f"server exited early with {server.returncode}")
-                try:
-                    with urllib.request.urlopen(
-                        f"http://127.0.0.1:{args.port}/health",
-                        timeout=2,
-                    ):
-                        break
-                except OSError:
-                    time.sleep(2)
-            else:
-                fail("server did not become healthy within 900s")
-            print("[ws] server healthy")
-            if args.sleep_cycle:
-                for path, payload in (
-                    ("/v1/omni/sleep", {"stage_ids": [0], "level": 1}),
-                    ("/v1/omni/wakeup", {"stage_ids": [0]}),
-                ):
-                    request = urllib.request.Request(
-                        f"http://127.0.0.1:{args.port}{path}",
-                        data=json.dumps(payload).encode(),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(request, timeout=600) as reply:
-                        print(f"[ws] {path}: {json.load(reply)}")
-            asyncio.run(run_client(args))
-        except SystemExit:
-            raise
-        except BaseException:
-            traceback.print_exc()
-            fail("websocket session raised (see traceback above)")
-        finally:
-            server.terminate()
+    command = [
+        sys.executable,
+        "-m",
+        "vllm_omni.entrypoints.cli.main",
+        "serve",
+        args.model,
+        "--omni",
+        "--deploy-config",
+        str(args.deploy_config),
+        "--trust-remote-code",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(args.port),
+    ]
+    if args.sleep_mode:
+        command.append("--enable-sleep-mode")
+    server = subprocess.Popen(command)
+    try:
+        deadline = time.monotonic() + 900
+        while time.monotonic() < deadline:
+            if server.poll() is not None:
+                fail(f"server exited early with {server.returncode}")
             try:
-                server.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                server.kill()
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{args.port}/health",
+                    timeout=2,
+                ):
+                    break
+            except OSError:
+                time.sleep(2)
+        else:
+            fail("server did not become healthy within 900s")
+        print("[ws] server healthy")
+        if args.sleep_cycle:
+            for path, payload in (
+                ("/v1/omni/sleep", {"stage_ids": [0], "level": 1}),
+                ("/v1/omni/wakeup", {"stage_ids": [0]}),
+            ):
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{args.port}{path}",
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=600) as reply:
+                    print(f"[ws] {path}: {json.load(reply)}")
+        asyncio.run(run_client(args))
+    except SystemExit:
+        raise
+    except BaseException:
+        traceback.print_exc()
+        fail("websocket session raised (see traceback above)")
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            server.kill()
 
 
 if __name__ == "__main__":

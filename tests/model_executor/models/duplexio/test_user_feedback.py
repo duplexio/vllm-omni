@@ -20,9 +20,8 @@ from duplexio.rollout_trajectory import TrajectoryRecorder
 from tests.model_executor.models.duplexio.test_bulk_prefill import CountingCodec, model_fixture, request_state
 from tests.model_executor.models.duplexio.test_user_heads import LocalVocabulary
 from vllm_omni.data_entry_keys import flatten_payload
-from vllm_omni.experimental.fullduplex.duplexio.runtime import build_duplexio_data_plane_prompt
-from vllm_omni.experimental.fullduplex.engine.contracts import DuplexInputMode
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.engine.duplex.contracts import DuplexFence
+from vllm_omni.model_executor.models.duplexio.duplex import DuplexIODuplexPlugin
 from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
 from vllm_omni.outputs.mm_outputs import MultimodalPayload
 
@@ -68,6 +67,7 @@ def feedback_model():
 def runtime():
     return {
         "duplexio_record_inputs": True,
+        "duplexio_scheduler_token_id": 1,
         "duplexio_text_sampling": {"temperature": 1.0, "top_k": 1, "top_p": 1.0},
         "duplexio_user_sampling": {"content": {"temperature": 1.0, "top_k": 1, "top_p": 1.0}},
         "duplexio_emit_temperatures": {"user": 1.0, "agent": 0.0, "tool_call": 0.0},
@@ -131,7 +131,7 @@ def test_feedback_actions_and_versions_span_staging_then_commit(monkeypatch):
 
     def step(*, prefix=False, final=False):
         nonlocal state
-        frames = 5 if prefix else 1
+        frames = 6 if prefix else 1
         info = {
             "duplexio_model_state": state,
             "duplex_token_offset": state.frames_seen * 6,
@@ -142,7 +142,9 @@ def test_feedback_actions_and_versions_span_staging_then_commit(monkeypatch):
                 "pcm": torch.ones(1920).numpy().tobytes(),
                 "decode_audio": False,
                 "final": final,
-                "duplexio_prefill": prefix,
+                "duplexio_prefix": prefix,
+                "duplexio_tool_token_ids": [],
+                "duplexio_tool_generation": 0,
             },
         }
         _, _, updates = model.preprocess(torch.zeros(frames * 6, dtype=torch.long), None, **info)
@@ -206,7 +208,7 @@ def test_feedback_actions_and_versions_span_staging_then_commit(monkeypatch):
     step(final=True)
     trace = recorder.tensors()
     assert consumed_user_ids == [2, 7, 7, 7, 2]
-    assert trace["prediction_rows"].tolist() == [4, 5, 6, 7, 8]
+    assert trace["prediction_rows"].tolist() == [5, 6, 7, 8, 9]
     assert trace["sampled_user_ids"].tolist() == [7, 7, 7, 2, 2]
     assert trace["sampled_user_emits"].tolist() == [True, True, True, False, False]
     assert trace["row_versions"].tolist() == [0, 0, 0, 1, 1]
@@ -220,13 +222,11 @@ def test_raw_audio_keeps_encoder_features_without_transcript_commits():
     model = feedback_model()
     state = request_state(model)
     state.text_input_ids = (state.text_input_ids[0], 7, *state.text_input_ids[2:])
-    prompt = build_duplexio_data_plane_prompt(
+    plan = DuplexIODuplexPlugin(lambda *args: None).plan_append(
         request_id="raw-frame", fence=DuplexFence("session"),
-        session_config={}, runtime_config=runtime(), seq=1, turn_seq=1,
-        mode=DuplexInputMode.APPEND_AUDIO_CHUNK, final=False,
+        session_config={}, runtime_config=runtime(), seq=2, turn_seq=1, final=False, sampling_params=None,
         payload={
             "format": "pcm_f32le", "sample_rate_hz": 24000,
-            "frame_size": 1920, "frame_count": 1, "valid_samples": 1920,
             "audio": base64.b64encode(torch.zeros(1920).numpy().tobytes()).decode(),
         },
     )
@@ -235,7 +235,7 @@ def test_raw_audio_keeps_encoder_features_without_transcript_commits():
         None,
         duplexio_model_state=state,
         duplex_token_offset=0, duplex_prompt_len=6,
-        **prompt["model_intermediate_buffer"],
+        **plan.prompt["model_intermediate_buffer"],
     )
     # CountingASR has an encoder only: calling any RNN-T transcript code fails.
     assert updates["duplexio_replay"]["text_ids"][0, 1].item() == 7
@@ -243,24 +243,25 @@ def test_raw_audio_keeps_encoder_features_without_transcript_commits():
 
 
 @torch.inference_mode()
-def test_chunked_context_records_all_rows_and_samples_only_at_boundary():
+def test_chunked_appends_record_all_rows_and_sample_only_at_their_end():
     model = feedback_model()
     state = request_state(model)
     recorder = TrajectoryRecorder()
-    for context in ("prefill", "system_input"):
-        prompt_len = (state.frames_seen + 5) * 6
-        for index, frames in enumerate((1, 2, 2)):
+    for prefix in (True, False):
+        prompt_len = (state.frames_seen + 6) * 6
+        for index, frames in enumerate((1, 2, 3)):
             info = {
                 "duplexio_model_state": state,
                 "duplex_token_offset": state.frames_seen * 6,
                 "duplex_prompt_len": prompt_len,
-                "duplex": {"frame_count": 5, f"duplexio_{context}": True, "decode_audio": False,
-                           "duplexio_system_token_ids": [6, 7, 8, 9, 10], "runtime_config": runtime()},
+                "duplex": {"frame_count": 6, "duplexio_prefix": prefix, "decode_audio": False,
+                           "duplexio_tool_token_ids": [] if prefix else [6, 7, 8, 9, 10], "duplexio_tool_generation": 0,
+                           "pcm": torch.zeros(1920).numpy().tobytes(), "runtime_config": runtime()},
             }
             keys = state.persistent_keys
             _, _, updates = model.preprocess(torch.zeros(frames * 6, dtype=torch.long), None, **info)
-            if context == "system_input":
-                # System input sees the pinned prompt and all earlier text.
+            if not prefix:
+                # The live frame sees the pinned prompt and all earlier text.
                 assert keys >= 2
                 assert updates["duplexio"]["persistent_last"][0].item() == keys
             info.update(updates)
@@ -271,13 +272,15 @@ def test_chunked_context_records_all_rows_and_samples_only_at_boundary():
             payload = MultimodalPayload.from_dict({name: values[0] for name, values in flatten_payload(model.finalize_multimodal_outputs_from_cpu_snapshot(output.multimodal_outputs)).items()})
             recorder.append(payload, version=0)
             state = model.postprocess(None, **info)["duplexio_model_state"]
-            assert frame_fields(payload)[f"duplex_{context}_complete"] == (index == 2)
+            fields = frame_fields(payload)
+            assert fields["predicted"] == (index == 2)
+            assert fields["prefix"] == prefix and fields["tool_result"] != prefix
             if index < 2:
                 assert payload["agent_audio_token_ids"].numel() == 0
             else:
                 assert payload["agent_audio_token_ids"].numel() > 0
     trace = recorder.tensors()
-    assert trace["text_ids"].shape[0] == 10
-    assert trace["text_ids"][5:, 0].tolist() == [6, 7, 8, 9, 10]
-    assert trace["prediction_rows"].tolist() == [4, 9]
-    assert trace["prompt_frames"].tolist() == [True, True] + [False] * 8
+    assert trace["text_ids"].shape[0] == 12
+    assert trace["text_ids"][7:, 0].tolist() == [6, 7, 8, 9, 10]
+    assert trace["prediction_rows"].tolist() == [5, 11]
+    assert trace["prompt_frames"].tolist() == [True, True] + [False] * 10

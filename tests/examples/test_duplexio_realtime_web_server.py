@@ -424,7 +424,7 @@ def test_model_audio_reaches_the_page_as_opus_packets() -> None:
     events = []
     for offset in range(0, 1_920 * 4, 1_920):
         events += transcoder.to_client(json.dumps({
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": "resp_1",
             "delta": base64.b64encode(reference[offset : offset + 1_920].tobytes()).decode(),
             "format": "pcm_s16le",
@@ -433,17 +433,17 @@ def test_model_audio_reaches_the_page_as_opus_packets() -> None:
         }))
     # A trailing partial frame is flushed, padded, ahead of the done event.
     events += transcoder.to_client(json.dumps({
-        "type": "response.audio.delta",
+        "type": "response.output_audio.delta",
         "response_id": "resp_1",
         "delta": base64.b64encode(reference[1_920 * 4 :].tobytes()).decode(),
     }))
-    events += transcoder.to_client('{"type":"response.audio.done","response_id":"resp_1"}')
+    events += transcoder.to_client('{"type":"response.output_audio.done","response_id":"resp_1"}')
 
     deltas = [json.loads(event) for event in events[:-1]]
-    assert [delta["type"] for delta in deltas] == ["response.audio.delta"] * 5
+    assert [delta["type"] for delta in deltas] == ["response.output_audio.delta"] * 5
     assert {(delta["format"], delta["response_id"]) for delta in deltas} == {("opus", "resp_1")}
     assert not any("metadata" in delta for delta in deltas)
-    assert json.loads(events[-1])["type"] == "response.audio.done"
+    assert json.loads(events[-1])["type"] == "response.output_audio.done"
     pcm = decode_opus([base64.b64decode(delta["delta"]) for delta in deltas])
     assert matches_tone(pcm, reference / 32768)
 
@@ -460,7 +460,7 @@ def test_proxy_transcodes_only_sessions_that_ask_for_opus(monkeypatch: pytest.Mo
             self.message_sent = True
             await asyncio.sleep(0.2)
             return json.dumps({
-                "type": "response.audio.delta",
+                "type": "response.output_audio.delta",
                 "delta": base64.b64encode(tone(0.08).tobytes()).decode(),
             })
 

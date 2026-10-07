@@ -49,7 +49,7 @@ def test_batched_resampling_keeps_each_stream_history(device):
 
 @torch.inference_mode()
 def test_model_preprocess_batches_audio_without_persisting_prepared_results(encoder):
-    from tests.model_executor.models.duplexio.test_bulk_prefill import input_info, model_fixture, request_state
+    from tests.model_executor.models.duplexio.test_bulk_prefill import append_info, model_fixture, request_state
 
     model = model_fixture()
     model.user_asr = encoder
@@ -59,11 +59,10 @@ def test_model_preprocess_batches_audio_without_persisting_prepared_results(enco
     for index in range(3):
         state = request_state(model)
         state.voice_prompt = torch.randn_like(state.voice_prompt) * 0.1
-        info = input_info(state, [3, 4, 5], system=False)
-        info["_omni_num_scheduled_tokens"] = 30
-        info["duplex"]["runtime_config"]["duplexio_record_inputs"] = True
+        info = append_info(state, prefix=True, pcm=(torch.randn(1920) * 0.1).numpy().tobytes())
+        info["_omni_num_scheduled_tokens"] = 36
         infos[str(index)] = info
-        expected[str(index)] = model.preprocess(torch.zeros(30, dtype=torch.long), None, **info)
+        expected[str(index)] = model.preprocess(torch.zeros(36, dtype=torch.long), None, **info)
     batch_sizes = []
     hook = encoder.model.encoder.register_forward_hook(
         lambda module, args, result: batch_sizes.append(result.last_hidden_state.shape[0]),
@@ -73,9 +72,9 @@ def test_model_preprocess_batches_audio_without_persisting_prepared_results(enco
     assert batch_sizes == [3]
     for request_id, info in infos.items():
         assert "prepared_audio" not in info
-        _, embeddings, updates = model.preprocess(torch.zeros(30, dtype=torch.long), None, **info, **prepared[request_id])
+        _, embeddings, updates = model.preprocess(torch.zeros(36, dtype=torch.long), None, **info, **prepared[request_id])
         torch.testing.assert_close(embeddings, expected[request_id][1], atol=2e-5, rtol=2e-4)
-        assert updates["duplexio_working_state"].frames_seen == 5
+        assert updates["duplexio_working_state"].frames_seen == 6
         assert info["duplexio_model_state"].frames_seen == 0
 
 
@@ -308,7 +307,7 @@ def test_parallel_prefill_matches_streaming_and_continuation(
 @torch.inference_mode()
 def test_tool_burst_leaves_real_asr_continuation_unchanged(encoder: FastConformerRNNT) -> None:
     from tests.model_executor.models.duplexio.test_bulk_prefill import (
-        input_info,
+        append_info,
         model_fixture,
         request_state,
     )
@@ -316,22 +315,16 @@ def test_tool_burst_leaves_real_asr_continuation_unchanged(encoder: FastConforme
     model = model_fixture()
     model.user_asr = encoder
     model.user_audio_input_adapter = torch.nn.Linear(encoder.output_dim, 11)
-    prefix = input_info(request_state(model), [3, 4, 5], system=False)
-    _, _, update = model.preprocess(torch.zeros(30, dtype=torch.long), None, **prefix)
+    _, _, update = model.preprocess(torch.zeros(36, dtype=torch.long), None, **append_info(request_state(model), prefix=True))
     before = update["duplexio_working_state"]
-    _, _, update = model.preprocess(
-        torch.zeros(18, dtype=torch.long), None, **input_info(before, [6, 7, 8], system=True),
-    )
-    after = update["duplexio_working_state"]
-    waveform = torch.randn(1920) * 0.1
+    live = (torch.randn(1920) * 0.1).numpy().tobytes()
+    _, _, update = model.preprocess(torch.zeros(6, dtype=torch.long), None, **append_info(before, pcm=live))
+    plain = update["duplexio_working_state"]
+    _, _, update = model.preprocess(torch.zeros(24, dtype=torch.long), None, **append_info(before, tool=(6, 7, 8), pcm=live))
+    after_tool = update["duplexio_working_state"]
+    waveform = (torch.randn(1920) * 0.1).numpy().tobytes()
     continuations = []
-    for state in (before, after):
-        _, _, update = model.preprocess(
-            torch.zeros(6, dtype=torch.long), None,
-            duplexio_model_state=state, duplex_token_offset=0, duplex_prompt_len=6,
-            duplex={"frame_count": 1, "pcm": waveform.numpy().tobytes(),
-                    "runtime_config": {"duplexio_record_inputs": True}},
-        )
+    for state in (plain, after_tool):
+        _, _, update = model.preprocess(torch.zeros(6, dtype=torch.long), None, **append_info(state, pcm=waveform))
         continuations.append(update["duplexio_replay"]["user_features"])
     torch.testing.assert_close(*continuations, atol=0, rtol=0)
-    assert before.user_asr is after.user_asr

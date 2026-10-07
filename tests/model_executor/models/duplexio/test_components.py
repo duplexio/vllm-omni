@@ -246,14 +246,8 @@ def test_duplexio_config_requires_hybrid_qwen_backbone() -> None:
         DuplexIOConfig.from_dict(config)
 
 
-def test_duplexio_pipeline_uses_native_full_duplex_control_plane() -> None:
-    assert DUPLEXIO_PIPELINE.duplex_control_enabled
-    assert DUPLEXIO_PIPELINE.duplex_runtime_extension.endswith(
-        ".DuplexIORuntimeExtension"
-    )
-    assert DUPLEXIO_PIPELINE.duplex_serving_adapter.endswith(
-        ".DuplexIOServingRuntimeAdapter"
-    )
+def test_duplexio_pipeline_uses_the_duplex_plugin() -> None:
+    assert DUPLEXIO_PIPELINE.duplex_plugin.endswith(".DuplexIODuplexPlugin")
     assert len(DUPLEXIO_PIPELINE.stages) == 1
     assert DUPLEXIO_PIPELINE.stages[0].retains_state_across_chunks
 
@@ -553,7 +547,7 @@ def test_unfinished_tool_context_does_not_run_prediction_heads() -> None:
     predictions = model.sample_frames(
         torch.zeros(6, 4),
         [(0, 6)],
-        [{"duplex": {"duplexio_system_input": True}}],
+        [{"duplex": {}}],
         [False],
     )
 
