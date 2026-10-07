@@ -142,7 +142,7 @@ def test_duplexio_installs_cell_addressing_at_stable_buffers() -> None:
         audio_window_frames=2,
         max_model_len=120,
     )
-    model.frame = DuplexIOFrameMetadata(layout, 12, torch.device("cpu"))
+    model.frame = DuplexIOFrameMetadata(12, torch.device("cpu"))
     frame = model.frame
     buffers = (
         frame.key_active,
@@ -173,7 +173,7 @@ def test_duplexio_installs_cell_addressing_at_stable_buffers() -> None:
     # An empty step must leave nothing addressable behind.
     model.update_graph_inputs([])
 
-    assert torch.equal(frame.write_slots(12), torch.full((12,), -1))
+    assert torch.equal(frame.write_slots(12, layout), torch.full((12,), -1))
     start, end, persistent = frame.row_reads(12)
     assert torch.equal(start, end) and not persistent.any()
     assert pointers == tuple(buffer.data_ptr() for buffer in buffers)

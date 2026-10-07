@@ -1466,11 +1466,16 @@ def test_build_logical_stage_init_plans_applies_runtime_env_to_config_build(monk
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
     monkeypatch.delenv("VLLM_OMNI_TEST_STAGE_ENV", raising=False)
-    monkeypatch.setattr(runtime_mod, "extract_legacy_stage_metadata", lambda cfg: _make_llm_metadata(cfg.stage_id))
+    def metadata(cfg):
+        # Real extraction carries the stage's runtime section, env included.
+        stage = _make_llm_metadata(cfg.stage_id)
+        stage.runtime_cfg = cfg.runtime
+        return stage
+
+    monkeypatch.setattr(runtime_mod, "extract_legacy_stage_metadata", metadata)
     monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
     monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
     monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})

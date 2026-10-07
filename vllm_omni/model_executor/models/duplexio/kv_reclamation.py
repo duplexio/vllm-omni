@@ -106,13 +106,7 @@ class DuplexIOFrameMetadata:
     so padded graph tokens neither write a slot nor see a key.
     """
 
-    def __init__(
-        self,
-        layout: DuplexIOKVLayout,
-        max_tokens: int,
-        device: torch.device,
-    ) -> None:
-        self.layout = layout
+    def __init__(self, max_tokens: int, device: torch.device) -> None:
         self.cell = torch.arange(max_tokens, device=device) % DUPLEXIO_NUM_CELLS
         self.positions = torch.arange(max_tokens, device=device)
         self.key_active = torch.ones(max_tokens, dtype=torch.bool, device=device)
@@ -153,15 +147,14 @@ class DuplexIOFrameMetadata:
         self.audio_last[region] = -1
         self.filled = min(self.filled, start)
 
-    def write_slots(self, tokens: int) -> Tensor:
-        """Compact slot per cell, -1 for cells that must not enter the cache.
+    def write_slots(self, tokens: int, layout: DuplexIOKVLayout) -> Tensor:
+        """Compact slot per cell in ``layout``, -1 for cells that must not enter the cache.
 
         Live audio cells land on their own frame, one past the last frame they
         see. Emitted text and pinned voice-prompt cells land on their persistent
         ordinal; any other cell has ordinal zero. An audio time below zero marks
         an inert padded token, which is skipped.
         """
-        layout = self.layout
         cell = self.cell[:tokens]
         audio_last = self.audio_last[:tokens]
         ordinal = self.persistent_ordinal[:tokens]
@@ -186,7 +179,7 @@ class DuplexIOFrameMetadata:
         and its own cell is merged separately, so nothing a step writes is read
         back. An inert padded row reads nothing.
         """
-        cells = self.layout.num_audio_cells
+        cells = DUPLEXIO_NUM_CELLS - DUPLEXIO_NUM_TEXT_CELLS
         audio_last = self.audio_last[:tokens:DUPLEXIO_NUM_CELLS]
         end = (audio_last * cells).clamp_min(0)
         start = torch.minimum((self.audio_first[:tokens:DUPLEXIO_NUM_CELLS] - 1) * cells, end)
@@ -250,7 +243,7 @@ class DuplexIOKVCacheManager(FullAttentionManager):
                 "DuplexIO compact KV requires vLLM's hybrid-cache block zeroing"
             )
         super().__init__(kv_cache_spec, **kwargs)
-        # vLLM 0.26 records only exact built-in full-attention spec types.
+        # vLLM records only exact built-in full-attention spec types.
         # This registered full-attention subtype needs the same lifecycle.
         self._record_new_block_ids = True
         self.layout = kv_cache_spec.layout
@@ -264,6 +257,7 @@ class DuplexIOKVCacheManager(FullAttentionManager):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        prefill_end: int = 0,
     ) -> int:
         del (
             num_tokens,
@@ -271,6 +265,7 @@ class DuplexIOKVCacheManager(FullAttentionManager):
             num_local_computed_tokens,
             num_tokens_main_model,
             apply_admission_cap,
+            prefill_end,
         )
         if new_computed_blocks:
             raise ValueError("DuplexIO role-aware KV cannot consume prefix hits")
@@ -333,7 +328,6 @@ def make_duplexio_kv_cache_spec(
         dtype=base.dtype,
         kv_quant_mode=base.kv_quant_mode,
         page_size_padded=base.page_size_padded,
-        indexes_kv_by_block_stride=base.indexes_kv_by_block_stride,
         sliding_window=base.sliding_window,
         attention_chunk_size=base.attention_chunk_size,
         non_causal=base.non_causal,

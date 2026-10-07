@@ -29,7 +29,8 @@ def test_time_normalization_preserves_bf16_activations() -> None:
 
 
 def test_block_normalization_matches_training_bf16_statistics() -> None:
-    flow = make_flow()
+    # Serving loads every parameter in the model dtype, including the norms' affine ones.
+    flow = make_flow().to(torch.bfloat16)
     hidden = torch.randn(7, 16, dtype=torch.bfloat16)
     expected = (hidden - hidden.mean(-1, keepdim=True)) / torch.sqrt(
         hidden.var(-1, unbiased=False, keepdim=True) + 1e-6

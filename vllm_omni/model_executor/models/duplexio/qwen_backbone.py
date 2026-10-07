@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated
+from vllm._custom_ops import reshape_and_cache_flash
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_layers_from_vllm_config
@@ -51,7 +52,6 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
-from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func, reshape_and_cache_flash
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend, FlashAttentionImpl
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -60,6 +60,7 @@ from vllm.v1.attention.backends.gdn_attn import (
 )
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheSpec
+from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
     DuplexIOFrameMetadata,
@@ -70,7 +71,6 @@ from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
 from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_function
 from vllm_omni.model_executor.models.duplexio.row_semantics import (
     DUPLEXIO_NUM_CELLS,
-    DUPLEXIO_NUM_TEXT_CELLS,
     expand_stream_conv_weight,
     mask_inactive_gdn_gates,
 )
@@ -86,6 +86,7 @@ from vllm_omni.model_executor.models.duplexio.stream_gdn import (
     gdn_cache_shapes,
     prepare_gdn_inputs,
 )
+
 
 class DuplexIORotaryEmbedding(nn.Module):
     """Cache phases from exported frequencies, never reconstruct their precision."""
@@ -218,7 +219,7 @@ class DuplexIORowReads:
             .flatten()
         )
         self.write_slots[:tokens].copy_(
-            self.physical(tables, frame.write_slots(tokens).view(rows, DUPLEXIO_NUM_CELLS)).flatten()
+            self.physical(tables, frame.write_slots(tokens, layout).view(rows, DUPLEXIO_NUM_CELLS)).flatten()
         )
 
 
@@ -255,12 +256,9 @@ class DuplexIOFlashAttentionMetadataBuilder(AttentionMetadataBuilder[DuplexIOAtt
             raise ValueError("DuplexIO applies its own audio window, not a sliding window")
         layers = get_layers_from_vllm_config(vllm_config, Attention, layer_names)
         frame = next(iter(layers.values())).frame
-        if frame.layout != kv_cache_spec.layout:
-            raise ValueError(
-                f"DuplexIO cache layout {kv_cache_spec.layout} does not match the layout "
-                f"{frame.layout} the model was built with"
-            )
-        self.reads = DuplexIORowReads(frame.layout, frame.cell.shape[0], device)
+        # vLLM settles a hybrid model's block size only after building it, so
+        # the cache spec, not the model, owns the layout.
+        self.reads = DuplexIORowReads(kv_cache_spec.layout, frame.cell.shape[0], device)
 
     def build(
         self,
@@ -659,6 +657,15 @@ def gdn_attention_core(mixed_qkv: Tensor, b: Tensor, a: Tensor, output: Tensor, 
     torch.ops.vllm.qwen_gdn_attention_core(mixed_qkv, b, a, output, layer_name=layer_name)
 
 
+class DuplexIOGatedRMSNorm(Qwen3_5RMSNormGated):
+    """Training's gated norm, which normalizes before it gates.
+
+    vLLM's GDN kernel warmup reads that order from every GDN layer's norm.
+    """
+
+    norm_before_gate = True
+
+
 class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     """Qwen GDN with six independent causal-convolution histories."""
 
@@ -674,7 +681,7 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             prefix=prefix,
             gqa_interleaved_layout=False,
         )
-        norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+        norm = DuplexIOGatedRMSNorm(self.head_v_dim, eps=self.layer_norm_epsilon)
         norm.weight = self.norm.weight
         self.norm = norm
         self.norm.compile(dynamic=True, fullgraph=True)
@@ -965,11 +972,6 @@ class DuplexIOQwenModel(nn.Module):
         # One frame of cell addressing, shared by every full-attention layer and
         # filled by the runner before each step.
         self.frame = DuplexIOFrameMetadata(
-            DuplexIOKVLayout(
-                block_size=vllm_config.cache_config.block_size,
-                audio_window_frames=vllm_config.model_config.hf_config.audio_attention_window_frames,
-                max_model_len=vllm_config.model_config.max_model_len,
-            ),
             vllm_config.scheduler_config.max_num_batched_tokens,
             vllm_config.device_config.device,
         )

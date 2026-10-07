@@ -1749,8 +1749,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         model_config = getattr(self, "model_config", None)
         if model_config is None:
             model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        model = getattr(self, "model", None)
         if not bool(getattr(model_config, "async_chunk", False)) and not self._model_omni_flag(
-            getattr(self, "model", None), "supports_async_whole_payload"
+            model, "supports_async_whole_payload"
         ):
             return False
 

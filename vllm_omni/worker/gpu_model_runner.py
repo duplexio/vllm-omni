@@ -976,6 +976,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             return torch.tensor([]), torch.tensor([])
 
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.is_valid_runtime_mode()
+        # Frame models schedule whole frames of decode_query_len cells, so a
+        # request-count warmup (the sampler's) runs one frame per request.
+        unit = getattr(self.get_model(), "decode_query_len", 1)
+        num_tokens = cdiv(num_tokens, unit) * unit
 
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.separate_routine(). This means that we are using
@@ -1016,9 +1020,6 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             if num_tokens % max_query_len != 0:
                 num_scheduled_tokens_list[-1] = num_tokens % max_query_len
         else:
-            # Frame models schedule whole frames of decode_query_len cells.
-            unit = getattr(self.get_model(), "decode_query_len", 1)
-            unit = unit if num_tokens % unit == 0 else 1
             num_reqs = min(num_tokens // unit, max_num_reqs)
             min_tokens_per_req = num_tokens // unit // num_reqs * unit
             num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs

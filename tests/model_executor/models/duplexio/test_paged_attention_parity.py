@@ -240,9 +240,7 @@ def run_session(
     ]
 
     pages = layout.max_blocks * requests
-    frame = DuplexIOFrameMetadata(
-        layout, sum(prefixes) * DUPLEXIO_NUM_CELLS, device
-    )
+    frame = DuplexIOFrameMetadata(sum(prefixes) * DUPLEXIO_NUM_CELLS, device)
     layer, builder, impl = paged_backend(spec, frame, heads)
     # Page 0 belongs to no request: a page outside the block table must never be
     # read. vLLM zeroes the pages it does hand out, which is what keeps
