@@ -10,6 +10,7 @@ from torch import Tensor
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 
 from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_function
+from vllm_omni.model_executor.models.duplexio.row_semantics import DUPLEXIO_NUM_CELLS
 
 
 def gdn_cache_dtypes(dtype: torch.dtype) -> tuple[torch.dtype, ...]:
@@ -28,9 +29,9 @@ def gdn_cache_shapes(
     """Keep convolution history and six independent recurrent head groups."""
     conv_shape, recurrent_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
         tp_size, key_heads, value_heads, key_dim, value_dim,
-        (conv_kernel_size - 1) * 6 + 1, 0,
+        (conv_kernel_size - 1) * DUPLEXIO_NUM_CELLS + 1, 0,
     )
-    return conv_shape, (recurrent_shape[0] * 6, *recurrent_shape[1:])
+    return conv_shape, (recurrent_shape[0] * DUPLEXIO_NUM_CELLS, *recurrent_shape[1:])
 
 
 @torch.compile(dynamic=True, fullgraph=True)
@@ -177,9 +178,10 @@ def append_gdn(
     Q/K are normalized at preparation; cached recurrence always remains FP32.
     """
     tokens = q.shape[0]
-    q, k, v = (x.reshape(tokens // 6, 6 * x.shape[1], x.shape[2]) for x in (q, k, v))
-    g, beta = (x.reshape(tokens // 6, 6 * x.shape[1]) for x in (g, beta))
-    boundaries = boundaries // 6
+    frames = tokens // DUPLEXIO_NUM_CELLS
+    q, k, v = (x.reshape(frames, -1, x.shape[2]) for x in (q, k, v))
+    g, beta = (x.reshape(frames, -1) for x in (g, beta))
+    boundaries = boundaries // DUPLEXIO_NUM_CELLS
     if q.shape[0] == slots.shape[0]:
         output = slot_recurrent_gdn(q, k, v, g, beta, cache, slots, boundaries, has_state)
         return output.reshape(tokens, -1, v.shape[-1])

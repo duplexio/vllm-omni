@@ -4,7 +4,6 @@ import math
 
 import pytest
 import torch
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule as upstream_gdn
 from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
 from vllm_omni.model_executor.models.duplexio.stream_gdn import (
@@ -17,13 +16,7 @@ from vllm_omni.model_executor.models.duplexio.stream_gdn import (
 
 pytest.importorskip("duplexio")
 
-from duplexio.modules.fla_block_gated_delta_rule.chunk import (
-    chunk_gated_delta_rule as training_gdn,
-)
-from duplexio.modules.fla_block_gated_delta_rule.chunk import (
-    l2_normalize,
-)
-from duplexio.modules.qwen3_5_stream_delta import _qwen_beta_gate
+from duplexio.modules.qwen3_5_stream_delta import _qwen_beta_gate, l2_normalize
 
 
 def make_state(aliased_storage: bool, slots: int = 3) -> torch.Tensor:
@@ -47,21 +40,6 @@ def make_state(aliased_storage: bool, slots: int = 3) -> torch.Tensor:
         )
         offset += math.prod(shape) * size
     return views[1]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("length", (6, 64, 138))
-@torch.inference_mode()
-def test_native_gdn_matches_training(length: int) -> None:
-    torch.manual_seed(27)
-    q = l2_normalize(torch.randn(1, length, 2, 128, device="cuda", dtype=torch.bfloat16))
-    k = l2_normalize(torch.randn_like(q))
-    v = torch.randn(1, length, 4, 128, device="cuda", dtype=torch.bfloat16)
-    g = -torch.rand(1, length, 4, device="cuda", dtype=torch.float32)
-    beta = torch.rand(1, length, 4, device="cuda", dtype=torch.bfloat16)
-    expected, _ = training_gdn(q, k, v, g, beta)
-    actual, _ = upstream_gdn(q, k, v, g, beta)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

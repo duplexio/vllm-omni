@@ -86,7 +86,6 @@ def test_streaming_matches_packed_training_and_resets_reused_slots(
     torch.manual_seed(613)
     channels, history_length = 32, 18
     source = nn.Conv1d(channels, channels, 4, groups=channels, bias=False, device="cuda", dtype=torch.bfloat16)
-    reference = training.BlockCausalConv1d(source, num_channels=6)
     native = DuplexIOQwenGatedDeltaNetAttention.__new__(DuplexIOQwenGatedDeltaNetAttention)
     nn.Module.__init__(native)
     native.full_cudagraph_enabled = False
@@ -104,12 +103,14 @@ def test_streaming_matches_packed_training_and_resets_reused_slots(
     boundaries = torch.tensor([0, *accumulate(lengths)], device="cuda", dtype=torch.int32)
     histories = [state[2].T.clone(), torch.zeros_like(state[0].T)]
     segments = [torch.cat((history, part)) for history, part in zip(histories, x.split(lengths), strict=True)]
+    # Training folds each frame's six cells into channels: (cells, C) -> (1, frames, 6C).
+    # Its FP32 reference conv avoids a causal_conv1d build against this venv's torch.
     reference_lengths = [part.shape[0] for part in segments]
-    reference_boundaries = torch.tensor([0, *accumulate(reference_lengths)], device="cuda", dtype=torch.int32)
-    sequence_ids = torch.repeat_interleave(torch.arange(2, device="cuda", dtype=torch.int32),
-                                          torch.tensor(reference_lengths, device="cuda"))
-    expected = reference(torch.cat(segments).T[None], cu_seqlens=reference_boundaries,
-                         sequence_ids=sequence_ids, activation="silu")[0].T
+    seq_idx = torch.repeat_interleave(torch.arange(2, dtype=torch.int32), torch.tensor(reference_lengths) // 6)[None]
+    expected = training.stream_causal_conv1d(
+        torch.cat(segments).float().cpu().view(1, -1, 6 * channels),
+        source.weight.squeeze(1).repeat(6, 1).float().cpu(), seq_idx,
+    ).view(-1, channels).cuda()
     expected = torch.cat([part[history_length:] for part in expected.split(reference_lengths)])
     chunks = torch.tensor([[request, chunk] for request, length in enumerate(lengths)
                            for chunk in range((length // 6 + 63) // 64)], device="cuda", dtype=torch.int32)
@@ -125,7 +126,8 @@ def test_streaming_matches_packed_training_and_resets_reused_slots(
             actual = native.apply_stream_causal_conv(x, state, slots, boundaries, has_state, chunks)
         state.copy_(original_state)
         graph.replay()
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # One rounding of the FP32 result is within half a BF16 ulp; rounding before SiLU is not.
+    torch.testing.assert_close(actual.float(), expected, rtol=2**-8, atol=1e-6)
     torch.testing.assert_close(state[2], segments[0][-history_length:].T, rtol=0, atol=0)
     torch.testing.assert_close(state[0], segments[1][-history_length:].T, rtol=0, atol=0)
     torch.testing.assert_close(state[1], original_state[1], rtol=0, atol=0)

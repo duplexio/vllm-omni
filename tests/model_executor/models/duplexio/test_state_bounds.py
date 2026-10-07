@@ -42,7 +42,8 @@ def test_gdn_request_state_shape_is_fixed_for_the_session_lifetime() -> None:
     )
 
     assert set(convolution) == {18, 48}
-    assert recurrent == (2, 8, 8)
+    # Two value heads per TP rank, one recurrent group per stream.
+    assert recurrent == (2 * 6, 8, 8)
 
 
 def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
