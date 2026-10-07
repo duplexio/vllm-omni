@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
 
@@ -8,6 +8,15 @@ from dataclasses import dataclass
 # Source: TeaCache paper and ComfyUI-TeaCache empirical tuning
 _MODEL_COEFFICIENTS = {
     # FLUX transformer coefficients from TeaCache paper
+    # Uncalibrated stand-in so Kandinsky 6 TeaCache can be enabled.
+    # Copied from Qwen-Image; refit before treating skips as quality-neutral.
+    "Kandinsky6Transformer3DModel": [
+        -4.50000000e02,
+        2.80000000e02,
+        -4.50000000e01,
+        3.20000000e00,
+        -2.00000000e-02,
+    ],
     "FluxTransformer2DModel": [
         4.98651651e02,
         -2.83781631e02,
@@ -83,6 +92,29 @@ _MODEL_COEFFICIENTS = {
     ],
     # LongCat Image transformer coefficients
     "LongCatImageTransformer2DModel": [652.5980, -424.1615, 84.5526, -4.5923, 0.1694],
+    # MammothModa2 DiT coefficients fitted from full-compute traces
+    # at 1024x1024 with 50 denoising steps.
+    "MammothModa2Transformer2DModel": [
+        -1761.242764481119,
+        859.398730831851,
+        -126.78044436937441,
+        9.16173963457422,
+        -0.1102826051200547,
+    ],
+    # MiniMax-H3 FL2VA coefficients.
+    "MiniMaxH3DiTModel": [
+        2.283704065852778e03,
+        -7.775977277886368e02,
+        9.408414741359490e01,
+        -4.232669906169421e00,
+        2.173782527946167e-01,
+    ],
+}
+
+_DEFAULT_REL_L1_THRESH = 0.2
+_MODEL_DEFAULT_REL_L1_THRESH = {
+    "MammothModa2Transformer2DModel": 0.075,
+    "MiniMaxH3DiTModel": 0.17,
 }
 
 
@@ -97,10 +129,8 @@ class TeaCacheConfig:
 
     Args:
         rel_l1_thresh: Threshold for accumulated relative L1 distance. When below threshold,
-            cached residual is reused. Values in [0.1, 0.3] work best:
-            - 0.2: ~1.5x speedup with minimal quality loss
-            - 0.4: ~1.8x speedup with slight quality loss
-            - 0.6: ~2.0x speedup with noticeable quality loss
+            cached residual is reused. If None, uses the model-specific default or 0.2
+            when no model-specific default is registered.
         coefficients: Polynomial coefficients for rescaling L1 distance. If None, uses
             model-specific defaults based on transformer_type.
         transformer_type: Transformer class name (e.g., "QwenImageTransformer2DModel").
@@ -108,14 +138,18 @@ class TeaCacheConfig:
             Defaults to "QwenImageTransformer2DModel".
     """
 
-    rel_l1_thresh: float = 0.2
+    rel_l1_thresh: float | None = None
     coefficients: list[float] | None = None
     transformer_type: str = "QwenImageTransformer2DModel"
 
     def __post_init__(self) -> None:
         """Validate and set default coefficients."""
-        if self.rel_l1_thresh <= 0:
-            raise ValueError(f"rel_l1_thresh must be positive, got {self.rel_l1_thresh}")
+        threshold = self.rel_l1_thresh
+        if threshold is None:
+            threshold = _MODEL_DEFAULT_REL_L1_THRESH.get(self.transformer_type, _DEFAULT_REL_L1_THRESH)
+        if threshold <= 0:
+            raise ValueError(f"rel_l1_thresh must be positive, got {threshold}")
+        self.rel_l1_thresh = threshold
 
         if self.coefficients is None:
             # Use model-specific coefficients, explicitly check if the type exists or not

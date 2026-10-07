@@ -12,8 +12,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <th>Level</th>
       <th>Scope & Focus</th>
       <th>Model Coverage Strategy</th>
-      <th>Feature Coverage Strategy</th>
-      <th>Interface Coverage Strategy</th>
+      <th>Module Strategy</th>
       <th>Tags</th>
       <th>Time Cost</th>
       <th>Test Dir</th>
@@ -31,14 +30,12 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td>/</td>
       <td>/</td>
       <td>/</td>
-      <td>/</td>
       <td><a href="https://github.com/vllm-project/vllm-omni/blob/main/.github/PULL_REQUEST_TEMPLATE.md">PR Checklist</a></td>
       <td>/</td>
       <td>/</td>
     </tr>
     <tr>
       <td>CI Failure Description</td>
-      <td>/</td>
       <td>/</td>
       <td>/</td>
       <td>/</td>
@@ -53,10 +50,13 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td>Unit tests for components like entrypoints, models</td>
       <td>/</td>
       <td>/</td>
-      <td>/</td>
       <td><code>core_model and cpu</code></td>
       <td rowspan="2">&lt;15min</td>
-      <td>/tests/{component_name}/test_xxx</td>
+      <td>
+        <code>tests/{component}/…</code> mirroring <code>vllm_omni/{component}/</code><br>
+        (e.g. <code>tests/diffusion/</code>, <code>tests/engine/</code>, <code>tests/entrypoints/</code>)<br>
+        Do <strong>not</strong> add new top-level <code>tests/</code> dirs unrelated to a component.
+      </td>
       <td>
         <a href="test_writing_guide.md#l1--l2-level-testing-unit-testing-and-basic-end-to-end-verification">L1 &amp; L2</a><br>
         Section 1 L1&amp;L2: Purpose, Test Content, Directory Location, Example
@@ -67,17 +67,18 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L2</strong><br>(E2E across models & GPU-required UT)</td>
       <td>Online (basic deployment scenarios):<br>dummy, normal inference function (output format, stream), some instance startup UT</td>
-      <td>High-priority models + online basic scenarios; request success, non-empty output, format match (no Whisper/accuracy)</td>
-      <td>High-priority features (using random lightweight models)</td>
-      <td>High-priority interfaces (using random lightweight models)</td>
+      <td>Key models + online basic scenarios; request success, non-empty output, format match (no Whisper/accuracy)</td>
+      <td>Key features and modules that require launching instances (prefer random weights)</td>
       <td><code>core_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>
-        <strong>Model tests:</strong><br>
-        /tests/e2e/online_serving/test_{model_name}.py<br>
-        <strong>Feature tests:</strong><br>
-        /tests/{component_name}/test_xxx<br>
-        <strong>Interface tests:</strong><br>
-        /tests/entrypoints/test_xxx
+        <strong>Model E2E:</strong><br>
+        <code>tests/e2e/online_serving/test_{model}.py</code><br>
+        <code>tests/e2e/offline_inference/test_{model}.py</code><br>
+        <strong>Feature integration:</strong><br>
+        <code>tests/e2e/features/&lt;feature&gt;/</code><br>
+        (e.g. <code>fullduplex/</code>, <code>custom_pipeline/</code>, <code>rlhf_test/</code>)<br>
+        <strong>Component / interface Test (GPU):</strong><br>
+        <code>tests/{component}/…</code>, <code>tests/entrypoints/…</code>
       </td>
       <td>
         <a href="test_writing_guide.md#l1--l2-level-testing-unit-testing-and-basic-end-to-end-verification">L1 &amp; L2</a><br>
@@ -89,19 +90,19 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L3</strong><br>(Important Perf & Integration & Accuracy)</td>
       <td>Online & Offline (multiple deployment scenarios):<br>real model, normal inference function, normal accuracy</td>
-      <td>High/medium-priority models + key online/offline scenarios; real weights, Whisper/similarity, preset voice gender, basic accuracy</td>
-      <td>Medium-priority features (using random lightweight models)</td>
-      <td>Medium-priority interfaces (using random lightweight models)</td>
+      <td>Key models + key online/offline scenarios; real weights, Whisper/similarity, preset voice gender, basic accuracy</td>
+      <td>Key features and modules that require launching instances (using real weights)</td>
       <td><code>advanced_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>&lt;30min</td>
       <td>
-        <strong>Model tests:</strong><br>
-        /tests/e2e/online_serving/test_{model_name}.py<br>
-        /tests/e2e/offline_inference/test_{model_name}.py<br>
-        <strong>Feature tests:</strong><br>
-        /tests/{component_name}/test_xxx<br>
-        <strong>Interface tests:</strong><br>
-        /tests/entrypoints/test_xxx
+        <strong>Model E2E:</strong><br>
+        <code>tests/e2e/online_serving/test_{model}.py</code><br>
+        <code>tests/e2e/offline_inference/test_{model}.py</code><br>
+        <code>tests/e2e/accuracy/</code><br>
+        <strong>Feature integration:</strong><br>
+        <code>tests/e2e/features/&lt;feature&gt;/</code><br>
+        <strong>Component / interface Test:</strong><br>
+        <code>tests/{component}/…</code>, <code>tests/entrypoints/…</code>
       </td>
       <td>
         <a href="test_writing_guide.md#l3-level-testing-core-integration-performance-and-accuracy-verification">L3</a><br>
@@ -113,50 +114,43 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L4</strong><br>(Perf & Integration & Accuracy)</td>
       <td>Online: full functional scenarios + performance test + doc test + accuracy test</td>
-      <td>High-priority models: function, performance, accuracy, and doc testing<br>Medium-priority models: function and doc testing</td>
-      <td>Low-priority features (using real weights)</td>
-      <td>Low-priority interfaces (using real weights)</td>
+      <td>Key models: function, performance, accuracy, and doc testing</td>
+      <td>Other features and modules that require launching instances (using real weights)</td>
       <td><code>full_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>&lt;3 hour</td>
       <td>
-        <strong>Model tests:</strong><br>
-        /tests/e2e/online_serving/test_{model_name}_expansion.py<br>
-        <strong>Feature tests:</strong><br>
-        /tests/{component_name}/test_xxx<br>
-        <strong>Interface tests:</strong><br>
-        /tests/entrypoints/test_xxx<br>
+        <strong>Model E2E:</strong><br>
+        <code>tests/e2e/online_serving/test_{model}_expansion.py</code><br>
+        <code>tests/e2e/offline_inference/test_{model}_expansion.py</code><br>
+        <code>tests/e2e/accuracy/test_{model}.py</code><br>
+        <strong>Feature integration:</strong><br>
+        <code>tests/e2e/features/&lt;feature&gt;/</code><br>
+        <strong>Component / interface Test:</strong><br>
+        <code>tests/{component}/…</code>, <code>tests/entrypoints/…</code><br>
         <strong>Performance:</strong><br>
-        /tests/dfx/perf/tests/test_qwen3_omni_*.json (Omni), test_tts.json (TTS),<br>
-        test_voxcpm2.json, test_higgs_audio_v3.json, and<br>
-        /tests/dfx/perf/tests/test_{diffusion_model}_vllm_omni.json (Diffusion)<br>
-        <strong>Doc Test:</strong><br>
-        tests/examples/online_serving/test_{model_name}.py<br>
-        tests/examples/offline_inference/test_{model_name}.py<br>
-        <strong>Accuracy Test:</strong><br>
-        /tests/e2e/accuracy/test_{model_name}.py
+        <code>tests/dfx/perf/tests/</code><br>
+        <strong>Doc examples:</strong><br>
+        <code>tests/examples/online_serving/</code>, <code>tests/examples/offline_inference/</code>
       </td>
       <td>
         <a href="test_writing_guide.md#l4-level-testing-full-functionality-performance-and-documentation-testing">L4</a><br>
         L4: Purpose, Test Content, Directory Location, Example
       </td>
-      <td>Nightly</td>
+      <td>Nightly / Days before Release<br>(additional GPU SKUs)</td>
       <td>GPU</td>
     </tr>
     <tr>
-      <td><strong>L5</strong><br>(Stability & Reliability)</td>
-      <td>Online: long-term stability test + reliability test</td>
-      <td>Long-term stability and reliability testing for high-priority models<br>Low-priority models: function and doc testing</td>
+      <td><strong>L5</strong><br>(Stability & Reliability & selected Perf)</td>
+      <td>Online: long-term stability + reliability; coverage test</td>
+      <td>Long-term stability and reliability testing for key models<br>Non-critical scenario performance and accuracy testing for key models<br>Other models: function and doc testing</td>
       <td>/</td>
-      <td>Invalid-parameter validation for high-priority interfaces</td>
       <td><code>slow and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td> Depends on reality </td>
       <td>
         <strong>Stability:</strong><br>
-        /tests/dfx/stability/tests/test_qwen3_omni.json<br>
-        /tests/dfx/stability/tests/test_wan22.json<br>
+        <code>tests/dfx/stability/tests/</code><br>
         <strong>Reliability:</strong><br>
-        tests/dfx/reliability/test_reliability_{model_key}.py<br>
-        (e.g. <code>test_reliability_qwen3_omni.py</code>, <code>test_reliability_wan22.py</code>, <code>test_reliability_hunyuan_image.py</code>, <code>test_reliability_voxcpm2.py</code>)
+        <code>tests/dfx/reliability/test_reliability_{model}.py</code>
       </td>
       <td>
         <a href="test_writing_guide.md#l5-level-testing-stability-and-reliability-testing">L5</a><br>
@@ -168,16 +162,29 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
   </tbody>
 </table>
 
-For per-level test authoring (directories, markers, examples), see [Test Writing Guide](./test_writing_guide.md).
+**Test Dir placement (summary):** component / unit under `tests/{component}/` mirroring `vllm_omni/`; model E2E under `tests/e2e/online_serving/`, `tests/e2e/offline_inference/`, and `tests/e2e/accuracy/`; feature integration under `tests/e2e/features/<feature>/`; doc example tests under `tests/examples/online_serving/` and `tests/examples/offline_inference/`; performance under `tests/dfx/perf/`; stability under `tests/dfx/stability/`; reliability under `tests/dfx/reliability/`. Do **not** add new top-level directories under `tests/` that are unrelated to a `vllm_omni` component (or to the established `e2e` / `dfx` / `helpers` / `examples` / `buildkite` layout).
+
+For per-level test authoring (markers, examples), see [Test Writing Guide](./test_writing_guide.md).
 
 ## Common Specifications
 
 Before entering specific testing levels, the project establishes two common specifications aimed at standardizing the development process and quickly locating issues.
 
-1.  ***PR Checklist ([`.github/PULL_REQUEST_TEMPLATE.md`](https://github.com/vllm-project/vllm-omni/blob/main/.github/PULL_REQUEST_TEMPLATE.md))***: This template defines the self-check items that must be completed before submitting a code review (Pull Request). It ensures that each code change meets basic requirements such as code style, dependency updates, and documentation synchronization before entering the automated testing pipeline, serving as the first manual line of defense for quality assurance.
-2.  ***CI Failure Explanation ([CI Failures](./failures.md))***: This document archives and explains common failure patterns in the Continuous Integration (CI) pipeline, error log interpretation, and preliminary troubleshooting steps. It helps developers and testers quickly diagnose the causes of automated test failures, improving problem-solving efficiency.
+1. ***PR Checklist ([`.github/PULL_REQUEST_TEMPLATE.md`](https://github.com/vllm-project/vllm-omni/blob/main/.github/PULL_REQUEST_TEMPLATE.md))***: This template defines the self-check items that must be completed before submitting a code review (Pull Request). It ensures that each code change meets basic requirements such as code style, dependency updates, and documentation synchronization before entering the automated testing pipeline, serving as the first manual line of defense for quality assurance.
+2. ***CI Failure Explanation ([CI Failures](./failures.md))***: This document archives and explains common failure patterns in the Continuous Integration (CI) pipeline, error log interpretation, and preliminary troubleshooting steps. It helps developers and testers quickly diagnose the causes of automated test failures, improving problem-solving efficiency.
 
 ## Notes
+
+### L4 cadence (nightly and pre-release)
+
+CUDA **L4** (`full_model`) jobs are defined once in [`.buildkite/cuda/test-nightly.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml). That file is reused at two cadences:
+
+- **Nightly:** scheduled `main` builds with `NIGHTLY=1` (and PR labels such as `nightly-test` / `omni-test`). Default fleet is typically H100.
+- **Pre-release:** the same L4 suite runs again on extra GPU SKUs before a release (for example B200 via `MIRROR_HW=b200`), so `full_model` coverage is not limited to the nightly machine type.
+
+AMD has an experimental, non-blocking `full_model` nightly vertical slice in [`.buildkite/amd/test-amd-nightly.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/test-amd-nightly.yml). It selects ROCm Qwen3-Omni function-expansion, accuracy, documentation-example, and AITER-on smoke coverage on the MI300 pool. AMD-only PR validation uses `amd-test` to admit the external AMD pipeline and `nightly-test` to select this suite; scheduled `main` builds select it with `NIGHTLY=1`. Keep it non-blocking while the lane accumulates stability and completion-time evidence.
+
+How count-form `mirror_hardwares` and `MIRROR_HW` pick a SKU: [CI Settings](./ci_settings.md).
 
 ### L2 / L3 diff-aware CI (CUDA)
 

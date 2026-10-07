@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
+from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 
 logger = init_logger(__name__)
 
@@ -45,7 +45,8 @@ class DistributedVaeExecutor:
     """
 
     def __init__(self):
-        self.group = get_dit_group()
+        # Use a dedicated process group spanning the complete worker WORLD.
+        self.group = get_world_group().device_group
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         self.parallel_size = 1
@@ -176,8 +177,14 @@ class DistributedVaeMixin:
         self.distributed_executor.set_parallel_size(parallel_size, mode=mode)
 
     def is_distributed_enabled(self) -> bool:
+        """Whether to use distributed tile/patch execution, not native tiling.
+
+        Batch decode has its own dispatch; in batch mode, encoding and each
+        assigned image chunk keep the native tiling/slicing settings.
+        """
         if (
             self.distributed_executor.parallel_size <= 1
+            or self.distributed_executor.parallel_mode == "batch"
             or not dist.is_initialized()
             or not getattr(self, "use_tiling", False)
         ):
@@ -189,7 +196,7 @@ class DistributedVaeMixin:
         if self.distributed_executor.parallel_size > pp_size:
             logger.warning(
                 f"vae_patch_parallel_size={self.distributed_executor.parallel_size} "
-                f"is greater than dit_group={world_size};"
-                f" using dit_group size={world_size}"
+                f"is greater than WORLD={world_size};"
+                f" using WORLD size={world_size}"
             )
         return True

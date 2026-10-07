@@ -388,11 +388,11 @@ class DuplexIOForConditionalGeneration(
     # make_omni_output returns fresh host tensors each step, so the runner can
     # hand them to the payload without another copy.
     omni_host_owned_multimodal_outputs = True
-    # Under async scheduling the runner finalizes a step (finalize_omni_output)
+    # Under async scheduling the runner finalizes a step (finalize_multimodal_outputs_from_cpu_snapshot)
     # on the engine thread after launching the next one, so each step's device
     # work runs under the other's host work. Without it, it finalizes at once.
     use_async_omni_output = True
-    async_omni_output_without_async_chunk = True
+    supports_async_whole_payload = True
     eager_omni_postprocess_before_async_output = True
     omni_async_output_build_in_background = False
     # Per-request embeddings are views of one packed step tensor.
@@ -1008,7 +1008,7 @@ class DuplexIOForConditionalGeneration(
             ],
         )
 
-    def finalize_omni_output(self, outputs: Any) -> Any:
+    def finalize_multimodal_outputs_from_cpu_snapshot(self, outputs: Any) -> Any:
         """The host half of ``make_omni_output``: wait for the draws, then feed them back."""
         return outputs.finalize(self) if isinstance(outputs, DuplexIOStepOutput) else outputs
 

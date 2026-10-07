@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -300,7 +303,16 @@ def apply_rope(
     max_period: float = 10_000,
     time_before_heads: bool = False,
 ):
-    """Apply rotary position embedding."""
+    """Apply rotary position embedding (GPT-J interleaved convention).
+
+    On NPU, uses ``torch_npu.npu_rotary_mul`` (a single fused rotation kernel)
+    instead of the manual 14-op eager rotation. The codec's GPT-J convention
+    (even/odd index pairs) is mathematically identical to the neox convention
+    after a layout conversion: interleaved ``[r0 i0 r1 i1 ...]`` -> neox
+    ``[r0 r1 ... i0 i1 ...]``, apply ``npu_rotary_mul``, convert back. This
+    fuses the 6 mul/add ops into 1 kernel. Result is bf16-identical
+    (max_abs_diff = 1 ULP). Falls back to the eager path on non-NPU.
+    """
     if time_before_heads:
         B, T, H, D = q.shape
     else:
@@ -319,6 +331,29 @@ def apply_rope(
     else:
         ts = ts.view(B, 1, -1, 1)
 
+    # Fast path: npu_rotary_mul (fused rotation kernel) on NPU.
+    if q.device.type == "npu":
+        import torch_npu
+
+        cos_d2 = torch.cos(freqs * ts)  # (..., 1, T, D//2)
+        sin_d2 = torch.sin(freqs * ts)
+        # neox cos/sin: cat([first_half, second_half]) -- each freq once per half.
+        cos = torch.cat([cos_d2, cos_d2], dim=-1)  # (..., 1, T, D)
+        sin = torch.cat([sin_d2, sin_d2], dim=-1)
+        dims = q.shape[:-1]
+        # interleaved -> neox: [r0 i0 r1 i1 ...] -> [r0 r1 ... i0 i1 ...]
+        q_neox = q.view(*dims, D // 2, 2).transpose(-1, -2).reshape(*dims, D).contiguous()
+        k_neox = k.view(*dims, D // 2, 2).transpose(-1, -2).reshape(*dims, D).contiguous()
+        # npu_rotary_mul: q_out = q * cos + rotate_half(q) * sin (neox rotation
+        # = GPT-J rotation after the layout conversion -- verified bf16-identical).
+        qo = torch_npu.npu_rotary_mul(q_neox, cos, sin)
+        ko = torch_npu.npu_rotary_mul(k_neox, cos, sin)
+        # neox -> interleaved (back)
+        qo = qo.view(*dims, 2, D // 2).transpose(-1, -2).reshape(*dims, D).contiguous()
+        ko = ko.view(*dims, 2, D // 2).transpose(-1, -2).reshape(*dims, D).contiguous()
+        return qo, ko
+
+    # Eager fallback (non-NPU): original 14-op GPT-J rotation in fp32.
     dims = q.shape[:-1]
     q = q.view(*dims, D // 2, 2)
     k = k.view(*dims, D // 2, 2)
@@ -484,7 +519,6 @@ class RingKVCache:
             return
         slots = state_slot_ids.to(device=self.end_offset.device, dtype=torch.long)
         self.end_offset.index_fill_(0, slots, 0)
-        self.cache.index_fill_(1, slots, 0)
 
     def complete(
         self,
@@ -505,11 +539,15 @@ class RingKVCache:
             end_offset = self.end_offset.index_select(0, slots)
             row_cache = self.cache.index_select(1, slots)
 
-            indexes = torch.arange(T, device=end_offset.device, dtype=end_offset.dtype)
+            # Upsampling can make a chunk longer than the ring. Only the last
+            # capacity tokens survive; writing all T tokens gives scatter_
+            # duplicate destinations and nondeterministic cache contents.
+            write_length = min(T, self.capacity)
+            indexes = torch.arange(T - write_length, T, device=end_offset.device, dtype=end_offset.dtype)
             indexes = (indexes + end_offset.view(-1, 1)) % self.capacity
-            scatter_indexes = indexes.view(B, 1, T, 1).expand(-1, H, T, D)
-            row_cache[0].scatter_(2, scatter_indexes, k)
-            row_cache[1].scatter_(2, scatter_indexes, v)
+            scatter_indexes = indexes.view(B, 1, write_length, 1).expand(-1, H, write_length, D)
+            row_cache[0].scatter_(2, scatter_indexes, k[:, :, -write_length:])
+            row_cache[1].scatter_(2, scatter_indexes, v[:, :, -write_length:])
             # Live and graph-padding rows always map to distinct slots. The
             # latter map only to scratch state, so this write cannot corrupt a
             # request even though dense graph operators still execute it.
@@ -695,7 +733,13 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         if self.context is None:
             capacity = self.weights_per_step if self.weights_per_step else 1024
         else:
-            capacity = self.context
+            # RingKVCache.complete writes a whole chunk before attending, so a
+            # ring of exactly ``context`` entries lets a T-token chunk evict up
+            # to T tokens of history that the chunk's own queries should still
+            # see (and, for T > context, evict part of the chunk itself).
+            # ``_ring_headroom`` (max chunk tokens at this layer) keeps every
+            # in-window key resident; 0 preserves the legacy truncation.
+            capacity = self.context + int(getattr(self, "_ring_headroom", 0))
 
         kv_cache = RingKVCache(
             batch_size,
@@ -757,20 +801,63 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         if self.rope:
             q, k = self.rope(q, k, offset, time_before_heads=False)
 
-        k, v, pos_k = self._complete_kv(k, v, execution_context)
-        pos_k = pos_k[:, None]
-
-        if self.causal:
-            pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(-1, 1)
-            delta = pos_q - pos_k
-            attn_bias = (pos_k >= 0) & (delta >= 0)
-            if self.context is not None:
-                attn_bias = attn_bias & (delta < self.context)
-            attn_bias = attn_bias[:, None]
+        slot_attention = getattr(self, "_slot_attention", None)
+        slot_attention_rows = getattr(self, "_slot_attention_rows", None)
+        advance_kv_offset = False
+        slot_path = state is not None and execution_context is not None and self.causal
+        if slot_path and slot_attention_rows is not None:
+            # One launch: the gathered MHA offset equals the ring's end_offset
+            # for every slot, and both advance together below.
+            valid_lengths = execution_context.valid_rows.to(dtype=torch.int32) * T
+            x = slot_attention_rows(
+                q,
+                k,
+                v,
+                state.kv_cache.cache,
+                offset,
+                execution_context.state_slot_ids,
+                valid_lengths,
+                self.context if self.context is not None else -1,
+            )
+            advance_kv_offset = True
+        elif slot_attention is not None and slot_path:
+            # Current streaming batches use one exact T. Padding rows own
+            # scratch slots and must not advance persistent attention state.
+            valid_lengths = execution_context.valid_rows.to(dtype=torch.int32) * T
+            x = slot_attention(
+                q,
+                k,
+                v,
+                state.kv_cache.cache,
+                state.kv_cache.end_offset,
+                execution_context.state_slot_ids,
+                valid_lengths,
+                self.context if self.context is not None else -1,
+            )
         else:
-            attn_bias = None
+            k, v, pos_k = self._complete_kv(k, v, execution_context)
+            pos_k = pos_k[:, None]
 
-        x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
+            if self.causal:
+                pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(-1, 1)
+                delta = pos_q - pos_k
+                attn_bias = (pos_k >= 0) & (delta >= 0)
+                if self.context is not None:
+                    attn_bias = attn_bias & (delta < self.context)
+                attn_bias = attn_bias[:, None]
+            else:
+                attn_bias = None
+
+            streaming_attention = getattr(self, "_streaming_attention", None)
+            if (
+                streaming_attention is not None
+                and attn_bias is not None
+                and q.dtype == torch.bfloat16
+                and q.shape[-1] == 64
+            ):
+                x = streaming_attention(q, k, v, attn_bias)
+            else:
+                x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
         x = x.transpose(1, 2).reshape(B, T, self.embed_dim)
         x = apply_weights_per_step(self.out_projs, self.weights_per_step_schedule, x, offset_cpu)
 
@@ -781,6 +868,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             else:
                 next_offset = torch.where(execution_context.valid_rows, offset + T, offset)
                 state.offset.index_copy_(0, execution_context.state_slot_ids, next_offset)
+                if advance_kv_offset:
+                    state.kv_cache.end_offset.index_copy_(0, execution_context.state_slot_ids, next_offset)
         return x
 
 
@@ -1581,6 +1670,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         decoder_kwargs_list = copy.deepcopy(config.decoder_kwargs)
         self.decoder = nn.ModuleList()
 
+        decoder_input_frame_rate = current_frame_rate
         for decoder_kwargs_i in decoder_kwargs_list:
             decoder_kwargs_i = dict(decoder_kwargs_i)
             if decoder_kwargs_i["module_type"] == "PatchedPretransform":
@@ -1595,6 +1685,11 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
                         context=int(round(current_frame_rate * context_duration)),
                     )
                 )
+                # Tokens this transformer sees per input code frame. Streaming
+                # ring headroom is sized from it (see initialize_decoder_state_pool).
+                self.decoder[-1].tokens_per_input_frame = max(
+                    1, int(round(current_frame_rate / decoder_input_frame_rate))
+                )
             current_frame_rate *= self.decoder[-1].downsample_ratio
 
         expected_output_frame_rate = float(self.sampling_rate * channel_interleave_factor)
@@ -1607,6 +1702,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         self._streaming_modules: list[StreamingModule] = []
         self._streaming_exec_mask: torch.Tensor | None = None
         self._decoder_state_capacity = 0
+        self._decoder_slot_offsets: torch.Tensor | None = None
         self.post_init()
 
     def _start_streaming(self, batch_size: int, *, decoder_only: bool = False) -> None:
@@ -1634,6 +1730,49 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         root.apply(_start)
         self._streaming_modules = streaming_modules
         self._streaming_exec_mask = shared_exec_mask
+        if decoder_only:
+            self._centralize_decoder_slot_offsets(batch_size)
+
+    def _centralize_decoder_slot_offsets(self, state_capacity: int) -> None:
+        """Pack per-module slot offsets so reset needs one CUDA kernel."""
+        state_tensors: list[tuple[StreamingState, list[tuple[object, str]]]] = []
+        for module in self._streaming_modules:
+            state = module._streaming_state
+            fields: list[tuple[object, str]] = []
+            if isinstance(state, MHAState):
+                fields.append((state, "offset"))
+                if state.kv_cache is not None:
+                    fields.append((state.kv_cache, "end_offset"))
+            elif isinstance(state, TransformerState):
+                fields.append((state, "offsets"))
+            else:
+                continue
+
+            if not all(
+                isinstance(getattr(owner, name), torch.Tensor)
+                and getattr(owner, name).shape == (state_capacity,)
+                and getattr(owner, name).dtype == torch.long
+                for owner, name in fields
+            ):
+                raise RuntimeError(
+                    "Dynamic decoder state slots require every per-slot offset to use the full decoder state capacity."
+                )
+            state_tensors.append((state, fields))
+
+        num_offsets = sum(len(fields) for _, fields in state_tensors)
+        if num_offsets == 0:
+            raise RuntimeError("Dynamic decoder state pool has no per-slot offsets.")
+        storage = torch.zeros(
+            (num_offsets, state_capacity),
+            dtype=torch.long,
+            device=next(self.parameters()).device,
+        )
+        row = 0
+        for state, fields in state_tensors:
+            for owner, name in fields:
+                setattr(owner, name, storage[row])
+                row += 1
+        self._decoder_slot_offsets = storage
 
     def _stop_streaming(self) -> None:
         """Stop streaming mode for all modules."""
@@ -1642,11 +1781,31 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         self._streaming_modules = []
         self._streaming_exec_mask = None
         self._decoder_state_capacity = 0
+        self._decoder_slot_offsets = None
 
-    def initialize_decoder_state_pool(self, state_capacity: int, scratch_capacity: int = 0) -> None:
-        """Allocate persistent decoder state independently of execution B."""
-        if state_capacity <= 0 or scratch_capacity < 0:
-            raise ValueError(f"Invalid decoder state capacities: state={state_capacity}, scratch={scratch_capacity}.")
+    def initialize_decoder_state_pool(
+        self, state_capacity: int, scratch_capacity: int = 0, chunk_frames: int = 0
+    ) -> None:
+        """Allocate persistent decoder state independently of execution B.
+
+        ``chunk_frames`` > 0 sizes every decoder attention ring as
+        ``context + chunk_frames * tokens_per_input_frame`` so that a chunk of
+        up to ``chunk_frames`` code frames never evicts keys inside its own
+        causal window; chunked streaming then matches whole-sequence decoding.
+        ``chunk_frames`` = 0 keeps the legacy ``context``-sized rings.
+        """
+        if state_capacity <= 0 or scratch_capacity < 0 or chunk_frames < 0:
+            raise ValueError(
+                "Invalid decoder state capacities: "
+                f"state={state_capacity}, scratch={scratch_capacity}, chunk_frames={chunk_frames}."
+            )
+        for module in self.decoder:
+            if not isinstance(module, MossAudioTokenizerProjectedTransformer):
+                continue
+            tokens_per_frame = int(getattr(module, "tokens_per_input_frame", 1))
+            for attention in module.modules():
+                if isinstance(attention, MossAudioTokenizerMultiheadAttention):
+                    attention._ring_headroom = chunk_frames * tokens_per_frame
         self._start_streaming(state_capacity + scratch_capacity, decoder_only=True)
         self._decoder_state_capacity = state_capacity + scratch_capacity
 
@@ -1658,18 +1817,16 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             raise RuntimeError("MOSS Audio Tokenizer decoder state pool is not initialized.")
         if state_slot_ids.numel() == 0:
             return
-        slots = state_slot_ids.to(device=next(self.parameters()).device, dtype=torch.long)
-        if not torch.cuda.is_current_stream_capturing():
-            slots_cpu = slots.detach().to("cpu")
-            if int(slots_cpu.min()) < 0 or int(slots_cpu.max()) >= self._decoder_state_capacity:
+        slot_offsets = self._decoder_slot_offsets
+        if slot_offsets is None:
+            raise RuntimeError("MOSS Audio Tokenizer decoder slot offsets are not initialized.")
+        if state_slot_ids.device.type == "cpu":
+            if int(state_slot_ids.min()) < 0 or int(state_slot_ids.max()) >= self._decoder_state_capacity:
                 raise ValueError(
-                    f"Decoder state slots must be in [0, {self._decoder_state_capacity}), got {slots_cpu.tolist()}"
+                    f"Decoder state slots must be in [0, {self._decoder_state_capacity}), got {state_slot_ids.tolist()}"
                 )
-        for module in self._streaming_modules:
-            state = module._streaming_state
-            reset_slots = getattr(state, "reset_slots", None)
-            if callable(reset_slots):
-                reset_slots(slots)
+        slots = state_slot_ids.to(device=slot_offsets.device, dtype=torch.long)
+        slot_offsets.index_fill_(1, slots, 0)
 
     def decode_streaming_batch(
         self,
@@ -1686,7 +1843,27 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             state_capacity=self._decoder_state_capacity,
             device=codes.device,
         )
-        return self._decode_frame(codes, codes_lengths, execution_context=execution_context)
+        audio, audio_lengths = self.decode_streaming_tensors(
+            codes,
+            codes_lengths,
+            state_slot_ids,
+            valid_rows,
+        )
+        return MossAudioTokenizerDecoderOutput(audio=audio, audio_lengths=audio_lengths)
+
+    def decode_streaming_tensors(
+        self,
+        codes: torch.Tensor,
+        codes_lengths: torch.Tensor,
+        state_slot_ids: torch.Tensor,
+        valid_rows: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tensor-only streaming decode boundary for vLLM compilation."""
+        execution_context = StreamingExecutionContext(
+            state_slot_ids=state_slot_ids,
+            valid_rows=valid_rows,
+        )
+        return self._decode_frame_tensors(codes, codes_lengths, execution_context=execution_context)
 
     def _set_streaming_exec_mask(self, exec_mask: torch.Tensor) -> None:
         """Update the shared active-slot mask with one device copy."""
@@ -1925,21 +2102,25 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         )
 
     @torch.no_grad()
-    def _decode_frame(
+    def _decode_frame_tensors(
         self,
         codes: torch.Tensor,
         codes_lengths: torch.Tensor | None = None,
         execution_context: StreamingExecutionContext | None = None,
-    ) -> MossAudioTokenizerDecoderOutput:
-        """Detokenize discrete tokens into audio waveform."""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Detokenize codes and return tensors without Python output wrappers."""
         nq, B, T = codes.shape
         device = codes.device
 
         if codes_lengths is None:
             codes_lengths = torch.full((B,), T, device=device, dtype=torch.long)
 
-        # Keep eager execution and CUDA Graph capture on the same BF16 path.
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        # Keep eager execution and CUDA/NPU Graph capture on the same BF16 path.
+        # Autocast is required on NPU because #5235's decode-LUT uses .float()
+        # for precision, producing float32 embeddings.  Without autocast, these
+        # float32 tensors flow into bf16 LayerNorm weights and NPU's aclnnLayerNorm
+        # rejects the mixed dtype (CUDA auto-casts; NPU does not).
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type != "cpu"):
             quantizer = cast(MossAudioTokenizerResidualVQ | MossAudioTokenizerResidualLFQ, self.quantizer)
             zq = quantizer.decode_codes(codes)
 
@@ -1955,7 +2136,22 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
                     d, d_lengths = decoder_module(d, d_lengths)
 
         d, d_lengths = self._restore_channels_from_codec(d, d_lengths)
-        return MossAudioTokenizerDecoderOutput(audio=d, audio_lengths=d_lengths)
+        return d, d_lengths
+
+    @torch.no_grad()
+    def _decode_frame(
+        self,
+        codes: torch.Tensor,
+        codes_lengths: torch.Tensor | None = None,
+        execution_context: StreamingExecutionContext | None = None,
+    ) -> MossAudioTokenizerDecoderOutput:
+        """Compatibility wrapper around the tensor-only decoder."""
+        audio, audio_lengths = self._decode_frame_tensors(
+            codes,
+            codes_lengths,
+            execution_context=execution_context,
+        )
+        return MossAudioTokenizerDecoderOutput(audio=audio, audio_lengths=audio_lengths)
 
     def encode(  # type: ignore[override]
         self,
