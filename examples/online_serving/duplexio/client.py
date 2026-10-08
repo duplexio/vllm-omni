@@ -28,13 +28,22 @@ def read_audio(path: Path) -> np.ndarray:
 
 
 async def run(args: argparse.Namespace) -> dict:
-    reference = read_audio(args.ref_audio)
+    reference = read_audio(args.ref_audio) if args.ref_audio else None
+    voice = (
+        {
+            "ref_audio_data": base64.b64encode(reference.tobytes()).decode(),
+            "ref_audio_format": "pcm_f32le",
+            "ref_audio_sample_rate": SAMPLE_RATE,
+        }
+        if reference is not None
+        else {}
+    )
     speech = read_audio(args.user_audio) if args.user_audio else np.empty(0, dtype="<f4")
     frames = max(int(args.seconds * SAMPLE_RATE / FRAME_SIZE), (speech.size + FRAME_SIZE - 1) // FRAME_SIZE)
     query = urlencode({"duplex": 1, "model": args.model, "autostart": 0})
     audio, text, user_text, agent_frames = [], [], [], []
     counts = Counter()
-    started = time.monotonic()
+    started = stream_started = time.monotonic()
     async with asyncio.timeout(frames * FRAME_SIZE / SAMPLE_RATE + 180):
         async with websockets.connect(
             f"{args.url.rstrip('/')}/v1/realtime?{query}", max_size=64 * 1024 * 1024
@@ -55,15 +64,13 @@ async def run(args: argparse.Namespace) -> dict:
                                 "auto_response": True,
                                 "start_role": "user" if args.user_audio or args.user_text else "agent",
                                 "text_only": bool(args.user_text),
-                                "ref_audio_data": base64.b64encode(reference.tobytes()).decode(),
-                                "ref_audio_format": "pcm_f32le",
-                                "ref_audio_sample_rate": SAMPLE_RATE,
+                                **voice,
                                 "duplexio_sampling": {
                                     "seed": args.seed,
-                                    # Greedy agent content; emission stays as trained.
+                                    # Typed turns score the text channel: greedy agent content, emission as trained.
                                     **(
                                         {"agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.0}}}
-                                        if getattr(args, "greedy", False)
+                                        if args.user_text
                                         else {}
                                     ),
                                 },
@@ -109,7 +116,10 @@ async def run(args: argparse.Namespace) -> dict:
                         )
                     elif kind == "response.audio_transcript.delta":
                         text.append(event["delta"])
-                        agent_frames.append((event["delta"], event.get("agent_emit_logprob")))
+                        # Seconds since input streaming began, so reply timing lines up with the question audio.
+                        agent_frames.append(
+                            (event["delta"], event.get("agent_emit_logprob"), round(time.monotonic() - stream_started, 3))
+                        )
                     elif kind == "conversation.item.input_audio_transcription.delta":
                         user_text.append(event["delta"])
 
@@ -161,6 +171,7 @@ async def run(args: argparse.Namespace) -> dict:
     sf.write(args.output, waveform, SAMPLE_RATE, subtype="PCM_16")
     return {
         "agent_text": "".join(text).strip(),
+        "agent_frames": agent_frames,
         "user_text": "".join(user_text).strip(),
         "audio_seconds": waveform.size / SAMPLE_RATE,
         "input_seconds": frames * FRAME_SIZE / SAMPLE_RATE,
@@ -174,19 +185,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="duplexio/duo-4b")
     parser.add_argument("--url", default="ws://127.0.0.1:8000")
-    parser.add_argument("--ref-audio", required=True, type=Path)
+    parser.add_argument("--ref-audio", type=Path, help="Agent voice reference; not used with --user-text")
     parser.add_argument("--user-audio", type=Path)
     parser.add_argument("--user-text", help="Type the user turn instead of speaking it; the session is text-only")
     parser.add_argument("--seconds", type=float, default=20)
     parser.add_argument("--instructions", default="You are a helpful voice assistant.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--greedy", action="store_true", help="Greedy agent text instead of the trained sampling")
     parser.add_argument("--output", type=Path, default=Path("agent.wav"))
     args = parser.parse_args()
     if args.seconds <= 0:
         parser.error("--seconds must be positive")
     if args.user_audio and args.user_text:
         parser.error("--user-audio and --user-text are mutually exclusive")
+    if not args.ref_audio and not args.user_text:
+        parser.error("--ref-audio is required unless --user-text starts a text-only session")
+    if args.ref_audio and args.user_text:
+        parser.error("Text-only sessions take no voice reference; drop --ref-audio")
     print(json.dumps(asyncio.run(run(args)), indent=2))
 
 

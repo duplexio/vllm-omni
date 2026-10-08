@@ -24,6 +24,7 @@ from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
     DuplexIORequestState,
     frame_inputs,
+    voice_prompt_samples,
 )
 
 
@@ -416,3 +417,26 @@ def test_typed_user_text_fills_the_user_cell_and_text_only_frames_skip_audio() -
     after = update["duplexio_working_state"]
     assert after.audio_position == typed.audio_position
     assert after.user_asr.next_mel_frame == typed.user_asr.next_mel_frame
+
+
+@torch.inference_mode()
+def test_text_only_prefix_without_voice_prompt_is_system_text_only() -> None:
+    model = model_fixture()
+    state = replace(request_state(model), voice_prompt=torch.empty(0))
+    info = input_info(state, [], system=False)
+    info["duplex"]["frame_count"] = 3
+    info["duplex_prompt_len"] = 18
+    info["duplex"]["runtime_config"] = {"duplexio_record_inputs": True, "duplexio_text_only": True}
+    _, _, update = model.preprocess(torch.zeros(18, dtype=torch.long), None, **info)
+    replay = update["duplexio_replay"]
+    assert replay["text_ids"].tolist() == [[3, 2, 2, 2], [4, 2, 2, 2], [5, 2, 2, 2]]
+    assert not replay["prompt_frames"].any()
+    assert not replay["audio_mask"].any()
+    assert model.audio_codec.waveforms == []
+    assert update["duplexio_working_state"].persistent_keys == 3
+
+
+def test_voice_prompt_samples_accept_the_empty_text_only_reference() -> None:
+    assert voice_prompt_samples(b"", 0).shape == (0,)
+    reference = torch.tensor([0.5, -0.25, 1.0], dtype=torch.float32).numpy().tobytes()
+    torch.testing.assert_close(voice_prompt_samples(reference, 8), torch.tensor([0.5, -0.25]))

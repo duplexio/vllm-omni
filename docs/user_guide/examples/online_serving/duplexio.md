@@ -75,65 +75,20 @@ The client prints the user and agent transcripts and saves the received PCM. The
 it closes the session to release its state. `--seconds` sets how long the client
 streams input, including the silence after the question. It does not end the answer.
 
-## Test ten spoken questions
-
-The inference test starts the server and makes ten spoken questions with Kokoro on
-the CPU. It opens a new user-first realtime session for each question. The
-questions go from simple arithmetic to reasoning, and the last one is an MMLU-style
-biology question.
-
-Install Kokoro and its English tokenizer assets in the serving environment, then
-run the test:
-
-```bash
-uv pip install kokoro==0.9.4 'misaki[en]==0.9.4'
-uv pip install 'https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl'
-bash examples/online_serving/duplexio/test_inference.sh
-```
-
-The test writes to `outputs/duplexio-inference/<timestamp>/`:
-
-- `server.log`, `server-command.txt`, `results.json` and the voice reference.
-- One numbered folder per question, with `question.txt`, `input.wav`, `answer.wav`
-  and `result.json`.
-
-The script stops the server when it finishes. If a request fails, the script
-continues with the next question and exits with a nonzero status at the end. A
-request counts as successful when the server returns audio and text. You still
-have to check answer correctness and audio quality yourself.
-
-To change the prompts, edit `examples/online_serving/duplexio/questions.json`. You
-can also give an output folder and a question file as the first two script
-arguments. The script passes all further arguments to `run_questions.py`, for
-example `--instructions`. A question can also be an object with `text` and an
-`answer` letter, as in `mmlu_questions.json`. The script then records the predicted
-letter and prints the number of correct answers.
-
-- `KOKORO_ASSETS=/path/to/kokoro` uses local Kokoro assets.
-- `DUPLEXIO_PORT` sets another server port.
-- `--text-only` types each question instead of speaking it. See
-  [Text-only sessions](#text-only-sessions).
-
-Each question gets thirty seconds of silence after its audio ends. The script pins
-the v7 checkpoint revision.
-
 ## Run the MMLU benchmark
 
 This benchmark scores the DuplexIO text channel on 100 MMLU questions. It types the
-questions instead of speaking them. You need the [serving environment](#install)
-and Kokoro from the [spoken-question test](#test-ten-spoken-questions). Kokoro still
-makes the speaker reference.
+questions into text-only sessions with greedy agent text and no voice prompt. You
+need only the [serving environment](#install).
 
-1. Score DuplexIO. The script starts the server, runs every question in a text-only
-   session and stops the server:
+1. Score DuplexIO. The script starts the server, runs every question and stops the
+   server:
 
    ```bash
-   bash examples/online_serving/duplexio/test_inference.sh outputs/mmlu100-duplexio \
-       examples/online_serving/duplexio/mmlu100_questions.json \
-       --text-only --greedy --response-seconds 12 --instructions "You are a helpful voice assistant."
+   bash examples/online_serving/duplexio/run_mmlu.sh outputs/mmlu100-duplexio
    ```
 
-2. Optional: score the backbone on the same questions as a reference:
+2. Optionally, score the backbone on the same questions as a reference:
 
    ```bash
    python examples/online_serving/duplexio/mmlu_baseline.py \
@@ -147,14 +102,16 @@ makes the speaker reference.
 On the DCAI cluster, submit step 1 from the repository root instead:
 
 ```bash
-sbatch examples/online_serving/duplexio/questions.sbatch \
-    "$PWD/examples/online_serving/duplexio/mmlu100_questions.json" \
-    --text-only --greedy --response-seconds 12 --instructions "You are a helpful voice assistant."
+sbatch examples/online_serving/duplexio/mmlu.sbatch
 ```
 
 The job log is `outputs/duplexio-inference/<job id>.log`. The results go to
-`outputs/duplexio-inference/<job id>/`. For a different sample, use your own
-question file.
+`outputs/duplexio-inference/<job id>/`.
+
+Both scripts take a question file as an argument and pass further arguments to
+`run_questions.py`. Use `--limit N` to run only the first N questions. A question
+is an object with `text` and an `answer` letter. Set `DUPLEXIO_PORT` to use another
+server port.
 
 ## How the MMLU benchmark works
 
@@ -167,15 +124,20 @@ Spoken questions mix several problems:
 The benchmark types the questions, so it measures only what the model knows. Each
 question runs in a [text-only session](#text-only-sessions):
 
+- The prefix holds only the system prompt. There is no voice prompt, because
+  text-only training had none. A pinned voice clip is context that every answer
+  token can attend to, and it changed some answers in tests.
 - The question goes into the user text cell, one token per frame, with audio off.
   DuplexIO's text-only chat training uses the same layout.
-- The server forces the agent to emit on every frame. The speak/wait head never
-  trained on text-only frames. Its probability follows word pacing, not the end of
-  an answer. It is low before a new word and high inside a word. So the model
-  cannot end the reply itself.
-- `--response-seconds` ends the reply instead. At one token per 80 ms frame, 12 s
-  is about 150 tokens. Replies that run longer tend to loop.
-- `--greedy` takes the most likely agent token instead of the trained sampling.
+- The agent text is greedy. The model always takes its most likely token.
+- The server forces the agent to emit on every frame. This is a workaround. The
+  speak/wait head never trained on text-only frames, and its probability follows
+  word pacing, not the end of an answer. It is low before a new word and high inside
+  a word. So the model cannot end the reply itself.
+- `--response-seconds` cuts the reply instead. At one token per 80 ms frame, 12 s
+  is about 150 tokens. Most replies commit to a letter within 15 tokens, but a
+  reply that reasons first can get cut before it answers. Replies that run longer
+  tend to loop.
 - `answer_letter_in` in `run_questions.py` finds the first option letter that the
   reply commits to.
 - The centered score is `(accuracy - 1/4) / (1 - 1/4)`. Random guessing gives 0
@@ -185,6 +147,28 @@ question runs in a [text-only session](#text-only-sessions):
 questions and 150-token budget, with thinking off and greedy sampling.
 `mmlu100_questions.json` is a seeded sample of the `cais/mmlu` test split.
 
+### Reply length in audio sessions
+
+In audio sessions the speak/wait head works as trained, and the model ends its own
+reply. A test ran `client.py --ref-audio --user-audio --seconds 90` with three
+spoken prompts:
+
+| Prompt | Agent text | Ended by itself |
+|---|---|---|
+| Tell me a long story about a lighthouse keeper. | 314 tokens, 0.5 to 89.5 s | No. The story continued at 90 s. |
+| Explain how photosynthesis works. | 172 tokens, 1.3 to 89.1 s | No. The list continued at 90 s. |
+| What is the capital of France? | 57 tokens, 3.9 to 26.4 s | Yes. |
+
+The agent text arrives in bursts while the speech catches up. Inside one answer, the
+gaps between bursts were up to 8 s. After the short answer, no text came for 17 s.
+So a stop rule has to watch the text, not the audio. After the answer ended, the
+agent audio kept making speech-like sound with no text behind it. The agent produced
+about 3.5 tokens per second, against 12.5 in a forced text-only session.
+
+The MMLU benchmark stays text-only for now. Audio sessions need a voice reference
+and run about 3.5 times slower. Spoken questions also make the agent take its turn
+at the first pause, before it hears the options.
+
 ## Realtime protocol
 
 Connect to `/v1/realtime?duplex=1&model=duplexio/duo-4b&autostart=0`. Then send
@@ -193,7 +177,7 @@ Connect to `/v1/realtime?duplex=1&model=duplexio/duo-4b&autostart=0`. Then send
 - `full_duplex: true`
 - `auto_response: true`
 - `start_role: "user"` or `"agent"`
-- the voice: `ref_audio_data` (base64 little-endian float32 PCM),
+- the voice, as base64 little-endian float32 PCM in `ref_audio_data`, with
   `ref_audio_format: "pcm_f32le"` and `ref_audio_sample_rate: 24000`
 
 Wait for `session.updated`. Then send `input_audio_buffer.append` events with 1,920
@@ -213,10 +197,11 @@ describe the numerical and state contracts.
 
 ### Text-only sessions
 
-Set `extra_body.text_only: true` and `start_role: "user"`. Then send
+Set `extra_body.text_only: true` and `start_role: "user"`, and send no
+`ref_audio_data`. The server rejects a voice reference in a text-only session, so
+the prefix holds only the system prompt, as in text-only training. Then send
 `{"type": "input_text.append", "text": ...}`. The server writes the text into the
-user cell, one token per frame, with audio off. DuplexIO's text-only chat training
-uses the same layout.
+user cell, one token per frame, with audio off.
 
 Keep sending `input_audio_buffer.append` frames to move the reply forward, one frame
 per event. Silent frames are enough. The server ignores their audio and decodes no
@@ -228,4 +213,5 @@ that the server adds itself. The reply continues until you stop sending frames.
 Each transcript delta carries `agent_emit_logprob`, the head's own log probability
 of speaking on that frame.
 
-To try it, run `client.py --user-text "..."`. Add `--greedy` for greedy agent text.
+To try it, run `client.py --user-text "..."`. The client asks for greedy agent text
+in text-only sessions. `run_questions.py` does the same for every question in a file.

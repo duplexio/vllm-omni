@@ -163,6 +163,36 @@ def test_reference_frame_count_is_decided_at_ingestion() -> None:
     assert pcm == raw
 
 
+def test_text_only_sessions_take_no_voice_prompt() -> None:
+    hf_config = SimpleNamespace(voice_prompt_max_frames=2)
+    config = DuplexSessionConfig(extra_body={"full_duplex": True, "text_only": True})
+    assert _voice_prompt_from_session(config, hf_config, text_only=True) == (b"", 0)
+    with pytest.raises(DuplexIOClientRuntimeConfigError) as exc_info:
+        _voice_prompt_from_session(config, hf_config)
+    assert exc_info.value.code == "ref_audio_required"
+    reference = base64.b64encode(bytes(4 * DUPLEXIO_FRAME_SIZE)).decode("ascii")
+    with_reference = DuplexSessionConfig(extra_body={"full_duplex": True, "text_only": True, "ref_audio_data": reference})
+    with pytest.raises(DuplexIOClientRuntimeConfigError) as exc_info:
+        _voice_prompt_from_session(with_reference, hf_config, text_only=True)
+    assert exc_info.value.code == "ref_audio_text_only"
+
+
+def test_text_only_prefix_has_no_voice_prompt_frames() -> None:
+    adapter = DuplexIOServingRuntimeAdapter(lambda *_args: None)
+    runtime_config = {
+        "duplexio_system_token_ids": [41, 42],
+        "duplexio_voice_prompt_frames": 0,
+        "duplexio_text_only": True,
+    }
+    (payload,) = adapter.initial_data_plane_payloads(SimpleNamespace(runtime_config=runtime_config, turn_id=0))
+    assert payload["frame_count"] == 2
+    for invalid in ({"duplexio_text_only": False}, {"duplexio_voice_prompt_frames": 1}):
+        with pytest.raises(RuntimeError, match="invalid voice-prompt frames"):
+            adapter.initial_data_plane_payloads(
+                SimpleNamespace(runtime_config={**runtime_config, **invalid}, turn_id=0)
+            )
+
+
 @pytest.mark.parametrize("replacement", [None, "same", "different", "invalid"])
 def test_reference_update_checks_original_audio(replacement: str | None) -> None:
     raw = base64.b64decode(reference_audio())

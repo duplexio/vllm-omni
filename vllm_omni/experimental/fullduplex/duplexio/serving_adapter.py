@@ -188,6 +188,7 @@ class DuplexIOServingRuntimeAdapter:
         voice_prompt, voice_prompt_frames = _voice_prompt_from_session(
             config,
             hf_config,
+            text_only=text_only,
         )
 
         depth = getattr(hf_config, "depth_transformer_config", {})
@@ -312,9 +313,11 @@ class DuplexIOServingRuntimeAdapter:
         if not isinstance(turn_id, int):
             raise RuntimeError("DuplexIO session is missing an integer turn_id")
         prompt_frames = runtime_config.get("duplexio_voice_prompt_frames")
-        if not isinstance(prompt_frames, int) or prompt_frames < 1:
+        # Text-only sessions have no voice prompt, matching text-only training.
+        text_only = runtime_config.get("duplexio_text_only", False)
+        if not isinstance(prompt_frames, int) or (prompt_frames != 0 if text_only else prompt_frames < 1):
             raise RuntimeError(
-                "DuplexIO session runtime_config has no pinned voice-prompt frames"
+                "DuplexIO session runtime_config has invalid voice-prompt frames"
             )
         payload = prefix_payload(prompt_frames, len(system_token_ids), decode_audio=True)
         payload["duplex_turn_id"] = turn_id
@@ -593,8 +596,13 @@ def render_tool_system_prompt(
 def _voice_prompt_from_session(
     config: DuplexSessionConfig,
     hf_config: object,
+    *,
+    text_only: bool = False,
 ) -> tuple[bytes, int]:
-    """Decode reference PCM and decide its pinned frame count at ingestion."""
+    """Decode reference PCM and decide its pinned frame count at ingestion.
+
+    Text-only sessions take no reference: text-only training had no voice prompt.
+    """
     extra_body = config.extra_body
     for rejected in ("ref_audio_path", "tts_ref_audio_path"):
         if rejected in extra_body or getattr(config, rejected, None):
@@ -604,6 +612,13 @@ def _voice_prompt_from_session(
                 code="ref_audio_path_rejected",
             )
     audio_data = extra_body.get("ref_audio_data")
+    if text_only:
+        if audio_data is not None:
+            raise DuplexIOClientRuntimeConfigError(
+                "DuplexIO text-only sessions take no ref_audio_data",
+                code="ref_audio_text_only",
+            )
+        return b"", 0
     if not isinstance(audio_data, str) or not audio_data:
         raise DuplexIOClientRuntimeConfigError(
             "DuplexIO requires ref_audio_data: base64 pcm_f32le reference audio "

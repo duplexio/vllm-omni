@@ -1410,10 +1410,14 @@ class DuplexIOForConditionalGeneration(
         reference = runtime_config["duplexio_voice_prompt_pcm"]
         prompt_frames = runtime_config["duplexio_voice_prompt_frames"]
         assert isinstance(reference, bytes)
-        assert isinstance(prompt_frames, int) and 1 <= prompt_frames <= self.config.voice_prompt_max_frames
+        # Text-only sessions have no voice prompt, matching text-only training.
+        text_only = bool(runtime_config.get("duplexio_text_only", False))
+        assert isinstance(prompt_frames, int) and (
+            prompt_frames == 0 if text_only else 1 <= prompt_frames <= self.config.voice_prompt_max_frames
+        )
         prompt_bytes = prompt_frames * self.config.frame_size * 4
         assert len(reference) >= prompt_bytes and len(reference) % 4 == 0
-        samples = torch.frombuffer(bytearray(reference[:prompt_bytes]), dtype=torch.float32)
+        samples = voice_prompt_samples(reference, prompt_bytes)
         if device.type == "cuda":
             # A pageable copy would wait for the queued backbone.
             samples = samples.pin_memory()
@@ -1771,6 +1775,13 @@ def _to_device(values: list[Any], dtype: torch.dtype, device: torch.device) -> T
 
 def _text_only(info: Mapping[str, Any]) -> bool:
     return bool(info["duplex"]["runtime_config"].get("duplexio_text_only", False))
+
+
+def voice_prompt_samples(reference: bytes, prompt_bytes: int) -> Tensor:
+    """The pinned reference as float32 samples; text-only sessions have none, which torch.frombuffer rejects."""
+    if not prompt_bytes:
+        return torch.empty(0, dtype=torch.float32)
+    return torch.frombuffer(bytearray(reference[:prompt_bytes]), dtype=torch.float32)
 
 
 def sample_tool_token(

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Start DuplexIO, ask ten spoken questions, and save inputs and answers.
-# Usage: ./test_inference.sh [output-directory] [questions.json] [run_questions.py options...]
+# Start DuplexIO and score its text channel on MMLU in text-only sessions (greedy, no voice prompt).
+# Usage: ./run_mmlu.sh [output-directory] [questions.json] [run_questions.py options, e.g. --limit 50]
 set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 out=${1:-outputs/duplexio-inference/$(date +%Y%m%d-%H%M%S)}
-questions=${2:-$script_dir/questions.json}
+questions=${2:-$script_dir/mmlu100_questions.json}
 model=${DUPLEXIO_MODEL:-duplexio/duo-4b}
 revision=${DUPLEXIO_REVISION:-80de418a31334c737100afe767a08b1a27f6ee1a}
 port=${DUPLEXIO_PORT:-8099}
@@ -60,6 +60,6 @@ if [[ "$ready" != true ]]; then
     echo "Server startup timed out; inspect $out/server.log" >&2
     exit 1
 fi
-echo "Server healthy. Running spoken questions."
+echo "Server healthy. Running text-only questions."
 python "$script_dir/run_questions.py" --model "$model" --url "ws://127.0.0.1:$port" \
     --questions "$questions" --output-dir "$out" "${@:3}"
