@@ -440,8 +440,12 @@ class FastConformerEncoder(nn.Module):
         self.feature_n_fft = feature_extractor.n_fft
         self.feature_win_length = feature_extractor.win_length
         self.feature_preemphasis = feature_extractor.preemphasis
-        # Signal-processing constants stay FP32, independently of model precision.
-        self.register_buffer("mel_filters", feature_extractor.mel_filters.float())
+        # Signal-processing constants stay FP32, independently of model precision,
+        # and live where the model is built, like the window.
+        self.register_buffer(
+            "mel_filters",
+            torch.as_tensor(feature_extractor.mel_filters, dtype=torch.float32, device=torch.get_default_device()),
+        )
         self.register_buffer(
             "stft_window", torch.hann_window(feature_extractor.win_length, periodic=False, dtype=torch.float32)
         )
