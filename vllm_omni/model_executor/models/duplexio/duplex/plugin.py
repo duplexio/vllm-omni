@@ -14,7 +14,7 @@ import base64
 import binascii
 import secrets
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionToolsParam
@@ -99,6 +99,15 @@ def stage_sampling_params(defaults: tuple[object, ...]) -> tuple[object, ...]:
     return tuple(configured)
 
 
+class GivenFrame(TypedDict):
+    """One frame of conversation history, in place of the model's prediction for it."""
+
+    user_token_id: int
+    agent_token_id: int
+    tool_call_token_id: int
+    agent_pcm: bytes  # One frame of float32 agent audio at the model's sample rate.
+
+
 def append_fields(
     runtime_config: Mapping[str, Any],
     pcm: bytes,
@@ -107,11 +116,14 @@ def append_fields(
     tool_token_ids: list[int],
     tool_generation: int,
     decode_audio: bool,
+    given_frame: GivenFrame | None = None,
 ) -> tuple[list[int], dict[str, object]]:
     """Scheduler slots and worker fields of one append.
 
     Rows are ``[voice prompt + system tokens if prefix] + [live frame] +
-    [tool-result tokens]``, six scheduler slots each.
+    [tool-result tokens]``, six scheduler slots each. A ``given_frame`` replays
+    conversation history: the live frame hears its tokens and agent audio instead
+    of the model's last prediction. Given frames must lead the conversation.
     """
     prefix_frames = (
         runtime_config["duplexio_voice_prompt_frames"] + len(runtime_config["duplexio_system_token_ids"])
@@ -127,6 +139,7 @@ def append_fields(
         "duplexio_tool_token_ids": tool_token_ids,
         "duplexio_tool_generation": tool_generation,
         "decode_audio": decode_audio,
+        "duplexio_given_frame": given_frame,
     }
 
 
@@ -557,4 +570,4 @@ def render_tool_system_prompt(tokenizer: Any, system_prompt: str, tools: list[di
     return "\n".join(blocks)
 
 
-__all__ = ["DuplexIODuplexPlugin", "append_fields", "stage_sampling_params"]
+__all__ = ["DuplexIODuplexPlugin", "GivenFrame", "append_fields", "stage_sampling_params"]

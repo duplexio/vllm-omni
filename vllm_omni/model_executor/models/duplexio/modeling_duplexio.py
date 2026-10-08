@@ -193,6 +193,9 @@ class DuplexIORequestState:
     # Keys in the never-expiring cache region: voice prompt, then emitted text.
     persistent_keys: int = 0
     tool_call_sequence: int = 0
+    # Every live frame so far had given inputs. Only given agent audio advances
+    # the input codec, so a given frame may not follow a sampled one.
+    history_open: bool = True
     sampling: RequestSampling | None = None
     # The step whose sampled ids this request still waits for on the host.
     pending_output: DuplexIOStepOutput | None = None
@@ -626,6 +629,12 @@ class DuplexIOForConditionalGeneration(
         if prefix and state.frames_seen != frame_start:
             raise ValueError("DuplexIO prefix must lead the request exactly once")
         live_row = prefix_count - frame_start if frame_start <= prefix_count < frame_end else None
+        given = duplex.get("duplexio_given_frame")
+        if live_row is not None:
+            if given is None:
+                state.history_open = False
+            else:
+                self.validate_given_frame(given, state)
         if live_row is not None and frame_count == 1:
             agent_codes = state.agent_audio_codes.unsqueeze(0)
         else:
@@ -637,6 +646,17 @@ class DuplexIOForConditionalGeneration(
             max(0, min(frame_end, prompt_count) - frame_start), live_row, None, agent_codes,
         )
 
+    def validate_given_frame(self, given: Mapping[str, Any], state: DuplexIORequestState) -> None:
+        """A live frame whose inputs are given: conversation history replayed before the model runs free."""
+        if not state.history_open:
+            raise ValueError("DuplexIO given frames must lead the conversation, before any sampled frame")
+        if state.tool_call_constraint is not None and state.tool_call_constraint.enabled:
+            raise ValueError("DuplexIO given frames need a session without tools")
+        if given["tool_call_token_id"] != self.silence_token_id:
+            raise ValueError("DuplexIO given frames cannot hold tool calls")
+        if len(given["agent_pcm"]) != self.config.frame_size * 4:
+            raise ValueError(f"DuplexIO given agent audio must be one {self.config.frame_size}-sample float32 frame")
+
     @torch.inference_mode()
     def prepare_audio_requests(
         self, requests: list[tuple[int, dict[str, Any]]], device: torch.device,
@@ -645,6 +665,11 @@ class DuplexIOForConditionalGeneration(
         live = {
             index: info["duplex"]["pcm"] for index, (_, info) in enumerate(requests)
             if prepared[index].live_row is not None
+        }
+        # Agent audio of the given live frames, heard instead of the last prediction.
+        given = {
+            index: info["duplex"]["duplexio_given_frame"]["agent_pcm"] for index, (_, info) in enumerate(requests)
+            if prepared[index].live_row is not None and info["duplex"].get("duplexio_given_frame") is not None
         }
         # The user encoder reads only this step's audio and its own caches, so on
         # CUDA it runs on a side stream, overlapping the previous step's backbone.
@@ -657,13 +682,15 @@ class DuplexIOForConditionalGeneration(
                 # One upload for the step. A blocking one waits for every queued
                 # kernel, including the previous step's; a pageable non_blocking one
                 # stages the bytes and returns at once.
-                pcm = torch.frombuffer(bytearray().join(live.values()), dtype=torch.float32)
-                sizes = [len(chunk) // pcm.element_size() for chunk in live.values()]
-                live = dict(zip(live, pcm.to(device, non_blocking=True).split(sizes), strict=True))
+                chunks = [*live.values(), *given.values()]
+                pcm = torch.frombuffer(bytearray().join(chunks), dtype=torch.float32)
+                sizes = [len(chunk) // pcm.element_size() for chunk in chunks]
+                uploaded = pcm.to(device, non_blocking=True).split(sizes)
+                live = dict(zip(live, uploaded[:len(live)], strict=True))
+                given = dict(zip(given, uploaded[len(live):], strict=True))
             acoustic = []
             user_waveforms = []
-            prompt_indices = []
-            prompt_waveforms = []
+            prompt_waveforms: dict[int, Tensor] = {}
             for index, item in enumerate(prepared):
                 # Acoustic rows, in stream order: the slice's voice-prompt rows
                 # hear silence, then the live row hears the client.
@@ -672,8 +699,7 @@ class DuplexIOForConditionalGeneration(
                     start = item.frame_start * self.config.frame_size
                     count = item.prompt_chunk_frames * self.config.frame_size
                     prompt_waveform = item.state.voice_prompt[start:start + count]
-                    prompt_indices.append(index)
-                    prompt_waveforms.append(prompt_waveform)
+                    prompt_waveforms[index] = prompt_waveform
                     waveforms.append(torch.zeros_like(prompt_waveform))
                 if index in live:
                     waveforms.append(live[index])
@@ -686,15 +712,26 @@ class DuplexIOForConditionalGeneration(
         if cuda and acoustic:
             main = torch.cuda.current_stream(device)
             main.wait_stream(self.user_audio_stream)
-            for features in user_features:
+            for features in (*user_features, *given.values()):
                 features.record_stream(main)
         for index, features in zip(acoustic, user_features, strict=True):
             prepared[index].user_features = self.place_user_features(prepared[index], features)
-        if prompt_indices:
-            states = [prepared[index].state for index in prompt_indices]
-            codes = self.encode_agent_audio_batch(prompt_waveforms, states)
-            for index, audio in zip(prompt_indices, codes, strict=True):
-                prepared[index].agent_codes = torch.cat((audio, prepared[index].agent_codes[audio.shape[0]:]))
+        # The agent codec hears, in stream order, the slice's voice-prompt rows and
+        # then a given live frame, exactly as training encodes a conversation.
+        heard = sorted({*prompt_waveforms, *given})
+        if heard:
+            waveforms = [
+                torch.cat([waveform for waveform in (prompt_waveforms.get(index), given.get(index)) if waveform is not None])
+                for index in heard
+            ]
+            codes = self.encode_agent_audio_batch(waveforms, [prepared[index].state for index in heard])
+            for index, audio in zip(heard, codes, strict=True):
+                item = prepared[index]
+                voice = item.prompt_chunk_frames
+                item.agent_codes = torch.cat((audio[:voice], item.agent_codes[voice:]))
+                if index in given:
+                    assert item.live_row is not None
+                    item.agent_codes[item.live_row] = audio[voice]
         return prepared
 
     def place_user_features(self, item: PreparedAudio, features: Tensor) -> Tensor:
@@ -762,7 +799,11 @@ class DuplexIOForConditionalGeneration(
                 elif frame < item.prefix_count:
                     text.append((state.system_token_ids[frame - item.prompt_count], *quiet))
                 elif frame == item.prefix_count:
-                    text.append((silence, *state.text_input_ids[1:]))
+                    given = duplex.get("duplexio_given_frame")
+                    if given is None:
+                        text.append((silence, *state.text_input_ids[1:]))
+                    else:
+                        text.append((silence, given["user_token_id"], given["agent_token_id"], given["tool_call_token_id"]))
                 else:
                     text.append((tool_ids[frame - item.prefix_count - 1], *quiet))
             rows.extend(
@@ -1107,6 +1148,7 @@ class DuplexIOForConditionalGeneration(
             frames.append([
                 duplex.get("epoch", 0), duplex.get("turn_id", 0),
                 duplex["duplexio_prefix"], bool(duplex["duplexio_tool_token_ids"]), duplex["duplexio_tool_generation"],
+                duplex.get("duplexio_given_frame") is not None,
                 bool(duplex.get("final", False)), predicting,
                 predicting and agent_token_id == silence and tool_token_id == silence,
                 tool_call is not None, row in drawn_tool_emits, predicting and user_token_id != silence,

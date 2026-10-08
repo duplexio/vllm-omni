@@ -267,6 +267,64 @@ def test_prefix_encodes_the_speaker_prompt_then_the_first_live_frame() -> None:
     torch.testing.assert_close(model.audio_codec.waveforms[0], torch.ones(2 * 1920))
 
 
+def given_info(state: DuplexIORequestState, agent_pcm: Tensor, *, prefix: bool = False, **frame: int):
+    """An append whose live frame replays history: ``frame`` names its given token ids."""
+    info = append_info(state, prefix=prefix)
+    info["duplex"]["duplexio_given_frame"] = {
+        "user_token_id": 2, "agent_token_id": 2, "tool_call_token_id": 2,
+        **frame, "agent_pcm": agent_pcm.numpy().tobytes(),
+    }
+    return info
+
+
+@torch.inference_mode()
+def test_given_frames_replay_history_through_the_voice_prompt_codec_stream() -> None:
+    model = model_fixture()
+    first, second = torch.randn(1920), torch.randn(1920)
+    _, _, update = model.preprocess(
+        torch.zeros(36, dtype=torch.long), None,
+        **given_info(request_state(model), first, prefix=True, user_token_id=9, agent_token_id=12),
+    )
+    replay = update["duplexio_replay"]
+    assert replay["text_ids"].tolist()[-1] == [2, 9, 12, 2]
+    # The codec hears the voice prompt, then the given agent frame, as one stream.
+    torch.testing.assert_close(replay["agent_audio"][:2], torch.tensor([[1, 64, 64], [2, 1, 1]]))
+    torch.testing.assert_close(replay["agent_audio"][-1], torch.tensor([3, 2, 2]))
+    torch.testing.assert_close(model.audio_codec.waveforms[0], torch.cat((torch.ones(2 * 1920), first)))
+    state = update["duplexio_working_state"]
+    assert state.input_mimi.encoder_transformer.position == 3
+    assert state.persistent_keys == 7  # Two prompt keys, three system tokens, then the given user and agent text.
+    # A sampled prediction is waiting; the next given frame replaces it.
+    state.text_input_ids = (2, 5, 6, 2)
+    state.agent_audio_codes = torch.tensor([7, 7, 7])
+    _, _, update = model.preprocess(
+        torch.zeros(6, dtype=torch.long), None, **given_info(state, second, agent_token_id=13),
+    )
+    replay = update["duplexio_replay"]
+    assert replay["text_ids"].tolist() == [[2, 2, 13, 2]]
+    torch.testing.assert_close(replay["agent_audio"], torch.tensor([[4, 3, 3]]))
+    torch.testing.assert_close(model.audio_codec.waveforms[1], second)
+    assert update["duplexio_working_state"].audio_position == 2
+
+
+@torch.inference_mode()
+def test_given_frames_must_lead_and_hold_no_tool_calls() -> None:
+    model = model_fixture()
+    _, _, update = model.preprocess(torch.zeros(36, dtype=torch.long), None, **append_info(request_state(model), prefix=True))
+    sampled = update["duplexio_working_state"]
+    assert not sampled.history_open
+    with pytest.raises(ValueError, match="lead the conversation"):
+        model.preprocess(torch.zeros(6, dtype=torch.long), None, **given_info(sampled, torch.zeros(1920)))
+    fresh = request_state(model)
+    with pytest.raises(ValueError, match="tool calls"):
+        model.preprocess(
+            torch.zeros(36, dtype=torch.long), None,
+            **given_info(fresh, torch.zeros(1920), prefix=True, tool_call_token_id=6),
+        )
+    with pytest.raises(ValueError, match="one 1920-sample"):
+        model.preprocess(torch.zeros(36, dtype=torch.long), None, **given_info(fresh, torch.zeros(960), prefix=True))
+
+
 @pytest.mark.parametrize(
     "frames,frames_seen,match",
     [(1, 0, "do not match"), (5, 0, "do not match"), (7, 0, "do not match"), (6, 6, "exactly once")],

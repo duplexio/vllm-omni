@@ -22,6 +22,7 @@ FRAME_FIELDS = (
     "prefix",  # The append carried the voice prompt and system tokens.
     "tool_result",  # The append carried tool-result rows after its live frame,
     "tool_generation",  # the newest of which had this generation.
+    "given",  # The live frame heard given history instead of the last prediction.
     "end_of_turn",
     "predicted",
     "model_listen",
@@ -36,7 +37,7 @@ FRAME_FIELDS = (
 )
 FRAME_INDEX = {name: index for index, name in enumerate(FRAME_FIELDS)}
 FRAME_FLAGS = frozenset({
-    "prefix", "tool_result", "end_of_turn", "predicted", "model_listen", "tool_call_complete",
+    "prefix", "tool_result", "given", "end_of_turn", "predicted", "model_listen", "tool_call_complete",
     "tool_emit_sampled", "user_emit",
 })
 # ``tool_emit_sampled`` marks frames whose tool emit was drawn; inside a call or
