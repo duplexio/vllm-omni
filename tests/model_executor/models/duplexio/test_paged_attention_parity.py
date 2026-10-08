@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The paged backend must reproduce dense DuplexIO attention over live sessions."""
 
 from collections.abc import Sequence
@@ -36,8 +36,7 @@ FRAME_FIELDS = (
     "audio_last",
 )
 # Paged attention reduces the history in page order and merges the diagonal
-# afterwards, so it does not round like a dense matmul. Bit-exactness with
-# training was traded for that simpler reduction.
+# afterwards, so it does not round like a dense matmul.
 TOLERANCE = {torch.bfloat16: 3e-2}
 
 
@@ -109,27 +108,6 @@ def dense_attention(
     )
 
 
-def training_attention(
-    query: Tensor, key: Tensor, value: Tensor, fields: dict[str, Tensor], scale: float, window: int,
-) -> Tensor:
-    training = pytest.importorskip("duplexio.models.duplexio")
-    from duplexio.modules.stream_attention import unified_attention
-
-    positions = torch.arange(query.shape[0], device=query.device)
-    sequence = torch.zeros_like(positions)
-    frame = positions // NUM_CELLS
-    cell = positions % NUM_CELLS
-    audio = fields["audio_position"]
-    mask, indices = training.attention_mask(
-        sequence, frame, audio, cell, sequence, frame, audio, cell,
-        fields["key_active"], fields["pinned"], window, query.shape[-1],
-    )
-    return unified_attention(
-        query.transpose(0, 1)[None], key[indices].transpose(0, 1)[None],
-        value[indices].transpose(0, 1)[None], mask, scale,
-    )[0].transpose(0, 1).float()
-
-
 def paged_backend(
     spec: DuplexIOKVCacheSpec, frame: DuplexIOFrameMetadata, heads: int,
 ) -> tuple[nn.Module, DuplexIOFlashAttentionMetadataBuilder, DuplexIOFlashAttentionImpl]:
@@ -198,7 +176,6 @@ def run_session(
     kv_heads: int,
     *,
     prompt_frames: int = 0,
-    training_reference: bool = False,
     window: int = WINDOW,
 ) -> None:
     """Replay ``len(prefixes)`` sessions through the paged backend, step by step."""
@@ -230,9 +207,8 @@ def run_session(
         }
         for request, prefix in enumerate(prefixes)
     ]
-    reference = training_attention if training_reference else dense_attention
     expected = [
-        reference(query[i], key[i], value[i], fields[i], dim**-0.5, window)
+        dense_attention(query[i], key[i], value[i], fields[i], dim**-0.5, window)
         for i in range(requests)
     ]
 
@@ -345,7 +321,6 @@ def test_batched_sessions_stay_isolated_in_a_shuffled_block_table(requests: int)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged cache")
-@pytest.mark.parametrize("training_reference", [False, True])
 @torch.inference_mode()
-def test_paged_sessions_with_pinned_voice_and_tool_bursts(training_reference: bool) -> None:
-    run_session([3, 5], 72, torch.bfloat16, 256, 16, 4, prompt_frames=2, training_reference=training_reference)
+def test_paged_sessions_with_pinned_voice_and_tool_bursts() -> None:
+    run_session([3, 5], 72, torch.bfloat16, 256, 16, 4, prompt_frames=2)

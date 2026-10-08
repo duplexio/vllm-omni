@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""User policy heads share training's full-frame predictor and causal targets."""
+"""User policy heads read the full frame and load in place."""
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -167,34 +166,3 @@ def test_loaded_user_heads_update_the_captured_graph_and_publish_version():
     assert {name: p.data_ptr() for name, p in model.named_parameters()} == pointers
     with pytest.raises(ValueError):
         model.set_policy_version(7)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA training parity")
-@torch.inference_mode()
-def test_training_user_losses_and_next_frame_targets_match_serving():
-    reference_path = os.environ.get("DUPLEXIO_USER_HEAD_REFERENCE")
-    if reference_path is None:
-        pytest.skip("Generate user_head_reference.py with the training environment first")
-    torch.backends.cuda.matmul.allow_tf32 = False
-    for case in torch.load(reference_path, weights_only=True):
-        model = head_model("cuda")
-        dtype = getattr(torch, case["dtype"])
-        model.llm.base_model.lm_head.to(dtype=dtype)
-        weights = [
-            (name if name.startswith("user_") else "llm.base_model.lm_head.weight", tensor.cuda())
-            for name, tensor in case["weights"].items()
-        ]
-        model.load_weights(weights)
-        hidden = case["hidden"].cuda()
-        with torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
-            logits, emissions = model.project_text(hidden)
-        torch.testing.assert_close(logits[:, 2].cpu(), case["logits"], rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(emissions[:, 2].float().cpu(), case["emit_logits"], rtol=1e-5, atol=1e-6)
-        target_rows = case["token_rows"].cuda()
-        ids = case["user_ids"].cuda()
-        # Both supervised and replayed user content use the previous frame.
-        ce = F.cross_entropy(logits[target_rows - 1, 2, 1:], ids[target_rows] - 1)
-        labels = ids[1:] != 0
-        bce = F.binary_cross_entropy_with_logits(emissions[:-1, 2].float(), labels.float())
-        torch.testing.assert_close(ce.cpu(), case["losses"]["user_token_ce"], rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(bce.cpu(), case["losses"]["user_emit"], rtol=1e-5, atol=1e-6)

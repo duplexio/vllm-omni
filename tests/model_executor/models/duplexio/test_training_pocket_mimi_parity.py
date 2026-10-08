@@ -7,7 +7,7 @@ import torch
 
 from vllm_omni.model_executor.models.duplexio.audio_representation import ContinuousAudioRepresentation
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import DuplexIOForConditionalGeneration
-from vllm_omni.model_executor.models.duplexio.pocket_mimi import PocketMimi
+from vllm_omni.model_executor.models.duplexio.pocket_mimi import PocketMimi, StreamingMultiheadAttention
 
 reference = pytest.importorskip("duplexio.modules.continuous_mimi")
 
@@ -111,3 +111,19 @@ def test_streaming_codec_matches_training_and_independent_requests(dtype):
     native.decode(latent[..., 1:2], native_state)
     after, _ = native.decode(latent[..., :1], native_state)
     torch.testing.assert_close(before, after, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_bounded_attention_matches_full_training_history() -> None:
+    torch.manual_seed(12)
+    training = reference.StreamingMultiheadAttention(32, 4, context=7).eval()
+    serving = StreamingMultiheadAttention(32, 4, context=7).eval()
+    serving.load_state_dict(training.state_dict())
+    initial = (2, torch.device("cpu"), torch.float32)
+    training_state = training.get_initial_state(*initial)
+    serving_state = serving.get_initial_state(*initial)
+    for length in (3, 5, 2, 4, 9, 1):
+        hidden = torch.randn(2, length, 32)
+        expected, training_state = training.step(hidden, training_state)
+        actual, serving_state = serving.step(hidden, serving_state)
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)

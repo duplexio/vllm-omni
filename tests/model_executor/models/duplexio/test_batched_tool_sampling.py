@@ -228,7 +228,7 @@ def test_agent_logprobs_match_the_distributions_actually_sampled(device):
     is deterministic given the logits, the emit outcome is recoverable from
     whether the returned id is silence, and a thresholded (greedy) decision has
     probability one. An importance ratio divides by these numbers, so a wrong
-    value here is silently wrong training rather than a crash.
+    value here silently corrupts learning instead of crashing.
     """
     model, infos, vocab = fixture(device, mixed=True)
     inputs = torch.Generator(device=device).manual_seed(97)

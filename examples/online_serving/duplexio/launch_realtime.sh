@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Launch the native DuplexIO server and its realtime web interface.
+# Launch the DuplexIO server and its realtime web interface.
 #
 # Usage:
 #   ./examples/online_serving/duplexio/launch_realtime.sh CHECKPOINT [VOICE]
 #
-# CHECKPOINT is a native export. Its prewarm.wav (mono 24 kHz) warms the first
+# CHECKPOINT is a DuplexIO checkpoint directory. Its prewarm.wav (mono 24 kHz) warms the first
 # session, and its audio clips are offered as voices in the page; VOICE names the
 # clip selected on load. DEPLOY_CONFIG,
 # WEB_HOST (default 127.0.0.1) and WEB_PORT (default 7862) override the defaults.
