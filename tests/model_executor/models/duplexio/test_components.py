@@ -297,18 +297,22 @@ def test_unfinished_tool_context_does_not_run_prediction_heads() -> None:
     assert predictions is None
 
 
-def test_token_heads_load_without_weight_name_mapping() -> None:
+def test_checkpoint_names_map_onto_the_flat_heads() -> None:
     model = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
     nn.Module.__init__(model)
-    model.llm = nn.Module()
-    model.llm.output_head_proj = nn.ModuleDict(
-        {name: nn.Linear(4, 4) for name in ("agent", "tool_call")}
-    )
-    model.user_token_projection = nn.Linear(24, 4)
+    model.lm_head = nn.Linear(4, 8, bias=False)
+    model.channel_emb = nn.Parameter(torch.zeros(4, 4))
+    model.output_head_proj = nn.ModuleDict({name: nn.Linear(4, 4) for name in ("agent", "tool_call")})
     model.user_emit_head = nn.Linear(24, 1)
     weights = {name: torch.randn_like(value) for name, value in model.state_dict().items()}
+    checkpoint = {
+        ("llm.base_model." + name if name.startswith("lm_head") else
+         "llm." + name if name.startswith(("channel_emb", "output_head_proj")) else name): value
+        for name, value in weights.items()
+    }
+    checkpoint["user_asr.model.decoder.weight"] = torch.zeros(1)  # The ASR decoder is never loaded.
 
-    assert model.load_weights(weights.items()) == set(weights)
+    assert model.load_weights(checkpoint.items()) == set(weights)
     for name, value in model.state_dict().items():
         torch.testing.assert_close(value, weights[name])
 

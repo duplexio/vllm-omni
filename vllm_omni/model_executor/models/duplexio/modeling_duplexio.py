@@ -291,44 +291,6 @@ class RequestSampling:
     parameters: tuple[float, ...]  # The row sample_streams reads, without the tool state.
 
 
-class _DuplexIOBaseModel(nn.Module):
-    def __init__(
-        self,
-        *,
-        vllm_config: VllmConfig,
-        prefix: str,
-    ) -> None:
-        super().__init__()
-        config = vllm_config.model_config.hf_text_config
-        self.model = DuplexIOQwenModel(
-            vllm_config=vllm_config,
-            prefix=f"{prefix}.model",
-        )
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=vllm_config.quant_config,
-                prefix=f"{prefix}.lm_head",
-            )
-
-
-class _DuplexIOMultiStreamQwen(nn.Module):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str) -> None:
-        super().__init__()
-        text_config = vllm_config.model_config.hf_text_config
-        self.base_model = _DuplexIOBaseModel(
-            vllm_config=vllm_config,
-            prefix=f"{prefix}.base_model",
-        )
-        self.channel_emb = nn.Parameter(torch.zeros(len(TEXT_STREAM_NAMES), text_config.hidden_size))
-        self.output_head_proj = nn.ModuleDict(
-            {name: nn.Linear(text_config.hidden_size, text_config.hidden_size) for name in OUTPUT_STREAM_NAMES}
-        )
-
-
 class DuplexIOForConditionalGeneration(
     nn.Module,
     HasInnerState,
@@ -383,22 +345,33 @@ class DuplexIOForConditionalGeneration(
         self.sampling_graphs: dict[tuple[int, int | None], FrameInputGraph] = {}
         self.pad_token_id = config.pad_token_id
         self.silence_token_id = config.silence_token_id
+        hidden_size = self.text_config.hidden_size
 
-        self.llm = _DuplexIOMultiStreamQwen(
-            vllm_config=vllm_config,
-            prefix=f"{prefix}.llm" if prefix else "llm",
+        self.model = DuplexIOQwenModel(vllm_config=vllm_config, prefix=f"{prefix}.model" if prefix else "model")
+        if self.text_config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                self.text_config.vocab_size,
+                hidden_size,
+                quant_config=vllm_config.quant_config,
+                prefix=f"{prefix}.lm_head" if prefix else "lm_head",
+            )
+        # Each text cell's stream embedding, and the agent and tool heads' input projections.
+        self.channel_emb = nn.Parameter(torch.zeros(len(TEXT_STREAM_NAMES), hidden_size))
+        self.output_head_proj = nn.ModuleDict(
+            {name: nn.Linear(hidden_size, hidden_size) for name in OUTPUT_STREAM_NAMES}
         )
         # Cell addressing for the backbone's cache, filled once per step and
         # read by every full-attention layer.
-        self.frame = self.llm.base_model.model.frame
-        hidden_size = self.text_config.hidden_size
+        self.frame = self.model.frame
         adapter_hidden_size = config.audio_adapter_config.get("hidden_size") or hidden_size
         self.user_asr = FastConformerEncoder.from_checkpoint(
             config.user_asr_config, vllm_config.model_config.model, revision=vllm_config.model_config.revision,
             use_cuda_graph=self.full_cudagraph_enabled, max_rows=vllm_config.scheduler_config.max_num_seqs,
         )
         self.user_audio_resampler = Resample(SAMPLE_RATE, ASR_SAMPLE_RATE, dtype=torch.float32).to(
-            device=self.llm.channel_emb.device,
+            device=self.channel_emb.device,
         )
         self.audio_codec = PocketMimi()
         self.audio_representation = ContinuousAudioRepresentation(LATENT_DIM)
@@ -430,18 +403,18 @@ class DuplexIOForConditionalGeneration(
         agent_suppressed, tool_suppressed = text_suppression_ids(self.tokenizer, self.silence_token_id)
         self.register_buffer(
             "agent_suppressed_token_ids",
-            torch.tensor(agent_suppressed, dtype=torch.long, device=self.llm.channel_emb.device),
+            torch.tensor(agent_suppressed, dtype=torch.long, device=self.channel_emb.device),
             persistent=False,
         )
         self.register_buffer(
             "tool_suppressed_token_ids",
-            torch.tensor(tool_suppressed, dtype=torch.long, device=self.llm.channel_emb.device),
+            torch.tensor(tool_suppressed, dtype=torch.long, device=self.channel_emb.device),
             persistent=False,
         )
         # The user stream suppresses only the silence token.
         self.register_buffer(
             "user_suppressed_token_ids",
-            torch.tensor([self.silence_token_id], dtype=torch.long, device=self.llm.channel_emb.device),
+            torch.tensor([self.silence_token_id], dtype=torch.long, device=self.channel_emb.device),
             persistent=False,
         )
         vocab_size = self.text_config.vocab_size
@@ -470,7 +443,7 @@ class DuplexIOForConditionalGeneration(
         )
 
     def embed_input_ids(self, input_ids: Tensor) -> Tensor:
-        return self.llm.base_model.model.embed_input_ids(input_ids)
+        return self.model.embed_input_ids(input_ids)
 
     def update_graph_inputs(
         self,
@@ -726,7 +699,7 @@ class DuplexIOForConditionalGeneration(
         packed = torch.tensor(rows, dtype=torch.long).to(device, non_blocking=True)
         text_ids, metadata = packed[:, :len(TEXT_STREAM_NAMES)], packed[:, len(TEXT_STREAM_NAMES):]
         user_features = torch.cat([
-            self.llm.channel_emb.new_zeros(item.frame_count, self.user_asr.output_dim)
+            self.channel_emb.new_zeros(item.frame_count, self.user_asr.output_dim)
             if item.user_features is None else item.user_features
             for item in audio
         ])
@@ -782,12 +755,12 @@ class DuplexIOForConditionalGeneration(
         """
         if not self.full_cudagraph_enabled or self.frame_input_graphs:
             return
-        device = self.llm.channel_emb.device
+        device = self.channel_emb.device
         max_rows = self.vllm_config.scheduler_config.max_num_seqs
         # Silent live frames: text ids, then frame_inputs' metadata.
         silence = (self.silence_token_id,) * len(TEXT_STREAM_NAMES)
         packed = torch.tensor([(*silence, 0, 1, 1, 0, 0)] * max_rows, dtype=torch.long, device=device)
-        user_features = self.llm.channel_emb.new_zeros(max_rows, self.user_asr.output_dim)
+        user_features = self.channel_emb.new_zeros(max_rows, self.user_asr.output_dim)
         agent_latents = self.initial_agent_latents(max_rows)
         for size in range(1, max_rows + 1):
             self.frame_input_graph((packed[:size], user_features[:size], agent_latents[:size]))
@@ -797,7 +770,7 @@ class DuplexIOForConditionalGeneration(
         parameters = torch.tensor(
             [(*sampling.parameters, sampling.flow_temperature, 0)] * max_rows, dtype=torch.float32, device=device,
         )
-        rows = self.llm.channel_emb.new_zeros(max_rows, NUM_CELLS, self.text_config.hidden_size)
+        rows = self.channel_emb.new_zeros(max_rows, NUM_CELLS, self.text_config.hidden_size)
         for size in range(1, max_rows + 1):
             tensors = (rows[:size], parameters[:size], self.allow_all_bitmask[:size])
             self.sampling_graph(tensors, top_k, width)
@@ -809,11 +782,11 @@ class DuplexIOForConditionalGeneration(
         with self.autocast(text_ids):
             user_hidden = self.user_audio_input_adapter(user_features)
             agent_hidden = self.agent_audio_input_adapter(agent_latents)
-        text_hidden = self.llm.base_model.model.embed_input_ids(text_ids.flatten()).view(
+        text_hidden = self.model.embed_input_ids(text_ids.flatten()).view(
             text_ids.shape[0], len(TEXT_STREAM_NAMES), -1
         )
         embeddings, *addressing = self.frame_inputs(
-            text_ids, text_hidden, self.llm.channel_emb, user_hidden, agent_hidden,
+            text_ids, text_hidden, self.channel_emb, user_hidden, agent_hidden,
             self.pad_token_id, self.silence_token_id,
             metadata, self.config.audio_attention_window_frames,
         )
@@ -832,7 +805,7 @@ class DuplexIOForConditionalGeneration(
         del input_ids, positions, intermediate_tensors, kwargs
         assert inputs_embeds is not None
         with torch.profiler.record_function("duplexio.backbone"):
-            return self.llm.base_model.model(
+            return self.model(
                 positions=self.frame.positions[:inputs_embeds.shape[0]] // NUM_CELLS,
                 key_active=self.frame.key_active[: inputs_embeds.shape[0]],
                 inputs_embeds=inputs_embeds,
@@ -1092,12 +1065,12 @@ class DuplexIOForConditionalGeneration(
         """Project the entire request batch before any CPU-side tool decisions."""
         projected = torch.cat(
             (
-                self.llm.output_head_proj["agent"](rows[:, AGENT_CELL]),
-                self.llm.output_head_proj["tool_call"](rows[:, TOOL_CALL_CELL]),
+                self.output_head_proj["agent"](rows[:, AGENT_CELL]),
+                self.output_head_proj["tool_call"](rows[:, TOOL_CALL_CELL]),
                 self.user_token_projection(rows.flatten(1)),
             )
         )
-        logits = self.logits_processor(self.llm.base_model.lm_head, projected)
+        logits = self.logits_processor(self.lm_head, projected)
         logits = logits.view(3, rows.shape[0], -1).transpose(0, 1)
         full_frames = rows.flatten(1)
         emit_logits = torch.cat(
@@ -1301,10 +1274,15 @@ class DuplexIOForConditionalGeneration(
 
     def initial_agent_latents(self, frames: int) -> Tensor:
         """Placeholder before the first prediction and on text-only rows."""
-        return self.llm.channel_emb.new_zeros(frames, LATENT_DIM)
+        return self.channel_emb.new_zeros(frames, LATENT_DIM)
 
     # The checkpoint carries the user ASR's whole RNN-T; the model reads only its encoder.
+    # Applied in order: checkpoints nest the backbone under ``llm.base_model``
+    # and carry the ASR model's decoder, which serving does not run.
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={
+        "llm.base_model.model.": "model.",
+        "llm.base_model.lm_head.": "lm_head.",
+        "llm.": "",
         "user_asr.model.encoder.": "user_asr.encoder.",
         "user_asr.model.": None,
     })

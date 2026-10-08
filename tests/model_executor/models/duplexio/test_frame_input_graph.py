@@ -12,8 +12,8 @@ from vllm_omni.model_executor.models.duplexio.pocket_mimi import LATENT_DIM
 @torch.inference_mode()
 def test_frame_projection_graph_matches_independent_requests_and_weight_refresh() -> None:
     model = model_fixture().cuda()
-    model.llm.channel_emb = torch.nn.Parameter(model.llm.channel_emb.cuda())
-    model.llm.base_model.model.cuda()
+    model.channel_emb = torch.nn.Parameter(model.channel_emb.cuda())
+    model.model.cuda()
     model.vllm_config.model_config.dtype = torch.bfloat16
     model.frame_inputs = torch.compile(
         frame_inputs, fullgraph=True, dynamic=True, options={"emulate_precision_casts": True},

@@ -21,7 +21,7 @@ def test_training_user_losses_and_next_frame_targets_match_serving():
     for case in torch.load(reference_path, weights_only=True):
         model = head_model("cuda")
         dtype = getattr(torch, case["dtype"])
-        model.llm.base_model.lm_head.to(dtype=dtype)
+        model.lm_head.to(dtype=dtype)
         weights = [
             (name if name.startswith("user_") else "llm.base_model.lm_head.weight", tensor.cuda())
             for name, tensor in case["weights"].items()

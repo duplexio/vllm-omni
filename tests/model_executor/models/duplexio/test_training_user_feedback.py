@@ -36,9 +36,9 @@ def feedback_model():
     model.audio_codec = Codec()
     model.audio_sampler = AudioSampler()
     model.policy_version = 0
-    model.llm.base_model.lm_head = nn.Linear(11, 32, bias=False)
-    model.llm.base_model.lm_head.quant_method = UnquantizedEmbeddingMethod()
-    model.llm.output_head_proj = nn.ModuleDict({name: nn.Linear(11, 11) for name in ("agent", "tool_call")})
+    model.lm_head = nn.Linear(11, 32, bias=False)
+    model.lm_head.quant_method = UnquantizedEmbeddingMethod()
+    model.output_head_proj = nn.ModuleDict({name: nn.Linear(11, 11) for name in ("agent", "tool_call")})
     model.user_token_projection = nn.Linear(66, 11)
     model.user_emit_head = nn.Linear(66, 1)
     model.agent_emit_head = nn.Linear(66, 1)
@@ -49,8 +49,8 @@ def feedback_model():
         setattr(model, f"{stream}_suppressed_token_ids", torch.tensor([2]))
     model.init_text_sampling(32, 4)
     with torch.no_grad():
-        model.llm.base_model.lm_head.weight.zero_()
-        model.llm.base_model.lm_head.weight[7, 0] = 1
+        model.lm_head.weight.zero_()
+        model.lm_head.weight[7, 0] = 1
         model.user_token_projection.weight.zero_()
         model.user_token_projection.bias.zero_()
         model.user_token_projection.bias[0] = 1

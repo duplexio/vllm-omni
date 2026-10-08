@@ -88,10 +88,8 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
     model.user_asr = CountingASR()
     model.user_audio_resampler = Resample(24_000, 16_000, dtype=torch.float32)
     model.audio_codec = CountingCodec()
-    model.llm = SimpleNamespace(
-        base_model=SimpleNamespace(model=TextEmbedding(11)),
-        channel_emb=nn.Parameter(torch.randn(4, 11)),
-    )
+    model.model = TextEmbedding(11)
+    model.channel_emb = nn.Parameter(torch.randn(4, 11))
     return model
 
 
@@ -213,8 +211,8 @@ def test_live_audio_advances_encoder_and_inserts_generated_feedback() -> None:
     user_features = torch.ones(1, 8)  # First frame of the counting encoder.
     info = append_info(state, pcm=torch.randn(1920).numpy().tobytes())
     _, embeddings, update = model.preprocess(torch.zeros(6, dtype=torch.long), None, **info)
-    expected_user = model.llm.base_model.model.embed_input_ids(torch.tensor([9]))[0]
-    torch.testing.assert_close(embeddings[1], expected_user + model.llm.channel_emb[1])
+    expected_user = model.model.embed_input_ids(torch.tensor([9]))[0]
+    torch.testing.assert_close(embeddings[1], expected_user + model.channel_emb[1])
     torch.testing.assert_close(
         embeddings[4:5], model.user_audio_input_adapter(user_features)
     )
