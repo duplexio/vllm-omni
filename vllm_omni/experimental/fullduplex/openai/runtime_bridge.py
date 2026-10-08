@@ -320,6 +320,9 @@ class NativeRuntimeBridgeMixin:
     _NATIVE_RESPONSE_MAX_CONTINUATION_UNITS = 8
 
     def _native_silence_unit_payload(self) -> dict[str, object]:
+        adapter_unit = getattr(self._serving_runtime_adapter, "silence_unit_payload", None)
+        if callable(adapter_unit):
+            return adapter_unit()
         return {
             "type": "audio",
             "audio": self._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO,
@@ -1145,6 +1148,8 @@ class NativeRuntimeBridgeMixin:
                 }
             ]
         payload["playback"] = session.playback.as_dict()
+        if isinstance(native_result.get("agent_emit_logprob"), float):
+            payload["agent_emit_logprob"] = native_result["agent_emit_logprob"]
         sample_rate_hz = native_result.get("sample_rate_hz") or native_result.get("audio_sample_rate_hz")
         if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
             payload["sample_rate_hz"] = int(sample_rate_hz)

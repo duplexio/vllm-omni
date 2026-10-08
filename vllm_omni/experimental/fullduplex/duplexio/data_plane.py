@@ -20,7 +20,7 @@ from vllm_omni.experimental.fullduplex.duplexio.input import (
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     duplex_resource_request_belongs_to_session,
 )
-from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
+from vllm_omni.model_executor.models.duplexio.frame_output import FRAME_LOGPROBS, frame_fields
 
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
 
@@ -260,6 +260,11 @@ class DuplexIODataPlaneSession:
         audio_token_ids = _metadata_int_list(metadata, "agent_audio_token_ids")
         if audio_token_ids:
             result["agent_audio_token_ids"] = audio_token_ids
+        frame_logprobs = metadata.get("frame_logprobs")
+        if isinstance(frame_logprobs, Tensor) and frame_logprobs.numel() == len(FRAME_LOGPROBS):
+            # Log probability of the agent's sampled emit/wait decision; under a forced emit
+            # this is the head's own probability of speaking.
+            result["agent_emit_logprob"] = float(frame_logprobs[FRAME_LOGPROBS.index("agent_emit_logprob")])
         return result
 
     def _user_text_delta(

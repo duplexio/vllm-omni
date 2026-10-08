@@ -76,3 +76,22 @@ def test_compiled_filter_preserves_seeded_draws() -> None:
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert torch.equal(eager_generator.get_state(), compiled_generator.get_state())
+
+
+@torch.inference_mode()
+def test_forced_agent_emit_overrides_a_waiting_emit_head() -> None:
+    from vllm_omni.model_executor.models.duplexio.text_sampling import (
+        FORCE_AGENT_EMIT, SAMPLING_PARAMETERS, sample_streams, sampling_parameters,
+    )
+    greedy = TokenSamplingOptions(0.0, None, None, torch.tensor([], dtype=torch.long))
+    row = sampling_parameters(greedy, greedy, (0.0, 0.0, 0.0), vocab_size=8)
+    parameters = torch.tensor([(*row, 0, 0), (*row, 0, 1)], dtype=torch.float32)
+    assert parameters.shape[1] == SAMPLING_PARAMETERS and parameters[1, FORCE_AGENT_EMIT] == 1
+    logits = torch.zeros(2, 3, 8)
+    logits[:, :, 5] = 10
+    # Every head says wait; only the forced row's agent speaks its best content token.
+    ids, *_ = sample_streams(
+        logits, torch.full((2, 3), -10.0), parameters, torch.zeros(2, 3, 8, dtype=torch.bool),
+        top_k=None, support_width=0, silence_token_id=2,
+    )
+    assert ids.tolist() == [[2, 2, 2], [2, 5, 2]]

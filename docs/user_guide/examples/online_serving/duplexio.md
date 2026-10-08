@@ -104,7 +104,46 @@ can also be an object with `text` and an `answer` letter, as in `mmlu_questions.
 the script then records the predicted letter and prints the number correct.
 Set `KOKORO_ASSETS=/path/to/kokoro` for local Kokoro assets and `DUPLEXIO_PORT`
 to choose another server port. Each question receives thirty seconds of silence
-after its complete audio, and the v7 checkpoint revision is pinned.
+after its complete audio, and the v7 checkpoint revision is pinned. Pass
+`--text-only` to type each question instead of speaking it (see below).
+
+## Measure the text channel on MMLU
+
+Spoken questions mix several problems: the agent takes its turn at the first pause
+and misses the options, user ASR garbles symbols, and agent audio can drift from
+its text. To test only what the model knows, type the questions instead:
+
+```bash
+bash examples/online_serving/duplexio/test_inference.sh outputs/mmlu100 \
+    examples/online_serving/duplexio/mmlu100_questions.json \
+    --text-only --greedy --response-seconds 12 --instructions "You are a helpful voice assistant."
+```
+
+This runs each question in a [text-only session](#text-only-sessions):
+
+- The question goes one token per frame into the user text cell, with audio off,
+  as in DuplexIO's text-only chat training.
+- The agent is forced to emit on every frame. Its speak/wait head never trained on
+  text-only frames, and its probability tracks word pacing (low before a new word,
+  high inside one), not the end of an answer. So the model cannot end the reply.
+- `--response-seconds` cuts the reply instead: 12 s is about 150 tokens at one
+  token per 80 ms frame. Replies left running tend to loop.
+- `--greedy` takes the most likely agent token instead of the trained sampling.
+- `answer_letter_in` in `run_questions.py` scores the first option letter the reply
+  commits to. The summary also prints a centered score, `(accuracy - 1/4) / (1 - 1/4)`,
+  so random guessing is 0 and a perfect score is 1.
+
+For a reference, `mmlu_baseline.py` asks the backbone the same questions with vLLM,
+using the same system prompt and token budget, with thinking off and greedy sampling:
+
+```bash
+python examples/online_serving/duplexio/mmlu_baseline.py \
+    --questions examples/online_serving/duplexio/mmlu100_questions.json --output qwen-mmlu100.json
+```
+
+The question files are seeded samples of the `cais/mmlu` test split.
+`examples/online_serving/duplexio/questions.sbatch` runs the DuplexIO side on one
+H100 of the DCAI cluster; split the file into chunks to run several jobs at once.
 
 ## Realtime protocol
 
@@ -127,3 +166,17 @@ with independent `agent` and `user` emission/content settings. Realtime user
 transcription defaults to greedy sampling. See the
 [native inference notes](https://github.com/duplexio/vllm-omni/blob/duplexio/examples/offline_inference/duplexio/README.md)
 for the numerical and state contracts.
+
+### Text-only sessions
+
+Set `extra_body.text_only: true` and `start_role: "user"`, then send
+`{"type": "input_text.append", "text": ...}`. The server writes the text one token
+per frame into the user cell with audio switched off, the layout DuplexIO uses for
+text-only chat training. Keep sending `input_audio_buffer.append` frames (silence is
+fine) to advance the reply one frame each. Their audio is ignored and no agent audio
+is decoded, so the reply arrives only as `response.audio_transcript.delta`. Training
+never fit the agent's speak/wait head on text-only frames, so the server forces the
+agent to emit on every text-only frame (the server's own silence frames included)
+and the reply runs until you stop sending frames. Each transcript delta carries
+`agent_emit_logprob`, the head's own log probability of speaking on that frame. Try it
+with `client.py --user-text "..."`; add `--greedy` for greedy agent text.

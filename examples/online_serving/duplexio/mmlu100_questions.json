@@ -1,0 +1,602 @@
+[
+  {
+    "text": "A state built a casino and issued bonds to finance its construction. On five occasions, there were episodes of violence in various casinos in the state. The state police attributed the violence to greed and fear at the casinos. To prevent such violence, the state legislature passes a statute prohibiting all gambling at privately owned casinos in the state. Is this law likely to be held constitutional if most casinos in the state were owned by those from out-of-state? A. Yes, because the act was expressly authorized by the state legislature. B. Yes, but only if the local interest in safety outweighs the burden of interstate commerce. C. No, because out-of-state casinos are part of interstate commerce. D. No, because the statute violates the due process rights of the owners of the casinos. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "professional_law",
+    "mmlu_test_index": 10856
+  },
+  {
+    "text": "what is one of the important differences between the middle and upper paleolithic? A. decreased use of imported raw materials and increased use of whatever was locally available. B. smaller sites, indicating a change from large roving bands of hunters to the earliest family groups and households. C. a profusion of stone tool traditions, indicating a change from temporal and geographic homogeneity to greater diversity and variability. D. a gradual decline in the use of stone hand axes and tools, indicating a change to more flexible and workable materials such as wood and bone. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "prehistory",
+    "mmlu_test_index": 10247
+  },
+  {
+    "text": "What kind of animal is a peregrine? A. moose. B. cat. C. bird. D. fish. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "miscellaneous",
+    "mmlu_test_index": 7410
+  },
+  {
+    "text": "The cities of Varanasi (Benares) in India and Mecca in Saudi Arabia are alike because both are A. capitals of countries formerly colonized by the English. B. destinations for vast numbers of pilgrims. C. financial centers for a large fraction of the world's economy. D. examples of modern urban planning. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "high_school_geography",
+    "mmlu_test_index": 3581
+  },
+  {
+    "text": "You seek the counsel of one of your peers who designed and implemented a communication program that resulted in the successful permitting of an automotive recycling center, despite strong opposition from community organizations. You have to design a program to win approval for a similar project proposed by your company. Your peer gives you a brief piece of advice that succinctly describes the foundation of his successful program. What is most likely your peer's advice for a successful communication program? A. Solve their problems. B. Kill them with kindness. C. Expose them to ridicule. D. Overwhelm them with facts. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "public_relations",
+    "mmlu_test_index": 13087
+  },
+  {
+    "text": "Which of the following would NOT be considered a barrier to diffusion of a cultural trait? A. Language. B. Religion. C. Oceans. D. Tolerant complaisant citizens. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "high_school_geography",
+    "mmlu_test_index": 3504
+  },
+  {
+    "text": "The lowest point on Earth is the bottom of the Mariana Trench at a depth of 35,840 feet below sea level. The highest point on Earth is the summit of Mt. Everest at a height of 29,028 feet above sea level. Which of the following is the best estimate of the distance between the lowest and highest points on Earth? A. 6,000 feet. B. 7,000 feet. C. 64,000 feet. D. 65,000 feet. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "elementary_mathematics",
+    "mmlu_test_index": 2383
+  },
+  {
+    "text": "In the Internet Protocol (IP) suite of protocols, which of the following best describes the purpose of the Address Resolution Protocol? A. To translate Web addresses to host names. B. To determine the IP address of a given host name. C. To determine the hardware address of a given host name. D. To determine the hardware address of a given IP address. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "college_computer_science",
+    "mmlu_test_index": 1058
+  },
+  {
+    "text": "In the absence of a provision to the contrary in the articles of incorporation, the directors of a corporation elected for a specified term A. can be removed from office at a meeting of the shareholders, but only for cause and after an opportunity to be heard has been given to the directors. B. can be removed from office at a meeting of the shareholders, with or without cause. C. can be removed from office at a meeting of the shareholders, but only for cause. D. can be removed from office prior to the expiration of their term only by a decree of the circuit court in an action by the shareholders. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "professional_law",
+    "mmlu_test_index": 10932
+  },
+  {
+    "text": "Which of the following is a strategy that the National Association of School Psychologists (NASP) recommends as a best practice for improving school safety? A. Expelling a student immediately after a minor disciplinary infraction. B. Implementing a strict student code of conduct, such as a zero-tolerance policy. C. Communicating to parents that the school environment is safe. D. Creating a school safety and response team. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "high_school_psychology",
+    "mmlu_test_index": 5099
+  },
+  {
+    "text": "The reticular formation and reticular activating system are associated with all of the following functions, EXCEPT: A. Decussation of auditory stimuli. B. Alertness. C. Consciousness. D. Pain. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "professional_psychology",
+    "mmlu_test_index": 12772
+  },
+  {
+    "text": "For which of these two scenarios does the main character (who uses I/me/my) do something clearly morally wrong, according to ordinary moral standards in the US as of 2020? Scenario 1 | The uber driver wanted to pay me for being so late last night. Scenario 2 | I will not break rules to become the best at something. A. Wrong, Wrong. B. Wrong, Not wrong. C. Not wrong, Wrong. D. Not wrong, Not wrong. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "moral_scenarios",
+    "mmlu_test_index": 8717
+  },
+  {
+    "text": "The radius of Mars is about half that of Earth; the mass of Mars is about one-tenth that of Earth. Which of the following is closest to the gravitational field at the surface of Mars? A. 10 N/kg. B. 4 N/kg. C. 2 N/kg. D. 0.5 N/kg. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "high_school_physics",
+    "mmlu_test_index": 4750
+  },
+  {
+    "text": "Which of the following amino acids cannot provide a substrate for gluconeogenesis? A. Leucine. B. Tryptophan. C. Histidine. D. isoleucine. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "nutrition",
+    "mmlu_test_index": 9520
+  },
+  {
+    "text": "Which of the following promotes glucose and amino acid uptake by muscle? A. Adrenaline. B. Insulin. C. Glycogen. D. Cortisol. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "clinical_knowledge",
+    "mmlu_test_index": 565
+  },
+  {
+    "text": "This question refers to the following information.\nAlthough in Protestant Europe, [Peter the Great] was surrounded by evidence of the new civil and political rights of individual men embodied in constitutions, bills of rights and parliaments, he did not return to Russia determined to share power with his people. On the contrary, he returned not only determined to change his country but also convinced that if Russia was to be transformed, it was he who must provide both the direction and the motive force. He would try to lead; but where education and persuasion were not enough, he could drive\u2014and if necessary flog\u2014the backward nation forward.\n\u2014Robert K. Massie, Peter the Great: His Life and World\nWhen Peter the Great ruled Russia, he continued the practice of which of the following? A. Decentralization of power. B. Isolationism. C. Serfdom. D. Reform. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "high_school_world_history",
+    "mmlu_test_index": 5997
+  },
+  {
+    "text": "The attitude of many ancient elites toward the consumption of resources seems to have been: A. \u201ca penny saved is a penny earned.\". B. \"if you've got it, flaunt it.\". C. \"look before you leap.\". D. \"the last shall be first and the first shall be last.\". Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "prehistory",
+    "mmlu_test_index": 10159
+  },
+  {
+    "text": "Rounded to the nearest 10,000, the population of Louisiana was 4,530,000 in 2010. Which number could be the actual population of Louisiana in 2010? A. 4,500,321. B. 4,524,491. C. 4,533,372. D. 4,535,343. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "elementary_mathematics",
+    "mmlu_test_index": 2310
+  },
+  {
+    "text": "If the Engle-Granger test is applied to the residuals of a potentially cointegrating regression, what would be the interpretation of the null hypothesis? A. The variables are cointegrated. B. The variables are not cointegrated. C. Both variables are stationary. D. Both variables are non-stationary. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "econometrics",
+    "mmlu_test_index": 1918
+  },
+  {
+    "text": "Which of the following groups or organizations can be identified as having the characteristics of a bureaucracy? A. An extended or consanguine family, including all the relatives by blood, marriage, or adoption. B. The government of a large city. C. A book club in which books are chosen by members who take turns alphabetically to lead discussion. D. The volunteers who gather annually to clean the neighborhood. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "sociology",
+    "mmlu_test_index": 13562
+  },
+  {
+    "text": "Which of the following is NOT a source of atmospheric carbon? A. Respiration. B. Photosynthesis. C. Bacterial decomposition. D. Combustion of fossil fuels. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "college_biology",
+    "mmlu_test_index": 759
+  },
+  {
+    "text": "The FED's Board of Governors has members each serving -year terms. A. 14 7. B. 7 14. C. 8 8. D. 50 2. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "high_school_macroeconomics",
+    "mmlu_test_index": 3884
+  },
+  {
+    "text": "Epictetus claims that the desire for one\u2019s loved ones to live forever is: A. a natural instinct. B. a sign of genuine love. C. blasphemous. D. silly. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "philosophy",
+    "mmlu_test_index": 9997
+  },
+  {
+    "text": "What was the average life expectancy of white males born in the U.S. just before the Civil War? A. 40 years. B. 50 years. C. 60 years. D. 70 years. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "miscellaneous",
+    "mmlu_test_index": 7558
+  },
+  {
+    "text": "Anscombe claims that it is not profitable to do moral philosophy until we have an adequate philosophy of: A. religion. B. physics. C. psychology. D. art. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "philosophy",
+    "mmlu_test_index": 9725
+  },
+  {
+    "text": "The complete resynthesis of phosphocreatine after very high intensity exercise normally takes: A. about 10 seconds. B. about 30 seconds. C. about 1 minute. D. about 4 minutes. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "college_medicine",
+    "mmlu_test_index": 1199
+  },
+  {
+    "text": "Which of the following can form hydrogen bonds? A. CH3OCH2CH3. B. HCN. C. CH3OCH2Br. D. CH3NH2. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "high_school_chemistry",
+    "mmlu_test_index": 3026
+  },
+  {
+    "text": "For which of these two scenarios does the main character (who uses I/me/my) do something clearly morally wrong, according to ordinary moral standards in the US as of 2020? Scenario 1 | I ran over the fresh grass with a lawnmower. Scenario 2 | My rent was due, so I had to sell my guitar without telling my friend. A. Wrong, Wrong. B. Wrong, Not wrong. C. Not wrong, Wrong. D. Not wrong, Not wrong. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "moral_scenarios",
+    "mmlu_test_index": 9100
+  },
+  {
+    "text": "Suppose you are given an EM algorithm that finds maximum likelihood estimates for a model with latent variables. You are asked to modify the algorithm so that it finds MAP estimates instead. Which step or steps do you need to modify? A. Expectation. B. Maximization. C. No modification necessary. D. Both. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "machine_learning",
+    "mmlu_test_index": 6927
+  },
+  {
+    "text": "Which of the following statements does NOT characterize arms control as a strategic policy? A. Arms control is an example of cooperative security, designed to address the problems associated with the security dilemma. B. Policies of arms control and disarmament was pursued during the Cold War in an attempt to achieve security. C. Arms control does not challenge the central role of weaponry and military power in the international system, instead focusing on the problems produced by specific weapon systems and relationships. D. After its successful application during the Cold War, arms control has retained its momentum and applicability in the contemporary security environment. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "security_studies",
+    "mmlu_test_index": 13268
+  },
+  {
+    "text": "Which of the following is true of haematemesis? A. A low blood pressure (<90mmHg systolic) and a tachycardia (>100/min) are worrying features. B. A pulse rate of 80/min in a patient taking Bisoprolol is reassuring. C. Abdominal pain is always present. D. An alcohol history is not essential. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "clinical_knowledge",
+    "mmlu_test_index": 709
+  },
+  {
+    "text": "Which of the following is true? A. Every compact space is complete. B. Every complete space is compact. C. Neither (a) nor (b). D. Both (a) and (b). Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "college_mathematics",
+    "mmlu_test_index": 1105
+  },
+  {
+    "text": "How did World War I shift economic power from Europe to the United States? A. The war reduced European population levels below that of the United States. B. The United States seized German resources after the war. C. European countries paid the United States for assistance. D. The United States became a creditor country and financial centre, with European war spending boosting the US economy. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "us_foreign_policy",
+    "mmlu_test_index": 13613
+  },
+  {
+    "text": "Prior to the issuance of its December 31 financial statements Stark Co. was named as a defendant in a lawsuit arising from an event that occurred in October. Stark's legal counsel believes that it is reasonably possible that there will be an unfavorable outcome and that damages will range from $100000 to $150000. Which amount(s) should Stark accrue and/or disclose in its December 31 financial statements? Accrue contingent liability Disclose contingent liability A. $100000 $100000 - $150000. B. $100000 $150000. C. $0 $100000 - $150000. D. $0 $150000. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "professional_accounting",
+    "mmlu_test_index": 10528
+  },
+  {
+    "text": "What is the term for the action in which managers at an organisation analyse the current situation of their organisation and then develop plans to accomplish its mission and achieve its goals? A. Synergy planning. B. Strategy formulation. C. Functional planning. D. SWOT analysis. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "management",
+    "mmlu_test_index": 7014
+  },
+  {
+    "text": "Which of the following best explains why people can digest starch but cannot digest cellulose even though both molecules are composed of glucose monomers? A. The bonds linking the monomers of starch differ in shape from the bonds linking the monomers of cellulose. B. Molecules of starch are much smaller than molecules of cellulose. C. Starch is an intracellular molecule, while cellulose is an extracellular molecule. D. Starch is hydrated by water, but cellulose is not. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "high_school_biology",
+    "mmlu_test_index": 2716
+  },
+  {
+    "text": "Robert is a marketer for a global consumer products company. He is working on the promotional campaign designed to reach a target audience in a new international market. Robert is working hard to make sure that the promotional campaign is clearly understood by the nation's consumers and doesn't offend anyone. By which of the factors in the external environment is he being influenced A. Socio-cultural environment. B. Competitive environment. C. Economic environment. D. Legal environment. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "marketing",
+    "mmlu_test_index": 7224
+  },
+  {
+    "text": "The ROM programmed during manufacturing process itself is called A. MROM. B. PROM. C. EPROM. D. EEPROM. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "electrical_engineering",
+    "mmlu_test_index": 2051
+  },
+  {
+    "text": "Is the recognition of foreign judgments subject to the same rules as those applicable to the incorporation and transformation of treaties? A. Foreign judgments are enforced on the basis of the doctrine of incorporation. B. Foreign judgments are enforced on the basis of the doctrine of transformation. C. The recognition of foreign judgments is dependent on the existence of appropriate bilateral or multilateral treaties. D. The courts exercise discretion as to the enforcement of foreign judgments on the basis of the rule of comity. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "international_law",
+    "mmlu_test_index": 6546
+  },
+  {
+    "text": "Lactose A. Is always the cause of milk intolerance. B. Cannot be digested in the human gut. C. Intolerance is present in up to 20% of the population. D. Is excluded on a low FODMAP diet. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "nutrition",
+    "mmlu_test_index": 9581
+  },
+  {
+    "text": "Which of the following best describes the fallacy of amphiboly? A. Using emotionally charged languages to create an impression about the subject of a claim, without making an argument that the language fits the subject. B. Referring to an act committed by an opponent in negative terms while referring to the same act committed by the arguer or supporters in favorable terms. C. Using grammar and punctuation in a way that a statement may have multiple interpretations, so it's not really clear what is meant. D. Changing the meaning of a word or phrase from one part of the argument to another. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "logical_fallacies",
+    "mmlu_test_index": 6832
+  },
+  {
+    "text": "Nagel thinks that the core of the absolutist position is that A. human persons have a right to life. B. it is permissible to harm as a foreseen but unintended consequence of action. C. the ends justify the means. D. the hostility should be directed at its true object. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "moral_disputes",
+    "mmlu_test_index": 8503
+  },
+  {
+    "text": "Glaucoma refers to the condition in which A. Fluid pressure in the eye is above normal. B. Inner and outer layers of the retina separate. C. The lens becomes cloudy and opaque. D. The central part of the retina no longer functions. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "human_aging",
+    "mmlu_test_index": 6231
+  },
+  {
+    "text": "A person who sustains major injuries that involve the destruction of the medulla oblongata will A. be paralyzed. B. fall into a coma. C. suffer severe speech impairment. D. die. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "high_school_psychology",
+    "mmlu_test_index": 4899
+  },
+  {
+    "text": "___________ is a communication disorder that is characterized by difficulties in regulating the rate, rhythm, pitch, and loudness of speech. A. Dysarthria. B. Paraphasia. C. Dysprosody. D. Adynamia. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "professional_psychology",
+    "mmlu_test_index": 12680
+  },
+  {
+    "text": "Suppose that the market price of Company X is $45 per share and that of Company Y is $30. If X offers three-fourths a share of common stock for each share of Y, the ratio of exchange of market prices would be: A. 0.667. B. 1. C. 1.125. D. 1.5. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "professional_accounting",
+    "mmlu_test_index": 10541
+  },
+  {
+    "text": "The ___________, otherwise known as _________ was launched in 1997 and is a global workplace standard that covers key labour rights such as working hours, forced labour and discrimination, with compliance being certified by independent auditors. A. Social accountability standard, SA 8000. B. Social accountability standard, SA 9000. C. Sarbanes-Oxley Act, SA 8000. D. Sarbanes-Oxley Act, SA 9000. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "business_ethics",
+    "mmlu_test_index": 455
+  },
+  {
+    "text": "Statement 1 | If a group has an element of order 10, then it has elements of orders 1, 2, and 5. Statement 2 | If a group has an element of order 2 and an element of order 3, then it has an element of order 6. A. True, True. B. False, False. C. True, False. D. False, True. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "abstract_algebra",
+    "mmlu_test_index": 83
+  },
+  {
+    "text": "Vasocongestion is a process of : A. muscle contraction. B. blood accumulation in the genitals. C. muscle relaxation. D. detumescence. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "human_sexuality",
+    "mmlu_test_index": 6384
+  },
+  {
+    "text": "Organizational characteristics, such as organizational size and location, are sometimes referred to as___________. A. DMU. B. Firmographics. C. ACORN. D. Product usage. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "marketing",
+    "mmlu_test_index": 7087
+  },
+  {
+    "text": "Which of the following is most likely to decrease the demand for kindergarten teachers? A. An increase in funding for education. B. Increased immigration of foreign citizens and their families. C. A decrease in the average number of children per household. D. Subsidies given to college students who major in elementary education. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "high_school_microeconomics",
+    "mmlu_test_index": 4626
+  },
+  {
+    "text": "The market demand curve for labor would shift to the left as the result of A. an increase in the price of the good which the labor is producing. B. an increase in demand for the good which the labor is producing. C. an increase in the wage rate paid to workers. D. a decrease in the marginal product of labor. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "high_school_microeconomics",
+    "mmlu_test_index": 4666
+  },
+  {
+    "text": "A segment of DNA from a lab mouse is determined to be 5\u2019 \u2013 GGATCCTCATG \u2013 3\u2019. Which of the following DNA segments would be the result of this original DNA sequence experiencing both a point mutation and a deletion? A. 5\u2019 \u2013 GCATCCTCATG \u2013 3\u2019. B. 5\u2019 \u2013 TGATCCCAG \u2013 3\u2019. C. 5\u2019 \u2013 GGTCCTCATC \u2013 3\u2019. D. 5\u2019 \u2013 GGATCCATG \u2013 3\u2019. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "college_medicine",
+    "mmlu_test_index": 1221
+  },
+  {
+    "text": "As of 2017, the share of GDP spent on the military by the United States is about A. 1%. B. 3%. C. 6%. D. 10%. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "global_facts",
+    "mmlu_test_index": 2663
+  },
+  {
+    "text": "When an ideal gas is allowed to expand isothermally, which one of the following is true? A. q = 0. B. w = 0. C. E = 0. D. q = -w. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "high_school_chemistry",
+    "mmlu_test_index": 3075
+  },
+  {
+    "text": "Excess reserves in the banking system will increase if A. the reserve ratio is increased. B. the checking deposits increase. C. the discount rate is increased. D. the Fed sells Treasury securities to commercial banks. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "high_school_macroeconomics",
+    "mmlu_test_index": 4195
+  },
+  {
+    "text": "Which of the following is not an objection that Kass makes against cloning? A. It constitutes unethical experimentation. B. It threatens identity and individuality. C. It will produce harmful biological mutations as clones produce further clones. D. It perverts our values concerning parenthood and the raising of children. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "moral_disputes",
+    "mmlu_test_index": 8187
+  },
+  {
+    "text": "The common mutation in \u03b1-thalassaemia consists of: A. a deletion. B. a duplication. C. an insertion. D. a point mutation. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "medical_genetics",
+    "mmlu_test_index": 7367
+  },
+  {
+    "text": "Which early battle led to the conversion of Mecca? A. The Battle of Uhud. B. The Battle of Camel. C. The Battle of the Trench. D. The Battle of Badr. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "world_religions",
+    "mmlu_test_index": 13892
+  },
+  {
+    "text": "How many states in the international system are likely to have nuclear weapons right now? A. Fewer than 7. B. Between 8 and 15. C. Between 16 and 25. D. More than 25. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "us_foreign_policy",
+    "mmlu_test_index": 13669
+  },
+  {
+    "text": "The normal modes of a carbon dioxide molecule that are infrared-active include which of the following?\nI. Bending\nII. Symmetric stretching\nIII. Asymmetric stretching A. I only. B. II only. C. III only. D. I and III only. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "college_chemistry",
+    "mmlu_test_index": 912
+  },
+  {
+    "text": "A stem-boring beetle has laid its eggs in the center of a 5-year-old wood twig, and the eggs have matured into larvae. In proper order (inside to outside), what tissues and tissue regions would the larvae encounter as they eat their way toward the outside of the twig? (For simplicity, assume that the epidermis has already fallen off completely.) A. Pith; primary xylem; secondary xylem; vascular cambium; primary phloem; secondary phloem; cortex. B. Pith; secondary xylem; primary xylem; vascular cambium; secondary phloem; primary phloem; cortex. C. Pith; secondary xylem; primary xylem; vascular cambium; primary phloem; secondary phloem; cortex. D. Pith; primary xylem; secondary xylem; vascular cambium; secondary phloem; primary phloem; cortex. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "college_biology",
+    "mmlu_test_index": 792
+  },
+  {
+    "text": "How do you describe a work group that comprises workers with demarcated tasks and distant line managers? A. Dependent. B. Independent. C. Interdependent. D. Collaborative. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "management",
+    "mmlu_test_index": 6975
+  },
+  {
+    "text": "To verify a digital signature we need the A. Sender\u2019s Private key. B. Sender\u2019s Public key. C. Receiver\u2019s Private key. D. Receiver\u2019s Public key. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "computer_security",
+    "mmlu_test_index": 1498
+  },
+  {
+    "text": "Which of the following is NOT a feature of continuously compounded returns (i.e. log-returns)? A. They can be interpreted as continuously compounded changes in the prices. B. They can be added over time to give returns for longer time periods. C. They can be added across a portfolio of assets to give portfolio returns. D. They are usually fat-tailed. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "econometrics",
+    "mmlu_test_index": 1813
+  },
+  {
+    "text": "Which of the following is typically associated with having a vasectomy? A. decreased testosterone production. B. reduced rigidity of erections. C. decreased sperm production. D. normal orgasm. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "human_sexuality",
+    "mmlu_test_index": 6391
+  },
+  {
+    "text": "In the diamond structure of elemental carbon, the nearest neighbors of each C atom lie at the corners of a A. square. B. hexagon. C. cube. D. tetrahedron. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "college_physics",
+    "mmlu_test_index": 1379
+  },
+  {
+    "text": "What is the limiting high-temperature molar heat capacity at constant volume (C_V) of a gas-phase diatomic molecule? A. 1.5R. B. 2R. C. 2.5R. D. 3.5R. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "college_chemistry",
+    "mmlu_test_index": 965
+  },
+  {
+    "text": "What is the genome structure of the polyomavirus family? A. Circular ds DNA with T antigen coding regions. B. Circular ssDNA. C. RNA genome with RT. D. Segmented RNA genome. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "virology",
+    "mmlu_test_index": 13842
+  },
+  {
+    "text": "Random variable X is normally distributed, with a mean of 25 and a standard deviation of 4. Which of the following is the approximate interquartile range for this distribution? A. 25.00 \u2013 22.30 = 2.70. B. 27.70 \u2013 22.30 = 5.40. C. 27.70 \u00f7 22.30 = 1.24. D. 2.00(4.00) = 8.00. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "high_school_statistics",
+    "mmlu_test_index": 5471
+  },
+  {
+    "text": "Both over-the-counter niacin and the prescription drug Lipitor are known to lower blood cholesterol levels. In one double-blind study Lipitor outperformed niacin. The 95% confidence interval estimate of the difference in mean cholesterol level lowering was (18, 41). Which of the following is a reasonable conclusion? A. Niacin lowers cholesterol an average of 18 points, while Lipitor lowers cholesterol an average of 41 points. B. There is a 0.95 probability that Lipitor will outperform niacin in lowering the cholesterol level of any given individual. C. There is a 0.95 probability that Lipitor will outperform niacin by at least 23 points in lowering the cholesterol level of any given individual. D. None of the above. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "high_school_statistics",
+    "mmlu_test_index": 5494
+  },
+  {
+    "text": "What is Kant's 'categorical imperative? A. You must not consciously harm another person. B. You must always act in the best interests of the community. C. You must treat human beings as means rather than ends. D. You must act according as if your values apply to everyone. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "jurisprudence",
+    "mmlu_test_index": 6665
+  },
+  {
+    "text": "This question refers to the following information.\nNo task is more urgent than that of preserving peace. Without peace our independence means little. The rehabilitation and upbuilding of our countries will have little meaning. Our revolutions will not be allowed to run their course. What can we do? We can do much! We can inject the voice of reason into world affairs. We can mobilize all the spiritual, all the moral, all the political strength of Asia and Africa on the side of peace. Yes, we! We, the peoples of Asia and Africa, 1.4 billion strong.\nIndonesian leader Sukarno, keynote address to the Bandung Conference, 1955\nLike numerous other leaders in Africa, Asia, and the Middle East, Sukarno attempted, but did not completely succeed, in maintaining a neutral stance during A. the Arab-Israeli conflict. B. the Korean War. C. the Cold War. D. the Vietnam conflicts. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "high_school_world_history",
+    "mmlu_test_index": 5855
+  },
+  {
+    "text": "The AH Protocol provides source authentication and data integrity, but not A. Integrity. B. Privacy. C. Nonrepudiation. D. Both A & C. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "computer_security",
+    "mmlu_test_index": 1484
+  },
+  {
+    "text": "The concomitant variation fallacy is A. attributing the cause of an event to a single cause when the cause is more complicated. B. arguing that since two events happened at the same time, one event must have caused the other. C. arguing that since one event preceded another event it must have caused the second event. D. drawing a conclusion based on sign reasoning when there is not really a direct relationship between the alleged sign and the subject of the conclusion. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "logical_fallacies",
+    "mmlu_test_index": 6829
+  },
+  {
+    "text": "Identify the antecedent of the following conditional proposition: The university raises tuition only if both the governor approves of it and the board of trustees recommends it. A. The university raises tuition. B. The governor approves of it. C. The board of trustees recommends it. D. The governor approves of it and the board of trustees recommends it. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "formal_logic",
+    "mmlu_test_index": 2534
+  },
+  {
+    "text": "While ratifying the Constitution, the primary point of disagreement between Federalists and Anti-Federalists was over A. whether representation in Congress should be equal among states or proportional to population. B. the strength of the federal government relative to the states. C. the future of the slave trade. D. whether people had inalienable rights. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "high_school_government_and_politics",
+    "mmlu_test_index": 3661
+  },
+  {
+    "text": "Compared with radiation from the Sun, terrestrial radiation has a lower A. wavelength. B. frequency. C. Both. D. Neither. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "conceptual_physics",
+    "mmlu_test_index": 1798
+  },
+  {
+    "text": "Which author emphasised strategy as achieving competitive advantage for an organization? A. Steyn (2003). B. Gregory (2006). C. Cutlip et al (2006). D. Henry (2006). Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "public_relations",
+    "mmlu_test_index": 13066
+  },
+  {
+    "text": "Compared to DNA viral replication, RNA viral replication is more susceptible to mutation because A. RNA replication takes place in the cytoplasm, whereas DNA replication takes place in the nucleus. B. RNA viruses replicate much faster than DNA viruses. C. RNA viruses use uracil instead of thymine. D. RNA replication lacks the proofreading functions characteristic of DNA replication. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "high_school_biology",
+    "mmlu_test_index": 2960
+  },
+  {
+    "text": "The polynomial which results from the expansion of $(x^2+5x+6)^2+(px+q)(x^3+7x^2+3x)$ has degree $2$. Find $p+q$. A. -2. B. -4. C. -1. D. 1. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "high_school_mathematics",
+    "mmlu_test_index": 4245
+  },
+  {
+    "text": "Although the benefit and contribution of civil society in encouraging sustainability, lobbying on important issues and helping the needy are taken for granted in many places, in many other countries, such as _____ and ______ civil society is far less developed than in, for instance, _______. A. Russia, China, Britain. B. Norway, China, Russia. C. Britain, United States, Australia. D. Canada, Russia, United States. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "business_ethics",
+    "mmlu_test_index": 428
+  },
+  {
+    "text": "Poles and zeros are arranged alternatively on negative real axis, then type of network is/are A. LC network. B. RC network. C. RL network. D. Both 2 and 3. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "electrical_engineering",
+    "mmlu_test_index": 2043
+  },
+  {
+    "text": "Differential distribution of substances in the egg most typically results in: A. differences in gene expression which may establish a pattern in the embryo as the cells divide. B. amplification of specific genes during development. C. development of polyploid tissues. D. loss of specific genes during development. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "medical_genetics",
+    "mmlu_test_index": 7382
+  },
+  {
+    "text": "The biggest single determinant of HIV transmission to the infant is: A. Mother\u2019age. B. Mother\u2019s viral load. C. Mother\u2019s immune status. D. Father\u2019s viral load. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "virology",
+    "mmlu_test_index": 13817
+  },
+  {
+    "text": "About what percentage of the global population was literate in 1950? A. 36%. B. 56%. C. 76%. D. 96%. Answer with the letter of the correct option.",
+    "answer": "B",
+    "subject": "global_facts",
+    "mmlu_test_index": 2583
+  },
+  {
+    "text": "Statement 1 | f : X \u2192 Y is continuous and X is compact. f must be uniformly continuous. Statement 2 | If f(x), g(x) : R \u2192 R are everywhere differentiable f(g(x)) must be everywhere differentiable. A. True, True. B. True, False. C. False, True. D. False, False. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "college_mathematics",
+    "mmlu_test_index": 1141
+  },
+  {
+    "text": "Which of the following statements about electric and magnetic fields is FALSE: A. A charge moving along the direction of an electric field will experience a force, but a charge moving along the direction of a magnetic field will not experience a force. B. All charges experience a force in an electric field, but only moving charges can experience a force in a magnetic field. C. A positive charge moves in the direction of an electric field; a positive charge moves perpendicular to a magnetic field. D. All moving charges experience a force parallel to an electric field and perpendicular to a magnetic field. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "high_school_physics",
+    "mmlu_test_index": 4845
+  },
+  {
+    "text": "Considered as a single group, the Small Business Administration, the Small Business committees in the House and Senate, and small business advocacy groups are an example of A. an iron triangle. B. a conference committee. C. a regulatory agency. D. dual federalism. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "high_school_government_and_politics",
+    "mmlu_test_index": 3774
+  },
+  {
+    "text": "According to Jaina traditions, what does the term ajiva mean? A. Soul. B. Sound. C. Non-matter. D. Non-soul. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "world_religions",
+    "mmlu_test_index": 13898
+  },
+  {
+    "text": "The auditory tube A. connects the inner ear and nasopharynx. B. is derived from the second pharyngeal pouch. C. is opened by the action of levator veli palatini. D. is closed by the action of tensor veli palatini. Answer with the letter of the correct option.",
+    "answer": "C",
+    "subject": "anatomy",
+    "mmlu_test_index": 135
+  },
+  {
+    "text": "Thermal conduction involves mainly A. electrons. B. protons. C. neutrons. D. ions. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "conceptual_physics",
+    "mmlu_test_index": 1610
+  },
+  {
+    "text": "What is the value of this python expression: 4 + 3 % 2? A. 1. B. 6. C. 4. D. 5. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "high_school_computer_science",
+    "mmlu_test_index": 3250
+  },
+  {
+    "text": "If links between various diseases are found, then future older adults will probably A. Take fewer medications. B. Be able to avoid certain diseases. C. Pay far less for pharmaceuticals. D. Pick and choose the disease(s) they want. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "human_aging",
+    "mmlu_test_index": 6200
+  },
+  {
+    "text": "Which of the given formulas of PL is the best symbolization of the following sentence?\nA person is considered to have lived with you for all of the present year if the person was born or died in the present year and your home was this person's home for the entire time this person was alive. A. [(B \u2228 D) \u2022 H] \u2283 L. B. [L \u2283 (B \u2228 D)] \u2022 H. C. L \u2283 [(B \u2228 D) \u2022 H]. D. (B \u2228 D \u2022 H) \u2283 L. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "formal_logic",
+    "mmlu_test_index": 2515
+  },
+  {
+    "text": "Social norms are: A. creative activities such as gardening, cookery and craftwork. B. the symbolic representation of social groups in the mass media. C. religious beliefs about how the world ought to be. D. rules and expectations about interaction that regulate social life. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "sociology",
+    "mmlu_test_index": 13490
+  },
+  {
+    "text": "Carlos Montado was born on Saturday, November 9, 2002. On what day of the week will Carlos be 706 days old? (Spell out the entire day of the week.) A. Friday. B. Thursday. C. Wednesday. D. Tuesday. Answer with the letter of the correct option.",
+    "answer": "A",
+    "subject": "high_school_mathematics",
+    "mmlu_test_index": 4252
+  },
+  {
+    "text": "A machine learning problem involves four attributes plus a class. The attributes have 3, 2, 2, and 2 possible values each. The class has 3 possible values. How many maximum possible different examples are there? A. 12. B. 24. C. 48. D. 72. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "machine_learning",
+    "mmlu_test_index": 6838
+  },
+  {
+    "text": "A programmer uses code published online under a Creative Commons Attribution (C C B Y) license in a commercial product. Which of the following best describes an acceptable use of the code? A. Copying code from the online source into the programmer's product without any other actions. B. Copying code from the online source into the programmer's product and limiting the copied code to ten code lines. C. Copying code from the online source into the programmer's product and changing all variable names. D. Copying code from the online source into the programmer's product and crediting the original author in the manner indicated by the license. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "high_school_computer_science",
+    "mmlu_test_index": 3199
+  },
+  {
+    "text": "If the Sun were suddenly replaced by a black hole of the same mass, it would have a Schwarzschild radius of 3,000 m. What effect, if any, would this change have on the orbits of the planets? A. The planets would move directly toward the Sun. B. The planets would move in spiral orbits. C. The planets would oscillate about their former elliptical orbits. D. The orbits would remain unchanged. Answer with the letter of the correct option.",
+    "answer": "D",
+    "subject": "college_physics",
+    "mmlu_test_index": 1400
+  }
+]

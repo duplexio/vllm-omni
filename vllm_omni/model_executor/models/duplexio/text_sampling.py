@@ -40,7 +40,10 @@ def content_distribution(logits: Tensor, sampling: TokenSamplingOptions) -> tupl
 TEMPERATURE, TOP_K, TOP_P, EMIT_TEMPERATURE = slice(0, 3), slice(3, 6), slice(6, 9), slice(9, 12)
 # 0: no tool grammar, 1: inside or forced into a call, 2: idle and free to start one.
 TOOL_STATE = 12
-SAMPLING_PARAMETERS = 13
+# Nonzero: the agent emits on this row whatever its emit head says (text-only sessions,
+# whose emit head was never trained on text-only frames).
+FORCE_AGENT_EMIT = 13
+SAMPLING_PARAMETERS = 14
 NO_TOP_P = 2.0  # A cumulative probability never exceeds it.
 
 
@@ -129,6 +132,7 @@ def sample_streams(
     emit_greedy = emit_temperature == 0
     probability = torch.sigmoid(emit_logits / emit_temperature.masked_fill(emit_greedy, 1))
     emitted = torch.where(emit_greedy, emit_logits >= 0, torch.rand_like(probability) < probability)
+    emitted[:, 0] |= parameters[:, FORCE_AGENT_EMIT] != 0
     emit_logprobs = torch.where(emitted, probability, 1 - probability).log().masked_fill(emit_greedy, 0)
     # A call's rows always emit; an idle row's emit draw decides whether one starts.
     tool_state = parameters[:, TOOL_STATE]

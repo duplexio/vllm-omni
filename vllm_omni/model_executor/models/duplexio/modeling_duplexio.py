@@ -642,7 +642,11 @@ class DuplexIOForConditionalGeneration(
         prepared = [self.prepare_audio_request(tokens, info, device) for tokens, info in requests]
         live = {
             index: info["duplex"]["pcm"] for index, (_, info) in enumerate(requests)
-            if not (info["duplex"].get("duplexio_prefill", False) or info["duplex"].get("duplexio_system_input", False))
+            if not (
+                info["duplex"].get("duplexio_prefill", False)
+                or info["duplex"].get("duplexio_system_input", False)
+                or _text_only(info)
+            )
         }
         # The user encoder reads only this step's audio and its own caches, so on
         # CUDA it runs on a side stream, overlapping the previous step's backbone.
@@ -737,15 +741,23 @@ class DuplexIOForConditionalGeneration(
             duplex = info["duplex"]
             prefill = duplex.get("duplexio_prefill", False)
             system = duplex.get("duplexio_system_input", False)
-            live = not (prefill or system)
+            text_only = _text_only(info)
+            live = not (prefill or system or text_only)
             if prefill:
                 system_ids = state.system_token_ids[
                     max(0, start - item.prompt_count):max(0, start + count - item.prompt_count)
                 ]
                 text = [(silence, *quiet)] * item.prompt_chunk_frames + [(token, *quiet) for token in system_ids]
             elif system:
-                text = [(token, *quiet) for token in duplex["duplexio_system_token_ids"][start:start + count]]
+                cell = TEXT_STREAM_NAMES.index(duplex.get("duplexio_input_stream", "system"))
+                text = [
+                    tuple(token if index == cell else silence for index in range(len(TEXT_STREAM_NAMES)))
+                    for token in duplex["duplexio_system_token_ids"][start:start + count]
+                ]
                 state.text_input_ids = (silence, *quiet)
+            elif text_only:
+                # Typed sessions have no audio: the user cell stays silent while the agent replies.
+                text = [(silence, silence, *state.text_input_ids[2:])] * count
             else:
                 text = [(silence, *state.text_input_ids[1:])] * count
             assert len(text) == count
@@ -834,7 +846,7 @@ class DuplexIOForConditionalGeneration(
         sampling = self.resolve_sampling(sampling_runtime(SamplingConfig()))
         top_k = sampled_top_k((sampling.agent, sampling.user), self.text_config.vocab_size)
         width = support_width([sampling.agent], top_k)
-        parameters = torch.tensor([(*sampling.parameters, 0)] * max_rows, dtype=torch.float32, device=device)
+        parameters = torch.tensor([(*sampling.parameters, 0, 0)] * max_rows, dtype=torch.float32, device=device)
         rows = self.llm.channel_emb.new_zeros(max_rows, DUPLEXIO_NUM_CELLS, self.text_config.hidden_size)
         for size in range(1, max_rows + 1):
             tensors = (rows[:size], parameters[:size], self.allow_all_bitmask[:size])
@@ -943,7 +955,10 @@ class DuplexIOForConditionalGeneration(
                 raise ValueError(f"DuplexIO request span must contain complete frames, got ({start}, {end})")
             states.append(state)
         rows = {} if batch is None else {index: row for row, index in enumerate(batch.indices)}
-        decode_rows = [row for index, row in rows.items() if infos[index]["duplex"].get("decode_audio", True)]
+        decode_rows = [
+            row for index, row in rows.items()
+            if infos[index]["duplex"].get("decode_audio", True) and not _text_only(infos[index])
+        ]
         predicted_audio = [] if batch is None else batch.audio.unbind(0)
         waveforms = self.decode_agent_audio_batch(
             [predicted_audio[row] for row in decode_rows],
@@ -1269,7 +1284,8 @@ class DuplexIOForConditionalGeneration(
                     tool_state = 2
                     pending.append(row)
             constraints.append(constraint if tool_state else None)
-            parameters.append((*state.sampling.parameters, tool_state))
+            force_agent_emit = _text_only(info) and not info["duplex"].get("duplexio_prefill", False)
+            parameters.append((*state.sampling.parameters, tool_state, float(force_agent_emit)))
             streams += (state.sampling.agent, state.sampling.user)
         top_k = sampled_top_k(streams, vocab_size)
         return SamplingInputs(
@@ -1751,6 +1767,10 @@ def _to_device(values: list[Any], dtype: torch.dtype, device: torch.device) -> T
     """Upload host metadata without waiting for the queued backbone."""
     host = torch.tensor(values, dtype=dtype, pin_memory=device.type == "cuda")
     return host.to(device, non_blocking=True)
+
+
+def _text_only(info: Mapping[str, Any]) -> bool:
+    return bool(info["duplex"]["runtime_config"].get("duplexio_text_only", False))
 
 
 def sample_tool_token(

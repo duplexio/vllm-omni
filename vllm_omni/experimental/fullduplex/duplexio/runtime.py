@@ -38,13 +38,22 @@ def prefix_payload(prompt_frames: int, system_frames: int, *, decode_audio: bool
 
 def tool_result_payload(token_ids: list[int], *, decode_audio: bool) -> dict[str, Any]:
     """Submit one complete tool result for scheduler-owned chunking."""
+    return context_text_payload(token_ids, stream="system", decode_audio=decode_audio)
+
+
+def user_text_payload(token_ids: list[int], *, decode_audio: bool) -> dict[str, Any]:
+    """Submit a typed user turn: one token per frame in the user cell, as in text-only training."""
+    return context_text_payload(token_ids, stream="user", decode_audio=decode_audio)
+
+
+def context_text_payload(token_ids: list[int], *, stream: str, decode_audio: bool) -> dict[str, Any]:
     frames = len(token_ids)
     return {
         "type": "audio", "audio": "", "format": "pcm_f32le",
         "sample_rate_hz": DUPLEXIO_SAMPLE_RATE, "frame_size": DUPLEXIO_FRAME_SIZE,
         "frame_count": frames, "valid_samples": frames * DUPLEXIO_FRAME_SIZE,
         "duplexio_system_input": True, "duplexio_system_token_ids": token_ids,
-        "decode_audio": decode_audio,
+        "duplexio_input_stream": stream, "decode_audio": decode_audio,
     }
 
 
@@ -85,6 +94,9 @@ def build_duplexio_data_plane_prompt(
         or not all(isinstance(token_id, int) and token_id >= 0 for token_id in duplexio_system_token_ids)
     ):
         raise ValueError("DuplexIO system input requires one token ID per frame")
+    duplexio_input_stream = payload.get("duplexio_input_stream", "system")
+    if duplexio_input_stream not in ("system", "user"):
+        raise ValueError("DuplexIO context input stream must be 'system' or 'user'")
     scheduler_token_id = runtime_config.get("duplexio_scheduler_token_id", 0)
     if not isinstance(scheduler_token_id, int) or scheduler_token_id < 0:
         raise ValueError("duplexio_scheduler_token_id must be a non-negative integer")
@@ -118,6 +130,7 @@ def build_duplexio_data_plane_prompt(
                 "duplexio_prefill": duplexio_prefill,
                 "duplexio_system_input": duplexio_system_input,
                 "duplexio_system_token_ids": duplexio_system_token_ids,
+                "duplexio_input_stream": duplexio_input_stream,
                 "decode_audio": payload.get("decode_audio", True),
             },
         },

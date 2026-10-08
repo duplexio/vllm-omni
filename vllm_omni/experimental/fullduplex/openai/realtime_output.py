@@ -146,16 +146,17 @@ class RealtimeOutputProjector:
             if emit_transcript:
                 if not has_text:
                     text = ""
-                payloads.append(
-                    {
-                        "type": "response.audio_transcript.delta",
-                        "response_id": response_id,
-                        "item_id": self._response_item_id(response_id),
-                        "output_index": 0,
-                        "content_index": 0,
-                        "delta": text,
-                    }
-                )
+                transcript_delta = {
+                    "type": "response.audio_transcript.delta",
+                    "response_id": response_id,
+                    "item_id": self._response_item_id(response_id),
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": text,
+                }
+                if "agent_emit_logprob" in event:
+                    transcript_delta["agent_emit_logprob"] = event["agent_emit_logprob"]
+                payloads.append(transcript_delta)
             if event.get("end_of_turn") is True:
                 payloads.extend(self._realtime_audio_done_events(event, response_id))
                 payloads.extend(

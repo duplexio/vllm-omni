@@ -385,3 +385,34 @@ def test_compacted_scheduler_offsets_do_not_change_model_positions() -> None:
     torch.testing.assert_close(update['duplexio']['positions'], torch.arange(300_000, 300_018))
     assert update['duplexio_working_state'].frames_seen == 50_003
     assert update['duplexio_working_state'].persistent_keys == 3
+
+
+@torch.inference_mode()
+def test_typed_user_text_fills_the_user_cell_and_text_only_frames_skip_audio() -> None:
+    model = model_fixture()
+    state = request_state(model)
+    state.frames_seen = 7
+    info = input_info(state, [6, 7, 8], system=True)
+    info["duplex"]["duplexio_input_stream"] = "user"
+    info["duplex"]["runtime_config"] = {"duplexio_record_inputs": True, "duplexio_text_only": True}
+    _, _, update = model.preprocess(torch.zeros(18, dtype=torch.long), None, **info)
+    replay = update["duplexio_replay"]
+    assert replay["text_ids"].tolist() == [[2, 6, 2, 2], [2, 7, 2, 2], [2, 8, 2, 2]]
+    assert not replay["audio_mask"].any()
+
+    typed = update["duplexio_working_state"]
+    # The last typed frame predicted a user token and the agent's first token.
+    typed.text_input_ids = (2, 9, 10, 2)
+    _, _, update = model.preprocess(torch.zeros(6, dtype=torch.long), None,
+        duplexio_model_state=typed,
+        duplex_token_offset=0, duplex_prompt_len=6,
+        duplex={"frame_count": 1, "pcm": torch.ones(1920).numpy().tobytes(),
+                "runtime_config": {"duplexio_record_inputs": True, "duplexio_text_only": True}},
+    )
+    replay = update["duplexio_replay"]
+    assert replay["text_ids"].tolist() == [[2, 2, 10, 2]]
+    assert not replay["audio_mask"].any()
+    assert not replay["user_features"].any()
+    after = update["duplexio_working_state"]
+    assert after.audio_position == typed.audio_position
+    assert after.user_asr.next_mel_frame == typed.user_asr.next_mel_frame

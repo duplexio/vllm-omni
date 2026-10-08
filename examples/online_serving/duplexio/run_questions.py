@@ -28,12 +28,23 @@ def load_kokoro():
     return KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M", model=model), str(root / "voices/af_heart.pt")
 
 
+def centered_score(correct: int, total: int, choices: int = 4) -> float:
+    """Accuracy rescaled so random guessing over `choices` options is 0 and perfect is 1 (as in nanochat)."""
+    chance = 1 / choices
+    return (correct / total - chance) / (1 - chance)
+
+
 def answer_letter_in(text: str) -> str | None:
-    text = text.replace("*", "")
-    match = re.search(r"answer(?:\s+is)?\s*[:\-]?\s*\(?([ABCD])\b", text, re.IGNORECASE) or re.match(
-        r"\W*\(?([ABCD])(?:[).:,]|\s*$)", text
+    """The first option letter the reply commits to: a leading or bold letter, or 'answer/option is X'."""
+    patterns = (
+        r"^\W*\(?([ABCD])(?:[).:,]|\s*\n|\s*$)",
+        r"\*\*\(?([ABCD])[.)]?\*\*",
+        r"(?i:answer|option)(?:\s+(?i:is))?\s*[:\-]?\s*\**\(?([ABCD])\b",
+        r"\b(?i:is)\s+\**\(?([ABCD])\b(?!\w)",
+        r"\b([ABCD])\**\s+is\s+(?i:the\s+)?(?i:correct|right)",
     )
-    return match.group(1).upper() if match else None
+    matches = [match for pattern in patterns if (match := re.search(pattern, text))]
+    return min(matches, key=lambda match: match.start(1)).group(1) if matches else None
 
 
 def synthesize(pipeline, voice: str, text: str, path: Path) -> float:
@@ -54,6 +65,8 @@ def main() -> None:
     parser.add_argument("--questions", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--response-seconds", type=float, default=30)
+    parser.add_argument("--text-only", action="store_true", help="Type each question into a text-only session instead of speaking it")
+    parser.add_argument("--greedy", action="store_true", help="Greedy agent text instead of the trained sampling")
     parser.add_argument(
         "--instructions",
         default="You are a helpful voice assistant. Answer the user's question clearly and briefly.",
@@ -77,24 +90,32 @@ def main() -> None:
         case.mkdir()
         (case / "question.txt").write_text(question + "\n")
         print(f"[{index}/{len(questions)}] {question}", flush=True)
-        result = {**item, "index": index, "question": question, "seed": 42, "instructions": args.instructions}
+        result = {
+            **item, "index": index, "question": question, "seed": 42, "instructions": args.instructions,
+            "mode": "text" if args.text_only else "audio",
+            "sampling": "greedy" if args.greedy else "training",
+        }
         del result["text"]
         try:
-            duration = synthesize(pipeline, voice, question, case / "input.wav")
-            result["question_audio_seconds"] = duration
+            duration = 0.0
+            if not args.text_only:
+                duration = synthesize(pipeline, voice, question, case / "input.wav")
+                result["question_audio_seconds"] = duration
             request = argparse.Namespace(
                 model=args.model,
                 url=args.url,
                 ref_audio=reference,
-                user_audio=case / "input.wav",
+                user_audio=None if args.text_only else case / "input.wav",
+                user_text=question if args.text_only else None,
                 seconds=duration + args.response_seconds,
                 instructions=args.instructions,
                 seed=42,
+                greedy=args.greedy,
                 output=case / "answer.wav",
             )
             result.update(asyncio.run(run(request)))
             if not result["agent_text"]:
-                raise RuntimeError("Audio was returned but the agent transcript is empty")
+                raise RuntimeError("The agent transcript is empty")
             result["status"] = "ok"
             print(f"  Heard: {result['user_text']}\n  Answer: {result['agent_text']}", flush=True)
             if "answer" in item:
@@ -110,7 +131,11 @@ def main() -> None:
     failed = sum(result["status"] != "ok" for result in results)
     scored = [result for result in results if "correct" in result]
     if scored:
-        print(f"Correct letters: {sum(result['correct'] for result in scored)}/{len(scored)}", flush=True)
+        correct = sum(result["correct"] for result in scored)
+        print(
+            f"Correct letters: {correct}/{len(scored)}; centered score {centered_score(correct, len(scored)):.3f}",
+            flush=True,
+        )
     print(
         f"Saved {len(results)} cases to {args.output_dir}; {failed} request errors. Correctness requires review.",
         flush=True,

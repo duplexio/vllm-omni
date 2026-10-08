@@ -1315,13 +1315,23 @@ class DuplexSessionRunnerMixin:
                         )
                         continue
                     if self._uses_native_input_append(session):
-                        await emit_event(
-                            {
-                                "type": "error",
-                                "error": "The selected native duplex runtime accepts audio append only",
-                                "code": "native_text_append_unsupported",
-                            }
-                        )
+                        user_text_payloads = getattr(self._serving_runtime_adapter, "user_text_data_plane_payloads", None)
+                        payloads = tuple(user_text_payloads(session, text)) if callable(user_text_payloads) else ()
+                        if not payloads:
+                            await emit_event(
+                                {
+                                    "type": "error",
+                                    "error": "The selected native duplex runtime accepts text only in text-only sessions",
+                                    "code": "native_text_append_unsupported",
+                                }
+                            )
+                            continue
+                        if not await wait_for_native_append_tail():
+                            continue
+                        for text_payload in payloads:
+                            append_task = await start_native_append(text_payload, final=False)
+                            if append_task is None or not await append_task:
+                                break
                         continue
                     else:
                         session.append_text(text)

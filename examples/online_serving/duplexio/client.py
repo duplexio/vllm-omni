@@ -32,7 +32,7 @@ async def run(args: argparse.Namespace) -> dict:
     speech = read_audio(args.user_audio) if args.user_audio else np.empty(0, dtype="<f4")
     frames = max(int(args.seconds * SAMPLE_RATE / FRAME_SIZE), (speech.size + FRAME_SIZE - 1) // FRAME_SIZE)
     query = urlencode({"duplex": 1, "model": args.model, "autostart": 0})
-    audio, text, user_text = [], [], []
+    audio, text, user_text, agent_frames = [], [], [], []
     counts = Counter()
     started = time.monotonic()
     async with asyncio.timeout(frames * FRAME_SIZE / SAMPLE_RATE + 180):
@@ -53,11 +53,20 @@ async def run(args: argparse.Namespace) -> dict:
                             "extra_body": {
                                 "full_duplex": True,
                                 "auto_response": True,
-                                "start_role": "user" if args.user_audio else "agent",
+                                "start_role": "user" if args.user_audio or args.user_text else "agent",
+                                "text_only": bool(args.user_text),
                                 "ref_audio_data": base64.b64encode(reference.tobytes()).decode(),
                                 "ref_audio_format": "pcm_f32le",
                                 "ref_audio_sample_rate": SAMPLE_RATE,
-                                "duplexio_sampling": {"seed": args.seed},
+                                "duplexio_sampling": {
+                                    "seed": args.seed,
+                                    # Greedy agent content; emission stays as trained.
+                                    **(
+                                        {"agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.0}}}
+                                        if getattr(args, "greedy", False)
+                                        else {}
+                                    ),
+                                },
                             },
                         },
                     }
@@ -100,11 +109,15 @@ async def run(args: argparse.Namespace) -> dict:
                         )
                     elif kind == "response.audio_transcript.delta":
                         text.append(event["delta"])
+                        agent_frames.append((event["delta"], event.get("agent_emit_logprob")))
                     elif kind == "conversation.item.input_audio_transcription.delta":
                         user_text.append(event["delta"])
 
             receiver = asyncio.create_task(receive())
             try:
+                if args.user_text:
+                    # Typed turn: one token per frame in the user cell; the silent frames below drive the reply.
+                    await socket.send(json.dumps({"type": "input_text.append", "text": args.user_text}))
                 stream_started = time.monotonic()
                 for index in range(frames):
                     if receiver.done():
@@ -131,6 +144,15 @@ async def run(args: argparse.Namespace) -> dict:
                 await receiver
             finally:
                 receiver.cancel()
+    if args.user_text:
+        return {
+            "agent_text": "".join(text).strip(),
+            "agent_frames": agent_frames,
+            "user_text": "".join(user_text).strip(),
+            "input_seconds": frames * FRAME_SIZE / SAMPLE_RATE,
+            "elapsed_seconds": time.monotonic() - started,
+            "events": dict(counts),
+        }
     if not audio:
         raise RuntimeError("Session produced no agent audio")
     waveform = np.concatenate(audio)
@@ -154,13 +176,17 @@ def main() -> None:
     parser.add_argument("--url", default="ws://127.0.0.1:8000")
     parser.add_argument("--ref-audio", required=True, type=Path)
     parser.add_argument("--user-audio", type=Path)
+    parser.add_argument("--user-text", help="Type the user turn instead of speaking it; the session is text-only")
     parser.add_argument("--seconds", type=float, default=20)
     parser.add_argument("--instructions", default="You are a helpful voice assistant.")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--greedy", action="store_true", help="Greedy agent text instead of the trained sampling")
     parser.add_argument("--output", type=Path, default=Path("agent.wav"))
     args = parser.parse_args()
     if args.seconds <= 0:
         parser.error("--seconds must be positive")
+    if args.user_audio and args.user_text:
+        parser.error("--user-audio and --user-text are mutually exclusive")
     print(json.dumps(asyncio.run(run(args)), indent=2))
 
 

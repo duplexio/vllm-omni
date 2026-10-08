@@ -25,7 +25,7 @@ from vllm_omni.experimental.fullduplex.duplexio.input import (
     DUPLEXIO_FRAME_SIZE,
     DUPLEXIO_SAMPLE_RATE,
 )
-from vllm_omni.experimental.fullduplex.duplexio.runtime import prefix_payload, tool_result_payload
+from vllm_omni.experimental.fullduplex.duplexio.runtime import prefix_payload, tool_result_payload, user_text_payload
 from vllm_omni.experimental.fullduplex.duplexio.session import (
     DuplexIOServingSessionState,
 )
@@ -91,6 +91,7 @@ class DuplexIOServingRuntimeAdapter:
             "duplexio_scheduler_token_id",
             "duplexio_sampling_seed",
             "duplexio_start_role",
+            "duplexio_text_only",
             "duplexio_voice_ids",
             "duplexio_voice_clip_index",
             "duplexio_depth_sampling",
@@ -180,6 +181,9 @@ class DuplexIOServingRuntimeAdapter:
         self.validate_client_extra_body(config.extra_body)
         _validate_full_duplex_mode(config)
         start_role = _start_role(config.extra_body)
+        text_only = config.extra_body.get("text_only", False)
+        if not isinstance(text_only, bool):
+            raise DuplexIOClientRuntimeConfigError("DuplexIO text_only must be a boolean", code="text_only_invalid")
         hf_config = getattr(model_config, "hf_config", model_config)
         voice_prompt, voice_prompt_frames = _voice_prompt_from_session(
             config,
@@ -274,6 +278,7 @@ class DuplexIOServingRuntimeAdapter:
                 for token in (*system_token_ids, *initial_prefix_ids)
             ],
             "duplexio_start_role": start_role,
+            "duplexio_text_only": text_only,
             "duplexio_voice_prompt_pcm": voice_prompt,
             "duplexio_voice_prompt_frames": voice_prompt_frames,
             "duplexio_scheduler_token_id": scheduler_token_id,
@@ -331,6 +336,42 @@ class DuplexIOServingRuntimeAdapter:
         if not token_ids:
             raise RuntimeError("DuplexIO tokenizer produced no tool-result tokens")
         payload = tool_result_payload(token_ids, decode_audio=True)
+        payload["duplex_turn_id"] = turn_id
+        return (payload,)
+
+    @staticmethod
+    def silence_unit_payload() -> dict[str, object]:
+        """One framed 80 ms silence row for server-side response continuations."""
+        return {
+            "type": "audio",
+            "audio": base64.b64encode(bytes(4 * DUPLEXIO_FRAME_SIZE)).decode("ascii"),
+            "format": "pcm_f32le",
+            "sample_rate_hz": DUPLEXIO_SAMPLE_RATE,
+            "frame_size": DUPLEXIO_FRAME_SIZE,
+            "frame_count": 1,
+            "valid_samples": DUPLEXIO_FRAME_SIZE,
+            "force_listen": False,
+            "is_speech": False,
+        }
+
+    def user_text_data_plane_payloads(
+        self,
+        session: object,
+        text: str,
+    ) -> tuple[dict[str, object], ...]:
+        """Typed user turns are supported only in text-only sessions, matching text-only training."""
+        if self.tokenizer is None:
+            raise RuntimeError("DuplexIO tokenizer is not configured")
+        runtime_config = getattr(session, "runtime_config", None)
+        turn_id = getattr(session, "turn_id", None)
+        if not isinstance(runtime_config, Mapping) or not isinstance(turn_id, int):
+            raise RuntimeError("DuplexIO session is missing runtime state")
+        if not runtime_config.get("duplexio_text_only", False):
+            return ()
+        token_ids = self.tokenizer.encode(text.strip(), add_special_tokens=False)
+        if not token_ids:
+            return ()
+        payload = user_text_payload(token_ids, decode_audio=False)
         payload["duplex_turn_id"] = turn_id
         return (payload,)
 

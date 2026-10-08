@@ -19,6 +19,7 @@ from vllm_omni.experimental.fullduplex.duplexio.input import (
 from vllm_omni.experimental.fullduplex.duplexio.runtime import (
     DuplexIORuntimeExtension,
     build_duplexio_data_plane_prompt,
+    user_text_payload,
 )
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexInputMode,
@@ -158,6 +159,44 @@ def test_data_plane_prompt_batches_system_input_frames() -> None:
     assert prompt["prompt_token_ids"] == [17] * 18
     duplex = prompt["model_intermediate_buffer"]["duplex"]
     assert duplex["duplexio_system_token_ids"] == [41, 42, 43]
+    assert duplex["duplexio_input_stream"] == "system"
+
+
+def test_data_plane_prompt_routes_typed_user_text_to_the_user_cell() -> None:
+    prompt = build_duplexio_data_plane_prompt(
+        request_id="request-1",
+        fence=DuplexFence("session-1"),
+        session_config={},
+        runtime_config={"duplexio_scheduler_token_id": 17},
+        seq=1,
+        turn_seq=1,
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        payload=user_text_payload([41, 42], decode_audio=False),
+        final=False,
+    )
+
+    duplex = prompt["model_intermediate_buffer"]["duplex"]
+    assert prompt["prompt_token_ids"] == [17] * 12
+    assert duplex["duplexio_system_input"] is True
+    assert duplex["duplexio_system_token_ids"] == [41, 42]
+    assert duplex["duplexio_input_stream"] == "user"
+    assert duplex["decode_audio"] is False
+
+
+def test_data_plane_prompt_rejects_unknown_input_stream() -> None:
+    payload = {**user_text_payload([41], decode_audio=False), "duplexio_input_stream": "agent"}
+    with pytest.raises(ValueError, match="'system' or 'user'"):
+        build_duplexio_data_plane_prompt(
+            request_id="request-1",
+            fence=DuplexFence("session-1"),
+            session_config={},
+            runtime_config={},
+            seq=1,
+            turn_seq=1,
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+            payload=payload,
+            final=False,
+        )
 
 
 @pytest.mark.parametrize("tokens", [[41, 42], [41, 42, -1], [41, 42, "43"], None])
@@ -288,3 +327,23 @@ def test_runtime_configures_per_frame_delta_outputs() -> None:
 
     assert configured[0].max_tokens == 1
     assert configured[0].output_kind == RequestOutputKind.DELTA
+
+
+def test_server_silence_unit_is_one_valid_frame() -> None:
+    from vllm_omni.experimental.fullduplex.duplexio.serving_adapter import DuplexIOServingRuntimeAdapter
+
+    prompt = build_duplexio_data_plane_prompt(
+        request_id="request-1",
+        fence=DuplexFence("session-1"),
+        session_config={},
+        runtime_config={"duplexio_scheduler_token_id": 17},
+        seq=1,
+        turn_seq=1,
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        payload=DuplexIOServingRuntimeAdapter.silence_unit_payload(),
+        final=False,
+    )
+
+    duplex = prompt["model_intermediate_buffer"]["duplex"]
+    assert duplex["frame_count"] == 1
+    assert duplex["pcm"] == bytes(4 * 1_920)

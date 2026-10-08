@@ -17,7 +17,9 @@ set -euo pipefail
 repo=/dcai/users/cardua/vllm-omni
 export PATH=/usr/local/bin:/usr/bin:/bin:/dcai/software/tenant/apps/slurm/current/bin
 export HF_HOME=/dcai/users/cardua/.cache/huggingface HF_HUB_OFFLINE=1
-export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=4
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} PYTHONUNBUFFERED=1 OMP_NUM_THREADS=4
+# Jobs can share a node; keep each server on its own port.
+export DUPLEXIO_PORT=${DUPLEXIO_PORT:-$((20000 + SLURM_JOB_ID % 20000))}
 export PYTHONPATH=$repo
 export KOKORO_ASSETS=/opt/kokoro
 export TRITON_CACHE_DIR=/var/tmp/cardua/duplexio-validation/triton
