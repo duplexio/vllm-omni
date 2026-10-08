@@ -271,8 +271,8 @@ class MossTTSRealtimeSession:
 class MossTTSRealtimeSessionStore:
     """In-memory state for batched Realtime turn requests.
 
-    ``history_turns`` bounds the audio/text replayed into each assistant
-    request.  The upstream realtime implementation keeps an unbounded KV
+    ``history_turns`` bounds the audio/text replayed into each turn.
+    The upstream realtime implementation keeps an unbounded KV
     conversation, but stateless HTTP turns cannot reuse that KV safely because
     the RVQ grid is request-specific.  A bounded window keeps prefill and
     memory costs predictable while retaining the immediately preceding turn.

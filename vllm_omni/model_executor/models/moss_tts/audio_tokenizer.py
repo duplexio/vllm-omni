@@ -8,7 +8,7 @@
 #
 # Vendored from OpenMOSS-Team/MOSS-Audio-Tokenizer (configuration_moss_audio_tokenizer.py
 # and modeling_moss_audio_tokenizer.py).  Simplified for inference-only use:
-#   - Streaming KV-cache infrastructure removed (single-pass batch decode only).
+#   - Decoder streaming state is explicit and separate from the model weights.
 #   - Training-only methods (forward, encode, decode) removed.
 #   - Dead branches removed: gating="none" always, weights_per_step=0 always,
 #     positional_embedding="rope" always, norm="layer_norm" always in default config.
@@ -155,6 +155,26 @@ class MossAudioTokenizerDecoderOutput(ModelOutput):
     audio_lengths: torch.Tensor | None = None
 
 
+@dataclass
+class CodecKVState:
+    """Chronological, right-aligned keys and values, bounded by the attention window."""
+
+    keys: torch.Tensor  # (slots, heads, context, head_dim)
+    values: torch.Tensor
+
+
+@dataclass
+class CodecDecodeState:
+    """Per-request decoder history; inactive slots do not advance."""
+
+    offsets: torch.Tensor  # (slots,), consumed codec frames
+    layers: list[list[CodecKVState] | None]
+
+    def reset(self, slots: torch.Tensor) -> None:
+        """Make released slots empty; old keys are excluded by the position mask."""
+        self.offsets.index_fill_(0, slots, 0)
+
+
 # ---------------------------------------------------------------------------
 # Building blocks
 # ---------------------------------------------------------------------------
@@ -169,7 +189,9 @@ class _LayerScale(nn.Module):
         return self.scale * x
 
 
-def _apply_rope(q: torch.Tensor, k: torch.Tensor, max_period: float = 10_000) -> tuple[torch.Tensor, torch.Tensor]:
+def _apply_rope(
+    q: torch.Tensor, k: torch.Tensor, max_period: float = 10_000, offsets: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotary position embedding over sequence dimension (B, H, T, D).
 
     Matches upstream MossAudioTokenizer's ``apply_rope``: pair the last dim
@@ -182,6 +204,8 @@ def _apply_rope(q: torch.Tensor, k: torch.Tensor, max_period: float = 10_000) ->
     ds = torch.arange(half, device=q.device, dtype=torch.float32)
     freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
     ts = torch.arange(T, device=q.device, dtype=torch.float32).view(1, 1, -1, 1)  # (1, 1, T, 1)
+    if offsets is not None:
+        ts = ts + offsets[:, None, None, None]
     rotr = torch.cos(freqs * ts)  # (1, 1, T, D/2)
     roti = torch.sin(freqs * ts)
 
@@ -202,7 +226,7 @@ def _apply_rope(q: torch.Tensor, k: torch.Tensor, max_period: float = 10_000) ->
 
 
 class _Attention(nn.Module):
-    """Causal multi-head self-attention with RoPE, no streaming KV cache."""
+    """Causal self-attention with RoPE and an optional explicit streaming cache."""
 
     def __init__(
         self,
@@ -281,6 +305,28 @@ class _Attention(nn.Module):
         out = out.transpose(1, 2).reshape(B, T, self.embed_dim)
         return self.out_proj(out)
 
+    def forward_chunk(
+        self, x: torch.Tensor, state: CodecKVState, slots: torch.Tensor, offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend to cached history without recomputing its projections or activations."""
+        batch, frames, _ = x.shape
+        heads, head_dim = self.num_heads, self.embed_dim // self.num_heads
+        qkv = self.in_proj(x).reshape(batch, frames, 3, heads, head_dim).permute(2, 0, 3, 1, 4)
+        q, k = _apply_rope(qkv[0], qkv[1], self.max_period, offsets)
+        keys = torch.cat([state.keys.index_select(0, slots), k], dim=2)
+        values = torch.cat([state.values.index_select(0, slots), qkv[2]], dim=2)
+        context = state.keys.shape[2]
+        queries = offsets[:, None] + torch.arange(frames, device=x.device)
+        positions = offsets[:, None] + torch.arange(-context, frames, device=x.device)
+        delta = queries[:, :, None] - positions[:, None, :]
+        mask = (positions[:, None, :] >= 0) & (delta >= 0) & (delta < context)
+        out = F.scaled_dot_product_attention(q, keys, values, attn_mask=mask[:, None])
+        # Retain old keys until attention finishes: writing the whole new chunk
+        # into a context-sized ring first would erase history needed by its first queries.
+        state.keys.index_copy_(0, slots, keys[:, :, -context:])
+        state.values.index_copy_(0, slots, values[:, :, -context:])
+        return self.out_proj(out.transpose(1, 2).reshape(batch, frames, self.embed_dim))
+
 
 class _TransformerLayer(nn.Module):
     def __init__(
@@ -314,6 +360,12 @@ class _TransformerLayer(nn.Module):
         x = x + self.ls1(self.attn(self.norm1(x)))
         x = x + self.ls2(self.ff2(F.gelu(self.ff1(self.norm2(x)))))
         return x
+
+    def forward_chunk(
+        self, x: torch.Tensor, state: CodecKVState, slots: torch.Tensor, offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        x = x + self.ls1(self.attn.forward_chunk(self.norm1(x), state, slots, offsets))
+        return x + self.ls2(self.ff2(F.gelu(self.ff1(self.norm2(x)))))
 
 
 class _Transformer(nn.Module):
@@ -365,6 +417,14 @@ class _ProjectedTransformer(nn.Module):
         x = self.transformer(x)
         x = self.out_proj(x).transpose(1, 2)  # (B, T, D) → (B, D, T)
         return x, lengths
+
+    def forward_chunk(
+        self, x: torch.Tensor, states: list[CodecKVState], slots: torch.Tensor, offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        x = self.in_proj(x.transpose(1, 2))
+        for layer, state in zip(self.transformer.layers, states, strict=True):
+            x = layer.forward_chunk(x, state, slots, offsets)
+        return self.out_proj(x).transpose(1, 2)
 
 
 class _PatchedPretransform(nn.Module):
@@ -544,7 +604,7 @@ def _build_modules(
 
 
 class MossAudioTokenizerModel(PreTrainedModel):
-    """MOSS Audio Tokenizer — inference-only (batch_encode / batch_decode)."""
+    """MOSS Audio Tokenizer with batch encoding and stateless or cached decoding."""
 
     config_class = MossAudioTokenizerConfig
     base_model_prefix = ""
@@ -580,6 +640,51 @@ class MossAudioTokenizerModel(PreTrainedModel):
         kw = dict(config.quantizer_kwargs)
         self.quantizer = _ResidualQ(**kw)
         self.post_init()
+
+    def new_decode_state(self, stream_slots: int) -> CodecDecodeState:
+        """Allocate bounded decoder KV storage in the model's device and dtype."""
+        layers: list[list[CodecKVState] | None] = []
+        for module in self.decoder:
+            if isinstance(module, _ProjectedTransformer):
+                states = []
+                for layer in module.transformer.layers:
+                    attention = layer.attn
+                    assert attention.causal and attention.context is not None and attention.context > 0
+                    shape = (
+                        stream_slots, attention.num_heads, attention.context,
+                        attention.embed_dim // attention.num_heads,
+                    )
+                    weight = attention.in_proj.weight
+                    states.append(CodecKVState(weight.new_zeros(shape), weight.new_zeros(shape)))
+                layers.append(states)
+            else:
+                layers.append(None)
+        return CodecDecodeState(
+            torch.zeros(stream_slots, dtype=torch.long, device=self.device), layers,
+        )
+
+    @torch.no_grad()
+    def decode_chunk(
+        self, codes: torch.Tensor, slots: torch.Tensor, state: CodecDecodeState,
+    ) -> MossAudioTokenizerDecoderOutput:
+        """Decode new codes (NQ, active slots, frames), retaining each slot's history.
+
+        All active rows contain equally many real frames. Slots are unique GPU
+        long indices; omitted slots retain both their history and position.
+        """
+        frames = codes.shape[-1]
+        offsets = state.offsets.index_select(0, slots)
+        lengths = torch.full_like(slots, frames)
+        audio = self.quantizer.decode_codes(codes)
+        for module, layer_states in zip(self.decoder, state.layers, strict=True):
+            if layer_states is None:
+                audio, lengths = module(audio, lengths)
+                offsets = offsets * module.patch_size
+            else:
+                audio = module.forward_chunk(audio, layer_states, slots, offsets)
+        state.offsets.index_add_(0, slots, torch.full_like(slots, frames))
+        audio, lengths = self._restore_channels_from_codec(audio, lengths)
+        return MossAudioTokenizerDecoderOutput(audio=audio, audio_lengths=lengths)
 
     @torch.no_grad()
     def batch_encode(

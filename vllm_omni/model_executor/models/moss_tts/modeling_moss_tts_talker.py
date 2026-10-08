@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from functools import partial
 from typing import Any
 
 import torch
@@ -26,6 +27,7 @@ from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
     MossTTSRealtimeConfig,
 )
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local import (
+    MossRealtimeFrameGraphs,
     MossTTSRealtimeLocalTransformer,
 )
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import (
@@ -881,6 +883,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
     have_multimodal_outputs: bool = True
     has_preprocess: bool = True
     has_postprocess: bool = True
+    requires_full_prefix_cached_hidden_states = False
 
     AUDIO_BOS = 1025
     AUDIO_EOS = 1026
@@ -935,6 +938,16 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         self.local_transformer = MossTTSRealtimeLocalTransformer(local_cfg)
         self.local_lm_heads = nn.ModuleList(
             [nn.Linear(int(local_cfg.hidden_size), self.audio_vocab_size, bias=False) for _ in range(self.n_vq)]
+        )
+        self.repetition_window = 50
+        self.generate_audio_frame: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = partial(
+            self.local_transformer.generate_frame,
+            lm_heads=self.local_lm_heads,
+            temperature=0.8,
+            top_p=0.6,
+            top_k=30,
+            do_sample=True,
+            repetition_penalty=1.1,
         )
 
         # No real text LM head — compute_logits builds a one-hot row directly.
@@ -1060,7 +1073,12 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
             # from ``info_dict["codes"]["ref"]``; slice the chunk that aligns
             # with this prefill window.
             ref_codes = (info_dict.get("codes", {}) or {}).get("ref")
-            ref_offset = int(info_dict.get("ref_offset", 0))
+            ref_offset = int(info_dict.get("_omni_num_computed_tokens", info_dict.get("ref_offset", 0)))
+            if is_first_call:
+                logger.info(
+                    "MOSS realtime prefill: prompt_tokens=%s cached_tokens=%d scheduled_tokens=%d",
+                    info_dict.get("_omni_prompt_len", span_len), ref_offset, span_len,
+                )
             chunk_audio = None
             if isinstance(ref_codes, torch.Tensor) and ref_codes.numel() > 0:
                 if ref_codes.dim() == 1 and ref_codes.numel() % self.n_vq == 0:
@@ -1179,37 +1197,42 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                 history = state.get("history_per_codebook")
                 if not isinstance(history, list) or len(history) != self.n_vq:
                     raise RuntimeError("MOSS-TTS realtime repetition history was not initialized during prefill")
-                hist_per_cb = [list(tokens[-50:]) for tokens in history]
                 active_indices.append(i)
                 active_last_hidden.append(hidden[row_end - 1])
-                active_histories.append(hist_per_cb)
+                active_histories.append(history)
 
             if active_indices:
-                new_codes_batch = self.local_transformer.generate_frame(
-                    torch.stack(active_last_hidden, dim=0),
-                    self.local_lm_heads,
-                    temperature=0.8,
-                    top_p=0.6,
-                    top_k=30,
-                    do_sample=True,
-                    repetition_penalty=1.1,
-                    history_per_codebook=active_histories,
+                history_ids = torch.tensor(
+                    [
+                        [
+                            tokens + [self.audio_vocab_size] * (self.repetition_window - len(tokens))
+                            for tokens in history
+                        ]
+                        for history in active_histories
+                    ],
+                    device=hidden.device,
+                    dtype=torch.long,
                 )
+                new_codes_batch = self.generate_audio_frame(
+                    torch.stack(active_last_hidden, dim=0), history_ids,
+                )
+                codes_cpu = new_codes_batch.tolist()
 
             for active_index, i in enumerate(active_indices):
                 info = info_dicts[i]
                 state = info["audio_state"]
                 new_codes = new_codes_batch[active_index]
+                new_codes_cpu = codes_cpu[active_index]
                 if int(state.get("step", 0)) < 5 or int(state.get("step", 0)) % 50 == 0:
                     logger.debug(
                         "[MossTTSRealtime make_omni] step=%d ch0=%d cursor=%d/%d",
                         int(state.get("step", 0)),
-                        int(new_codes[0].item()),
+                        new_codes_cpu[0],
                         int(state.get("text_cursor", 0)),
                         len(state.get("remaining_text") or []),
                     )
 
-                ch0 = int(new_codes[0].item())
+                ch0 = new_codes_cpu[0]
                 # Stop condition mirrors upstream: codebook 0 == eos_audio_id.
                 if ch0 == self.AUDIO_EOS:
                     state["is_stopping"] = True
@@ -1224,10 +1247,9 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     continue
 
                 history = state["history_per_codebook"]
-                new_codes_cpu = new_codes.tolist()
                 for codebook, token in enumerate(new_codes_cpu):
-                    history[codebook].append(int(token))
-                    del history[codebook][:-50]
+                    history[codebook].append(token)
+                    del history[codebook][:-self.repetition_window]
 
                 info["audio_codes"] = {"current": new_codes}
                 state["step"] = int(state.get("step", 0)) + 1
@@ -1311,6 +1333,17 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         self._stacked_audio_emb_w = torch.stack(
             [self.embed_tokens[i + 1].weight.detach() for i in range(self.n_vq)], dim=0
         )  # (n_vq, audio_vocab_size, hidden_size)
+
+        if not self.vllm_config.model_config.enforce_eager:
+            self.generate_audio_frame = MossRealtimeFrameGraphs(
+                self.generate_audio_frame,
+                self.local_lm_heads[0].weight.new_zeros((1, self.hidden_size)),
+                torch.full(
+                    (1, self.n_vq, self.repetition_window), self.audio_vocab_size,
+                    dtype=torch.long, device=self.local_lm_heads[0].weight.device,
+                ),
+                self.vllm_config.scheduler_config.max_num_seqs,
+            )
 
         logger.info(
             "[MossTTSRealtime] loaded %d/%d params; skipped=%d (first 5: %s)",

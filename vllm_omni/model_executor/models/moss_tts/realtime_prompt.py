@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_omni.model_executor.models.moss_tts.session import MossTTSRealtimeSegment
+from vllm_omni.model_executor.models.moss_tts.session import MossTTSRealtimeSegment, SpeakerRole
 
 
 @dataclass(frozen=True)
@@ -110,10 +110,11 @@ def _assistant_history_grid(
 def _history_grid(
     processor: Any,
     segments: Sequence[MossTTSRealtimeSegment],
+    target_role: SpeakerRole,
 ) -> np.ndarray:
     grids: list[np.ndarray] = []
     for index, segment in enumerate(segments):
-        if segment.role == "user":
+        if segment.role != target_role:
             user_codes = _as_audio_tokens(segment.codes, int(processor.channels))
             assert user_codes is not None
             grids.append(
@@ -122,8 +123,8 @@ def _history_grid(
                     dtype=np.int64,
                 )
             )
-        elif segment.role == "assistant":
-            if index == 0 or segments[index - 1].role == "assistant":
+        else:
+            if index == 0 or segments[index - 1].role == target_role:
                 grids.append(_assistant_prefix_grid(processor, after_user=index > 0))
             grids.append(
                 _assistant_history_grid(
@@ -132,8 +133,6 @@ def _history_grid(
                     audio_codes=segment.codes,
                 )
             )
-        else:
-            raise ValueError(f"Unknown MOSS Realtime history role: {segment.role!r}")
     if not grids:
         return np.empty((0, int(processor.channels) + 1), dtype=np.int64)
     return np.concatenate(grids, axis=0)
@@ -145,11 +144,13 @@ def build_realtime_prompt(
     text: str,
     reference_codes: torch.Tensor,
     history_segments: Sequence[MossTTSRealtimeSegment] = (),
+    role: SpeakerRole = "assistant",
     prefill_text_tokens: int = 12,
 ) -> MossTTSRealtimePrompt:
     """Build the exact mixed text/audio grid expected by Realtime.
 
-    ``history_segments`` contains completed turns from the assistant session.
+    The target voice occupies the model's assistant slot. History from the
+    other voice is rendered as user speech, regardless of its real-world role.
     The upstream realtime implementation keeps those rows in its KV cache; a
     stateless vLLM request must present the same rows explicitly.
     """
@@ -160,10 +161,10 @@ def build_realtime_prompt(
     system_grid = processor.make_ensemble(prompt_audio_tokens=reference_tokens)
     grids = [np.asarray(system_grid, dtype=np.int64)]
 
-    history = _history_grid(processor, history_segments)
+    history = _history_grid(processor, history_segments, role)
     if history.shape[0]:
         grids.append(history)
-    if not history_segments or history_segments[-1].role != "user":
+    if not history_segments or history_segments[-1].role == role:
         grids.append(
             _assistant_prefix_grid(
                 processor,

@@ -77,6 +77,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     width: int
     decode_flag: bool
     codec_streaming: bool
+    return_context_codes: bool
     ref_code_len: int
     ref_context_size: int
     ref_context_request_id: str
@@ -85,6 +86,7 @@ class OmniPayloadMeta(TypedDict, total=False):
 
 
 class OmniPayload(TypedDict, total=False):
+    prefix_cache_input_ids: torch.Tensor
     hidden_states: HiddenStates
     embed: Embeddings
     ids: Ids
@@ -166,6 +168,7 @@ class MetaStruct(_StructBase):
     width: int | None = None
     decode_flag: bool | None = None
     codec_streaming: bool | None = None
+    return_context_codes: bool | None = None
     ref_code_len: int | None = None
     ref_context_size: int | None = None
     ref_context_request_id: str | None = None
@@ -178,6 +181,7 @@ class MetaStruct(_StructBase):
 
 
 class OmniPayloadStruct(_StructBase):
+    prefix_cache_input_ids: torch.Tensor | None = None
     hidden: torch.Tensor | None = None
     hidden_states: HiddenStatesStruct | None = None
     embed: EmbeddingsStruct | None = None

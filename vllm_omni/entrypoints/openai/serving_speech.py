@@ -1988,38 +1988,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._speaker_cache.put(cache_key, {"codes": codes.detach().cpu()})
         return codes
 
-    async def _roundtrip_moss_realtime_context_codes(self, codes: torch.Tensor) -> torch.Tensor:
-        """Re-encode generated audio before using it as the next user context.
-
-        Realtime's reference implementation decodes each completed user turn
-        and encodes that waveform again before putting it in the assistant
-        prompt.  The generated RVQ rows are not a stable substitute: the
-        decoder's boundary handling and quantizer state are part of the
-        conditioning contract.
-        """
-        if codes.ndim != 2 or codes.shape[0] == 0:
-            raise ValueError(f"MOSS Realtime context codes must be 2-D and non-empty, got {tuple(codes.shape)}")
-        codec = self._get_moss_realtime_codec()
-        codebooks = int(codes.shape[1])
-
-        def decode_and_encode() -> torch.Tensor:
-            with torch.inference_mode():
-                decoded = codec.batch_decode(
-                    codes_list=[codes.transpose(0, 1).contiguous()],
-                    num_quantizers=codebooks,
-                )
-                if decoded.audio is None or decoded.audio_lengths is None:
-                    raise RuntimeError("MOSS Audio Tokenizer returned no waveform for Realtime context")
-                waveform = decoded.audio[0]
-                waveform = waveform[..., : int(decoded.audio_lengths[0].item())]
-                encoded = codec.batch_encode([waveform], num_quantizers=codebooks)
-                if encoded.audio_codes is None or encoded.audio_codes_lengths is None:
-                    raise RuntimeError("MOSS Audio Tokenizer returned no codes for Realtime context")
-                frame_count = int(encoded.audio_codes_lengths[0].item())
-                return encoded.audio_codes[:codebooks, 0, :frame_count].transpose(0, 1).contiguous().cpu()
-
-        return await asyncio.to_thread(decode_and_encode)
-
     def _require_moss_ttsd_sessions(self):
         if self._moss_variant != "ttsd" or self._moss_ttsd_sessions is None:
             raise ValueError("Turnwise sessions require a MOSS-TTSD deployment")
@@ -2264,11 +2232,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 processor,
                 text=turn.text,
                 reference_codes=reference_codes,
-                history_segments=(
-                    turn.history_segments
-                    if turn.role == "assistant"
-                    else ()
-                ),
+                history_segments=turn.history_segments,
+                role=turn.role,
             )
             params: dict[str, Any] = {
                 "prompt_token_ids": prompt.text_ids,
@@ -2277,9 +2242,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "all": prompt.remaining_text_ids,
                 },
                 "codes": {"ref": prompt.audio_codes},
-                # The RVQ grid is additional information rather than token
-                # ids, so a session-wide cache salt is unsafe across turns.
-                "_cache_salt": f"{turn.cache_salt}:turn-{turn.revision}",
+                "prefix_cache_input_ids": prompt.audio_codes,
+                "_cache_salt": f"{turn.cache_salt}:{turn.role}",
+                "meta": {"return_context_codes": turn.role == "user"},
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
@@ -3387,22 +3352,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return mm, key
 
     @staticmethod
-    def _extract_moss_codes(multimodal_output: dict[str, Any]) -> torch.Tensor:
-        """Extract the final raw ``(frames, codebooks)`` grid from Stage 1."""
+    def _extract_moss_codes(multimodal_output: dict[str, Any], key: str = "audio_codes") -> torch.Tensor:
+        """Extract a final nonempty two-dimensional code grid from Stage 1."""
         candidates: list[torch.Tensor] = []
 
         def collect(value: Any) -> None:
             if isinstance(value, torch.Tensor):
-                if value.ndim == 2 and value.shape[0] > 0:
+                if value.ndim == 2 and value.numel() > 0:
                     candidates.append(value)
                 return
             if isinstance(value, (list, tuple)):
                 for item in value:
                     collect(item)
 
-        collect(multimodal_output.get("audio_codes"))
+        collect(multimodal_output.get(key))
         if not candidates:
-            raise ValueError("MOSS codec stage did not return generated RVQ codes")
+            raise ValueError(f"MOSS codec stage did not return {key}")
         return candidates[-1].detach().to("cpu", torch.long).contiguous()
 
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
@@ -4230,7 +4195,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             is_moss = self._tts_model_type in {"moss_tts_nano", "moss_tts"}
             moss_async_chunk = is_moss and bool(getattr(self.engine_client.model_config, "async_chunk", False))
             moss_chunks: list[Any] = []
-            moss_code_chunks: list[torch.Tensor] = []
+            moss_context_chunks: list[torch.Tensor] = []
             moss_sample_rate: int | None = None
 
             final_output: OmniRequestOutput | None = None
@@ -4253,12 +4218,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 for cand in candidates:
                     if hasattr(cand, "numel") and cand.numel() > 0:
                         moss_chunks.append(cand)
-                code_value = step_audio.get("audio_codes")
-                code_candidates = code_value if isinstance(code_value, list) else [code_value]
-                for code in code_candidates:
-                    if isinstance(code, torch.Tensor) and code.ndim == 2 and code.numel() > 0:
-                        moss_code_chunks.append(code.detach().to("cpu", torch.long).contiguous())
                 sr_step = step_audio.get("sr")
+                context = step_audio.get("context_codes", [])
+                moss_context_chunks.extend(context if isinstance(context, list) else [context])
                 if sr_step is not None:
                     sr_val_step = sr_step[-1] if isinstance(sr_step, list) and sr_step else sr_step
                     moss_sample_rate = int(sr_val_step.item()) if hasattr(sr_val_step, "item") else int(sr_val_step)
@@ -4327,13 +4289,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
             audio_response: AudioResponse = self.create_audio(audio_obj)
             if session_turn is not None:
-                if moss_async_chunk and moss_code_chunks:
-                    generated_codes = torch.cat(moss_code_chunks, dim=0)
-                else:
-                    generated_codes = self._extract_moss_codes(audio_output)
+                generated_codes = self._extract_moss_codes(audio_output).transpose(0, 1).contiguous()
                 if self._moss_variant == "realtime":
                     if session_turn.role == "user":
-                        generated_codes = await self._roundtrip_moss_realtime_context_codes(generated_codes)
+                        generated_codes = self._extract_moss_codes(
+                            {"context_codes": moss_context_chunks}, key="context_codes"
+                        ).transpose(0, 1).contiguous()
                     self._require_moss_realtime_sessions().commit_turn(session_turn, generated_codes)
                     self._moss_realtime_pending_turns.pop(session_turn.session_id, None)
                 else:

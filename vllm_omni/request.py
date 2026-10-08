@@ -11,7 +11,12 @@ from vllm.v1.request import Request
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine import (
+    AdditionalInformationEntry,
+    AdditionalInformationPayload,
+    OmniEngineCoreRequest,
+    PromptEmbedsPayload,
+)
 
 
 class OmniRequest(Request):
@@ -37,6 +42,11 @@ class OmniRequest(Request):
         additional_information: AdditionalInformationPayload | None = None,
         **kwargs,
     ):
+        # The base constructor hashes the prompt before returning.
+        self.prefix_cache_input_ids: AdditionalInformationEntry | None = (
+            additional_information.entries.get("prefix_cache_input_ids")
+            if additional_information is not None else None
+        )
         if prompt_embeds is not None:
             kwargs["prompt_embeds"] = self._maybe_decode_prompt_embeds(prompt_embeds)
         super().__init__(*args, **kwargs)

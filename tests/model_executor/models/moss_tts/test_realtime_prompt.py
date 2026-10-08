@@ -93,6 +93,36 @@ def test_next_turn_replays_completed_user_and_assistant_inputs() -> None:
     )
 
 
+def test_user_turn_replays_agent_as_other_speaker_and_user_as_target() -> None:
+    prompt = build_realtime_prompt(
+        FakeRealtimeProcessor(),
+        text="again",
+        role="user",
+        reference_codes=torch.tensor([[8, 9]], dtype=torch.long),
+        history_segments=(
+            MossTTSRealtimeSegment(
+                role="assistant",
+                text="hello",
+                codes=torch.tensor([[5, 6], [7, 8]], dtype=torch.long),
+            ),
+            MossTTSRealtimeSegment(
+                role="user",
+                text="thanks",
+                codes=torch.tensor([[11, 12], [13, 14], [15, 16]], dtype=torch.long),
+            ),
+        ),
+    )
+
+    assert prompt.text_ids[1 : 1 + len("hello") + 3] == [20] * (len("hello") + 3)
+    user_history_start = 1 + len("hello") + 3
+    assert prompt.text_ids[user_history_start : user_history_start + 2] == [ord("t"), ord("h")]
+    continuation_start = user_history_start + 2
+    torch.testing.assert_close(
+        prompt.audio_codes[continuation_start : continuation_start + 3],
+        torch.tensor([[11, 12], [13, 14], [15, 16]]),
+    )
+
+
 def test_assistant_history_requires_audio_codes() -> None:
     with pytest.raises(ValueError, match="audio codes"):
         build_realtime_prompt(

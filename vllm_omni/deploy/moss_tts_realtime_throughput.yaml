@@ -1,0 +1,63 @@
+# Bulk turnwise synthesis: one replica per H100, 64 concurrent conversations.
+# Generate each turn sequentially; decode its complete waveform before returning.
+# Run with MOSS_REALTIME_CONTEXT_TURNS=4 and max_new_tokens=512 per turn.
+# Eight replicas measured 465.5x realtime across 1,024 full-dialogue replays;
+# 1,020 completed and four HTTP read errors remain unresolved. Excludes warmup.
+# https://wandb.ai/andersthuesen/moss-tts-throughput/artifacts/profile/node-verified/v0
+async_chunk: false
+trust_remote_code: true
+
+connectors:
+  shm:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      codec_chunk_frames: 512
+      codec_stream_slots: 64
+      decode_cudagraph_capture_batch_sizes: [1]
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_max_step_frames: 512
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.35
+    attention_backend: FLASHINFER
+    enable_prefix_caching: false
+    async_scheduling: true
+    enable_chunked_prefill: true
+    max_num_batched_tokens: 8192
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_1: shm
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 4096
+      repetition_penalty: 1.1
+      stop_token_ids: [151645]
+
+  - stage_id: 1
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.12
+    enforce_eager: false
+    attention_backend: FLASHINFER
+    enable_prefix_caching: false
+    async_scheduling: true
+    compilation_config:
+      cudagraph_mode: NONE
+    max_num_batched_tokens: 196608
+    max_model_len: 196608
+    devices: "0"
+    input_connectors:
+      from_stage_0: shm
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      repetition_penalty: 1.0

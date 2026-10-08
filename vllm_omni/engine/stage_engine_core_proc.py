@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
 )
+from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.system_utils import (
     decorate_logs,
     set_process_title,
@@ -28,6 +29,7 @@ from vllm.v1.engine.utils import (
     SignalCallback,
 )
 
+from vllm_omni.core.input_block_hashes import get_omni_request_block_hasher
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.stage_init_utils import set_death_signal
@@ -50,6 +52,14 @@ class StageEngineCoreProc(EngineCoreProc):
     entry point for launching in a subprocess.  Does **not** delegate to
     ``EngineCoreProc.run_engine_core()``.
     """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        if self.request_block_hasher is not None:
+            self.request_block_hasher = get_omni_request_block_hasher(
+                self.scheduler.kv_cache_manager.block_pool.hash_block_size,
+                get_hash_fn_by_name(self.vllm_config.cache_config.prefix_caching_hash_algo),
+            )
 
     @staticmethod
     def run_stage_core(

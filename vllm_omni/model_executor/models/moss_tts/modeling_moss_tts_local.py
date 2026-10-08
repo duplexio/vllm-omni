@@ -25,6 +25,9 @@ position while preserving the causal attention result.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,7 +39,50 @@ from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
     MossTTSLocalTransformerConfig,
 )
 
-HistoryPerCodebook = list[list[int]] | list[list[list[int]]]
+
+@dataclass
+class FrameGraphState:
+    graph: torch.cuda.CUDAGraph
+    hidden: torch.Tensor
+    history: torch.Tensor
+    codes: torch.Tensor
+
+
+class MossRealtimeFrameGraphs:
+    """Replay a complete codebook rollout with fixed GPU inputs per batch bucket."""
+
+    def __init__(
+        self,
+        generate: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        hidden: torch.Tensor,
+        history: torch.Tensor,
+        max_batch_size: int,
+    ) -> None:
+        self.states: dict[int, FrameGraphState] = {}
+        sizes = [1]
+        while sizes[-1] < max_batch_size:
+            sizes.append(min(sizes[-1] * 2, max_batch_size))
+        pool = torch.cuda.graph_pool_handle()
+        for size in sizes:
+            static_hidden = hidden.expand(size, -1).clone()
+            static_history = history.expand(size, -1, -1).clone()
+            for _ in range(2):
+                generate(static_hidden, static_history)
+            torch.accelerator.synchronize(hidden.device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool):
+                codes = generate(static_hidden, static_history)
+            self.states[size] = FrameGraphState(graph, static_hidden, static_history, codes)
+
+    def __call__(self, hidden: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
+        batch = hidden.shape[0]
+        size = next(size for size in self.states if size >= batch)
+        state = self.states[size]
+        state.hidden[:batch].copy_(hidden)
+        state.history[:batch].copy_(history)
+        state.graph.replay()
+        # Requests retain these codes after the next graph replay.
+        return state.codes[:batch].clone()
 
 
 class MossTTSRealtimeLocalTransformer(nn.Module):
@@ -69,24 +115,21 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
     def generate_frame(
         self,
         backbone_last_hidden: torch.Tensor,  # (B, H)
-        lm_heads: nn.ModuleList,  # ModuleList of rvq Linear(H -> audio_vocab_size)
+        history_ids: torch.Tensor | None = None,  # (B, rvq, window), padded with vocab_size
         *,
+        lm_heads: nn.ModuleList,  # ModuleList of rvq Linear(H -> audio_vocab_size)
         temperature: float = 1.0,
         top_k: int = 50,
         top_p: float = 0.95,
         do_sample: bool = True,
         repetition_penalty: float = 1.0,
-        history_per_codebook: HistoryPerCodebook | None = None,
     ) -> torch.Tensor:
         """Generate one audio frame (rvq codebook tokens) for batch B.
 
         Returns a ``(B, rvq)`` LongTensor.
 
-        For a single request, ``history_per_codebook[i]`` is a list of
-        recently-emitted token ids for codebook ``i``. For a batch, use
-        ``history_per_codebook[batch][codebook]``. When
-        ``repetition_penalty != 1.0`` those tokens get their logits scaled
-        down (mirrors upstream's rep-penalty behaviour).
+        History is a GPU tensor so the entire rollout can be captured without
+        copying Python token lists to the device between codebook steps.
         """
         device = backbone_last_hidden.device
         B = backbone_last_hidden.shape[0]
@@ -97,23 +140,10 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
 
         codes = backbone_last_hidden.new_zeros((B, rvq), dtype=torch.long)
 
-        histories: list[list[list[int]]] | None
-        if history_per_codebook is None:
-            histories = None
-        elif B == 1 and (
-            not history_per_codebook
-            or not history_per_codebook[0]
-            or not isinstance(history_per_codebook[0][0], list)
-        ):
-            # Preserve the original single-request calling convention.
-            histories = [history_per_codebook]  # type: ignore[list-item]
-        else:
-            histories = history_per_codebook  # type: ignore[assignment]
-
         # The cache is scoped to this frame.  Position zero is the talker
         # hidden state; every later position is the embedding of the previous
         # codebook token.
-        frame_embed = backbone_last_hidden.to(dtype=next(self.model.parameters()).dtype).unsqueeze(1)
+        frame_embed = backbone_last_hidden.unsqueeze(1)
         past_key_values = None
         for step in range(rvq):
             pos_ids = torch.full((B, 1), step, dtype=torch.long, device=device)
@@ -124,8 +154,8 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
             )
             logits = lm_heads[step](hidden[:, -1, :]).float()
 
-            if repetition_penalty != 1.0 and histories is not None:
-                apply_repetition_penalty(logits, histories, step, repetition_penalty)
+            if repetition_penalty != 1.0 and history_ids is not None:
+                apply_repetition_penalty(logits, history_ids[:, step], repetition_penalty)
 
             codes[:, step] = _sample_token(logits, temperature, top_k, top_p, do_sample)
 
@@ -137,36 +167,11 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
 
 def apply_repetition_penalty(
     logits: torch.Tensor,
-    histories: list[list[list[int]]],
-    codebook: int,
+    history_ids: torch.Tensor,
     repetition_penalty: float,
 ) -> None:
     """Apply one history penalty mask across a batched codebook decode."""
     batch_size, vocab_size = logits.shape
-    token_lists = [
-        histories[index][codebook] if codebook < len(histories[index]) else []
-        for index in range(batch_size)
-    ]
-    max_history = max((len(tokens) for tokens in token_lists), default=0)
-    if max_history == 0:
-        return
-
-    # Use vocab_size as a sentinel so padded history entries cannot collide
-    # with a real token id, including token 0.
-    history_ids = torch.full(
-        (batch_size, max_history),
-        vocab_size,
-        dtype=torch.long,
-        device=logits.device,
-    )
-    for index, tokens in enumerate(token_lists):
-        if tokens:
-            history_ids[index, : len(tokens)] = torch.as_tensor(
-                tokens,
-                dtype=torch.long,
-                device=logits.device,
-            )
-
     seen = torch.zeros(
         (batch_size, vocab_size + 1),
         dtype=torch.bool,

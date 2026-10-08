@@ -39,23 +39,21 @@ class _MossCodecStreamSession:
 
     def __init__(
         self,
-        codec: nn.Module,
+        codec: MossAudioTokenizerModel | MossAudioTokenizerV2Model,
         *,
         stream_slots: int,
         n_vq: int,
     ) -> None:
         self._codec = codec
-        self._stream_slots = int(stream_slots)
+        self._stream_slots = stream_slots
         self._batch_size = self._stream_slots
-        self._n_vq = int(n_vq)
+        self._n_vq = n_vq
         self._device = next(codec.parameters()).device
         self._free_stream_slots = list(range(self._stream_slots))
         self._exit_stack = contextlib.ExitStack()
         self._closed = False
-        self._native_streaming = callable(getattr(codec, "streaming", None)) and callable(
-            getattr(codec, "_decode_frame", None)
-        )
-        self._history: dict[int, torch.Tensor] = {}
+        self._native_streaming = isinstance(codec, MossAudioTokenizerV2Model)
+        self._v1_state = None if self._native_streaming else codec.new_decode_state(stream_slots)
         if self._native_streaming:
             with torch.no_grad():
                 self._exit_stack.enter_context(codec.streaming(self._batch_size))
@@ -68,13 +66,14 @@ class _MossCodecStreamSession:
     def release(self, slot: int) -> None:
         if self._closed:
             return
-        if self._native_streaming:
-            self.reset_slots([slot])
-        self._history.pop(slot, None)
+        self.reset_slots([slot])
         self._free_stream_slots.append(slot)
 
     def reset_slots(self, slots: list[int]) -> None:
-        if not slots or not self._native_streaming:
+        if not slots:
+            return
+        if self._v1_state is not None:
+            self._v1_state.reset(torch.tensor(slots, device=self._device, dtype=torch.long))
             return
         reset_mask = torch.zeros(self._batch_size, dtype=torch.bool, device=self._device)
         reset_mask[slots] = True
@@ -93,7 +92,7 @@ class _MossCodecStreamSession:
         if self._native_streaming:
             with torch.no_grad():
                 self._exit_stack.close()
-        self._history.clear()
+        self._v1_state = None
         self._closed = True
 
     @torch.no_grad()
@@ -137,47 +136,15 @@ class _MossCodecStreamSession:
 
     @torch.no_grad()
     def _step_v1(self, slot_codes: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
-        """Decode v1 requests from accumulated causal histories.
-
-        The v1 tokenizer exposes only stateless ``batch_decode``.  Decoding a
-        chunk in isolation would reset the causal receptive field at every
-        boundary and produces audible seams.  Keeping the code history and
-        trimming the already-emitted waveform preserves the same causal
-        prefix for every request while still presenting all ready requests as
-        one ragged batch to the GPU.
-        """
-        histories: list[torch.Tensor] = []
-        previous_lengths: list[int] = []
-        slots: list[int] = []
-        for slot, codes in slot_codes.items():
-            history = self._history.get(slot)
-            previous_length = 0 if history is None else int(history.shape[1])
-            if history is None:
-                history = codes.detach().to(self._device, torch.long).contiguous()
-            else:
-                history = torch.cat(
-                    [history, codes.detach().to(self._device, torch.long)],
-                    dim=1,
-                ).contiguous()
-            self._history[slot] = history
-            slots.append(slot)
-            histories.append(history)
-            previous_lengths.append(previous_length)
-
-        result = self._codec.batch_decode(codes_list=histories, num_quantizers=self._n_vq)
-        if result.audio is None:
-            return {}
-
-        audio = result.audio.detach().to("cpu", torch.float32)
-        lengths = result.audio_lengths.detach().to("cpu") if result.audio_lengths is not None else None
-        out: dict[int, torch.Tensor] = {}
-        for index, slot in enumerate(slots):
-            wav = audio[index]
-            if lengths is not None:
-                wav = wav[..., : int(lengths[index].item())]
-            trim = min(previous_lengths[index] * self._codec.downsample_rate, wav.shape[-1])
-            out[slot] = wav[..., trim:].contiguous()
-        return out
+        """Decode only new frames using each active request's cached decoder KV."""
+        assert self._v1_state is not None
+        slots = list(slot_codes)
+        slot_ids = torch.tensor(slots, device=self._device, dtype=torch.long)
+        codes = torch.stack(list(slot_codes.values()), dim=1)
+        result = self._codec.decode_chunk(codes, slot_ids, self._v1_state)
+        assert result.audio is not None
+        audio = result.audio.cpu()
+        return {slot: audio[index].contiguous() for index, slot in enumerate(slots)}
 
 
 class MossTTSCodecDecoder(nn.Module):
@@ -233,8 +200,8 @@ class MossTTSCodecDecoder(nn.Module):
         self._stream_max_step_frames: int = self._connector_int("codec_max_step_frames", default=100)
         self._stream_req_slots: dict[str, int] = {}
         self._stream_pending_codes: dict[str, list[torch.Tensor]] = {}
-        self._stream_code_history: dict[str, torch.Tensor] = {}
         self._stream_starved_reqs: set[str] = set()
+        self.context_audio: dict[str, list[torch.Tensor]] = {}
 
     # ------------------------------------------------------------------
     # vLLM-Omni stubs (codec has no AR loop)
@@ -281,11 +248,11 @@ class MossTTSCodecDecoder(nn.Module):
         OmniOutput with:
           multimodal_outputs["model_outputs"] — list of (T_wav,) float32 tensors
           multimodal_outputs["sr"]            — list of scalar int32 tensors
-          multimodal_outputs["audio_codes"]   — list of (T_code, NQ) int64 tensors
+          multimodal_outputs["audio_codes"]   — list of (NQ, T_code) int64 tensors
         """
         sr_tensor = self._sr_tensor
         empty = self._empty_audio()
-        empty_codes = torch.empty((0, self._n_vq), dtype=torch.long)
+        empty_codes = torch.empty((self._n_vq, 0), dtype=torch.long)
         info_list: list[dict[str, Any]] = list(runtime_additional_information or [{}])
         num_req = max(len(info_list), 1)
 
@@ -311,7 +278,10 @@ class MossTTSCodecDecoder(nn.Module):
                 audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": audios, "sr": srs, "audio_codes": code_outputs},
+                multimodal_outputs={
+                    "model_outputs": audios, "sr": srs, "audio_codes": code_outputs,
+                    "context_codes": self.encode_context_outputs(audios, info_list),
+                },
             )
 
         # ``input_ids`` is concatenated across all requests. vLLM-Omni runners
@@ -360,16 +330,8 @@ class MossTTSCodecDecoder(nn.Module):
             streaming_enabled = bool(meta.get("codec_streaming", False))
             code_flat_numel = meta.get("code_flat_numel")
             if streaming_enabled and finished and code_flat_numel is not None and int(code_flat_numel) == 0:
-                req_key = self._runtime_request_key(info, meta, i)
-                # The terminal control packet carries no new audio frames. Keep
-                # the complete RVQ grid in its multimodal output so a
-                # FINAL_ONLY consumer can commit the session context even when
-                # intermediate codec chunks were not exposed to the client.
-                completed_codes = self._stream_code_history.get(req_key)
                 for _, wav in self._finish_empty_streaming_requests([info]).items():
                     audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
-                if completed_codes is not None:
-                    code_outputs[i] = completed_codes
                 continue
             if seg.numel() % self._n_vq != 0:
                 logger.warning(
@@ -398,28 +360,12 @@ class MossTTSCodecDecoder(nn.Module):
                     f"MOSS codec left context must be within [0, {t_chunk}], got {left_ctx}"
                 )
             code_outputs[i] = (
-                codes_nq_t[:, left_ctx:].transpose(0, 1).detach().to("cpu", torch.long).contiguous()
+                codes_nq_t[:, left_ctx:].detach().to("cpu", torch.long).contiguous()
             )
 
             req_key = self._runtime_request_key(info, meta, i)
 
             if streaming_enabled:
-                code_chunk = code_outputs[i]
-                previous_codes = self._stream_code_history.get(req_key)
-                full_codes = (
-                    code_chunk
-                    if previous_codes is None
-                    else torch.cat([previous_codes, code_chunk], dim=0).contiguous()
-                )
-                if finished:
-                    # A normal (non-streaming) speech request sees only the
-                    # terminal payload. Preserve the complete generated grid
-                    # there so session context does not depend on output
-                    # accumulation of intermediate chunks.
-                    code_outputs[i] = full_codes
-                    self._stream_code_history.pop(req_key, None)
-                else:
-                    self._stream_code_history[req_key] = full_codes
                 streaming_work.append((i, req_key, codes_nq_t, finished))
                 continue
             offline_work.append((i, codes_nq_t, left_ctx))
@@ -476,8 +422,49 @@ class MossTTSCodecDecoder(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs, "audio_codes": code_outputs},
+            multimodal_outputs={
+                "model_outputs": audios, "sr": srs, "audio_codes": code_outputs,
+                "context_codes": self.encode_context_outputs(audios, info_list),
+            },
         )
+
+    def encode_context_outputs(
+        self, audios: list[torch.Tensor], info_list: list[dict[str, Any]],
+    ) -> list[torch.Tensor]:
+        """Batch-encode requested completed waveforms on the codec's device.
+
+        Streaming chunks are retained only until their terminal packet. Raw
+        generated codes remain a separate output from these waveform-derived codes.
+        """
+        # Audio outputs accumulate on their last (time) axis in the transport.
+        outputs = [torch.empty((self._n_vq, 0), dtype=torch.long) for _ in audios]
+        finished_indices: list[int] = []
+        waveforms: list[torch.Tensor] = []
+        for index, (audio, info) in enumerate(zip(audios, info_list, strict=True)):
+            meta = info.get("meta", {})
+            if not meta.get("return_context_codes", False):
+                continue
+            if not meta.get("codec_streaming", False) and not audio.numel():
+                continue
+            request_id = self._runtime_request_key(info, meta, index)
+            parts = self.context_audio.setdefault(request_id, [])
+            if audio.numel():
+                parts.append(audio)
+            if meta.get("codec_streaming", False) and not meta.get("stream_finished", False):
+                continue
+            self.context_audio.pop(request_id)
+            if not parts:
+                raise RuntimeError(f"MOSS context encoding received no audio for {request_id}")
+            waveforms.append(torch.cat(parts, dim=-1).to(next(self._codec.parameters()).device))
+            finished_indices.append(index)
+        if waveforms:
+            encoded = self._codec.batch_encode(waveforms, num_quantizers=self._n_vq)
+            assert encoded.audio_codes is not None and encoded.audio_codes_lengths is not None
+            codes = encoded.audio_codes.permute(1, 0, 2).cpu()
+            lengths = encoded.audio_codes_lengths.cpu().tolist()
+            for row, (index, length) in enumerate(zip(finished_indices, lengths, strict=True)):
+                outputs[index] = codes[row, :, :length].contiguous()
+        return outputs
 
     def _finish_empty_streaming_requests(self, info_list: list[dict[str, Any]]) -> dict[int, torch.Tensor]:
         """Release codec stream state for empty finish sentinels.
@@ -511,7 +498,6 @@ class MossTTSCodecDecoder(nn.Module):
                         req_key,
                     )
                 self._finish_stream_request(req_key, session, slot)
-            self._stream_code_history.pop(req_key, None)
         return outputs
 
     @staticmethod
@@ -673,7 +659,6 @@ class MossTTSCodecDecoder(nn.Module):
             session.release(slot)
         self._stream_req_slots.pop(request_id, None)
         self._stream_pending_codes.pop(request_id, None)
-        self._stream_code_history.pop(request_id, None)
         self._stream_starved_reqs.discard(request_id)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
@@ -688,6 +673,7 @@ class MossTTSCodecDecoder(nn.Module):
         session = self._stream_session
         for req_id in finished_req_ids:
             request_id = str(req_id)
+            self.context_audio.pop(request_id, None)
             slot = self._stream_req_slots.get(request_id)
             has_state = (
                 slot is not None or request_id in self._stream_pending_codes or request_id in self._stream_starved_reqs
@@ -699,7 +685,6 @@ class MossTTSCodecDecoder(nn.Module):
             else:
                 self._stream_req_slots.pop(request_id, None)
                 self._stream_pending_codes.pop(request_id, None)
-                self._stream_code_history.pop(request_id, None)
                 self._stream_starved_reqs.discard(request_id)
 
     def _connector_int(self, name: str, default: int = 0) -> int:

@@ -66,5 +66,5 @@ def test_codec_trims_context_audio_and_returns_only_new_codes() -> None:
     assert output.multimodal_outputs["model_outputs"][0].tolist() == [6.0, 7.0, 8.0, 9.0]
     torch.testing.assert_close(
         output.multimodal_outputs["audio_codes"][0],
-        codes[3:],
+        codes[3:].transpose(0, 1),
     )

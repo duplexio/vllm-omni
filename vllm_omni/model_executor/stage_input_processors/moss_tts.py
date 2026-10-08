@@ -106,7 +106,9 @@ def talker2codec(
     ``(T, NQ)``; Stage 1 consumes the codebook-major flattening
     ``[NQ * T]`` and reconstructs the grid for decoding.
     """
-    del prompt, requires_multimodal_data, streaming_context
+    del requires_multimodal_data, streaming_context
+    info = deserialize_additional_information((prompt or {}).get("additional_information"))
+    return_context_codes = info.get("meta", {}).get("return_context_codes", False)
     results: list[Any] = []
 
     for stage_out in source_outputs:
@@ -125,6 +127,7 @@ def talker2codec(
             OmniTokensPrompt(
                 prompt_token_ids=flat,
                 multi_modal_data={"codes": {"audio": codes_nq_t}},
+                additional_information={"meta": {"return_context_codes": return_context_codes}},
             )
         )
 
@@ -292,6 +295,8 @@ def talker2codec_raw_async_chunk(
     """
     external_req_id = getattr(request, "external_req_id", None)
     req_id = str(external_req_id if external_req_id is not None else getattr(request, "request_id", id(request)))
+    info = deserialize_additional_information(getattr(request, "additional_information", None))
+    return_context_codes = info.get("meta", {}).get("return_context_codes", False)
 
     if not hasattr(transfer_manager, "code_prompt_token_ids"):
         transfer_manager.code_prompt_token_ids = defaultdict(list)
@@ -354,6 +359,7 @@ def talker2codec_raw_async_chunk(
                     req_id=[req_id],
                     left_context_size=0,
                     codec_streaming=True,
+                    return_context_codes=return_context_codes,
                     codec_chunk_frames=0,
                     codec_left_context_frames=0,
                     code_flat_numel=0,
@@ -387,6 +393,7 @@ def talker2codec_raw_async_chunk(
             req_id=[req_id],
             left_context_size=0,
             codec_streaming=True,
+            return_context_codes=return_context_codes,
             codec_chunk_frames=int(chunk_codes.shape[0]),
             codec_left_context_frames=0,
             code_flat_numel=int(codec_flat.numel()),
