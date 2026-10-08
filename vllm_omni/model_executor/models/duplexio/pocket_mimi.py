@@ -14,6 +14,9 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 
+LATENT_DIM = 32  # Channels of the continuous latent between encoder and decoder.
+
+
 @dataclass
 class Conv1dState:
     previous: Tensor | None
@@ -505,7 +508,7 @@ class ConvTrUpsample1d(nn.Module):
 class DummyQuantizer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.output_proj = nn.Conv1d(32, 512, 1, bias=False)
+        self.output_proj = nn.Conv1d(LATENT_DIM, 512, 1, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.output_proj(x)

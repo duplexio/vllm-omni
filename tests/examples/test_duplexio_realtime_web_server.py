@@ -112,7 +112,7 @@ def test_index_exposes_sample_clips() -> None:
                 "top_k": 20,
                 "top_p": 0.95,
             },
-            "audio": {"temperature": 0.8, "top_k": 250},
+            "audio": {"temperature": 0.8},
             "emit": {"agent": 0.6, "tool_call": 0.6},
         },
     )
@@ -141,36 +141,11 @@ def test_index_points_the_page_at_a_direct_relay() -> None:
     assert '"realtimePath": "wss://engine.example/v1/realtime"' in TestClient(app).get("/").text
 
 
-def test_sampling_defaults_apply_serving_temperatures(tmp_path: Path) -> None:
+def test_sampling_defaults_are_the_engine_defaults_and_the_checkpoint_audio_temperature(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(
         json.dumps(
             {
-                "depth_transformer_config": {
-                    "sampling_temperature": 0.8,
-                    "sampling_top_k": 250,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert server.load_sampling_defaults(config_path) == {
-        "agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.6, "top_k": 20, "top_p": 0.95}},
-        "user": {"emission": {"temperature": 0.0}, "content": {"temperature": 0.0, "top_k": None, "top_p": None}},
-        "audio": {"temperature": 0.7, "top_k": 250},
-    }
-
-
-def test_sampling_defaults_offer_flowmap_temperature_for_continuous_checkpoint(
-    tmp_path: Path,
-) -> None:
-    """A flow-map audio head's default temperature is its checkpoint's, and it has no top-k."""
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "audio_representation": "continuous",
                 "flowmap_config": {"sampling_temperature": 0.3},
             }
         ),

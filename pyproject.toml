@@ -188,7 +188,7 @@ include = ["vllm_omni*"]
     "model_executor/models/step_audio2/assets/*.wav",
     "transformers_utils/chat_templates/*.jinja",
 ]
-"vllm_omni.model_executor.models.duplexio" = ["MoshiLicense.txt", "PocketTTSLicense.txt", "GDN_LICENSE"]
+"vllm_omni.model_executor.models.duplexio" = ["PocketTTSLicense.txt", "GDN_LICENSE"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm

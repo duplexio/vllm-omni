@@ -7,13 +7,13 @@ import torch
 from torch import nn
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.model_executor.models.duplexio.fastconformer import FastConformerRNNT
+from vllm_omni.model_executor.models.duplexio.fastconformer import FastConformerEncoder
 
 
 def test_exported_frontend_buffers_load_through_native_loader() -> None:
     # Only serialization is under test; no encoder/processor arithmetic is mocked.
     model = nn.Linear(4, 4)
-    model.config = SimpleNamespace(encoder_config=SimpleNamespace(hidden_size=4), blank_token_id=0)
+    model.config = SimpleNamespace(hidden_size=4)
     processor = SimpleNamespace(
         set_num_lookahead_tokens=lambda _: None,
         feature_extractor=SimpleNamespace(
@@ -24,7 +24,7 @@ def test_exported_frontend_buffers_load_through_native_loader() -> None:
             mel_filters=torch.zeros(128, 257),
         ),
     )
-    encoder = FastConformerRNNT(model, processor)
+    encoder = FastConformerEncoder(model, processor)
     filters = torch.randn_like(encoder.mel_filters)
     window = torch.randn_like(encoder.stft_window)
     loaded = AutoWeightsLoader(encoder).load_weights(

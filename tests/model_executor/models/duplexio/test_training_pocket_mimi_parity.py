@@ -42,10 +42,10 @@ def test_real_silence_matches_training_in_acoustic_frame_order() -> None:
         encoder_transformer=training.encoder_transformer.get_initial_state(waveform[None, None]),
         decoder_transformer=training.decoder_transformer.get_initial_state(waveform[None, None]),
     )
-    state = native.audio_codec.new_state(1)
+    request = SimpleNamespace(input_mimi=native.audio_codec.new_state(1))
     encoded = []
     for chunk in chunks:
-        rows, state = native.encode_agent_audio(chunk, state, None)
+        (rows,) = native.encode_agent_audio_batch([chunk], [request])
         with torch.autocast("cuda", dtype=torch.bfloat16):
             streamed, training_state = training.step_encode(chunk[None, None], training_state)
         torch.testing.assert_close(rows, streamed[0].T.float(), atol=0, rtol=0)

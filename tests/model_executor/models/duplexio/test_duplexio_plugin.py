@@ -74,12 +74,8 @@ def model_config(monkeypatch, byte_tokenizer):
         hf_config=SimpleNamespace(
             voice_prompt_max_frames=125,
             default_system_prompt="system",
-            initial_agent_prefix="<|im_start|>assistant\n",
-            initial_user_prefix="<|im_start|>user\n",
             pad_token_id=11,
             silence_token_id=257,
-            depth_transformer_config={"sampling_temperature": 0.9, "sampling_top_k": 32},
-            quantized_audio_config={"codebook_size": 64},
         ),
     )
 
@@ -118,7 +114,7 @@ async def test_runtime_config_pins_the_reference_audio_and_prompt(model_config, 
     assert runtime["duplexio_start_role"] == (start_role or "user")
     assert runtime["duplexio_scheduler_token_id"] == 11
     assert isinstance(runtime["duplexio_sampling_seed"], int)
-    assert runtime["duplexio_depth_sampling"] == {"temperature": 0.7, "top_k": 32}
+    assert "duplexio_flow_temperature" not in runtime
     assert runtime["duplexio_text_sampling"] == {"temperature": 0.6, "top_k": 20, "top_p": 0.95}
     assert runtime["duplexio_emit_temperatures"] == {"user": 0.0, "agent": 1.0, "tool_call": 1.0}
     # The runtime config crosses the engine boundary with every append.
@@ -134,12 +130,12 @@ async def test_runtime_config_applies_client_sampling(model_config) -> None:
         duplexio_sampling={
             "seed": 9,
             "agent": {"content": {"temperature": 0.2}},
-            "audio": {"temperature": 0.5, "top_k": 4},
+            "audio": {"temperature": 0.5},
         },
     )
     assert runtime["duplexio_sampling_seed"] == 9
     assert runtime["duplexio_text_sampling"]["temperature"] == 0.2
-    assert runtime["duplexio_depth_sampling"] == {"temperature": 0.5, "top_k": 4}
+    assert runtime["duplexio_flow_temperature"] == 0.5
 
 
 @pytest.mark.asyncio
@@ -152,26 +148,13 @@ async def test_runtime_config_applies_client_sampling(model_config) -> None:
         ({"auto_response": False}, "full_duplex_required"),
         ({"start_role": "narrator"}, "start_role_invalid"),
         ({"duplexio_sampling": {"seed": -1}}, "invalid_sampling"),
-        ({"duplexio_sampling": {"audio": {"top_k": 65}}}, "invalid_sampling"),
+        ({"duplexio_sampling": {"audio": {"top_k": 4}}}, "invalid_sampling"),
     ],
 )
 async def test_runtime_config_rejects_invalid_sessions(model_config, extra_body, code) -> None:
     with pytest.raises(DuplexRuntimeConfigError) as error:
         await open_session(model_config, **extra_body)
     assert error.value.code == code
-
-
-@pytest.mark.asyncio
-async def test_flowmap_checkpoint_takes_audio_temperature_only(model_config) -> None:
-    model_config.hf_config.quantized_audio_config = {}
-    model_config.hf_config.depth_transformer_config = {}
-    _, default = await open_session(model_config)
-    assert "duplexio_flow_temperature" not in default
-    _, runtime = await open_session(model_config, duplexio_sampling={"audio": {"temperature": 0.5}})
-    assert runtime["duplexio_flow_temperature"] == 0.5
-    with pytest.raises(DuplexRuntimeConfigError) as error:
-        await open_session(model_config, duplexio_sampling={"audio": {"top_k": 4}})
-    assert error.value.code == "invalid_sampling"
 
 
 @pytest.mark.asyncio

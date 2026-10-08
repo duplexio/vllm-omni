@@ -8,7 +8,7 @@ import torch
 from torch import Tensor
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
 
-from vllm_omni.model_executor.models.duplexio.row_semantics import DUPLEXIO_NUM_CELLS
+from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
 
 
 @torch.compile(dynamic=True, fullgraph=True)
@@ -68,14 +68,14 @@ def merge_row_attention(
     tokens, heads, dim = query.shape
     kv_heads = self_key.shape[1]
     groups = heads // kv_heads
-    rows = tokens // DUPLEXIO_NUM_CELLS
-    grouped = query.view(rows, DUPLEXIO_NUM_CELLS, kv_heads, groups, dim).float()
+    rows = tokens // NUM_CELLS
+    grouped = query.view(rows, NUM_CELLS, kv_heads, groups, dim).float()
 
     empty = empty.view(rows, 2)
 
     def partial(output: Tensor, lse: Tensor, empty: Tensor) -> tuple[Tensor, Tensor]:
-        lse = lse.view(kv_heads, DUPLEXIO_NUM_CELLS, groups, rows).permute(3, 1, 0, 2)
-        output = output.view(rows, kv_heads, DUPLEXIO_NUM_CELLS, groups, dim).transpose(1, 2)
+        lse = lse.view(kv_heads, NUM_CELLS, groups, rows).permute(3, 1, 0, 2)
+        output = output.view(rows, kv_heads, NUM_CELLS, groups, dim).transpose(1, 2)
         empty = empty[:, None, None, None]
         return (
             output.float().masked_fill(empty[..., None], 0),
@@ -84,8 +84,8 @@ def merge_row_attention(
 
     audio, audio_lse = partial(audio, audio_lse, empty[:, 0])
     persistent, persistent_lse = partial(persistent, persistent_lse, empty[:, 1])
-    own_key = self_key.view(rows, DUPLEXIO_NUM_CELLS, kv_heads, 1, dim).float()
-    own_value = self_value.view(rows, DUPLEXIO_NUM_CELLS, kv_heads, 1, dim).float()
+    own_key = self_key.view(rows, NUM_CELLS, kv_heads, 1, dim).float()
+    own_value = self_value.view(rows, NUM_CELLS, kv_heads, 1, dim).float()
     own = (grouped * own_key).sum(-1) * scale
     # (rows, 1, kv_heads, 1, extra, dim)
     slots = extra_slots.view(rows, -1)

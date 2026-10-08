@@ -180,7 +180,7 @@ def _fake_platform():
 
 @pytest.mark.parametrize(
     ("level", "expected_tags"),
-    [(1, ("weights", "kv_cache")), (2, tuple())],
+    [(1, ("weights",)), (2, tuple())],
 )
 def test_sleep_offload_tags_by_level(monkeypatch, level, expected_tags):
     import vllm.device_allocator.cumem as cumem_mod

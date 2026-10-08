@@ -1,11 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Packed six-cell convolution with FP32 accumulation and fused SiLU."""
 
 import torch
 from torch import Tensor
 from vllm.triton_utils import tl, triton
 
-from vllm_omni.model_executor.models.duplexio.row_semantics import DUPLEXIO_NUM_CELLS
+from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
+
+
+def expand_stream_conv_weight(weight: Tensor) -> Tensor:
+    """Space a (channels, 1, kernel) causal kernel's taps one frame apart in the packed cell sequence."""
+    expanded = weight.new_zeros((*weight.shape[:-1], (weight.shape[-1] - 1) * NUM_CELLS + 1))
+    expanded[..., ::NUM_CELLS] = weight
+    return expanded
 
 
 @triton.jit
@@ -84,10 +92,10 @@ def stream_causal_conv(
     """
     channels, history = x.shape[1], state.shape[2]
     output = torch.empty_like(x, memory_format=torch.contiguous_format)
-    stream_conv_kernel[(chunk_indices.shape[0], triton.cdiv(channels, 32), DUPLEXIO_NUM_CELLS)](
+    stream_conv_kernel[(chunk_indices.shape[0], triton.cdiv(channels, 32), NUM_CELLS)](
         x, weight, bias, state, slots, boundaries, has_state, chunk_indices, output,
         channels, history, slots.stride(0), *x.stride(), weight.stride(0), *state.stride(), bias is not None,
-        DUPLEXIO_NUM_CELLS, 32,
+        NUM_CELLS, 32,
     )
     update_stream_conv_state_kernel[(boundaries.shape[0] - 1, triton.cdiv(channels, 32))](
         x, state, slots, boundaries, has_state, channels, history, slots.stride(0), *x.stride(), *state.stride(),

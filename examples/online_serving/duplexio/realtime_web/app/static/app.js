@@ -32,7 +32,6 @@
   const textTopK = document.getElementById('text-top-k');
   const textTopP = document.getElementById('text-top-p');
   const audioTemperature = document.getElementById('audio-temperature');
-  const audioTopK = document.getElementById('audio-top-k');
   const agentEmitTemperature = document.getElementById('agent-emit-temperature');
   const samplingSeed = document.getElementById('sampling-seed');
   const toolPicker = document.getElementById('tool-picker');
@@ -257,10 +256,6 @@
     textTopK.value = text.top_k ?? '';
     textTopP.value = floatValue(text.top_p);
     audioTemperature.value = floatValue(audio.temperature);
-    audioTopK.value = audio.top_k ?? '';
-    // A continuous flow-map checkpoint's audio head has a temperature but no top-k.
-    audioTemperature.closest('label').hidden = sampling.audio === undefined;
-    audioTopK.closest('label').hidden = audio.top_k === undefined;
     agentEmitTemperature.value = floatValue(emit.temperature);
   }
 
@@ -280,20 +275,12 @@
       ['top_k', textTopK],
       ['top_p', textTopP],
     ];
-    // Hidden knobs may still hold values the browser restored from an older page.
-    const audioDefaults = config.sampling?.audio || {};
-    const audioValues = [
-      ['temperature', audioTemperature],
-      ['top_k', audioTopK],
-    ].filter(([name]) => audioDefaults[name] !== undefined);
     for (const [name, input] of textValues) {
       const value = samplingNumber(input);
       if (name !== 'temperature' || value !== null) text[name] = value;
     }
-    for (const [name, input] of audioValues) {
-      const value = samplingNumber(input);
-      if (value !== null) audio[name] = value;
-    }
+    const audioTemperatureValue = samplingNumber(audioTemperature);
+    if (audioTemperatureValue !== null) audio.temperature = audioTemperatureValue;
     const emitTemperature = samplingNumber(agentEmitTemperature);
     const seed = samplingNumber(samplingSeed);
     return {

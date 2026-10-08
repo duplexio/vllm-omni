@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from vllm_omni.model_executor.models.duplexio.qwen_backbone import DuplexIOQwenGatedDeltaNetAttention
-from vllm_omni.model_executor.models.duplexio.row_semantics import expand_stream_conv_weight
+from vllm_omni.model_executor.models.duplexio.stream_conv import expand_stream_conv_weight
 from vllm_omni.model_executor.models.duplexio.stream_conv import stream_causal_conv, update_stream_conv_state_kernel
 
 training = pytest.importorskip("duplexio.modules.qwen3_5_stream_delta")
@@ -92,7 +92,7 @@ def test_streaming_matches_packed_training_and_resets_reused_slots(
     native.activation = "silu"
     native.conv1d = nn.Conv1d(channels, channels, 19, groups=channels, bias=False,
                             device="cuda", dtype=torch.bfloat16)
-    native.conv1d.weight.copy_(expand_stream_conv_weight(source.weight, num_cells=6))
+    native.conv1d.weight.copy_(expand_stream_conv_weight(source.weight))
     state = torch.randn(3, channels, history_length, device="cuda", dtype=torch.bfloat16)
     original_state = state.clone()
     slot_table = torch.ones(2, slot_stride, device="cuda", dtype=torch.int32)

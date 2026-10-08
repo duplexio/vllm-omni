@@ -12,19 +12,16 @@ from torchaudio.transforms import Resample
 from vllm_omni.model_executor.models.duplexio.audio_adapters import (
     AudioInputAdapter,
 )
-from vllm_omni.model_executor.models.duplexio.audio_representation import (
-    DelayedMimiRepresentation,
-    MimiEmbedding,
-)
+from vllm_omni.model_executor.models.duplexio.audio_representation import ContinuousAudioRepresentation
 from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FastConformerAudioStreamState,
 )
-from vllm_omni.model_executor.models.duplexio.mimi import MimiStreamingState, MimiTransformerState
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
     DuplexIORequestState,
     frame_inputs,
 )
+from vllm_omni.model_executor.models.duplexio.pocket_mimi import LATENT_DIM
 
 
 class TextEmbedding(nn.Module):
@@ -50,16 +47,24 @@ class CountingASR:
 
 
 class CountingCodec(nn.Module):
+    """Stands in for Pocket Mimi: a stream's frame k encodes to a latent full of k; the state is its position."""
+
     def __init__(self):
         super().__init__()
         self.waveforms = []
 
-    def encode(self, waveform, codebooks, state):
-        self.waveforms.append(waveform.flatten())
-        frames = waveform.numel() // 1920
-        start = state.encoder_transformer.position
-        state.encoder_transformer.position += frames
-        return torch.arange(start + 1, start + frames + 1)[None, None].expand(1, codebooks, -1)
+    def encode_batch(self, waveforms, positions):
+        latents = []
+        for waveform, position in zip(waveforms, positions, strict=True):
+            self.waveforms.append(waveform.flatten())
+            frames = waveform.numel() // 1920
+            latents.append(torch.arange(position + 1, position + frames + 1).float()[None, None].expand(1, LATENT_DIM, -1))
+        return latents, [position + waveform.numel() // 1920 for waveform, position in zip(waveforms, positions)]
+
+
+def latent(*values: float) -> Tensor:
+    """Agent-audio rows, each a latent filled with one value."""
+    return torch.tensor(values, dtype=torch.float32)[:, None].expand(-1, LATENT_DIM)
 
 
 def model_fixture() -> DuplexIOForConditionalGeneration:
@@ -78,14 +83,9 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
     model.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(dtype=torch.float32)
     )
-    model.audio_representation = DelayedMimiRepresentation(
-        num_codebooks=3,
-        codebook_size=64,
-        acoustic_delay_frames=1,
-    )
-    model.agent_audio_embedding = MimiEmbedding(3, 64, 5)
+    model.audio_representation = ContinuousAudioRepresentation(LATENT_DIM)
     model.user_audio_input_adapter = AudioInputAdapter(8, 7, 11)
-    model.agent_audio_input_adapter = AudioInputAdapter(5, 7, 11)
+    model.agent_audio_input_adapter = AudioInputAdapter(LATENT_DIM, 7, 11)
     model.user_asr = CountingASR()
     model.user_audio_resampler = Resample(24_000, 16_000, dtype=torch.float32)
     model.audio_codec = CountingCodec()
@@ -99,11 +99,10 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
 def request_state(model: DuplexIOForConditionalGeneration) -> DuplexIORequestState:
     return DuplexIORequestState(
         text_input_ids=(2, 2, 2, 2),
-        agent_audio_codes=model.initial_agent_audio(1)[0],
+        agent_latent=model.initial_agent_latents(1)[0],
         user_asr=FastConformerAudioStreamState(),
-        agent_delay=model.audio_representation.new_state(device=torch.device("cpu")),
-        output_mimi=MimiStreamingState(),
-        input_mimi=MimiStreamingState(encoder_transformer=MimiTransformerState.empty(0)),
+        output_mimi=0,
+        input_mimi=0,
         voice_prompt=torch.ones(2 * 1920),
         system_token_ids=(3, 4, 5),
     )
@@ -179,7 +178,7 @@ def test_tool_rows_follow_the_live_frame_as_text() -> None:
     initial = request_state(model)
     initial.frames_seen = 6  # The prefix and the first live frame precede tools.
     initial.text_input_ids = (2, 9, 12, 2)
-    initial.agent_audio_codes = torch.tensor([3, 4, 5])
+    initial.agent_latent = latent(3)[0]
     _, embeddings, update = model.preprocess(
         torch.zeros(24, dtype=torch.long), None, **append_info(initial, tool=(6, 7, 8)),
     )
@@ -187,14 +186,14 @@ def test_tool_rows_follow_the_live_frame_as_text() -> None:
     assert replay["text_ids"].tolist() == [[2, 9, 12, 2], [6, 2, 2, 2], [7, 2, 2, 2], [8, 2, 2, 2]]
     assert replay["audio_mask"].tolist() == [True, False, False, False]
     torch.testing.assert_close(replay["user_features"], torch.tensor([1, 0, 0, 0]).float()[:, None].expand(-1, 8))
-    torch.testing.assert_close(replay["agent_audio"], torch.tensor([[3, 4, 5], [64, 64, 64], [64, 64, 64], [64, 64, 64]]))
+    torch.testing.assert_close(replay["agent_audio"], latent(3, 0, 0, 0))
     state = update["duplexio_working_state"]
     assert state.frames_seen == 10
     assert state.persistent_keys == 5  # The user and agent feedback, then three tool tokens.
     assert state.audio_position == 1
     assert state.user_asr.next_mel_frame == 1
     assert initial.user_asr.next_mel_frame == 0
-    assert state.input_mimi.encoder_transformer.position == 0
+    assert state.input_mimi == 0
     assert not update["duplexio"]["key_active"].view(4, 6)[1:, 4:].any()
     assert not embeddings.view(4, 6, -1)[1:, 4:].any()
     assert model.audio_codec.waveforms == []
@@ -205,7 +204,7 @@ def test_live_audio_advances_encoder_and_inserts_generated_feedback() -> None:
     model = model_fixture()
     state = request_state(model)
     state.text_input_ids = (2, 9, 12, 2)
-    state.agent_audio_codes = torch.tensor([3, 4, 5])
+    state.agent_latent = latent(3)[0]
     user_features = torch.ones(1, 8)  # First frame of the counting encoder.
     info = append_info(state, pcm=torch.randn(1920).numpy().tobytes())
     _, embeddings, update = model.preprocess(torch.zeros(6, dtype=torch.long), None, **info)
@@ -216,9 +215,7 @@ def test_live_audio_advances_encoder_and_inserts_generated_feedback() -> None:
     )
     torch.testing.assert_close(
         embeddings[5:6],
-        model.agent_audio_input_adapter(
-            model.agent_audio_embedding(state.agent_audio_codes[None])
-        ),
+        model.agent_audio_input_adapter(state.agent_latent[None]),
     )
     assert update["duplexio_working_state"].audio_position == 1
     assert state.audio_position == 0
@@ -227,7 +224,7 @@ def test_live_audio_advances_encoder_and_inserts_generated_feedback() -> None:
     replay = update["duplexio_replay"]
     assert replay["text_ids"].tolist() == [[2, 9, 12, 2]]
     torch.testing.assert_close(replay["user_features"], user_features)
-    torch.testing.assert_close(replay["agent_audio"], torch.tensor([[3, 4, 5]]))
+    torch.testing.assert_close(replay["agent_audio"], latent(3))
     assert replay["audio_mask"].tolist() == [True]
     assert update["duplexio"]["key_active"].tolist() == [
         False,
@@ -249,12 +246,12 @@ def test_prefix_encodes_the_speaker_prompt_then_the_first_live_frame() -> None:
     # The encoder hears silence under the voice prompt, then the live frame.
     torch.testing.assert_close(replay["user_features"], torch.tensor([1, 2, 0, 0, 0, 3]).float()[:, None].expand(-1, 8))
     torch.testing.assert_close(
-        replay["agent_audio"], torch.tensor([[1, 64, 64], [2, 1, 1]] + [[64, 64, 64]] * 4),
+        replay["agent_audio"], latent(1, 2, 0, 0, 0, 0),
     )
     state = update["duplexio_working_state"]
     assert state.frames_seen == 6
     assert state.user_asr.next_mel_frame == 3
-    assert state.input_mimi.encoder_transformer.position == 2
+    assert state.input_mimi == 2
     assert state.audio_position == 1
     masks = update["duplexio"]
     assert masks["key_active"].view(6, 6)[:, 4:].tolist() == [[False, True]] * 2 + [[False, False]] * 3 + [[True, True]]
@@ -288,21 +285,21 @@ def test_given_frames_replay_history_through_the_voice_prompt_codec_stream() -> 
     replay = update["duplexio_replay"]
     assert replay["text_ids"].tolist()[-1] == [2, 9, 12, 2]
     # The codec hears the voice prompt, then the given agent frame, as one stream.
-    torch.testing.assert_close(replay["agent_audio"][:2], torch.tensor([[1, 64, 64], [2, 1, 1]]))
-    torch.testing.assert_close(replay["agent_audio"][-1], torch.tensor([3, 2, 2]))
+    torch.testing.assert_close(replay["agent_audio"][:2], latent(1, 2))
+    torch.testing.assert_close(replay["agent_audio"][-1], latent(3)[0])
     torch.testing.assert_close(model.audio_codec.waveforms[0], torch.cat((torch.ones(2 * 1920), first)))
     state = update["duplexio_working_state"]
-    assert state.input_mimi.encoder_transformer.position == 3
+    assert state.input_mimi == 3
     assert state.persistent_keys == 7  # Two prompt keys, three system tokens, then the given user and agent text.
     # A sampled prediction is waiting; the next given frame replaces it.
     state.text_input_ids = (2, 5, 6, 2)
-    state.agent_audio_codes = torch.tensor([7, 7, 7])
+    state.agent_latent = latent(7)[0]
     _, _, update = model.preprocess(
         torch.zeros(6, dtype=torch.long), None, **given_info(state, second, agent_token_id=13),
     )
     replay = update["duplexio_replay"]
     assert replay["text_ids"].tolist() == [[2, 2, 13, 2]]
-    torch.testing.assert_close(replay["agent_audio"], torch.tensor([[4, 3, 3]]))
+    torch.testing.assert_close(replay["agent_audio"], latent(4))
     torch.testing.assert_close(model.audio_codec.waveforms[1], second)
     assert update["duplexio_working_state"].audio_position == 2
 
@@ -368,13 +365,13 @@ def test_scheduler_chunks_preserve_embeddings_masks_and_replay(prefix: bool, chu
     for name in ("frames_seen", "audio_position", "persistent_keys"):
         assert getattr(state, name) == getattr(bulk_update["duplexio_working_state"], name)
     assert state.user_asr.next_mel_frame == bulk_update["duplexio_working_state"].user_asr.next_mel_frame
-    assert state.input_mimi.encoder_transformer.position == bulk_update["duplexio_working_state"].input_mimi.encoder_transformer.position
+    assert state.input_mimi == bulk_update["duplexio_working_state"].input_mimi
 
 
 def test_trailing_tool_rows_leave_the_live_frame_unchanged() -> None:
     model = model_fixture()
     state = request_state(model)
-    state.agent_audio_codes = torch.tensor([7, 8, 9])
+    state.agent_latent = latent(7)[0]
     state.text_input_ids = (2, 9, 12, 2)
     pcm = torch.ones(1920).numpy().tobytes()
     _, live, live_update = model.preprocess(torch.zeros(6, dtype=torch.long), None, **append_info(state, pcm=pcm))
@@ -384,7 +381,7 @@ def test_trailing_tool_rows_leave_the_live_frame_unchanged() -> None:
     torch.testing.assert_close(tool[:6], live)
     for key in ("text_ids", "user_features", "agent_audio"):
         torch.testing.assert_close(tool_update["duplexio_replay"][key][:1], live_update["duplexio_replay"][key])
-    assert state.input_mimi.encoder_transformer.position == 0
+    assert state.input_mimi == 0
     assert model.audio_codec.waveforms == []
 
 

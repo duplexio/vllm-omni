@@ -6,19 +6,19 @@ from tokenizers import Tokenizer, models
 from torchaudio import functional as AF
 from torchaudio.transforms import Resample
 from transformers import (
-    AutoModelForRNNT,
     NemotronAsrStreamingConfig,
     NemotronAsrStreamingEncoderConfig,
     NemotronAsrStreamingFeatureExtractor,
     NemotronAsrStreamingProcessor,
     PreTrainedTokenizerFast,
 )
+from transformers.models.nemotron_asr_streaming.modeling_nemotron_asr_streaming import NemotronAsrStreamingEncoder
 
 from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FRAME_SAMPLES,
     GRAPH_BATCH_SIZES,
     FastConformerAudioStreamState,
-    FastConformerRNNT,
+    FastConformerEncoder,
     FastConformerStreamState,
     graph_batch_size,
     streaming_resample_batch,
@@ -64,7 +64,7 @@ def test_model_preprocess_batches_audio_without_persisting_prepared_results(enco
         infos[str(index)] = info
         expected[str(index)] = model.preprocess(torch.zeros(36, dtype=torch.long), None, **info)
     batch_sizes = []
-    hook = encoder.model.encoder.register_forward_hook(
+    hook = encoder.encoder.register_forward_hook(
         lambda module, args, result: batch_sizes.append(result.last_hidden_state.shape[0]),
     )
     prepared = model.preprocess_batch(req_ids=list(infos), model_intermediate_buffer=infos, device=torch.device("cpu"))
@@ -84,15 +84,15 @@ def test_batched_streams_preserve_age_order_and_accepted_state(encoder):
     for frames in (0, 2, 9, 15):
         state = FastConformerAudioStreamState()
         if frames:
-            _, state = encoder.encode_audio_chunk(torch.randn(frames * FRAME_SAMPLES) * 0.1, state)
+            _, state = encode_one(encoder, torch.randn(frames * FRAME_SAMPLES) * 0.1, state)
         states.append(state)
     for order in ([3, 0, 2, 1], [2, 1, 3], [3, 2]):
         waveforms = [torch.randn(FRAME_SAMPLES) * 0.1 for _ in order]
         previous = [states[index] for index in order]
-        expected = [encoder.encode_audio_chunk(waveform, state)[0]
+        expected = [encode_one(encoder, waveform, state)[0]
                     for waveform, state in zip(waveforms, previous, strict=True)]
         batch_sizes = []
-        hook = encoder.model.encoder.register_forward_hook(lambda module, args, result: batch_sizes.append(result.last_hidden_state.shape[0]))
+        hook = encoder.encoder.register_forward_hook(lambda module, args, result: batch_sizes.append(result.last_hidden_state.shape[0]))
         actual, updated = encoder.encode_audio_batch(waveforms, previous)
         hook.remove()
         assert 2 in batch_sizes  # Unequal ages beyond the cache window batch together.
@@ -106,8 +106,13 @@ def test_batched_streams_preserve_age_order_and_accepted_state(encoder):
             torch.testing.assert_close(first, second, atol=0, rtol=0)
 
 
+def encode_one(encoder, waveform, state):
+    outputs, states = encoder.encode_audio_batch([waveform], [state])
+    return outputs[0], states[0]
+
+
 @pytest.fixture
-def encoder() -> FastConformerRNNT:
+def encoder() -> FastConformerEncoder:
     torch.manual_seed(9)
     config = NemotronAsrStreamingConfig(
         encoder_config=NemotronAsrStreamingEncoderConfig(
@@ -122,7 +127,7 @@ def encoder() -> FastConformerRNNT:
         unk_token="<unk>",
     )
     processor = NemotronAsrStreamingProcessor(NemotronAsrStreamingFeatureExtractor(feature_size=8), tokenizer)
-    return FastConformerRNNT(AutoModelForRNNT.from_config(config), processor).eval()
+    return FastConformerEncoder(NemotronAsrStreamingEncoder(config.encoder_config), processor).eval()
 
 
 @pytest.mark.parametrize("first", [False, True])
@@ -146,7 +151,6 @@ def test_cached_frontend_matches_upstream_processor(encoder, first, device):
         actual = encoder.prepare_streaming_audio_chunk(value, first=first)
         # The upstream processor returns CPU features even for CUDA waveforms.
         torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=1e-5, rtol=1e-6)
-    assert len(encoder.frontend_constants) == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
@@ -268,13 +272,13 @@ def test_graphs_captured_before_serving_cover_every_batch(encoder, monkeypatch):
 @pytest.mark.parametrize("frames", [1, 4, 16])
 @torch.inference_mode()
 def test_parallel_prefill_matches_streaming_and_continuation(
-    encoder: FastConformerRNNT, frames: int, monkeypatch: pytest.MonkeyPatch,
+    encoder: FastConformerEncoder, frames: int, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     waveform = torch.randn(frames * FRAME_SAMPLES) * 0.1
     serial_state = FastConformerAudioStreamState()
     serial = []
     for frame in waveform.split(FRAME_SAMPLES):
-        output, serial_state = encoder.encode_audio_chunk(frame, serial_state)
+        output, serial_state = encode_one(encoder, frame, serial_state)
         serial.append(output)
     calls = []
     frontend_batches = []
@@ -285,17 +289,17 @@ def test_parallel_prefill_matches_streaming_and_continuation(
         return prepare(waveform, first=first)
 
     monkeypatch.setattr(encoder, "prepare_streaming_audio_chunk", record_frontend)
-    hook = encoder.model.encoder.register_forward_hook(lambda *args: calls.append(1))
-    bulk, bulk_state = encoder.encode_audio_chunk(waveform, FastConformerAudioStreamState())
+    hook = encoder.encoder.register_forward_hook(lambda *args: calls.append(1))
+    bulk, bulk_state = encode_one(encoder, waveform, FastConformerAudioStreamState())
     hook.remove()
     monkeypatch.setattr(encoder, "prepare_streaming_audio_chunk", prepare)
     assert frontend_batches == ([1] if frames == 1 else [1, frames - 1])
     torch.testing.assert_close(bulk, torch.cat(serial, dim=1), atol=2e-5, rtol=2e-4)
     for continuation in (torch.zeros(3 * FRAME_SAMPLES), torch.randn(2 * FRAME_SAMPLES) * 0.1):
-        actual, bulk_state = encoder.encode_audio_chunk(continuation, bulk_state)
+        actual, bulk_state = encode_one(encoder, continuation, bulk_state)
         expected = []
         for frame in continuation.split(FRAME_SAMPLES):
-            output, serial_state = encoder.encode_audio_chunk(frame, serial_state)
+            output, serial_state = encode_one(encoder, frame, serial_state)
             expected.append(output)
         torch.testing.assert_close(actual, torch.cat(expected, dim=1), atol=2e-5, rtol=2e-4)
         assert bulk_state.next_mel_frame == serial_state.next_mel_frame
@@ -305,7 +309,7 @@ def test_parallel_prefill_matches_streaming_and_continuation(
 
 
 @torch.inference_mode()
-def test_tool_burst_leaves_real_asr_continuation_unchanged(encoder: FastConformerRNNT) -> None:
+def test_tool_burst_leaves_real_asr_continuation_unchanged(encoder: FastConformerEncoder) -> None:
     from tests.model_executor.models.duplexio.test_bulk_prefill import (
         append_info,
         model_fixture,

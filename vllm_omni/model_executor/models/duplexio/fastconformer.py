@@ -1,4 +1,6 @@
-"""Cache-aware FastConformer and RNN-T from the exported checkpoint."""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Cache-aware streaming FastConformer encoder for the user's audio."""
 
 from __future__ import annotations
 
@@ -17,19 +19,6 @@ from torchaudio.transforms import Resample
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1_280
 NUM_LOOKAHEAD_TOKENS = 0
-# The RNN-T's sub-word vocabulary marks the first piece of every word.
-WORD_START = "\u2581"
-# A word is normally released when the next one starts, but the last word before
-# a pause has no successor — and is the one the agent needs to take its turn, so
-# silence ends it instead. Measured over 6881 aligned words (300 Emilia clips):
-# waiting longer splits fewer words across two releases, which matters because a
-# split re-encodes as Qwen ids the backbone never saw for that word (1.5% of
-# words at 4 frames, 3.9% at 3, 18.5% at 1), but it also delays the whole stream.
-# Training placed a word at word_end + first-piece emission latency (p50 3
-# frames, support ≤13); a streaming decoder cannot beat last-piece + this wait,
-# which is p50 8 / p90 12 frames here — inside that support, where 8 frames
-# (p50 12 / p90 16) left half the words past anything training showed.
-WORD_END_SILENCE_FRAMES = 4
 # Encoder graphs are captured for these batch sizes; a batch pads to the next.
 GRAPH_BATCH_SIZES = (1, 2, 4, 8, 12, 16, 20, 24, 28, 32)
 
@@ -161,12 +150,6 @@ class FastConformerStreamState:
             return self.layout.cached_frames
         return 0 if self._past_key_values is None else self._past_key_values.get_seq_length()
 
-    @property
-    def batch_size(self) -> int:
-        if self.flat is not None:
-            return self.flat.shape[0]
-        return self._past_key_values.layers[0].keys.shape[0]
-
     @classmethod
     def stack(cls, states: list[FastConformerStreamState]) -> FastConformerStreamState:
         """Batch equal cache windows without mutating accepted request state.
@@ -255,28 +238,12 @@ class FlatCacheLayout:
 
 
 @dataclass
-class RNNTGreedyState:
-    """Resumable greedy RNN-T decode state for one live utterance."""
-
-    # Prediction-network LSTM state, and its output for the emitted prefix.
-    hidden: Tensor | None = None
-    cell: Tensor | None = None
-    prediction: Tensor | None = None
-    # Sub-word ids of the word still being spoken. A word is released only once
-    # the next one starts, so text the model has already seen never changes.
-    word_token_ids: tuple[int, ...] = ()
-    # Encoder frames since the last emitted sub-word.
-    silent_frames: int = 0
-
-
-@dataclass
 class FastConformerAudioStreamState:
     """Raw-audio frontend and encoder state for one live utterance."""
 
     encoder: FastConformerStreamState = field(
         default_factory=FastConformerStreamState,
     )
-    rnnt: RNNTGreedyState = field(default_factory=RNNTGreedyState)
     audio_buffer: Tensor | None = None
     buffer_start_sample: int = 0
     next_mel_frame: int = 0
@@ -408,14 +375,10 @@ class FastConformerGraph:
         )
 
 
-class FastConformerRNNT(nn.Module):
-    """Own the pretrained FastConformer encoder and its native RNN-T.
+class FastConformerEncoder(nn.Module):
+    """The frozen, cache-aware FastConformer encoder of a streaming RNN-T; the model reads its hidden states."""
 
-    The conversational model consumes ``last_hidden_state``. Transcripts are
-    decoded separately by the checkpoint's prediction and joint networks.
-    """
-
-    model: Any
+    encoder: Any
     processor: Any
     mel_filters: Tensor
     stft_window: Tensor
@@ -423,42 +386,36 @@ class FastConformerRNNT(nn.Module):
     @classmethod
     def from_export(
         cls, config: dict[str, Any], root: Path, *, use_cuda_graph: bool = False,
-    ) -> FastConformerRNNT:
+    ) -> FastConformerEncoder:
         """Construct locally; the native model loader supplies all weights."""
-        from transformers import AutoConfig, AutoModelForRNNT, AutoProcessor
+        from transformers import AutoConfig, AutoProcessor
+        from transformers.models.nemotron_asr_streaming.modeling_nemotron_asr_streaming import (
+            NemotronAsrStreamingEncoder,
+        )
 
         values = dict(config)
-        model_type = values.pop("model_type")
-        model = AutoModelForRNNT.from_config(AutoConfig.for_model(model_type, **values))
-        processor = AutoProcessor.from_pretrained(
-            root / "user_asr", local_files_only=True
-        )
-        return cls(model, processor, use_cuda_graph=use_cuda_graph)
+        encoder = NemotronAsrStreamingEncoder(AutoConfig.for_model(values.pop("model_type"), **values).encoder_config)
+        processor = AutoProcessor.from_pretrained(root / "user_asr", local_files_only=True)
+        return cls(encoder, processor, use_cuda_graph=use_cuda_graph)
 
-    def __init__(self, model: Any, processor: Any, *, use_cuda_graph: bool = False) -> None:
+    def __init__(self, encoder: Any, processor: Any, *, use_cuda_graph: bool = False) -> None:
         super().__init__()
-        self.model = model
+        self.encoder = encoder
         self.processor = processor
         self.use_cuda_graph = use_cuda_graph
         self.graphs: dict[int, FastConformerGraph] = {}
-        # Signal-processing constants remain FP32, independently of model precision.
-        self.frontend_constants: dict[torch.device, tuple[Tensor, Tensor]] = {}
         self.processor.set_num_lookahead_tokens(NUM_LOOKAHEAD_TOKENS)
-        config = model.config
-        self.output_dim = config.encoder_config.hidden_size
-        self.blank_token_id = config.blank_token_id
-        self.model.requires_grad_(False)
-        self.model.eval()
+        self.output_dim = encoder.config.hidden_size
+        self.encoder.requires_grad_(False)
+        self.encoder.eval()
         feature_extractor = processor.feature_extractor
         self.feature_hop_length = feature_extractor.hop_length
         self.feature_n_fft = feature_extractor.n_fft
         self.feature_win_length = feature_extractor.win_length
         self.feature_preemphasis = feature_extractor.preemphasis
-        self.register_buffer("mel_filters", feature_extractor.mel_filters)
-        self.register_buffer(
-            "stft_window",
-            torch.hann_window(feature_extractor.win_length, periodic=False),
-        )
+        # Signal-processing constants stay FP32, independently of model precision.
+        self.register_buffer("mel_filters", feature_extractor.mel_filters.float())
+        self.register_buffer("stft_window", torch.hann_window(feature_extractor.win_length, periodic=False, dtype=torch.float32))
 
     @cached_property
     def chunk_sizes(self) -> StreamingChunkSizes:
@@ -469,16 +426,11 @@ class FastConformerRNNT(nn.Module):
             processor.num_mel_frames_first_audio_chunk, processor.num_mel_frames_per_audio_chunk,
         )
 
-    def train(self, mode: bool = True) -> FastConformerRNNT:
-        """Keep a frozen ASR subsystem deterministic under parent ``train()``."""
-        super().train(False)
-        return self
-
     def encode_feature_chunk(
         self, input_features: Tensor, state: FastConformerStreamState
     ) -> tuple[Tensor, FastConformerStreamState]:
         """Advance the native cache-aware encoder by one exact feature chunk."""
-        output = self.model.get_audio_features(
+        output = self.encoder(
             input_features=input_features,
             past_key_values=state.past_key_values,
             padding_cache=state.padding_cache,
@@ -494,31 +446,9 @@ class FastConformerRNNT(nn.Module):
             ),
         )
 
-    def streaming_raw_audio_slice(
-        self, waveform: Tensor, start: int, size: int
-    ) -> Tensor:
-        """Slice one STFT-aligned raw chunk, padding only utterance boundaries."""
-        end = start + size
-        valid_start = max(start, 0)
-        valid_end = min(end, waveform.shape[0])
-        parts = []
-        if start < 0:
-            parts.append(waveform.new_zeros(-start))
-        parts.append(waveform[valid_start:valid_end])
-        if end > waveform.shape[0]:
-            parts.append(waveform.new_zeros(end - waveform.shape[0]))
-        return torch.cat(parts)
-
     def prepare_streaming_audio_chunk(self, waveform: Tensor, *, first: bool) -> Tensor:
         """Extract exact streaming mels from one window or a batch of equal windows."""
-        if waveform.device not in self.frontend_constants:
-            self.frontend_constants[waveform.device] = (
-                self.processor.feature_extractor.mel_filters.to(waveform.device),
-                torch.hann_window(
-                    self.feature_win_length, periodic=False, device=waveform.device, dtype=torch.float32,
-                ),
-            )
-        mel_filters, window = self.frontend_constants[waveform.device]
+        mel_filters, window = self.mel_filters, self.stft_window
         waveform = waveform.unsqueeze(0) if waveform.ndim == 1 else waveform
         with torch.autocast(waveform.device.type, enabled=False):
             if self.feature_preemphasis is not None:
@@ -545,40 +475,10 @@ class FastConformerRNNT(nn.Module):
             raise ValueError(
                 f"Streaming audio chunk produced {actual_frames} mel frames; expected {required_frames}"
             )
-        model_param = next(self.model.parameters())
+        model_param = next(self.encoder.parameters())
         return features[:, :required_frames].to(
             device=model_param.device, dtype=model_param.dtype
         )
-
-    def streaming_feature_chunks(self, waveform: Tensor) -> Iterable[Tensor]:
-        """Yield exact upstream mel chunks for a complete 16 kHz waveform."""
-        if waveform.ndim != 1:
-            raise ValueError(
-                f"Streaming RNN-T expects one waveform, got shape {tuple(waveform.shape)}"
-            )
-        if waveform.shape[0] % FRAME_SAMPLES:
-            raise ValueError(
-                f"Streaming RNN-T expects complete 80 ms frames, got {waveform.shape[0]} samples"
-            )
-        frame_count = waveform.shape[0] // FRAME_SAMPLES
-        if frame_count == 0:
-            raise ValueError("Streaming RNN-T requires at least one 80 ms frame")
-        mel_frame = 0
-        for frame in range(frame_count):
-            first = frame == 0
-            if first:
-                start = 0
-                size = self.chunk_sizes.first_samples
-            else:
-                start = (
-                    mel_frame * self.feature_hop_length
-                    - self.feature_n_fft // 2
-                )
-                size = self.chunk_sizes.samples
-            raw_chunk = self.streaming_raw_audio_slice(waveform, start, size)
-            features = self.prepare_streaming_audio_chunk(raw_chunk, first=first)
-            yield features
-            mel_frame += features.shape[1]
 
     def take_audio_windows(
         self, waveform: Tensor, state: FastConformerAudioStreamState
@@ -636,13 +536,6 @@ class FastConformerRNNT(nn.Module):
             next_mel_frame=next_mel_frame,
         )
 
-    def encode_audio_chunk(
-        self, waveform: Tensor, state: FastConformerAudioStreamState,
-    ) -> tuple[Tensor, FastConformerAudioStreamState]:
-        """Consume available live 16 kHz audio and emit complete encoder states."""
-        outputs, states = self.encode_audio_batch([waveform], [state])
-        return outputs[0], states[0]
-
     def encode_audio_batch(
         self, waveforms: list[Tensor], states: list[FastConformerAudioStreamState],
     ) -> tuple[list[Tensor], list[FastConformerAudioStreamState]]:
@@ -672,14 +565,14 @@ class FastConformerRNNT(nn.Module):
             if chunks:
                 inputs[index] = torch.cat(chunks)
                 groups[(inputs[index].shape[0], states[index].encoder.cached_frames)].append(index)
-        parameter = next(self.model.parameters())
+        parameter = next(self.encoder.parameters())
         outputs = [parameter.new_empty((1, 0, self.output_dim)) for _ in states]
         for indices in groups.values():
             previous = [states[index].encoder for index in indices]
             with torch.profiler.record_function("duplexio.asr_encoder"):
                 features = torch.stack([inputs[index] for index in indices])
                 steady = (
-                    previous[0].cached_frames == self.model.config.encoder_config.sliding_window - 1
+                    previous[0].cached_frames == self.encoder.config.sliding_window - 1
                     and features.shape[1] == self.chunk_sizes.mel_frames
                 )
                 if self.use_cuda_graph and steady:
@@ -721,7 +614,7 @@ class FastConformerRNNT(nn.Module):
         silence = [torch.zeros(FRAME_SAMPLES, device=self.mel_filters.device) for _ in range(streams)]
         self.use_cuda_graph = False
         try:
-            while states[0].encoder.cached_frames < self.model.config.encoder_config.sliding_window - 1:
+            while states[0].encoder.cached_frames < self.encoder.config.sliding_window - 1:
                 _, states = self.encode_audio_batch(silence, states)
         finally:
             self.use_cuda_graph = True
@@ -730,129 +623,6 @@ class FastConformerRNNT(nn.Module):
             _, states[:size] = self.encode_audio_batch(silence[:size], states[:size])
         assert set(self.graphs) == set(GRAPH_BATCH_SIZES)
 
-    def prediction_step(
-        self,
-        token_id: int,
-        hidden: Tensor | None,
-        cell: Tensor | None,
-        device: torch.device,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Advance the prediction network by one emitted token."""
-        decoder = self.model.decoder
-        embeddings = decoder.embedding(
-            torch.tensor([[token_id]], dtype=torch.long, device=device)
-        )
-        output, (hidden, cell) = decoder.lstm(
-            embeddings, None if hidden is None else (hidden, cell)
-        )
-        return decoder.decoder_projector(output), hidden, cell
-
-    @torch.inference_mode()
-    def decode_words(
-        self, encoded: Tensor, state: RNNTGreedyState
-    ) -> tuple[tuple[str, ...], RNNTGreedyState]:
-        """Greedily transcribe encoder states, returning the words that finished.
-
-        Each returned word carries the leading space its ``▁`` piece stands for,
-        and a group that continues an already released word (punctuation after a
-        pause) carries none, so the caller concatenates them as-is.
-
-        The native greedy schedule: a blank advances one encoder frame, a symbol
-        stays on the frame and advances the prediction network, and
-        ``max_symbols_per_step`` symbols force an advance. Unlike ``generate``,
-        which consumes a whole utterance, the LSTM state lives in ``state`` so a
-        live session resumes on its next 80 ms append.
-        """
-        # The joint head consumes projected encoder states, while the
-        # conversational model embeds the unprojected ones that
-        # encode_audio_chunk returns; projecting again here keeps the transcript
-        # decode independent of the feature path for one small matmul a frame.
-        projected = self.model.encoder_projector(encoded)
-        tokenizer = self.processor.tokenizer
-        hidden, cell, prediction = state.hidden, state.cell, state.prediction
-        word_token_ids = state.word_token_ids
-        if prediction is None:
-            # generate() seeds the prediction network with a single blank step.
-            prediction, hidden, cell = self.prediction_step(
-                self.blank_token_id, hidden, cell, encoded.device
-            )
-        def release(token_ids: tuple[int, ...]) -> str:
-            lead = (
-                " "
-                if tokenizer.convert_ids_to_tokens(token_ids[0]).startswith(WORD_START)
-                else ""
-            )
-            return lead + tokenizer.decode(list(token_ids))
-
-        words: list[str] = []
-        silent_frames = state.silent_frames
-        for index in range(projected.shape[1]):
-            frame = projected[:, index : index + 1, None, :]
-            emitted = False
-            for _ in range(self.model.max_symbols_per_step):
-                logits = self.model.joint(
-                    encoder_hidden_states=frame,
-                    decoder_hidden_states=prediction[:, None],
-                )
-                token_id = int(logits.flatten().argmax())
-                if token_id == self.blank_token_id:
-                    break
-                starts_word = tokenizer.convert_ids_to_tokens(token_id).startswith(
-                    WORD_START
-                )
-                if starts_word and word_token_ids:
-                    words.append(release(word_token_ids))
-                    word_token_ids = ()
-                prediction, hidden, cell = self.prediction_step(
-                    token_id, hidden, cell, encoded.device
-                )
-                word_token_ids += (token_id,)
-                emitted = True
-            silent_frames = 0 if emitted else silent_frames + 1
-            if word_token_ids and silent_frames >= WORD_END_SILENCE_FRAMES:
-                words.append(release(word_token_ids))
-                word_token_ids = ()
-        return tuple(words), RNNTGreedyState(
-            hidden, cell, prediction, word_token_ids, silent_frames
-        )
-
-    @torch.inference_mode()
-    def transcribe_streaming_features(
-        self,
-        chunks: Iterable[Tensor],
-        *,
-        max_new_tokens: int,
-        streamer: Any | None = None,
-    ) -> list[str]:
-        """Decode exact mel chunks through the native streaming RNN-T state."""
-        feature_generator = (chunk for chunk in chunks)
-        generated = self.model.generate(
-            input_features=feature_generator,
-            num_lookahead_tokens=NUM_LOOKAHEAD_TOKENS,
-            max_new_tokens=max_new_tokens,
-            streamer=streamer,
-            return_dict_in_generate=True,
-            # The export carries no generation config; the prediction network
-            # starts from blank, exactly as decode_words seeds it.
-            decoder_start_token_id=self.blank_token_id,
-        )
-        return self.processor.batch_decode(
-            generated.sequences, skip_special_tokens=True
-        )
-
-    @torch.inference_mode()
-    def transcribe_streaming_waveform(
-        self, waveform: Tensor, *, streamer: Any | None = None
-    ) -> str:
-        """Decode one complete waveform through native streaming RNN-T state."""
-        frame_count = waveform.shape[0] // FRAME_SAMPLES
-        return self.transcribe_streaming_features(
-            self.streaming_feature_chunks(waveform),
-            max_new_tokens=frame_count * self.model.max_symbols_per_step,
-            streamer=streamer,
-        )[0]
-
-
 # Only captured steady windows compile: their shapes differ in batch alone, and
 # fusing the encoder's elementwise work shortens every replay.
-steady_encode = torch.compile(FastConformerRNNT.encode_feature_chunk, fullgraph=True)
+steady_encode = torch.compile(FastConformerEncoder.encode_feature_chunk, fullgraph=True)

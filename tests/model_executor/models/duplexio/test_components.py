@@ -13,16 +13,8 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend, GDNAttentio
 from vllm_omni.model_executor.models.duplexio.audio_adapters import (
     AudioInputAdapter,
 )
-from vllm_omni.model_executor.models.duplexio.audio_representation import (
-    DelayedMimiRepresentation,
-    MimiEmbedding,
-)
 from vllm_omni.model_executor.models.duplexio.configuration_duplexio import (
     DuplexIOConfig,
-)
-from vllm_omni.model_executor.models.duplexio.depth_sampler import (
-    DepthAutoregressiveSampler,
-    DepthSamplerConfig,
 )
 from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
     DuplexIOFrameMetadata,
@@ -49,13 +41,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _config() -> DuplexIOConfig:
     return DuplexIOConfig(
-        audio_representation="quantized",
         user_asr_config={"model_type": "nemotron_asr_streaming"},
-        user_asr_streaming_config={
-            "num_lookahead_tokens": 0,
-            "sample_rate": 16_000,
-            "frame_samples": 1_280,
-        },
         text_config={
             "model_type": "qwen3_5_text",
             "hidden_size": 32,
@@ -67,34 +53,8 @@ def _config() -> DuplexIOConfig:
             "vocab_size": 128,
             "layer_types": ["full_attention", "linear_attention"],
         },
-        audio_codec_config={
-            "model_type": "mimi",
-            "num_quantizers": 32,
-            "codebook_size": 2_048,
-            "sampling_rate": 24_000,
-            "frame_rate": 12.5,
-        },
-        audio_adapter_config={
-            "hidden_size": 16,
-        },
-        quantized_audio_config={
-            "num_codebooks": 8,
-            "codebook_size": 2_048,
-            "embedding_dim": 512,
-            "acoustic_delay_frames": 1,
-        },
-        depth_transformer_config={
-            "implementation": "duplexio_depth_v2",
-            "low_rank_embeddings": 8,
-            "dim": 32,
-            "num_layers": 2,
-            "num_heads": 4,
-            "mlp_dim": 64,
-            "sampling_temperature": 0.8,
-            "sampling_top_k": 32,
-            "semantic_sampling_top_k": 1,
-            "codebook_loss_weights": [3, 3, 3, 2, 2, 2, 1, 1],
-        },
+        flowmap_config={"mlp_dim": 16, "mlp_depth": 2, "inference_steps": 8, "sampling_temperature": 1.0},
+        audio_adapter_config={"hidden_size": 16},
         pad_token_id=1,
         silence_token_id=2,
     )
@@ -106,11 +66,8 @@ def test_duplexio_config_round_trips_nested_text_config() -> None:
 
     assert restored.get_text_config().model_type == "qwen3_5_text"
     assert restored.get_text_config().hidden_size == 32
-    assert restored.quantized_audio_config["num_codebooks"] == 8
-    assert restored.depth_transformer_config["implementation"] == "duplexio_depth_v2"
+    assert restored.flowmap_config["inference_steps"] == 8
     assert restored.audio_adapter_config == {"hidden_size": 16}
-    assert restored.initial_agent_prefix == "<|im_start|>assistant\n"
-    assert restored.initial_user_prefix == "<|im_start|>user\n"
 
 
 def test_duplexio_text_config_uses_one_dimensional_rope() -> None:
@@ -179,62 +136,6 @@ def test_duplexio_installs_cell_addressing_at_stable_buffers() -> None:
     assert pointers == tuple(buffer.data_ptr() for buffer in buffers)
 
 
-def test_duplexio_config_rejects_pre_v4_export() -> None:
-    config = _config().to_dict()
-    config["duplexio_export_version"] = 3
-
-    with pytest.raises(ValueError, match="export version"):
-        DuplexIOConfig.from_dict(config)
-
-
-def test_duplexio_config_rejects_non_row_quantum() -> None:
-    with pytest.raises(ValueError, match="six cells"):
-        DuplexIOConfig(
-            text_config={"model_type": "qwen3_5_text"},
-            num_cells=5,
-            audio_codec_config={
-                "model_type": "mimi",
-                "num_quantizers": 32,
-                "codebook_size": 2_048,
-                "sampling_rate": 24_000,
-                "frame_rate": 12.5,
-            },
-            audio_adapter_config={"architecture": "mlp"},
-            quantized_audio_config={
-                "num_codebooks": 8,
-                "codebook_size": 2_048,
-            },
-        )
-
-
-def test_duplexio_config_rejects_old_depth_checkpoint() -> None:
-    config = _config().to_dict()
-    config["depth_transformer_config"] = {
-        "implementation": "moshi_original_depformer",
-    }
-
-    with pytest.raises(ValueError, match="unconditioned depth checkpoint"):
-        DuplexIOConfig.from_dict(config)
-
-
-def test_duplexio_config_accepts_full_width_depth_embeddings() -> None:
-    config = _config().to_dict()
-    config["depth_transformer_config"]["low_rank_embeddings"] = None
-
-    assert (
-        DuplexIOConfig.from_dict(config).depth_transformer_config["low_rank_embeddings"]
-        is None
-    )
-
-
-def test_duplexio_config_rejects_non_native_acoustic_delay() -> None:
-    config = _config().to_dict()
-    config["quantized_audio_config"]["acoustic_delay_frames"] = 2
-
-    with pytest.raises(ValueError, match="one acoustic delay frame"):
-        DuplexIOConfig.from_dict(config)
-
-
 def test_duplexio_config_requires_hybrid_qwen_backbone() -> None:
     config = _config().to_dict()
     config["text_config"]["layer_types"] = [
@@ -242,7 +143,7 @@ def test_duplexio_config_requires_hybrid_qwen_backbone() -> None:
         "full_attention",
     ]
 
-    with pytest.raises(ValueError, match="full-attention and linear-attention"):
+    with pytest.raises(ValueError, match="full- or linear-attention"):
         DuplexIOConfig.from_dict(config)
 
 
@@ -396,114 +297,6 @@ def test_mlp_adapters_return_backbone_inputs_without_a_skip() -> None:
     assert agent_hidden.shape == (4, 11)
 
 
-def test_delayed_mimi_streaming_reassembles_raw_columns() -> None:
-    representation = DelayedMimiRepresentation(
-        num_codebooks=3,
-        codebook_size=10,
-        acoustic_delay_frames=1,
-    )
-    encode_state = representation.new_state(device=torch.device("cpu"))
-    decode_state = representation.new_state(device=torch.device("cpu"))
-    raw = [torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6])]
-
-    delayed = [representation.encode_column(column, encode_state) for column in raw]
-    decoded = [representation.decode_column(column, decode_state) for column in delayed]
-
-    assert torch.equal(delayed[0], torch.tensor([1, 10, 10]))
-    assert torch.equal(delayed[1], torch.tensor([4, 2, 3]))
-    assert decoded[0] is None
-    assert torch.equal(decoded[1], raw[0])
-
-
-def test_delayed_mimi_sequence_matches_column_streaming() -> None:
-    representation = DelayedMimiRepresentation(
-        num_codebooks=3,
-        codebook_size=10,
-        acoustic_delay_frames=1,
-    )
-    raw = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
-    streaming_state = representation.new_state(device=torch.device("cpu"))
-    sequence_state = representation.new_state(device=torch.device("cpu"))
-
-    streaming = torch.stack(
-        [representation.encode_column(column, streaming_state) for column in raw]
-    )
-    sequence = representation.encode_sequence(raw, sequence_state)
-
-    torch.testing.assert_close(sequence, streaming)
-    torch.testing.assert_close(
-        sequence_state.previous_acoustic_codes,
-        streaming_state.previous_acoustic_codes,
-    )
-
-
-def test_mimi_embedding_keeps_checkpoint_module_layout() -> None:
-    embedding = MimiEmbedding(3, 7, 5)
-
-    assert set(embedding.state_dict()) == {
-        "embeddings.0.weight",
-        "embeddings.1.weight",
-        "embeddings.2.weight",
-    }
-    assert embedding(torch.tensor([[1, 2, 3]])).shape == (1, 5)
-
-
-def test_depth_sampling_is_deterministic_at_top_k_one() -> None:
-    torch.manual_seed(1)
-    model = DepthAutoregressiveSampler(
-        DepthSamplerConfig(
-            conditioning_dim=5,
-            text_vocab_size=11,
-            codebook_size=7,
-            num_codebooks=3,
-            low_rank_embeddings=2,
-            dim=8,
-            num_layers=2,
-            num_heads=2,
-            feedforward_dim=12,
-            sampling_top_k=1,
-        )
-    ).eval()
-    conditioning = torch.randn(2, 5)
-    text_tokens = torch.tensor([2, 4])
-
-    first = model.sample(conditioning, text_tokens)
-    second = model.sample(conditioning, text_tokens)
-
-    torch.testing.assert_close(first, second)
-
-
-def test_depth_sampler_runs_with_native_bfloat16_parameters() -> None:
-    torch.manual_seed(1)
-    model = (
-        DepthAutoregressiveSampler(
-            DepthSamplerConfig(
-                conditioning_dim=5,
-                text_vocab_size=11,
-                codebook_size=7,
-                num_codebooks=3,
-                low_rank_embeddings=2,
-                dim=8,
-                num_layers=2,
-                num_heads=2,
-                feedforward_dim=12,
-                sampling_top_k=1,
-            )
-        )
-        .eval()
-        .bfloat16()
-    )
-    conditioning = torch.randn(2, 5, dtype=torch.bfloat16)
-    text_tokens = torch.tensor([2, 4])
-
-    sampled = model.sample(conditioning, text_tokens)
-
-    assert sampled.shape == (2, 3)
-    assert all(
-        parameter.dtype == torch.bfloat16 for parameter in model.parameters()
-    )
-
-
 def test_factorized_text_argmax_excludes_silence_from_content() -> None:
     logits = torch.tensor(
         [
@@ -596,29 +389,3 @@ def test_vocabulary_suppression_is_model_owned_and_sampling_temperature_stays_dy
     second = model.resolve_sampling(runtime).agent
     assert (first.temperature, second.temperature) == (0.3, 1.2)
     assert first.suppressed_token_ids is second.suppressed_token_ids is suppressed
-
-
-def test_depth_sampler_uses_current_checkpoint_module_names() -> None:
-    model = DepthAutoregressiveSampler(
-        DepthSamplerConfig(
-            conditioning_dim=5,
-            text_vocab_size=11,
-            codebook_size=7,
-            num_codebooks=3,
-            low_rank_embeddings=2,
-            dim=8,
-            num_layers=1,
-            num_heads=2,
-            feedforward_dim=12,
-        )
-    )
-    keys = set(model.state_dict())
-
-    assert "conditioning_projections.0.weight" in keys
-    assert "previous_codebook_embeddings.0.output_projection.weight" in keys
-    assert "text_embedding.output_projection.weight" in keys
-    assert "transformer.layers.0.attention.input_projections.0.weight" in keys
-    assert "transformer.layers.0.feedforward.layers.0.input.weight" in keys
-    assert "transformer.layers.0.attention_norm.weight" in keys
-    assert not any("modulation" in key for key in keys)
-    assert "heads.0.weight" in keys

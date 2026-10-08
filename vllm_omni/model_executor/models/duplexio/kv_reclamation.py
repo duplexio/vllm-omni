@@ -21,10 +21,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from vllm_omni.model_executor.models.duplexio.row_semantics import (
-    DUPLEXIO_NUM_CELLS,
-    DUPLEXIO_NUM_TEXT_CELLS,
-)
+from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS, NUM_TEXT_CELLS
 
 
 @dataclass(frozen=True)
@@ -46,7 +43,7 @@ class DuplexIOKVLayout:
 
     @property
     def max_frames(self) -> int:
-        return self.max_model_len // DUPLEXIO_NUM_CELLS
+        return self.max_model_len // NUM_CELLS
 
     @property
     def audio_ring_frames(self) -> int:
@@ -59,7 +56,7 @@ class DuplexIOKVLayout:
 
     @property
     def num_audio_cells(self) -> int:
-        return DUPLEXIO_NUM_CELLS - DUPLEXIO_NUM_TEXT_CELLS
+        return NUM_CELLS - NUM_TEXT_CELLS
 
     @property
     def persistent_base(self) -> int:
@@ -73,7 +70,7 @@ class DuplexIOKVLayout:
     def max_persistent_keys(self) -> int:
         # A row writes at most four persistent keys: its text cells, or one
         # voice-prompt key.
-        return self.max_frames * DUPLEXIO_NUM_TEXT_CELLS
+        return self.max_frames * NUM_TEXT_CELLS
 
     @property
     def max_compact_slots(self) -> int:
@@ -107,7 +104,7 @@ class DuplexIOFrameMetadata:
     """
 
     def __init__(self, max_tokens: int, device: torch.device) -> None:
-        self.cell = torch.arange(max_tokens, device=device) % DUPLEXIO_NUM_CELLS
+        self.cell = torch.arange(max_tokens, device=device) % NUM_CELLS
         self.positions = torch.arange(max_tokens, device=device)
         self.key_active = torch.ones(max_tokens, dtype=torch.bool, device=device)
         self.persistent_ordinal = torch.zeros(max_tokens, dtype=torch.int32, device=device)
@@ -159,9 +156,9 @@ class DuplexIOFrameMetadata:
         audio_last = self.audio_last[:tokens]
         ordinal = self.persistent_ordinal[:tokens]
         persistent = ordinal > 0
-        audio = (cell >= DUPLEXIO_NUM_TEXT_CELLS) & self.key_active[:tokens] & (audio_last >= 0)
+        audio = (cell >= NUM_TEXT_CELLS) & self.key_active[:tokens] & (audio_last >= 0)
         audio_slot = torch.remainder(
-            audio_last * layout.num_audio_cells + cell - DUPLEXIO_NUM_TEXT_CELLS,
+            audio_last * layout.num_audio_cells + cell - NUM_TEXT_CELLS,
             layout.persistent_base,
         )
         return (
@@ -179,11 +176,11 @@ class DuplexIOFrameMetadata:
         and its own cell is merged separately, so nothing a step writes is read
         back. An inert padded row reads nothing.
         """
-        cells = DUPLEXIO_NUM_CELLS - DUPLEXIO_NUM_TEXT_CELLS
-        audio_last = self.audio_last[:tokens:DUPLEXIO_NUM_CELLS]
+        cells = NUM_CELLS - NUM_TEXT_CELLS
+        audio_last = self.audio_last[:tokens:NUM_CELLS]
         end = (audio_last * cells).clamp_min(0)
-        start = torch.minimum((self.audio_first[:tokens:DUPLEXIO_NUM_CELLS] - 1) * cells, end)
-        return start, end, self.persistent_last[:tokens:DUPLEXIO_NUM_CELLS]
+        start = torch.minimum((self.audio_first[:tokens:NUM_CELLS] - 1) * cells, end)
+        return start, end, self.persistent_last[:tokens:NUM_CELLS]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -311,7 +308,7 @@ def make_duplexio_kv_cache_spec(
     """Convert an Attention-produced full spec to DuplexIO's compact spec."""
     if base.kv_quant_mode != KVQuantMode.NONE:
         raise ValueError("DuplexIO attention does not support quantized KV cache")
-    if max_model_len < DUPLEXIO_NUM_CELLS:
+    if max_model_len < NUM_CELLS:
         raise ValueError("DuplexIO max_model_len must fit at least one frame")
     if base.block_size % 16:
         raise ValueError(

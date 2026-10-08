@@ -23,11 +23,8 @@ from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
     DuplexIOFlashAttentionMetadataBuilder,
     DuplexIOPagedAttention,
 )
-from vllm_omni.model_executor.models.duplexio.row_semantics import (
-    DUPLEXIO_NUM_CELLS,
-    DUPLEXIO_NUM_TEXT_CELLS,
-    duplexio_attention_visible,
-)
+from tests.model_executor.models.duplexio.reference_attention import attention_visible
+from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS, NUM_TEXT_CELLS
 
 WINDOW = 2
 BLOCK_SIZE = 64
@@ -46,7 +43,7 @@ TOLERANCE = {torch.bfloat16: 3e-2}
 
 def cells(values: Tensor) -> Tensor:
     """Give every cell of a row the row's value."""
-    return values[:, None].expand(-1, DUPLEXIO_NUM_CELLS).flatten()
+    return values[:, None].expand(-1, NUM_CELLS).flatten()
 
 
 def session_fields(
@@ -94,14 +91,14 @@ def dense_attention(
 ) -> Tensor:
     """Reduce the exact visibility relation in fp32 over every session token."""
     positions = torch.arange(query.shape[0], device=query.device)
-    visible = duplexio_attention_visible(
+    visible = attention_visible(
         positions[:, None],
         positions[None],
         fields["audio_position"][:, None],
         fields["audio_position"][None],
         fields["key_active"][None],
         fields["pinned"][None],
-        audio_attention_window_frames=window,
+        window_frames=window,
     )
     groups = query.shape[1] // key.shape[1]
     keys = key.float().repeat_interleave(groups, 1)
@@ -120,8 +117,8 @@ def training_attention(
 
     positions = torch.arange(query.shape[0], device=query.device)
     sequence = torch.zeros_like(positions)
-    frame = positions // DUPLEXIO_NUM_CELLS
-    cell = positions % DUPLEXIO_NUM_CELLS
+    frame = positions // NUM_CELLS
+    cell = positions % NUM_CELLS
     audio = fields["audio_position"]
     mask, indices = training.attention_mask(
         sequence, frame, audio, cell, sequence, frame, audio, cell,
@@ -217,10 +214,10 @@ def run_session(
             dtype=dtype,
         ),
         audio_window_frames=window,
-        max_model_len=rows * DUPLEXIO_NUM_CELLS,
+        max_model_len=rows * NUM_CELLS,
     )
     layout = spec.layout
-    tokens = rows * DUPLEXIO_NUM_CELLS
+    tokens = rows * NUM_CELLS
     query = torch.randn(requests, tokens, heads, dim, device=device, dtype=dtype)
     key = torch.randn(requests, tokens, kv_heads, dim, device=device, dtype=dtype)
     value = torch.randn_like(key)
@@ -240,7 +237,7 @@ def run_session(
     ]
 
     pages = layout.max_blocks * requests
-    frame = DuplexIOFrameMetadata(sum(prefixes) * DUPLEXIO_NUM_CELLS, device)
+    frame = DuplexIOFrameMetadata(sum(prefixes) * NUM_CELLS, device)
     layer, builder, impl = paged_backend(spec, frame, heads)
     # Page 0 belongs to no request: a page outside the block table must never be
     # read. vLLM zeroes the pages it does hand out, which is what keeps
@@ -261,8 +258,8 @@ def run_session(
     while live:
         used = [
             torch.arange(
-                consumed[request] * DUPLEXIO_NUM_CELLS,
-                (consumed[request] + step) * DUPLEXIO_NUM_CELLS,
+                consumed[request] * NUM_CELLS,
+                (consumed[request] + step) * NUM_CELLS,
                 device=device,
             )
             for request, step in zip(live, steps, strict=True)
@@ -274,12 +271,12 @@ def run_session(
                 for name in FRAME_FIELDS
             }
         )
-        sizes = [step * DUPLEXIO_NUM_CELLS for step in steps]
+        sizes = [step * NUM_CELLS for step in steps]
         metadata = step_metadata(
             builder,
             sizes,
             [
-                (consumed[request] + step) * DUPLEXIO_NUM_CELLS
+                (consumed[request] + step) * NUM_CELLS
                 for request, step in zip(live, steps, strict=True)
             ],
             block_table[live],

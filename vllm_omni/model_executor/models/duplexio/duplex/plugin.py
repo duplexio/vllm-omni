@@ -35,15 +35,14 @@ from vllm_omni.model_executor.common.duplex.payload import decode_pcm_f32le_payl
 from vllm_omni.model_executor.common.duplex.pcm_buffer import FixedFramePcmAppendBuffer
 from vllm_omni.model_executor.models.duplexio.duplex.data_plane import DuplexIODataPlane
 from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
-from vllm_omni.model_executor.models.duplexio.row_semantics import DUPLEXIO_NUM_CELLS
+from vllm_omni.model_executor.models.duplexio.configuration_duplexio import INITIAL_AGENT_PREFIX, INITIAL_USER_PREFIX
+from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_SIZE, NUM_CELLS, SAMPLE_RATE
 from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig, sampling_runtime
 from vllm_omni.model_executor.models.duplexio.tool_calling import tool_call_grammar
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
-SAMPLE_RATE = 24_000
-FRAME_SIZE = 1_920
 CHUNK_PERIOD_MS = 80
 #: Tool results the session may queue before the model has taken the oldest.
 MAX_PENDING_TOOL_RESULTS = 8
@@ -56,7 +55,6 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "duplexio_voice_prompt_pcm",
         "duplexio_voice_prompt_frames",
         "duplexio_system_token_ids",
-        "duplexio_depth_sampling",
         "duplexio_flow_temperature",
         "duplexio_emit_temperatures",
         "duplexio_user_sampling",
@@ -70,12 +68,11 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
 
 
 class AudioSamplingConfig(BaseModel):
-    """Client overrides for the audio-code sampler."""
+    """Client override for the agent-audio head; absent, it samples at the checkpoint's temperature."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
     temperature: float | None = Field(default=None, gt=0)
-    top_k: int | None = Field(default=None, ge=1)
 
 
 class ClientSamplingConfig(SamplingConfig):
@@ -131,7 +128,7 @@ def append_fields(
         else 0
     )
     frame_count = prefix_frames + 1 + len(tool_token_ids)
-    prompt_token_ids = [runtime_config["duplexio_scheduler_token_id"]] * (frame_count * DUPLEXIO_NUM_CELLS)
+    prompt_token_ids = [runtime_config["duplexio_scheduler_token_id"]] * (frame_count * NUM_CELLS)
     return prompt_token_ids, {
         "pcm": pcm,
         "frame_count": frame_count,
@@ -288,7 +285,7 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
         system_prompt = config.instructions or hf_config.default_system_prompt
         if tools:
             system_prompt = render_tool_system_prompt(tokenizer, system_prompt, tools)
-        initial_prefix = hf_config.initial_agent_prefix if start_role == "agent" else hf_config.initial_user_prefix
+        initial_prefix = INITIAL_AGENT_PREFIX if start_role == "agent" else INITIAL_USER_PREFIX
         system_token_ids = [
             *tokenizer.encode(system_prompt, add_special_tokens=False),
             *tokenizer.encode(initial_prefix, add_special_tokens=False),
@@ -297,26 +294,9 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
         policies = sampling_runtime(client_sampling)
         if config.temperature is not None:
             policies["duplexio_text_sampling"]["temperature"] = config.temperature
-        depth_sampling = {"temperature": 0.7, "top_k": hf_config.depth_transformer_config.get("sampling_top_k", 250)}
-        # Absent, a flow-map head samples at its checkpoint's temperature.
-        flow_temperature: dict[str, float] = {}
-        if client_sampling.audio is not None and not hf_config.quantized_audio_config:
-            if client_sampling.audio.top_k is not None:
-                raise DuplexRuntimeConfigError(
-                    "This DuplexIO checkpoint samples audio with a flow-map head, which has no top_k",
-                    code="invalid_sampling",
-                )
-            if client_sampling.audio.temperature is not None:
-                flow_temperature["duplexio_flow_temperature"] = client_sampling.audio.temperature
-        elif client_sampling.audio is not None:
-            audio_sampling = client_sampling.audio.model_dump(exclude_none=True)
-            codebook_size = hf_config.quantized_audio_config["codebook_size"]
-            if audio_sampling.get("top_k", 0) > codebook_size:
-                raise DuplexRuntimeConfigError(
-                    f"DuplexIO audio sampling top_k exceeds the {codebook_size}-entry codebook",
-                    code="invalid_sampling",
-                )
-            depth_sampling.update(audio_sampling)
+        flow_temperature = {} if client_sampling.audio is None or client_sampling.audio.temperature is None else {
+            "duplexio_flow_temperature": client_sampling.audio.temperature,
+        }
         return {
             **policies,
             "instructions": config.instructions,
@@ -331,7 +311,6 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
             else secrets.randbits(63),
             "duplexio_tools": tools,
             "duplexio_tool_choice": tool_choice,
-            "duplexio_depth_sampling": depth_sampling,
             **flow_temperature,
         }
 

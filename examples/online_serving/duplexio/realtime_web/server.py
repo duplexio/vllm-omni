@@ -32,13 +32,6 @@ DEFAULT_TOOLS_PATH = Path(__file__).parent / "tools.json"
 SESSION_COOKIE_NAME = "__Host-duplexio_session"
 
 
-class DepthSamplingDefaults(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    sampling_temperature: float = Field(gt=0)
-    sampling_top_k: int = Field(ge=1)
-
-
 class FlowMapSamplingDefaults(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -48,10 +41,7 @@ class FlowMapSamplingDefaults(BaseModel):
 class CheckpointSamplingDefaults(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    # A discrete (Mimi depth-transformer) checkpoint samples audio codes with a
-    # temperature and top-k; a continuous flow-map head has only a temperature.
-    depth_transformer_config: DepthSamplingDefaults | None = None
-    flowmap_config: FlowMapSamplingDefaults | None = None
+    flowmap_config: FlowMapSamplingDefaults
 
 
 def join_ws_url(base: str, path: str, query: str) -> str:
@@ -81,13 +71,7 @@ def load_sampling_defaults(config_path: Path) -> dict[str, object]:
         config_path.read_text(encoding="utf-8")
     )
     # The page shows the defaults a session gets when it overrides nothing.
-    sampling: dict[str, object] = SamplingConfig().model_dump()
-    depth = checkpoint.depth_transformer_config
-    if depth is not None:
-        sampling["audio"] = {"temperature": 0.7, "top_k": depth.sampling_top_k}
-    elif checkpoint.flowmap_config is not None:
-        sampling["audio"] = {"temperature": checkpoint.flowmap_config.sampling_temperature}
-    return sampling
+    return {**SamplingConfig().model_dump(), "audio": {"temperature": checkpoint.flowmap_config.sampling_temperature}}
 
 
 def password_matches(password: str, password_hash: str) -> bool:

@@ -6,15 +6,8 @@ from typing import Any, cast
 
 import torch
 
-from vllm_omni.model_executor.models.duplexio.audio_representation import (
-    DelayedMimiState,
-)
 from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FastConformerAudioStreamState,
-)
-from vllm_omni.model_executor.models.duplexio.mimi import (
-    MimiStreamingState,
-    MimiTransformerState,
 )
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
@@ -46,17 +39,14 @@ def test_gdn_request_state_shape_is_fixed_for_the_session_lifetime() -> None:
     assert recurrent == (2 * 6, 8, 8)
 
 
-def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
+def test_request_state_fork_shares_immutable_prefix_and_codec_state() -> None:
+    codec_state = object()  # Pocket Mimi states are replaced, never mutated.
     state = DuplexIORequestState(
         text_input_ids=(0, 0, 0, 0),
-        agent_audio_codes=torch.zeros(8, dtype=torch.long),
+        agent_latent=torch.zeros(32),
         user_asr=FastConformerAudioStreamState(),
-        input_mimi=MimiStreamingState(),
-        agent_delay=DelayedMimiState(torch.zeros(7, dtype=torch.long)),
-        output_mimi=MimiStreamingState(
-            encoder_transformer=MimiTransformerState.empty(2),
-            decoder_transformer=MimiTransformerState.empty(2),
-        ),
+        input_mimi=codec_state,
+        output_mimi=codec_state,
         voice_prompt=torch.zeros(1_920),
         system_token_ids=(1, 2, 3),
         frames_seen=100_000,
@@ -65,17 +55,10 @@ def test_request_state_fork_shares_immutable_prefix_tensors() -> None:
     )
 
     fork = state.fork()
+    fork.frames_seen += 1
 
-    assert fork.frames_seen == 100_000
-    assert fork.audio_position == 99_000
-    assert fork.persistent_keys == 250_000
-    assert fork.text_input_ids == (0, 0, 0, 0)
-    assert fork.agent_audio_codes.shape == (8,)
-    assert fork.agent_delay.previous_acoustic_codes.shape == (7,)
+    assert state.frames_seen == 100_000
+    assert (fork.audio_position, fork.persistent_keys, fork.text_input_ids) == (99_000, 250_000, (0, 0, 0, 0))
     # The pinned prompt is immutable for the session, so a fork shares it.
     assert fork.voice_prompt is state.voice_prompt
-    assert fork.output_mimi is not state.output_mimi
-    assert (
-        fork.output_mimi.decoder_transformer
-        is not state.output_mimi.decoder_transformer
-    )
+    assert fork.output_mimi is codec_state

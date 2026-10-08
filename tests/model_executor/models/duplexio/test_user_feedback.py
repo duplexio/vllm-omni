@@ -71,7 +71,6 @@ def runtime():
         "duplexio_text_sampling": {"temperature": 1.0, "top_k": 1, "top_p": 1.0},
         "duplexio_user_sampling": {"content": {"temperature": 1.0, "top_k": 1, "top_p": 1.0}},
         "duplexio_emit_temperatures": {"user": 1.0, "agent": 0.0, "tool_call": 0.0},
-        "duplexio_depth_sampling": {"temperature": 0.7, "top_k": 1},
     }
 
 
@@ -100,13 +99,11 @@ def test_sampling_cache_reuses_settings_and_tracks_session_updates():
     settings["duplexio_text_sampling"]["temperature"] = 0.3
     settings["duplexio_user_sampling"]["content"]["temperature"] = 0.0
     settings["duplexio_emit_temperatures"]["user"] = 0.0
-    settings["duplexio_depth_sampling"]["top_k"] = 2
     model.sample_text_batch(logits, emissions, [info])
     updated = working.sampling
     assert updated is not initial
     assert updated.agent.temperature == updated.tool.temperature == 0.3
     assert updated.user.temperature == updated.emission.user == 0.0
-    assert updated.depth.top_k == 2
     assert state.sampling is initial
     assert initial.agent.temperature == initial.user.temperature == initial.emission.user == 1.0
     model.sample_text_batch(logits, emissions, [info])

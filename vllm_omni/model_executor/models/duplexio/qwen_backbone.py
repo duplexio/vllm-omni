@@ -68,18 +68,14 @@ from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
     DuplexIOKVLayout,
     make_duplexio_kv_cache_spec,
 )
+from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
 from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_function
-from vllm_omni.model_executor.models.duplexio.row_semantics import (
-    DUPLEXIO_NUM_CELLS,
-    expand_stream_conv_weight,
-    mask_inactive_gdn_gates,
-)
 from vllm_omni.model_executor.models.duplexio.stream_attention import (
     cached_rotary_pos_emb,
     gated_attention_output,
     merge_row_attention,
 )
-from vllm_omni.model_executor.models.duplexio.stream_conv import stream_causal_conv
+from vllm_omni.model_executor.models.duplexio.stream_conv import expand_stream_conv_weight, stream_causal_conv
 from vllm_omni.model_executor.models.duplexio.stream_gdn import (
     append_gdn,
     gdn_cache_dtypes,
@@ -166,13 +162,12 @@ class DuplexIORowReads:
 
     def __init__(self, layout: DuplexIOKVLayout, max_tokens: int, device: torch.device) -> None:
         self.layout = layout
-        rows = cdiv(max_tokens, DUPLEXIO_NUM_CELLS)
+        rows = cdiv(max_tokens, NUM_CELLS)
         self.window_keys = layout.audio_window_frames * layout.num_audio_cells
         self.audio_pages = cdiv(self.window_keys + layout.block_size - 1, layout.block_size)
+        # Every step rewrites what it reads, so these buffers hold nothing across
+        # steps: like the rest of the KV cache, sleep may discard them.
         self.cu_seqlens = torch.arange(rows + 1, dtype=torch.int32, device=device)
-        self.row_starts = self.cu_seqlens[:rows] * DUPLEXIO_NUM_CELLS
-        self.page_ids = torch.arange(self.audio_pages, device=device)
-        self.extra_ids = torch.arange(layout.num_audio_cells, dtype=torch.int32, device=device)
         self.tables = torch.zeros(rows, layout.max_blocks, dtype=torch.int32, device=device)
         self.audio_table = torch.zeros(rows, self.audio_pages, dtype=torch.int32, device=device)
         self.audio_seqused = torch.zeros(rows, dtype=torch.int32, device=device)
@@ -183,7 +178,7 @@ class DuplexIORowReads:
         # sequence's normalizer over other rows' normalizers.
         self.empty = torch.ones(rows * 2, dtype=torch.bool, device=device)
         self.extra_slots = torch.full((rows * layout.num_audio_cells,), -1, dtype=torch.long, device=device)
-        self.write_slots = torch.full((rows * DUPLEXIO_NUM_CELLS,), -1, dtype=torch.long, device=device)
+        self.write_slots = torch.full((rows * NUM_CELLS,), -1, dtype=torch.long, device=device)
 
     def physical(self, tables: Tensor, logical: Tensor) -> Tensor:
         """Resolve per-row logical slots through the rows' page tables, -1 where none."""
@@ -197,8 +192,11 @@ class DuplexIORowReads:
         self, frame: DuplexIOFrameMetadata, query_start_loc: Tensor, block_table: Tensor, tokens: int,
     ) -> None:
         layout = self.layout
-        rows = tokens // DUPLEXIO_NUM_CELLS
-        request = torch.searchsorted(query_start_loc, self.row_starts[:rows], right=True, out_int32=True) - 1
+        rows = tokens // NUM_CELLS
+        device = block_table.device
+        torch.arange(rows + 1, dtype=torch.int32, device=device, out=self.cu_seqlens[: rows + 1])
+        row_starts = self.cu_seqlens[:rows] * NUM_CELLS
+        request = torch.searchsorted(query_start_loc, row_starts, right=True, out_int32=True) - 1
         tables = self.tables[:rows]
         torch.index_select(block_table, 0, request.clamp_(0, block_table.shape[0] - 1), out=tables)
         start, end, persistent = frame.row_reads(tokens)
@@ -209,17 +207,17 @@ class DuplexIORowReads:
         audio = torch.where(windowed < end, end - first_page * layout.block_size, 0)
         torch.eq(torch.stack((audio, persistent), 1), 0, out=self.empty[: rows * 2].view(rows, 2))
         self.audio_seqused[:rows].copy_(audio.clamp_min(1))
-        pages = torch.remainder(first_page[:, None] + self.page_ids, layout.audio_ring_pages)
+        pages = torch.remainder(first_page[:, None] + torch.arange(self.audio_pages, device=device), layout.audio_ring_pages)
         torch.gather(tables, 1, pages, out=self.audio_table[:rows])
         self.persistent_seqused[:rows].copy_(persistent.clamp_min(1))
-        extra = start[:, None] + self.extra_ids
+        extra = start[:, None] + torch.arange(layout.num_audio_cells, dtype=torch.int32, device=device)
         self.extra_slots[: rows * layout.num_audio_cells].copy_(
             self.physical(tables, torch.remainder(extra, layout.persistent_base))
             .masked_fill(extra >= windowed[:, None], -1)
             .flatten()
         )
         self.write_slots[:tokens].copy_(
-            self.physical(tables, frame.write_slots(tokens, layout).view(rows, DUPLEXIO_NUM_CELLS)).flatten()
+            self.physical(tables, frame.write_slots(tokens, layout).view(rows, NUM_CELLS)).flatten()
         )
 
 
@@ -302,7 +300,7 @@ class DuplexIOFlashAttentionImpl(FlashAttentionImpl):
         if attn_metadata is None:
             return output.fill_(0)
         tokens = attn_metadata.num_actual_tokens
-        rows = tokens // DUPLEXIO_NUM_CELLS
+        rows = tokens // NUM_CELLS
         query, key, value = query[:tokens], key[:tokens], value[:tokens]
         reads = attn_metadata.reads
         layout = reads.layout
@@ -319,7 +317,7 @@ class DuplexIOFlashAttentionImpl(FlashAttentionImpl):
         # (tokens, heads) -> (rows, kv_heads * cells * groups): a KV head's
         # grouped query heads of all six cells are consecutive.
         packed = (
-            query.view(rows, DUPLEXIO_NUM_CELLS, self.num_kv_heads, -1, self.head_size)
+            query.view(rows, NUM_CELLS, self.num_kv_heads, -1, self.head_size)
             .transpose(1, 2)
             .reshape(rows, -1, self.head_size)
         )
@@ -407,8 +405,8 @@ class DuplexIOGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         metadata: CommonAttentionMetadata,
     ) -> bool:
         return (
-            metadata.max_query_len == DUPLEXIO_NUM_CELLS
-            and metadata.num_actual_tokens == DUPLEXIO_NUM_CELLS * metadata.num_reqs
+            metadata.max_query_len == NUM_CELLS
+            and metadata.num_actual_tokens == NUM_CELLS * metadata.num_reqs
         )
 
     def refresh_full_graph_metadata(
@@ -481,7 +479,7 @@ class DuplexIOGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         token_boundaries = common_attn_metadata.query_start_loc_cpu.tolist()
         chunk_counts = [
-            ((end - start) // DUPLEXIO_NUM_CELLS + 63) // 64
+            ((end - start) // NUM_CELLS + 63) // 64
             for start, end in zip(token_boundaries, token_boundaries[1:])
         ]
         chunks = [
@@ -695,22 +693,12 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             Callable[[Tensor, Tensor], None],
             cast(Any, original_weight).weight_loader,
         )
-        expanded_weight = nn.Parameter(
-            expand_stream_conv_weight(
-                original_weight.detach(),
-                num_cells=DUPLEXIO_NUM_CELLS,
-            )
-        )
+        expanded_weight = nn.Parameter(expand_stream_conv_weight(original_weight.detach()))
 
         def weight_loader(param: Tensor, loaded_weight: Tensor) -> None:
             original = param.new_empty((*param.shape[:-1], self.conv_kernel_size))
             original_loader(original, loaded_weight)
-            param.data.copy_(
-                expand_stream_conv_weight(
-                    original,
-                    num_cells=DUPLEXIO_NUM_CELLS,
-                )
-            )
+            param.data.copy_(expand_stream_conv_weight(original))
 
         set_weight_attrs(expanded_weight, {"weight_loader": weight_loader})
         self.conv1d.weight = expanded_weight
@@ -762,7 +750,7 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             boundaries = torch.tensor((0, tokens), device=mixed_qkv.device, dtype=torch.int32)
             state_indices = torch.zeros(1, device=mixed_qkv.device, dtype=torch.int32)
             has_initial_state = torch.zeros(1, device=mixed_qkv.device, dtype=torch.bool)
-            blocks = torch.arange((tokens // DUPLEXIO_NUM_CELLS + 63) // 64, device=mixed_qkv.device, dtype=torch.int32)
+            blocks = torch.arange((tokens // NUM_CELLS + 63) // 64, device=mixed_qkv.device, dtype=torch.int32)
             chunk_indices = torch.stack((torch.zeros_like(blocks), blocks), 1)
             cache = tuple(torch.empty((1, *shape), device=mixed_qkv.device, dtype=dtype)
                           for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype(), strict=True))
@@ -820,11 +808,11 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             dim=-1,
         )
         output_gate = output_gate.reshape(num_tokens, -1, self.head_v_dim)
-        beta_logits, decay_logits = mask_inactive_gdn_gates(
-            beta_logits,
-            decay_logits,
-            key_active,
-        )
+        # Inactive cells must not touch the recurrent state: beta = sigmoid(-inf)
+        # and the softplus-derived decay of -inf are both exactly zero.
+        inactive = ~key_active.unsqueeze(-1)
+        beta_logits = beta_logits.masked_fill(inactive, -torch.inf)
+        decay_logits = decay_logits.masked_fill(inactive, -torch.inf)
         core_output = hidden_states.new_zeros(
             num_tokens,
             self.num_v_heads // self.tp_size,
