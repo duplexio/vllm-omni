@@ -113,7 +113,6 @@ async def test_runtime_config_pins_the_reference_audio_and_prompt(model_config, 
     assert runtime["duplexio_system_token_ids"] == [3, 4, *prefix_ids]
     assert runtime["duplexio_start_role"] == (start_role or "user")
     assert runtime["duplexio_scheduler_token_id"] == 11
-    assert isinstance(runtime["duplexio_sampling_seed"], int)
     assert "duplexio_flow_temperature" not in runtime
     assert runtime["duplexio_text_sampling"] == {"temperature": 0.6, "top_k": 20, "top_p": 0.95}
     assert runtime["duplexio_emit_temperatures"] == {"user": 0.0, "agent": 1.0, "tool_call": 1.0}
@@ -128,12 +127,10 @@ async def test_runtime_config_applies_client_sampling(model_config) -> None:
     _, runtime = await open_session(
         model_config,
         duplexio_sampling={
-            "seed": 9,
             "agent": {"content": {"temperature": 0.2}},
             "audio": {"temperature": 0.5},
         },
     )
-    assert runtime["duplexio_sampling_seed"] == 9
     assert runtime["duplexio_text_sampling"]["temperature"] == 0.2
     assert runtime["duplexio_flow_temperature"] == 0.5
 
@@ -147,7 +144,7 @@ async def test_runtime_config_applies_client_sampling(model_config) -> None:
         ({"ref_audio_path": "/voices/a.wav"}, "ref_audio_path_rejected"),
         ({"auto_response": False}, "full_duplex_required"),
         ({"start_role": "narrator"}, "start_role_invalid"),
-        ({"duplexio_sampling": {"seed": -1}}, "invalid_sampling"),
+        ({"duplexio_sampling": {"seed": 9}}, "invalid_sampling"),
         ({"duplexio_sampling": {"audio": {"top_k": 4}}}, "invalid_sampling"),
     ],
 )
@@ -165,24 +162,24 @@ async def test_runtime_config_rejects_server_owned_keys(model_config) -> None:
 
 @pytest.mark.asyncio
 async def test_updates_change_nothing(model_config) -> None:
-    plugin, runtime = await open_session(model_config, duplexio_sampling={"seed": 9})
-    unchanged = plugin.runtime_config_for_update(session_config(duplexio_sampling={"seed": 9}), runtime)
+    plugin, runtime = await open_session(model_config, duplexio_sampling={"agent": {"content": {"temperature": 0.2}}})
+    unchanged = plugin.runtime_config_for_update(session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}}), runtime)
     assert unchanged == runtime
-    same = session_config(duplexio_sampling={"seed": 9})
+    same = session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}})
     same.temperature = runtime["duplexio_text_sampling"]["temperature"]
     assert plugin.runtime_config_for_update(same, runtime) == runtime
-    warmer = session_config(duplexio_sampling={"seed": 9})
+    warmer = session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}})
     warmer.temperature = 0.9
     for config, code in [
         (warmer, "sampling_update_unsupported"),
-        (session_config(duplexio_sampling={"seed": 10}), "sampling_update_unsupported"),
-        (session_config(duplexio_sampling={"seed": 9}, start_role="agent"), "start_role_update_unsupported"),
-        (session_config(duplexio_sampling={"seed": 9}, ref_audio_data=reference_audio(4)), "voice_update_unsupported"),
+        (session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.3}}}), "sampling_update_unsupported"),
+        (session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}}, start_role="agent"), "start_role_update_unsupported"),
+        (session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}}, ref_audio_data=reference_audio(4)), "voice_update_unsupported"),
     ]:
         with pytest.raises(DuplexRuntimeConfigError) as error:
             plugin.runtime_config_for_update(config, runtime)
         assert error.value.code == code
-    instructed = session_config(duplexio_sampling={"seed": 9})
+    instructed = session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}})
     instructed.instructions = "be brief"
     with pytest.raises(DuplexRuntimeConfigError, match="instructions"):
         plugin.runtime_config_for_update(instructed, runtime)

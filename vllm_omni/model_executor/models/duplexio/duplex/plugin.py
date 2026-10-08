@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import secrets
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -50,7 +49,6 @@ MAX_PENDING_TOOL_RESULTS = 8
 PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
     {
         "duplexio_scheduler_token_id",
-        "duplexio_sampling_seed",
         "duplexio_start_role",
         "duplexio_voice_prompt_pcm",
         "duplexio_voice_prompt_frames",
@@ -80,7 +78,6 @@ class ClientSamplingConfig(SamplingConfig):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    seed: int | None = Field(default=None, ge=0, lt=2**63)
     audio: AudioSamplingConfig | None = None
 
 
@@ -306,9 +303,6 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
             "duplexio_voice_prompt_pcm": voice_prompt,
             "duplexio_voice_prompt_frames": voice_prompt_frames,
             "duplexio_scheduler_token_id": hf_config.pad_token_id,
-            "duplexio_sampling_seed": client_sampling.seed
-            if client_sampling.seed is not None
-            else secrets.randbits(63),
             "duplexio_tools": tools,
             "duplexio_tool_choice": tool_choice,
             **flow_temperature,

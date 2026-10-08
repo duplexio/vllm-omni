@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend, GDNAttentionMetadata
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from vllm_omni.model_executor.models.duplexio.audio_adapters import (
     AudioInputAdapter,
@@ -178,16 +178,6 @@ def test_duplexio_cudagraph_supports_uniform_six_cell_batches() -> None:
     )
 
 
-def test_duplexio_gdn_uses_frame_graph_backend() -> None:
-    attention = DuplexIOQwenGatedDeltaNetAttention.__new__(
-        DuplexIOQwenGatedDeltaNetAttention
-    )
-    nn.Module.__init__(attention)
-    attention.full_cudagraph_enabled = True
-
-    assert attention.get_attn_backend() is DuplexIOGDNAttentionBackend
-
-
 def test_duplexio_gdn_cache_allocation_preserves_fp32_recurrence() -> None:
     config = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16))
     attention = DuplexIOQwenGatedDeltaNetAttention.__new__(DuplexIOQwenGatedDeltaNetAttention)
@@ -199,14 +189,12 @@ def test_duplexio_gdn_cache_allocation_preserves_fp32_recurrence() -> None:
     )
 
 
-def test_duplexio_gdn_uses_standard_backend_in_eager_mode() -> None:
-    attention = DuplexIOQwenGatedDeltaNetAttention.__new__(
-        DuplexIOQwenGatedDeltaNetAttention
-    )
+def test_duplexio_gdn_chunks_by_frames_without_full_graphs_too() -> None:
+    """vLLM's stock GDN backend chunks by tokens, which the frame-strided kernels would misread."""
+    attention = DuplexIOQwenGatedDeltaNetAttention.__new__(DuplexIOQwenGatedDeltaNetAttention)
     nn.Module.__init__(attention)
-    attention.full_cudagraph_enabled = False
 
-    assert attention.get_attn_backend() is GDNAttentionBackend
+    assert attention.get_attn_backend() is DuplexIOGDNAttentionBackend
 
 
 def test_duplexio_gdn_graph_refreshes_every_recurrent_state_input(

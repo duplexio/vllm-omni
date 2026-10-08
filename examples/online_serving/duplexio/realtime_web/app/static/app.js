@@ -33,7 +33,6 @@
   const textTopP = document.getElementById('text-top-p');
   const audioTemperature = document.getElementById('audio-temperature');
   const agentEmitTemperature = document.getElementById('agent-emit-temperature');
-  const samplingSeed = document.getElementById('sampling-seed');
   const toolPicker = document.getElementById('tool-picker');
   const statusElement = document.getElementById('status');
   const statusLabel = document.getElementById('status-label');
@@ -282,9 +281,7 @@
     const audioTemperatureValue = samplingNumber(audioTemperature);
     if (audioTemperatureValue !== null) audio.temperature = audioTemperatureValue;
     const emitTemperature = samplingNumber(agentEmitTemperature);
-    const seed = samplingNumber(samplingSeed);
     return {
-      ...(seed === null ? {} : { seed }),
       agent: {
         content: text,
         emission: emitTemperature === null ? {} : { temperature: emitTemperature },

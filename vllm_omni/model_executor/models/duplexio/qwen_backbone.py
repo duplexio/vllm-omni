@@ -684,10 +684,6 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.norm = norm
         self.norm.compile(dynamic=True, fullgraph=True)
         assert self.activation == "silu"
-        self.full_cudagraph_enabled = (
-            vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
-            and not vllm_config.model_config.enforce_eager
-        )
         original_weight = cast(Tensor, self.conv1d.weight)
         original_loader = cast(
             Callable[[Tensor, Tensor], None],
@@ -716,9 +712,8 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        if self.full_cudagraph_enabled:
-            return DuplexIOGDNAttentionBackend
-        return super().get_attn_backend()
+        # Chunked by frames in every mode: the kernels read chunk indices against frame boundaries.
+        return DuplexIOGDNAttentionBackend
 
     def apply_stream_causal_conv(
         self,
