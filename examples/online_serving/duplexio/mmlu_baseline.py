@@ -36,6 +36,7 @@ def main() -> None:
         text = output.outputs[0].text
         predicted = answer_letter_in(text)
         results.append({**question, "agent_text": text, "predicted": predicted, "correct": predicted == question["answer"]})
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(results, indent=2) + "\n")
     correct = sum(result["correct"] for result in results)
     print(
