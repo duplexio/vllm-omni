@@ -162,11 +162,15 @@ async def test_runtime_config_rejects_invalid_sessions(model_config, extra_body,
 
 
 @pytest.mark.asyncio
-async def test_flowmap_checkpoint_rejects_audio_sampling(model_config) -> None:
+async def test_flowmap_checkpoint_takes_audio_temperature_only(model_config) -> None:
     model_config.hf_config.quantized_audio_config = {}
     model_config.hf_config.depth_transformer_config = {}
+    _, default = await open_session(model_config)
+    assert "duplexio_flow_temperature" not in default
+    _, runtime = await open_session(model_config, duplexio_sampling={"audio": {"temperature": 0.5}})
+    assert runtime["duplexio_flow_temperature"] == 0.5
     with pytest.raises(DuplexRuntimeConfigError) as error:
-        await open_session(model_config, duplexio_sampling={"audio": {"temperature": 0.5}})
+        await open_session(model_config, duplexio_sampling={"audio": {"top_k": 4}})
     assert error.value.code == "invalid_sampling"
 
 
@@ -177,14 +181,17 @@ async def test_runtime_config_rejects_server_owned_keys(model_config) -> None:
 
 
 @pytest.mark.asyncio
-async def test_updates_change_only_the_text_temperature(model_config) -> None:
+async def test_updates_change_nothing(model_config) -> None:
     plugin, runtime = await open_session(model_config, duplexio_sampling={"seed": 9})
     unchanged = plugin.runtime_config_for_update(session_config(duplexio_sampling={"seed": 9}), runtime)
     assert unchanged == runtime
+    same = session_config(duplexio_sampling={"seed": 9})
+    same.temperature = runtime["duplexio_text_sampling"]["temperature"]
+    assert plugin.runtime_config_for_update(same, runtime) == runtime
     warmer = session_config(duplexio_sampling={"seed": 9})
     warmer.temperature = 0.9
-    assert plugin.runtime_config_for_update(warmer, runtime)["duplexio_text_sampling"]["temperature"] == 0.9
     for config, code in [
+        (warmer, "sampling_update_unsupported"),
         (session_config(duplexio_sampling={"seed": 10}), "sampling_update_unsupported"),
         (session_config(duplexio_sampling={"seed": 9}, start_role="agent"), "start_role_update_unsupported"),
         (session_config(duplexio_sampling={"seed": 9}, ref_audio_data=reference_audio(4)), "voice_update_unsupported"),

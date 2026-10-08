@@ -38,9 +38,11 @@ def content_distribution(logits: Tensor, sampling: TokenSamplingOptions) -> tupl
 # Columns of the per-row parameters that ``sample_streams`` reads; each setting
 # holds one value per stream, in logits order (agent, tool, user).
 TEMPERATURE, TOP_K, TOP_P, EMIT_TEMPERATURE = slice(0, 3), slice(3, 6), slice(6, 9), slice(9, 12)
+# The flow-map audio head's temperature, read after text sampling.
+FLOW_TEMPERATURE = 12
 # 0: no tool grammar, 1: inside or forced into a call, 2: idle and free to start one.
-TOOL_STATE = 12
-SAMPLING_PARAMETERS = 13
+TOOL_STATE = 13
+SAMPLING_PARAMETERS = 14
 NO_TOP_P = 2.0  # A cumulative probability never exceeds it.
 
 

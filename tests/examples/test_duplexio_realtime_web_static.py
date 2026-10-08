@@ -168,7 +168,7 @@ def test_frontend_sends_sampling_parameters_before_session_start() -> None:
     assert "sampling.agent?.emission" in app
     assert "const sessionSampling = samplingOptions();" in app
     assert "duplexio_sampling: sessionSampling" in app
-    assert "agentEmitTemperature.value = emit.temperature" in app
+    assert "agentEmitTemperature.value = floatValue(emit.temperature)" in app
     assert "samplingPicker.disabled = true" in app
     assert "samplingPicker.disabled = false" in app
 

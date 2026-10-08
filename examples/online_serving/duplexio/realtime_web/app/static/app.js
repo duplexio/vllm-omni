@@ -242,23 +242,26 @@
     toolPicker.replaceChildren(...options);
   }
 
+  // Show real-valued settings as floats: a temperature of 1 reads 1.0.
+  function floatValue(value) {
+    if (value === undefined || value === null) return '';
+    return Number.isInteger(value) ? value.toFixed(1) : String(value);
+  }
+
   function populateSampling() {
     const sampling = config.sampling || {};
     const text = sampling.agent?.content || {};
     const audio = sampling.audio || {};
     const emit = sampling.agent?.emission || {};
-    textTemperature.value = text.temperature ?? '';
+    textTemperature.value = floatValue(text.temperature);
     textTopK.value = text.top_k ?? '';
-    textTopP.value = text.top_p ?? '';
-    audioTemperature.value = audio.temperature ?? '';
+    textTopP.value = floatValue(text.top_p);
+    audioTemperature.value = floatValue(audio.temperature);
     audioTopK.value = audio.top_k ?? '';
-    // A continuous flow-map checkpoint samples audio at the temperature baked
-    // into it, so it reports no audio defaults: hide the knobs the backend
-    // would ignore.
-    for (const input of [audioTemperature, audioTopK]) {
-      input.closest('label').hidden = sampling.audio === undefined;
-    }
-    agentEmitTemperature.value = emit.temperature ?? '';
+    // A continuous flow-map checkpoint's audio head has a temperature but no top-k.
+    audioTemperature.closest('label').hidden = sampling.audio === undefined;
+    audioTopK.closest('label').hidden = audio.top_k === undefined;
+    agentEmitTemperature.value = floatValue(emit.temperature);
   }
 
   function samplingNumber(input) {
@@ -277,20 +280,19 @@
       ['top_k', textTopK],
       ['top_p', textTopP],
     ];
+    // Hidden knobs may still hold values the browser restored from an older page.
+    const audioDefaults = config.sampling?.audio || {};
     const audioValues = [
       ['temperature', audioTemperature],
       ['top_k', audioTopK],
-    ];
+    ].filter(([name]) => audioDefaults[name] !== undefined);
     for (const [name, input] of textValues) {
       const value = samplingNumber(input);
       if (name !== 'temperature' || value !== null) text[name] = value;
     }
-    // Hidden knobs may still hold values the browser restored from an older page.
-    if (config.sampling?.audio !== undefined) {
-      for (const [name, input] of audioValues) {
-        const value = samplingNumber(input);
-        if (value !== null) audio[name] = value;
-      }
+    for (const [name, input] of audioValues) {
+      const value = samplingNumber(input);
+      if (value !== null) audio[name] = value;
     }
     const emitTemperature = samplingNumber(agentEmitTemperature);
     const seed = samplingNumber(samplingSeed);

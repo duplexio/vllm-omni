@@ -156,16 +156,16 @@ def test_sampling_defaults_apply_serving_temperatures(tmp_path: Path) -> None:
     )
 
     assert server.load_sampling_defaults(config_path) == {
-        "agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.7, "top_k": 20, "top_p": 0.95}},
+        "agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.6, "top_k": 20, "top_p": 0.95}},
         "user": {"emission": {"temperature": 0.0}, "content": {"temperature": 0.0, "top_k": None, "top_p": None}},
         "audio": {"temperature": 0.7, "top_k": 250},
     }
 
 
-def test_sampling_defaults_omit_audio_for_continuous_checkpoint(
+def test_sampling_defaults_offer_flowmap_temperature_for_continuous_checkpoint(
     tmp_path: Path,
 ) -> None:
-    """A flow-map audio head takes no client sampling overrides."""
+    """A flow-map audio head's default temperature is its checkpoint's, and it has no top-k."""
     config_path = tmp_path / "config.json"
     config_path.write_text(
         json.dumps(
@@ -178,8 +178,9 @@ def test_sampling_defaults_omit_audio_for_continuous_checkpoint(
     )
 
     assert server.load_sampling_defaults(config_path) == {
-        "agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.7, "top_k": 20, "top_p": 0.95}},
+        "agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.6, "top_k": 20, "top_p": 0.95}},
         "user": {"emission": {"temperature": 0.0}, "content": {"temperature": 0.0, "top_k": None, "top_p": None}},
+        "audio": {"temperature": 0.3},
     }
 
 

@@ -20,6 +20,8 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
+from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
+
 # Found beside this file: run as a script, the file's directory is on sys.path.
 from realtime_relay import INPUT_SAMPLE_RATE, backend_query, issue_ticket, relay, ticket_key
 
@@ -28,18 +30,6 @@ APP_DIR = Path(__file__).parent / "app"
 STATIC_DIR = APP_DIR / "static"
 DEFAULT_TOOLS_PATH = Path(__file__).parent / "tools.json"
 SESSION_COOKIE_NAME = "__Host-duplexio_session"
-DEFAULT_SAMPLING = {
-    "agent": {
-        "emission": {"temperature": 1.0},
-        "content": {"temperature": 0.7, "top_k": 20, "top_p": 0.95},
-    },
-    "user": {
-        "emission": {"temperature": 0.0},
-        "content": {"temperature": 0.0, "top_k": None, "top_p": None},
-    },
-}
-
-
 
 
 class DepthSamplingDefaults(BaseModel):
@@ -49,13 +39,19 @@ class DepthSamplingDefaults(BaseModel):
     sampling_top_k: int = Field(ge=1)
 
 
+class FlowMapSamplingDefaults(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    sampling_temperature: float = Field(gt=0)
+
+
 class CheckpointSamplingDefaults(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    # Only a discrete (Mimi depth-transformer) checkpoint has a client-tunable
-    # audio sampler. A continuous flow-map head samples at the temperature
-    # baked into its checkpoint, so it exports no depth transformer config.
+    # A discrete (Mimi depth-transformer) checkpoint samples audio codes with a
+    # temperature and top-k; a continuous flow-map head has only a temperature.
     depth_transformer_config: DepthSamplingDefaults | None = None
+    flowmap_config: FlowMapSamplingDefaults | None = None
 
 
 def join_ws_url(base: str, path: str, query: str) -> str:
@@ -84,15 +80,14 @@ def load_sampling_defaults(config_path: Path) -> dict[str, object]:
     checkpoint = CheckpointSamplingDefaults.model_validate_json(
         config_path.read_text(encoding="utf-8")
     )
+    # The page shows the defaults a session gets when it overrides nothing.
+    sampling: dict[str, object] = SamplingConfig().model_dump()
     depth = checkpoint.depth_transformer_config
-    return {
-        **DEFAULT_SAMPLING,
-        **(
-            {}
-            if depth is None
-            else {"audio": {"temperature": 0.7, "top_k": depth.sampling_top_k}}
-        ),
-    }
+    if depth is not None:
+        sampling["audio"] = {"temperature": 0.7, "top_k": depth.sampling_top_k}
+    elif checkpoint.flowmap_config is not None:
+        sampling["audio"] = {"temperature": checkpoint.flowmap_config.sampling_temperature}
+    return sampling
 
 
 def password_matches(password: str, password_hash: str) -> bool:

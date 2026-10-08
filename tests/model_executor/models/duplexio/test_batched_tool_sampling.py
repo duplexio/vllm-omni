@@ -38,6 +38,7 @@ def fixture(device: str, *, mixed: bool):
     model.user_suppressed_token_ids = model.agent_suppressed_token_ids
     model.tool_suppressed_token_ids = model.agent_suppressed_token_ids
     model.text_config = SimpleNamespace(vocab_size=len(vocab))
+    model.config = SimpleNamespace(flowmap_config={"sampling_temperature": 1.0})
     model.init_text_sampling(len(vocab), 8)
     model.tool_call_compiler = object.__new__(ToolCallConstraintCompiler)
     infos = []

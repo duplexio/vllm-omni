@@ -57,6 +57,7 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "duplexio_voice_prompt_frames",
         "duplexio_system_token_ids",
         "duplexio_depth_sampling",
+        "duplexio_flow_temperature",
         "duplexio_emit_temperatures",
         "duplexio_user_sampling",
         "duplexio_text_sampling",
@@ -284,12 +285,17 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
         if config.temperature is not None:
             policies["duplexio_text_sampling"]["temperature"] = config.temperature
         depth_sampling = {"temperature": 0.7, "top_k": hf_config.depth_transformer_config.get("sampling_top_k", 250)}
-        if client_sampling.audio is not None:
-            if not hf_config.quantized_audio_config:
+        # Absent, a flow-map head samples at its checkpoint's temperature.
+        flow_temperature: dict[str, float] = {}
+        if client_sampling.audio is not None and not hf_config.quantized_audio_config:
+            if client_sampling.audio.top_k is not None:
                 raise DuplexRuntimeConfigError(
-                    "This DuplexIO checkpoint samples audio with its flow-map head, which takes no client sampling",
+                    "This DuplexIO checkpoint samples audio with a flow-map head, which has no top_k",
                     code="invalid_sampling",
                 )
+            if client_sampling.audio.temperature is not None:
+                flow_temperature["duplexio_flow_temperature"] = client_sampling.audio.temperature
+        elif client_sampling.audio is not None:
             audio_sampling = client_sampling.audio.model_dump(exclude_none=True)
             codebook_size = hf_config.quantized_audio_config["codebook_size"]
             if audio_sampling.get("top_k", 0) > codebook_size:
@@ -313,6 +319,7 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
             "duplexio_tools": tools,
             "duplexio_tool_choice": tool_choice,
             "duplexio_depth_sampling": depth_sampling,
+            **flow_temperature,
         }
 
     def runtime_config_for_update(
@@ -320,7 +327,7 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
         config: DuplexSessionConfig,
         current: Mapping[str, object],
     ) -> dict[str, object]:
-        """Only the text temperature may change: everything else is already in the cache."""
+        """Nothing may change: sampling, like the prompt, is fixed when a session starts."""
         self.validate_client_extra_body(config.extra_body)
         require_full_duplex(config)
         reject_changed_runtime_value(
@@ -360,12 +367,16 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
             message="DuplexIO cannot change the reference audio after a session is created",
             code="voice_update_unsupported",
         )
-        updated = dict(current)
         if config.temperature is not None:
             text_sampling = current["duplexio_text_sampling"]
             assert isinstance(text_sampling, Mapping)
-            updated["duplexio_text_sampling"] = {**text_sampling, "temperature": config.temperature}
-        return updated
+            reject_changed_runtime_value(
+                config.temperature,
+                text_sampling["temperature"],
+                message="DuplexIO sampling parameters cannot change after a session is created",
+                code="sampling_update_unsupported",
+            )
+        return dict(current)
 
     def runtime_config_for_function_output(
         self,

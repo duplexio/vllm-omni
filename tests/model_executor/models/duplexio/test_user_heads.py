@@ -42,6 +42,7 @@ def head_model(device="cpu"):
     model.tool_call_emit_head = nn.Linear(6 * 32, 1)
     model.logits_processor = LocalVocabulary()
     model.text_config = SimpleNamespace(vocab_size=64)
+    model.config = SimpleNamespace(flowmap_config={"sampling_temperature": 1.0})
     model.register_buffer("user_suppressed_token_ids", torch.tensor([0]), persistent=False)
     model.register_buffer("agent_suppressed_token_ids", torch.tensor([0]), persistent=False)
     model.register_buffer("tool_suppressed_token_ids", torch.tensor([0]), persistent=False)

@@ -71,7 +71,9 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
     model.full_cudagraph_enabled = False
     model.frame_inputs = frame_inputs
     # Audio cells see a two-frame window here, so eviction shows up in the test.
-    model.config = SimpleNamespace(audio_attention_window_frames=2, frame_size=1920, sample_rate=24000)
+    model.config = SimpleNamespace(
+        audio_attention_window_frames=2, frame_size=1920, sample_rate=24000, flowmap_config={"sampling_temperature": 1.0},
+    )
     model.text_config = SimpleNamespace(max_position_embeddings=262144)
     model.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(dtype=torch.float32)

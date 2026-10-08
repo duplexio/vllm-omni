@@ -65,6 +65,17 @@ def test_temperature_is_noise_variance(temperature: float) -> None:
     torch.testing.assert_close(flow.sample(torch.randn(3, 12), noise), temperature**0.5 * noise)
 
 
+def test_row_temperatures_override_the_checkpoint_temperature() -> None:
+    flow = make_flow(temperature=0.3)
+    with torch.no_grad():
+        flow.final_layer.linear.weight.zero_()
+        flow.final_layer.linear.bias.zero_()
+    noise = torch.randn(3, 4)
+    temperature = torch.tensor([0.0, 0.5, 1.0])
+    expected = temperature.sqrt().unsqueeze(-1) * noise
+    torch.testing.assert_close(flow.sample(torch.randn(3, 12), noise, temperature), expected)
+
+
 @pytest.mark.parametrize("steps", [1, 3])
 def test_sampling_integrates_from_zero_to_one(steps: int) -> None:
     flow = make_flow(steps=steps)

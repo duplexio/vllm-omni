@@ -125,9 +125,9 @@ class FlowMapSampler(nn.Module):
             if compile else self.flow.sample
         )
 
-    def sample(self, conditioning: Tensor, noise: Tensor) -> Tensor:
-        """Sample with explicit request-owned noise."""
-        return self.sample_function(conditioning, noise)
+    def sample(self, conditioning: Tensor, noise: Tensor, temperature: Tensor | None = None) -> Tensor:
+        """Sample with explicit request-owned noise, at each row's temperature if given."""
+        return self.sample_function(conditioning, noise, temperature)
 
 
 class FlowMap(nn.Module):
@@ -172,9 +172,14 @@ class FlowMap(nn.Module):
             hidden = block(hidden, modulation)
         return self.final_layer(hidden, modulation)
 
-    def sample(self, conditioning: Tensor, noise: Tensor) -> Tensor:
-        """Integrate from noise (time zero) to a normalized latent (time one)."""
-        current = self.sampling_temperature**0.5 * noise
+    def sample(self, conditioning: Tensor, noise: Tensor, temperature: Tensor | None = None) -> Tensor:
+        """Integrate from noise (time zero) to a normalized latent (time one).
+
+        ``temperature`` holds one value per row; without it every row samples at
+        the checkpoint's temperature.
+        """
+        scale = self.sampling_temperature**0.5 if temperature is None else temperature.sqrt().unsqueeze(-1)
+        current = scale * noise
         for step in range(self.inference_steps):
             s = conditioning.new_full(
                 conditioning.shape[:-1], step / self.inference_steps

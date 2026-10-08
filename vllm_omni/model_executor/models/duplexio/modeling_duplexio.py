@@ -77,6 +77,7 @@ from vllm_omni.model_executor.models.duplexio.row_semantics import (
 from vllm_omni.model_executor.models.duplexio.sampling_config import ContentPolicy, SamplingConfig, sampling_runtime
 from vllm_omni.model_executor.models.duplexio.stream_gdn import gdn_cache_dtypes, gdn_cache_shapes
 from vllm_omni.model_executor.models.duplexio.text_sampling import (
+    FLOW_TEMPERATURE,
     TokenSamplingOptions,
     content_distribution,
     sample_streams,
@@ -336,6 +337,7 @@ class RequestSampling:
     user: TokenSamplingOptions
     emission: EmitSamplingTemperatures
     depth: DepthSamplingOptions | None
+    flow_temperature: float  # The flow-map audio head's; unused by a depth sampler.
     parameters: tuple[float, ...]  # The row sample_streams reads, without the tool state.
 
 
@@ -848,7 +850,9 @@ class DuplexIOForConditionalGeneration(
         sampling = self.resolve_sampling(sampling_runtime(SamplingConfig()))
         top_k = sampled_top_k((sampling.agent, sampling.user), self.text_config.vocab_size)
         width = support_width([sampling.agent], top_k)
-        parameters = torch.tensor([(*sampling.parameters, 0)] * max_rows, dtype=torch.float32, device=device)
+        parameters = torch.tensor(
+            [(*sampling.parameters, sampling.flow_temperature, 0)] * max_rows, dtype=torch.float32, device=device,
+        )
         rows = self.llm.channel_emb.new_zeros(max_rows, DUPLEXIO_NUM_CELLS, self.text_config.hidden_size)
         for size in range(1, max_rows + 1):
             tensors = (rows[:size], parameters[:size], self.allow_all_bitmask[:size])
@@ -1189,7 +1193,8 @@ class DuplexIOForConditionalGeneration(
             noise = torch.randn(
                 rows.shape[0], self.audio_representation.embedding_dim, device=rows.device, dtype=torch.float32,
             )
-            return (*sampled, self.audio_sampler.sample(rows[:, AGENT_AUDIO_CELL].float(), noise))
+            audio = self.audio_sampler.sample(rows[:, AGENT_AUDIO_CELL].float(), noise, parameters[:, FLOW_TEMPERATURE])
+            return (*sampled, audio)
 
     def sample_depth_audio(self, rows: Tensor, agent_ids: Tensor, infos: list[dict[str, Any]]) -> Tensor:
         groups: dict[tuple[float, int | None], list[int]] = {}
@@ -1280,7 +1285,7 @@ class DuplexIOForConditionalGeneration(
                     tool_state = 2
                     pending.append(row)
             constraints.append(constraint if tool_state else None)
-            parameters.append((*state.sampling.parameters, tool_state))
+            parameters.append((*state.sampling.parameters, state.sampling.flow_temperature, tool_state))
             streams += (state.sampling.agent, state.sampling.user)
         top_k = sampled_top_k(streams, vocab_size)
         return SamplingInputs(
@@ -1333,7 +1338,7 @@ class DuplexIOForConditionalGeneration(
     def resolve_sampling(self, runtime: Mapping[str, Any]) -> RequestSampling:
         """Validate new or updated wire settings once before sampling a request."""
         source = sampling_source(runtime)
-        agent_config, user_config, emission_config, depth_config = source
+        agent_config, user_config, emission_config, depth_config, flow_temperature = source
         agent_policy = ContentPolicy.model_validate(agent_config)
         user_policy = ContentPolicy.model_validate(user_config)
         agent = TokenSamplingOptions(
@@ -1352,6 +1357,10 @@ class DuplexIOForConditionalGeneration(
             user=user,
             emission=emission,
             depth=DepthSamplingOptions.model_validate(depth_config) if depth_config is not None else None,
+            flow_temperature=(
+                self.config.flowmap_config.get("sampling_temperature", 0.0)
+                if flow_temperature is None else flow_temperature
+            ),
             parameters=sampling_parameters(
                 agent, user, (emission.agent, emission.tool_call, emission.user), self.text_config.vocab_size,
             ),
@@ -1683,6 +1692,7 @@ def sampling_source(runtime: Mapping[str, Any]) -> tuple[object, ...]:
         runtime["duplexio_user_sampling"]["content"],
         runtime["duplexio_emit_temperatures"],
         runtime.get("duplexio_depth_sampling"),
+        runtime.get("duplexio_flow_temperature"),
     )
 
 
