@@ -22,6 +22,7 @@ from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     frame_inputs,
 )
 from vllm_omni.model_executor.models.duplexio.pocket_mimi import LATENT_DIM
+from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
 
 
 class TextEmbedding(nn.Module):
@@ -76,10 +77,8 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
     model.full_cudagraph_enabled = False
     model.frame_inputs = frame_inputs
     # Audio cells see a two-frame window here, so eviction shows up in the test.
-    model.config = SimpleNamespace(
-        audio_attention_window_frames=2, frame_size=1920, sample_rate=24000, flowmap_config={"sampling_temperature": 1.0},
-    )
-    model.text_config = SimpleNamespace(max_position_embeddings=262144)
+    model.config = SimpleNamespace(audio_attention_window_frames=2, flowmap_config={"sampling_temperature": 1.0})
+    model.text_config = SimpleNamespace(max_position_embeddings=262144, vocab_size=32)
     model.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(dtype=torch.float32)
     )
@@ -105,6 +104,7 @@ def request_state(model: DuplexIOForConditionalGeneration) -> DuplexIORequestSta
         input_mimi=0,
         voice_prompt=torch.ones(2 * 1920),
         system_token_ids=(3, 4, 5),
+        sampling=model.resolve_sampling(SamplingConfig().model_dump()),
     )
 
 

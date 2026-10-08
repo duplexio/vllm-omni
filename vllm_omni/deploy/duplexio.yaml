@@ -1,4 +1,4 @@
-# Native single-stage DuplexIO deployment.
+# Single-stage DuplexIO deployment.
 pipeline: duplexio
 async_chunk: false
 session_mode: duplex
@@ -16,7 +16,7 @@ stages:
     max_num_seqs: 1
     # Retained text capacity: four text KV slots per six scheduler positions
     # (49152 text slots). Audio and voice KV occupy separate fixed regions;
-    # elapsed audio frames no longer consume this budget. Each append also
+    # elapsed audio frames do not consume this budget. Each append also
     # needs scheduling headroom within max_model_len.
     max_model_len: 73728
     # Scheduler chunks contain whole six-cell frames across all streams.

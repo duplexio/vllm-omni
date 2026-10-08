@@ -20,6 +20,7 @@ from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext, DuplexRuntime
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.model_executor.models.duplexio.duplex import DuplexIODuplexPlugin
 from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields, pack_frame
+from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -113,9 +114,7 @@ async def test_runtime_config_pins_the_reference_audio_and_prompt(model_config, 
     assert runtime["duplexio_system_token_ids"] == [3, 4, *prefix_ids]
     assert runtime["duplexio_start_role"] == (start_role or "user")
     assert runtime["duplexio_scheduler_token_id"] == 11
-    assert "duplexio_flow_temperature" not in runtime
-    assert runtime["duplexio_text_sampling"] == {"temperature": 0.6, "top_k": 20, "top_p": 0.95}
-    assert runtime["duplexio_emit_temperatures"] == {"user": 0.0, "agent": 1.0, "tool_call": 1.0}
+    assert runtime["duplexio_sampling"] == SamplingConfig().model_dump()
     # The runtime config crosses the engine boundary with every append.
     wire = serialize_additional_information({"duplex": {"runtime_config": runtime}})
     decoded = MsgpackDecoder(AdditionalInformationPayload).decode(MsgpackEncoder().encode(wire))
@@ -131,8 +130,8 @@ async def test_runtime_config_applies_client_sampling(model_config) -> None:
             "audio": {"temperature": 0.5},
         },
     )
-    assert runtime["duplexio_text_sampling"]["temperature"] == 0.2
-    assert runtime["duplexio_flow_temperature"] == 0.5
+    assert runtime["duplexio_sampling"]["agent"]["content"]["temperature"] == 0.2
+    assert runtime["duplexio_sampling"]["audio"]["temperature"] == 0.5
 
 
 @pytest.mark.asyncio
@@ -166,7 +165,7 @@ async def test_updates_change_nothing(model_config) -> None:
     unchanged = plugin.runtime_config_for_update(session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}}), runtime)
     assert unchanged == runtime
     same = session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}})
-    same.temperature = runtime["duplexio_text_sampling"]["temperature"]
+    same.temperature = runtime["duplexio_sampling"]["agent"]["content"]["temperature"]
     assert plugin.runtime_config_for_update(same, runtime) == runtime
     warmer = session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}})
     warmer.temperature = 0.9

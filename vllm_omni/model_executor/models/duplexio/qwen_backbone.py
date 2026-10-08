@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native Qwen3.5 backbone layers with DuplexIO's six-cell semantics."""
+"""Qwen3.5 backbone layers over DuplexIO's six-cell frames."""
 
 from __future__ import annotations
 
@@ -62,13 +62,13 @@ from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheSpec
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
+from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
 from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
     DuplexIOFrameMetadata,
     DuplexIOKVCacheSpec,
     DuplexIOKVLayout,
     make_duplexio_kv_cache_spec,
 )
-from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
 from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_function
 from vllm_omni.model_executor.models.duplexio.stream_attention import (
     cached_rotary_pos_emb,
@@ -85,7 +85,7 @@ from vllm_omni.model_executor.models.duplexio.stream_gdn import (
 
 
 class DuplexIORotaryEmbedding(nn.Module):
-    """Cache phases from exported frequencies, never reconstruct their precision."""
+    """Cache RoPE phases from the checkpoint's frequencies rather than recomputing them."""
 
     def __init__(self, rotary_dim: int, max_positions: int, dtype: torch.dtype) -> None:
         super().__init__()
@@ -97,7 +97,7 @@ class DuplexIORotaryEmbedding(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
         loaded = AutoWeightsLoader(self).load_weights(weights)
         if loaded != {"inverse_frequencies", "attention_scaling"}:
-            raise ValueError(f"Incomplete exported RoPE constants: {sorted(loaded)}")
+            raise ValueError(f"Incomplete RoPE constants in the checkpoint: {sorted(loaded)}")
         positions = torch.arange(self.max_positions, device=self.inverse_frequencies.device, dtype=torch.float32)
         phases = torch.outer(positions, self.inverse_frequencies)
         self.cos_sin_cache = (
@@ -519,7 +519,7 @@ class DuplexIOGDNAttentionBackend(GDNAttentionBackend):
 
 
 class DuplexIOPagedAttention(Attention):
-    """Attention layer that declares DuplexIO's native cache contract."""
+    """Attention layer that declares DuplexIO's cache layout."""
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         base = super().get_kv_cache_spec(vllm_config)
@@ -656,7 +656,7 @@ def gdn_attention_core(mixed_qkv: Tensor, b: Tensor, a: Tensor, output: Tensor, 
 
 
 class DuplexIOGatedRMSNorm(Qwen3_5RMSNormGated):
-    """Training's gated norm, which normalizes before it gates.
+    """Gated RMSNorm that normalizes before it gates.
 
     vLLM's GDN kernel warmup reads that order from every GDN layer's norm.
     """
@@ -837,7 +837,7 @@ class DuplexIOQwenDecoderLayer(nn.Module):
         config = vllm_config.model_config.hf_text_config
         if config.model_type != "qwen3_5_text":
             raise ValueError(
-                "Native DuplexIO requires the dense qwen3_5_text backbone"
+                "DuplexIO requires the dense qwen3_5_text backbone"
             )
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
@@ -892,7 +892,7 @@ class DuplexIOQwenDecoderLayer(nn.Module):
         key_active: Tensor,
     ) -> tuple[Tensor, Tensor]:
         if residual is not None:
-            # Training rounds the previous MLP residual sum before the next norm.
+            # Round the previous MLP residual sum to the activation dtype before the next norm, as the checkpoint was trained.
             hidden_states = hidden_states + residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -932,7 +932,7 @@ class DuplexIOQwenDecoderLayer(nn.Module):
     }
 )
 class DuplexIOQwenModel(nn.Module):
-    """Inference-only dense Qwen3.5 model used by native DuplexIO."""
+    """Inference-only dense Qwen3.5 backbone of DuplexIO."""
 
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | WeightsMapper(
         orig_to_new_suffix={".scale": ".weight"},

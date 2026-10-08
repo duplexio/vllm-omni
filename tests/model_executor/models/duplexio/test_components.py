@@ -22,9 +22,6 @@ from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
 )
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
-    EmitSamplingTemperatures,
-    TokenSamplingOptions,
-    _sample_factorized_text_ids,
     text_suppression_ids,
 )
 from vllm_omni.model_executor.models.duplexio.pipeline import DUPLEXIO_PIPELINE
@@ -285,41 +282,6 @@ def test_mlp_adapters_return_backbone_inputs_without_a_skip() -> None:
     assert agent_hidden.shape == (4, 11)
 
 
-def test_factorized_text_argmax_excludes_silence_from_content() -> None:
-    logits = torch.tensor(
-        [
-            [0.0, 1.0, 100.0, 3.0],
-            [4.0, 2.0, 100.0, 1.0],
-            [1.0, 5.0, 100.0, 2.0],
-        ]
-    )
-    emit_logits = torch.tensor([-1.0, 0.0, 1.0])
-
-    sampled = _sample_factorized_text_ids(
-        logits,
-        emit_logits,
-        silence_token_id=2,
-        sampling=TokenSamplingOptions(
-            temperature=0.0,
-            top_k=4,
-            top_p=0.95,
-            suppressed_token_ids=torch.tensor([2], dtype=torch.long),
-        ),
-        emit_temperature=0.0,
-        generator=torch.Generator().manual_seed(1),
-    )
-
-    assert torch.equal(sampled, torch.tensor([2, 0, 1]))
-
-
-def test_emit_temperatures_are_read_per_stream() -> None:
-    temperatures = EmitSamplingTemperatures.model_validate({"user": 0.6, "agent": 0.4, "tool_call": 0.8})
-
-    assert temperatures.user == 0.6
-    assert temperatures.agent == 0.4
-    assert temperatures.tool_call == 0.8
-
-
 def test_unfinished_tool_context_does_not_run_prediction_heads() -> None:
     model = DuplexIOForConditionalGeneration.__new__(
         DuplexIOForConditionalGeneration
@@ -351,7 +313,7 @@ def test_token_heads_load_without_weight_name_mapping() -> None:
         torch.testing.assert_close(value, weights[name])
 
 
-def test_vocabulary_suppression_is_model_owned_and_sampling_temperature_stays_dynamic() -> None:
+def test_only_the_tool_stream_may_emit_tool_call_markers() -> None:
     encoded = {
         "<|im_start|>": [11], "<|im_end|>": [12],
         "<think>": [14, 15], "</think>": [16, 17],
@@ -361,19 +323,3 @@ def test_vocabulary_suppression_is_model_owned_and_sampling_temperature_stays_dy
     agent_ids, tool_ids = text_suppression_ids(tokenizer, 13)
     assert agent_ids == [11, 12, 13, 18, 19]
     assert tool_ids == [11, 12, 13]
-    suppressed = torch.tensor(agent_ids, dtype=torch.long)
-    model = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
-    torch.nn.Module.__init__(model)
-    model.agent_suppressed_token_ids = suppressed
-    model.tool_suppressed_token_ids = torch.tensor(tool_ids)
-    model.user_suppressed_token_ids = suppressed
-    model.text_config = SimpleNamespace(vocab_size=20)
-    model.config = SimpleNamespace(flowmap_config={"sampling_temperature": 1.0})
-    options = {"temperature": 0.3, "top_k": 5, "top_p": 1.0}
-    runtime = {"duplexio_text_sampling": options, "duplexio_user_sampling": {"content": options},
-               "duplexio_emit_temperatures": {"user": 1.0, "agent": 1.0, "tool_call": 1.0}}
-    first = model.resolve_sampling(runtime).agent
-    options["temperature"] = 1.2
-    second = model.resolve_sampling(runtime).agent
-    assert (first.temperature, second.temperature) == (0.3, 1.2)
-    assert first.suppressed_token_ids is second.suppressed_token_ids is suppressed

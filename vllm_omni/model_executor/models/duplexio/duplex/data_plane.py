@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Project native DuplexIO frame outputs into internal duplex events."""
+"""Project DuplexIO frame outputs into duplex events."""
 
 from __future__ import annotations
 

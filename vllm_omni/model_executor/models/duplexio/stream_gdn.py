@@ -9,8 +9,8 @@ from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
 from torch import Tensor
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 
-from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_function
 from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
+from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_function
 
 
 def gdn_cache_dtypes(dtype: torch.dtype) -> tuple[torch.dtype, ...]:
@@ -57,7 +57,7 @@ def prepare_gdn_inputs(
     key_dim: int,
     value_dim: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Match training's Q/K normalization and FP32 decay gate arithmetic."""
+    """L2-normalize Q and K and compute the decay gate in FP32, as the checkpoint was trained."""
     key_width = key_heads * key_dim
     q, k, v = qkv.split((key_width, key_width, qkv.shape[1] - key_width * 2), -1)
     q = normalize_gdn_qk(q.view(qkv.shape[0], key_heads, key_dim))

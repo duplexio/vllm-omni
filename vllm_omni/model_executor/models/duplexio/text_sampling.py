@@ -12,27 +12,6 @@ class TokenSamplingOptions:
     temperature: float
     top_k: int | None
     top_p: float | None
-    suppressed_token_ids: Tensor
-
-
-def content_distribution(logits: Tensor, sampling: TokenSamplingOptions) -> tuple[Tensor, Tensor]:
-    """Return top-k token IDs and probabilities, applying top-p within that cap."""
-    if sampling.suppressed_token_ids.numel():
-        logits = logits.clone()
-        logits.index_fill_(-1, sampling.suppressed_token_ids, torch.finfo(logits.dtype).min)
-    scaled = logits.float() / sampling.temperature
-    if sampling.top_k is None and sampling.top_p is None:
-        indices = torch.arange(scaled.shape[-1], device=scaled.device).expand_as(scaled)
-        return indices, torch.softmax(scaled, dim=-1)
-    k = min(sampling.top_k, scaled.shape[-1]) if sampling.top_k is not None else scaled.shape[-1]
-    top_values, top_indices = torch.topk(scaled, k=k, dim=-1)
-    if sampling.top_p is not None:
-        sorted_probabilities = torch.softmax(top_values, dim=-1)
-        remove = sorted_probabilities.cumsum(dim=-1) > sampling.top_p
-        remove[..., 1:] = remove[..., :-1].clone()
-        remove[..., 0] = False
-        top_values = top_values.masked_fill(remove, torch.finfo(top_values.dtype).min)
-    return top_indices, torch.softmax(top_values, dim=-1)
 
 
 # Columns of the per-row parameters that ``sample_streams`` reads; each setting
@@ -96,7 +75,7 @@ def sample_streams(
     Returns the ``[rows, 3]`` ids in text-input order (user, agent, tool), the idle rows
     that started a call, the six ``[rows, 6]`` frame log probabilities, and the
     ``[rows, 2, support_width]`` agent and tool content supports: the ids the draw
-    could pick, best first and padded with -1. A learner that renormalizes over a
+    could pick, best first and padded with -1. A consumer that renormalizes over a
     recorded support scores exactly the distribution sampled, even where its own
     logits would move a top-p or top-k boundary.
     """

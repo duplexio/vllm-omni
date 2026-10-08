@@ -15,7 +15,7 @@ import binascii
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypedDict
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import ValidationError
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionToolsParam
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
@@ -32,11 +32,11 @@ from vllm_omni.engine.duplex.plugin import (
 )
 from vllm_omni.model_executor.common.duplex.payload import decode_pcm_f32le_payload
 from vllm_omni.model_executor.common.duplex.pcm_buffer import FixedFramePcmAppendBuffer
-from vllm_omni.model_executor.models.duplexio.duplex.data_plane import DuplexIODataPlane
-from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
 from vllm_omni.model_executor.models.duplexio.configuration_duplexio import INITIAL_AGENT_PREFIX, INITIAL_USER_PREFIX
+from vllm_omni.model_executor.models.duplexio.duplex.data_plane import DuplexIODataPlane
 from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_SIZE, NUM_CELLS, SAMPLE_RATE
-from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig, sampling_runtime
+from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
+from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
 from vllm_omni.model_executor.models.duplexio.tool_calling import tool_call_grammar
 
 if TYPE_CHECKING:
@@ -53,32 +53,12 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "duplexio_voice_prompt_pcm",
         "duplexio_voice_prompt_frames",
         "duplexio_system_token_ids",
-        "duplexio_flow_temperature",
-        "duplexio_emit_temperatures",
-        "duplexio_user_sampling",
-        "duplexio_text_sampling",
         "duplexio_tools",
         "duplexio_tool_choice",
         "duplexio_tool_generation",
         "duplexio_tool_results",
     }
 )
-
-
-class AudioSamplingConfig(BaseModel):
-    """Client override for the agent-audio head; absent, it samples at the checkpoint's temperature."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    temperature: float | None = Field(default=None, gt=0)
-
-
-class ClientSamplingConfig(SamplingConfig):
-    """Validated public sampling configuration of one session (``extra_body.duplexio_sampling``)."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    audio: AudioSamplingConfig | None = None
 
 
 def stage_sampling_params(defaults: tuple[object, ...]) -> tuple[object, ...]:
@@ -148,8 +128,9 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
         self.data_plane = DuplexIODataPlane(encode_audio)
-        # One checkpoint per engine, so one tokenizer, set at the first session open.
+        # One checkpoint per engine, so one tokenizer and voice cap, set at the first session open.
         self.tokenizer: Any | None = None
+        self.voice_prompt_max_frames = 0
 
     # ---- engine policy ----
 
@@ -269,7 +250,8 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
         assert model_config is not None
         hf_config = model_config.hf_config
         start_role = parse_start_role(config.extra_body)
-        voice_prompt, voice_prompt_frames = voice_prompt_from_session(config, hf_config.voice_prompt_max_frames)
+        self.voice_prompt_max_frames = hf_config.voice_prompt_max_frames
+        voice_prompt, voice_prompt_frames = voice_prompt_from_session(config, self.voice_prompt_max_frames)
         tokenizer = cached_tokenizer_from_config(model_config)
         self.tokenizer = tokenizer
         self.data_plane.configure(tokenizer.backend_tokenizer, silence_token_id=hf_config.silence_token_id)
@@ -287,17 +269,9 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
             *tokenizer.encode(system_prompt, add_special_tokens=False),
             *tokenizer.encode(initial_prefix, add_special_tokens=False),
         ]
-        client_sampling = parse_client_sampling(config.extra_body)
-        policies = sampling_runtime(client_sampling)
-        if config.temperature is not None:
-            policies["duplexio_text_sampling"]["temperature"] = config.temperature
-        flow_temperature = {} if client_sampling.audio is None or client_sampling.audio.temperature is None else {
-            "duplexio_flow_temperature": client_sampling.audio.temperature,
-        }
         return {
-            **policies,
             "instructions": config.instructions,
-            "duplexio_client_sampling": config.extra_body.get("duplexio_sampling"),
+            "duplexio_sampling": session_sampling(config),
             "duplexio_system_token_ids": system_token_ids,
             "duplexio_start_role": start_role,
             "duplexio_voice_prompt_pcm": voice_prompt,
@@ -305,7 +279,6 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
             "duplexio_scheduler_token_id": hf_config.pad_token_id,
             "duplexio_tools": tools,
             "duplexio_tool_choice": tool_choice,
-            **flow_temperature,
         }
 
     def runtime_config_for_update(
@@ -317,8 +290,8 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
         self.validate_client_extra_body(config.extra_body)
         require_full_duplex(config)
         reject_changed_runtime_value(
-            config.extra_body.get("duplexio_sampling"),
-            current["duplexio_client_sampling"],
+            session_sampling(config),
+            current["duplexio_sampling"],
             message="DuplexIO sampling parameters cannot change after a session is created",
             code="sampling_update_unsupported",
         )
@@ -346,22 +319,13 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
                 "DuplexIO has no named voices; supply ref_audio_data instead",
                 code="voice_update_unsupported",
             )
-        voice_prompt, _ = voice_prompt_from_session(config, current["duplexio_voice_prompt_frames"])
+        voice_prompt, _ = voice_prompt_from_session(config, self.voice_prompt_max_frames)
         reject_changed_runtime_value(
             voice_prompt,
             current["duplexio_voice_prompt_pcm"],
             message="DuplexIO cannot change the reference audio after a session is created",
             code="voice_update_unsupported",
         )
-        if config.temperature is not None:
-            text_sampling = current["duplexio_text_sampling"]
-            assert isinstance(text_sampling, Mapping)
-            reject_changed_runtime_value(
-                config.temperature,
-                text_sampling["temperature"],
-                message="DuplexIO sampling parameters cannot change after a session is created",
-                code="sampling_update_unsupported",
-            )
         return dict(current)
 
     def runtime_config_for_function_output(
@@ -429,14 +393,17 @@ def parse_start_role(extra_body: Mapping[str, object]) -> str:
     return str(role)
 
 
-def parse_client_sampling(extra_body: Mapping[str, object]) -> ClientSamplingConfig:
+def session_sampling(config: DuplexSessionConfig) -> dict[str, Any]:
+    """``extra_body.duplexio_sampling``, with the session's ``temperature`` setting the agent's text."""
     try:
-        return ClientSamplingConfig.model_validate(extra_body.get("duplexio_sampling", {}))
+        sampling = SamplingConfig.model_validate(config.extra_body.get("duplexio_sampling", {}), strict=True)
     except ValidationError as exc:
         raise DuplexRuntimeConfigError(
             f"Invalid DuplexIO sampling configuration: {exc}", code="invalid_sampling"
         ) from exc
-
+    if config.temperature is not None:
+        sampling.agent.content.temperature = config.temperature
+    return sampling.model_dump()
 
 def voice_prompt_from_session(config: DuplexSessionConfig, max_frames: int) -> tuple[bytes, int]:
     """Decode the reference PCM (``extra_body.ref_audio_data``) and its pinned frame count."""
@@ -472,7 +439,7 @@ def voice_prompt_from_session(config: DuplexSessionConfig, max_frames: int) -> t
         raise DuplexRuntimeConfigError(
             "DuplexIO reference audio is shorter than one 80 ms frame", code="ref_audio_too_short"
         )
-    return raw, frames
+    return raw[: frames * 4 * FRAME_SIZE], frames
 
 
 def normalize_tools(value: object) -> list[dict[str, Any]]:
@@ -524,7 +491,7 @@ def normalize_tool_choice(value: object, tools: list[dict[str, Any]]) -> dict[st
 
 
 def render_tool_system_prompt(tokenizer: Any, system_prompt: str, tools: list[dict[str, Any]]) -> str:
-    """The system blocks the chat template renders for these tools, as training saw them."""
+    """The system blocks the chat template renders for these tools."""
     rendered = tokenizer.apply_chat_template(
         [{"role": "system", "content": system_prompt}, {"role": "user", "content": ""}],
         tools=tools,

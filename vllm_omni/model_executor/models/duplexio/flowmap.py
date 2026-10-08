@@ -49,7 +49,7 @@ class TimestepEmbedder(nn.Module):
 
 
 class PocketLayerNorm(nn.Module):
-    """Preserve the training model's activation-dtype normalization arithmetic."""
+    """LayerNorm computed in the activation dtype, without an FP32 upcast."""
 
     def __init__(self, dim: int, *, elementwise_affine: bool = True) -> None:
         super().__init__()
@@ -94,7 +94,7 @@ class FinalLayer(nn.Module):
 
 
 class FlowMapSampler(nn.Module):
-    """Keep the training checkpoint's audio_sampler.flow parameter namespace."""
+    """The checkpoint's ``audio_sampler.flow`` module, optionally compiled for serving."""
 
     def __init__(
         self,
@@ -131,11 +131,10 @@ class FlowMapSampler(nn.Module):
 
 
 class FlowMap(nn.Module):
-    """FP32 parameters and integration with the training checkpoint's names.
+    """A one-to-few-step flow map from noise to the agent's next audio latent, with FP32 parameters.
 
     Rows are independent conversations. The caller supplies standard-normal
-    noise explicitly, so parity checks can replay identical stochastic inputs.
-    Match the reference rollout's autocast context for linear-layer arithmetic.
+    noise per row; linear layers follow the ambient autocast.
     """
 
     def __init__(

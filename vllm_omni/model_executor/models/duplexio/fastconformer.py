@@ -6,10 +6,9 @@ from __future__ import annotations
 
 import copy
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from functools import cached_property, partial
-from pathlib import Path
 from typing import Any, NamedTuple
 
 import torch
@@ -102,7 +101,7 @@ class FastConformerStreamState:
         return 0 if self._past_key_values is None else self._past_key_values.layers[0].keys.shape[-2]
 
     def tensors(self) -> list[Tensor]:
-        """Initialized cache storage, in native layer order."""
+        """Initialized cache storage, in layer order."""
         if self.flat is not None:
             return self.layout.views(self.flat)
         return [
@@ -212,7 +211,7 @@ class FlatCacheLayout:
         return [piece.view(-1, *shape) for piece, shape in zip(pieces, self.shapes, strict=True)]
 
     def containers(self, tensors: list[Tensor]) -> tuple[Any, Any]:
-        """Native cache containers shaped like the template's, holding ``tensors``."""
+        """Cache containers shaped like the template's, holding ``tensors``."""
         return self.fill(self.template, tensors)
 
     def fill(self, state: FastConformerStreamState, tensors: list[Tensor | None]) -> tuple[Any, Any]:
@@ -384,10 +383,10 @@ class FastConformerEncoder(nn.Module):
     stft_window: Tensor
 
     @classmethod
-    def from_export(
-        cls, config: dict[str, Any], root: Path, *, use_cuda_graph: bool = False,
+    def from_checkpoint(
+        cls, config: dict[str, Any], checkpoint: str, *, revision: str | None, use_cuda_graph: bool = False,
     ) -> FastConformerEncoder:
-        """Construct locally; the native model loader supplies all weights."""
+        """Build the encoder from its config and the checkpoint's ``user_asr`` processor; the model loader supplies weights."""
         from transformers import AutoConfig, AutoProcessor
         from transformers.models.nemotron_asr_streaming.modeling_nemotron_asr_streaming import (
             NemotronAsrStreamingEncoder,
@@ -395,7 +394,7 @@ class FastConformerEncoder(nn.Module):
 
         values = dict(config)
         encoder = NemotronAsrStreamingEncoder(AutoConfig.for_model(values.pop("model_type"), **values).encoder_config)
-        processor = AutoProcessor.from_pretrained(root / "user_asr", local_files_only=True)
+        processor = AutoProcessor.from_pretrained(checkpoint, subfolder="user_asr", revision=revision)
         return cls(encoder, processor, use_cuda_graph=use_cuda_graph)
 
     def __init__(self, encoder: Any, processor: Any, *, use_cuda_graph: bool = False) -> None:
@@ -429,7 +428,7 @@ class FastConformerEncoder(nn.Module):
     def encode_feature_chunk(
         self, input_features: Tensor, state: FastConformerStreamState
     ) -> tuple[Tensor, FastConformerStreamState]:
-        """Advance the native cache-aware encoder by one exact feature chunk."""
+        """Advance the cache-aware encoder by one exact feature chunk."""
         output = self.encoder(
             input_features=input_features,
             past_key_values=state.past_key_values,

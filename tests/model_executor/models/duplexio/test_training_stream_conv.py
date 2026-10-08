@@ -7,8 +7,11 @@ import torch
 from torch import nn
 
 from vllm_omni.model_executor.models.duplexio.qwen_backbone import DuplexIOQwenGatedDeltaNetAttention
-from vllm_omni.model_executor.models.duplexio.stream_conv import expand_stream_conv_weight
-from vllm_omni.model_executor.models.duplexio.stream_conv import stream_causal_conv, update_stream_conv_state_kernel
+from vllm_omni.model_executor.models.duplexio.stream_conv import (
+    expand_stream_conv_weight,
+    stream_causal_conv,
+    update_stream_conv_state_kernel,
+)
 
 training = pytest.importorskip("duplexio.modules.qwen3_5_stream_delta")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires packed CUDA convolution")

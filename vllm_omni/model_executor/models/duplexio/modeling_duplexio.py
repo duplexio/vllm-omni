@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native vLLM implementation of the DuplexIO full-duplex model."""
+"""DuplexIO, a full-duplex speech model that listens and speaks in the same 80 ms frames."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from typing import Any, cast
 import torch
 import torch.nn.functional as F
 import xgrammar as xgr
-from pydantic import BaseModel, ConfigDict, Field
 from torch import Tensor, nn
 from torchaudio.transforms import Resample
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -38,9 +37,6 @@ from vllm_omni.model_executor.models.duplexio.audio_adapters import (
     AudioInputAdapter,
 )
 from vllm_omni.model_executor.models.duplexio.audio_representation import ContinuousAudioRepresentation
-from vllm_omni.model_executor.models.duplexio.checkpoint import (
-    resolve_checkpoint_directory,
-)
 from vllm_omni.model_executor.models.duplexio.configuration_duplexio import (
     DuplexIOConfig,
 )
@@ -51,26 +47,24 @@ from vllm_omni.model_executor.models.duplexio.fastconformer import (
     streaming_resample_batch,
 )
 from vllm_omni.model_executor.models.duplexio.flowmap import FlowMapSampler
-from vllm_omni.model_executor.models.duplexio.pocket_mimi import LATENT_DIM, ContinuousMimiState, PocketMimi
-from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
-    DuplexIOQwenModel,
-)
 from vllm_omni.model_executor.models.duplexio.frame_layout import (
     AGENT_AUDIO_CELL,
     AGENT_CELL,
     FRAME_SIZE,
     NUM_CELLS,
-    NUM_TEXT_CELLS,
     SAMPLE_RATE,
     TEXT_STREAM_NAMES,
     TOOL_CALL_CELL,
 )
-from vllm_omni.model_executor.models.duplexio.sampling_config import ContentPolicy, SamplingConfig, sampling_runtime
+from vllm_omni.model_executor.models.duplexio.pocket_mimi import LATENT_DIM, ContinuousMimiState, PocketMimi
+from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
+    DuplexIOQwenModel,
+)
+from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
 from vllm_omni.model_executor.models.duplexio.stream_gdn import gdn_cache_dtypes, gdn_cache_shapes
 from vllm_omni.model_executor.models.duplexio.text_sampling import (
     FLOW_TEMPERATURE,
     TokenSamplingOptions,
-    content_distribution,
     sample_streams,
     sampled_top_k,
     sampling_parameters,
@@ -119,12 +113,6 @@ class SamplingInputs:
 
 
 @dataclass
-class ToolTokenSample:
-    token_id: Tensor
-    logprob: Tensor
-
-
-@dataclass
 class FrameBatch:
     """Queued samples for the eligible requests, before any host read."""
 
@@ -162,7 +150,7 @@ class DuplexIOStepOutput:
 
 @dataclass
 class DuplexIORequestState:
-    """Request-owned state; Qwen KV/GDN caches belong to the native runner."""
+    """Request-owned state; the backbone's KV and GDN caches belong to the runner."""
 
     text_input_ids: tuple[int, ...]  # Host feedback: the ids the next frame feeds back.
     agent_latent: Tensor
@@ -172,6 +160,7 @@ class DuplexIORequestState:
     # Raw reference audio; text-only context never advances either encoder.
     voice_prompt: Tensor
     system_token_ids: tuple[int, ...]
+    sampling: RequestSampling
     tool_call_constraint: ToolCallConstraintState | None = None
     frames_seen: int = 0
     audio_position: int = 0
@@ -181,7 +170,6 @@ class DuplexIORequestState:
     # Every live frame so far had given inputs. Only given agent audio advances
     # the input codec, so a given frame may not follow a sampled one.
     history_open: bool = True
-    sampling: RequestSampling | None = None
     # The step whose sampled ids this request still waits for on the host.
     pending_output: DuplexIOStepOutput | None = None
 
@@ -293,24 +281,12 @@ class FrameInputGraph:
         return tuple(value.clone() for value in self.outputs)
 
 
-class EmitSamplingTemperatures(BaseModel):
-    """Validated emission temperatures received at the engine boundary."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    agent: float = Field(ge=0)
-    tool_call: float = Field(ge=0)
-    user: float = Field(ge=0)
-
-
 @dataclass(frozen=True)
 class RequestSampling:
-    """Resolved request policy; suppression tensors remain model-owned."""
+    """A session's resolved sampling; suppression masks remain model-owned."""
 
-    source: tuple[object, ...]
     agent: TokenSamplingOptions
-    tool: TokenSamplingOptions
     user: TokenSamplingOptions
-    emission: EmitSamplingTemperatures
     flow_temperature: float
     parameters: tuple[float, ...]  # The row sample_streams reads, without the tool state.
 
@@ -420,12 +396,9 @@ class DuplexIOForConditionalGeneration(
         self.frame = self.llm.base_model.model.frame
         hidden_size = self.text_config.hidden_size
         adapter_hidden_size = config.audio_adapter_config.get("hidden_size") or hidden_size
-        root = resolve_checkpoint_directory(
-            vllm_config.model_config.model,
-            revision=vllm_config.model_config.revision,
-        )
-        self.user_asr = FastConformerEncoder.from_export(
-            config.user_asr_config, root, use_cuda_graph=self.full_cudagraph_enabled,
+        self.user_asr = FastConformerEncoder.from_checkpoint(
+            config.user_asr_config, vllm_config.model_config.model, revision=vllm_config.model_config.revision,
+            use_cuda_graph=self.full_cudagraph_enabled,
         )
         self.user_audio_resampler = Resample(SAMPLE_RATE, ASR_SAMPLE_RATE, dtype=torch.float32).to(
             device=self.llm.channel_emb.device,
@@ -470,7 +443,7 @@ class DuplexIOForConditionalGeneration(
             torch.tensor(tool_suppressed, dtype=torch.long, device=self.llm.channel_emb.device),
             persistent=False,
         )
-        # Training's conditional user CE excludes only the silence token.
+        # The user stream suppresses only the silence token.
         self.register_buffer(
             "user_suppressed_token_ids",
             torch.tensor([self.silence_token_id], dtype=torch.long, device=self.llm.channel_emb.device),
@@ -538,7 +511,7 @@ class DuplexIOForConditionalGeneration(
             or token_offset % NUM_CELLS or prompt_len % NUM_CELLS
         ):
             raise ValueError(
-                "Native DuplexIO requires complete six-cell frames; "
+                "DuplexIO requires complete six-cell frames; "
                 f"got frame_count={append_frames}, tokens={tokens}, offset={token_offset}, end={prompt_len}"
             )
         frame_count = tokens // NUM_CELLS
@@ -652,7 +625,7 @@ class DuplexIOForConditionalGeneration(
         for index, features in zip(acoustic, user_features, strict=True):
             prepared[index].user_features = self.place_user_features(prepared[index], features)
         # The agent codec hears, in stream order, the slice's voice-prompt rows and
-        # then a given live frame, exactly as training encodes a conversation.
+        # then a given live frame.
         heard = sorted({*prompt_waveforms, *given})
         if heard:
             waveforms = [
@@ -823,7 +796,7 @@ class DuplexIOForConditionalGeneration(
         agent_latents = self.initial_agent_latents(max_rows)
         for size in range(1, max_rows + 1):
             self.frame_input_graph((packed[:size], user_features[:size], agent_latents[:size]))
-        sampling = self.resolve_sampling(sampling_runtime(SamplingConfig()))
+        sampling = self.resolve_sampling(SamplingConfig().model_dump())
         top_k = sampled_top_k((sampling.agent, sampling.user), self.text_config.vocab_size)
         width = support_width([sampling.agent], top_k)
         parameters = torch.tensor(
@@ -869,7 +842,7 @@ class DuplexIOForConditionalGeneration(
     ) -> Tensor | IntermediateTensors:
         del input_ids, request_token_spans, request_sample_eligible, kwargs
         if inputs_embeds is None:
-            raise ValueError("Native DuplexIO requires precomputed frame embeddings")
+            raise ValueError("DuplexIO requires precomputed frame embeddings")
         del model_intermediate_buffer
         with torch.profiler.record_function("duplexio.backbone"):
             return self.llm.base_model.model(
@@ -1187,24 +1160,6 @@ class DuplexIOForConditionalGeneration(
         )
         return logits, emit_logits
 
-    def sample_text_batch(
-        self,
-        logits: Tensor,
-        emit_logits: Tensor,
-        infos: list[dict[str, Any]],
-    ) -> TextSamplingResult:
-        """Sample agent/tool/user decisions and apply the host's tool decisions."""
-        inputs = self.sampling_inputs(infos, logits.device)
-        text_ids, tool_starts, frame_logprobs, support_ids = self.sample_text(
-            logits, emit_logits, inputs.parameters, inputs.tool_bitmask, top_k=inputs.top_k,
-            support_width=inputs.support_width,
-        )
-        text = TextSamplingResult(
-            text_ids, tool_starts, frame_logprobs, support_ids, inputs.pending, inputs.calling, [None] * len(infos),
-        )
-        self.finish_text_batch(text, infos, text_ids.tolist(), tool_starts.tolist())
-        return text
-
     def sampling_inputs(self, infos: list[dict[str, Any]], device: torch.device) -> SamplingInputs:
         """Resolve each row's policy and tool state on the host, with one upload each."""
         vocab_size = self.text_config.vocab_size
@@ -1215,9 +1170,6 @@ class DuplexIOForConditionalGeneration(
         calling: list[int] = []
         for row, info in enumerate(infos):
             state = info["duplexio_working_state"]
-            runtime = info["duplex"]["runtime_config"]
-            if state.sampling is None or state.sampling.source != sampling_source(runtime):
-                state.sampling = self.resolve_sampling(runtime)
             # Rows inside a call, or forced to start one, sample under its grammar.
             # Idle rows draw a start decision and, speculatively, the call's first
             # token, so the host only commits what the device already chose.
@@ -1284,34 +1236,21 @@ class DuplexIOForConditionalGeneration(
                 text.tool_calls[row] = self.tool_call_compiler.take_completed_call(constraint)
         return started
 
-    def resolve_sampling(self, runtime: Mapping[str, Any]) -> RequestSampling:
-        """Validate new or updated wire settings once before sampling a request."""
-        source = sampling_source(runtime)
-        agent_config, user_config, emission_config, flow_temperature = source
-        agent_policy = ContentPolicy.model_validate(agent_config)
-        user_policy = ContentPolicy.model_validate(user_config)
-        agent = TokenSamplingOptions(
-            agent_policy.temperature, agent_policy.top_k, agent_policy.top_p, self.agent_suppressed_token_ids,
+    def resolve_sampling(self, sampling: Mapping[str, Any]) -> RequestSampling:
+        """Validate a session's sampling once; agent text and tool calls share the agent policy."""
+        config = SamplingConfig.model_validate(sampling)
+        agent, user = (
+            TokenSamplingOptions(policy.content.temperature, policy.content.top_k, policy.content.top_p)
+            for policy in (config.agent, config.user)
         )
-        user = TokenSamplingOptions(
-            user_policy.temperature, user_policy.top_k, user_policy.top_p, self.user_suppressed_token_ids,
-        )
-        emission = EmitSamplingTemperatures.model_validate(emission_config)
+        emit = (config.agent.emission.temperature, config.agent.emission.temperature, config.user.emission.temperature)
+        flow_temperature = config.audio.temperature
         return RequestSampling(
-            source=copy.deepcopy(source),
             agent=agent,
-            tool=TokenSamplingOptions(
-                agent_policy.temperature, agent_policy.top_k, agent_policy.top_p, self.tool_suppressed_token_ids,
-            ),
             user=user,
-            emission=emission,
-            flow_temperature=(
-                self.config.flowmap_config.get("sampling_temperature", 0.0)
-                if flow_temperature is None else flow_temperature
-            ),
-            parameters=sampling_parameters(
-                agent, user, (emission.agent, emission.tool_call, emission.user), self.text_config.vocab_size,
-            ),
+            flow_temperature=self.config.flowmap_config["sampling_temperature"] if flow_temperature is None
+            else flow_temperature,
+            parameters=sampling_parameters(agent, user, emit, self.text_config.vocab_size),
         )
 
     def compute_logits(
@@ -1359,40 +1298,21 @@ class DuplexIOForConditionalGeneration(
         runtime_config: Mapping[str, object],
         device: torch.device,
     ) -> DuplexIORequestState:
-        reference = runtime_config["duplexio_voice_prompt_pcm"]
-        prompt_frames = runtime_config["duplexio_voice_prompt_frames"]
-        assert isinstance(reference, bytes)
-        assert isinstance(prompt_frames, int) and 1 <= prompt_frames <= self.config.voice_prompt_max_frames
-        prompt_bytes = prompt_frames * FRAME_SIZE * 4
-        assert len(reference) >= prompt_bytes and len(reference) % 4 == 0
-        samples = torch.frombuffer(bytearray(reference[:prompt_bytes]), dtype=torch.float32)
+        samples = torch.frombuffer(bytearray(runtime_config["duplexio_voice_prompt_pcm"]), dtype=torch.float32)
         if device.type == "cuda":
             # A pageable copy would wait for the queued backbone.
             samples = samples.pin_memory()
-        samples = samples.to(device, non_blocking=True)
-        system_tokens = runtime_config.get("duplexio_system_token_ids", ())
-        if not isinstance(system_tokens, (list, tuple)) or not all(isinstance(token, int) for token in system_tokens):
-            raise ValueError("duplexio_system_token_ids must be integer token IDs")
-        tools = runtime_config.get("duplexio_tools", [])
-        tool_choice = runtime_config.get(
-            "duplexio_tool_choice",
-            {"mode": "none"},
-        )
-        if not isinstance(tools, list) or not all(isinstance(tool, Mapping) for tool in tools):
-            raise ValueError("duplexio_tools must be a list of tool definitions")
-        if not isinstance(tool_choice, Mapping):
-            raise ValueError("duplexio_tool_choice must be an object")
         return DuplexIORequestState(
             text_input_ids=(self.silence_token_id,) * len(TEXT_STREAM_NAMES),
             agent_latent=self.initial_agent_latents(1)[0],
             user_asr=FastConformerAudioStreamState(),
             input_mimi=self.audio_codec.new_state(1),
             output_mimi=self.audio_codec.new_state(1),
-            voice_prompt=samples,
-            system_token_ids=cast(tuple[int, ...], tuple(system_tokens)),
+            voice_prompt=samples.to(device, non_blocking=True),
+            system_token_ids=tuple(runtime_config["duplexio_system_token_ids"]),
+            sampling=self.resolve_sampling(runtime_config["duplexio_sampling"]),
             tool_call_constraint=self.tool_call_compiler.new_state(
-                cast(list[Mapping[str, Any]], tools),
-                tool_choice,
+                runtime_config["duplexio_tools"], runtime_config["duplexio_tool_choice"],
             ),
         )
 
@@ -1557,159 +1477,10 @@ def frame_inputs(
     )
 
 
-def sampling_source(runtime: Mapping[str, Any]) -> tuple[object, ...]:
-    """Select only policy fields; per-frame metadata must not invalidate the cache."""
-    return (
-        runtime["duplexio_text_sampling"],
-        runtime["duplexio_user_sampling"]["content"],
-        runtime["duplexio_emit_temperatures"],
-        runtime.get("duplexio_flow_temperature"),
-    )
-
-
-def _sample_content_token_ids(
-    logits: Tensor,
-    sampling: TokenSamplingOptions,
-    *,
-    generator: torch.Generator | None = None,
-    distribution: Callable[[Tensor, TokenSamplingOptions], tuple[Tensor, Tensor]] = content_distribution,
-) -> Tensor:
-    if sampling.temperature == 0:
-        if sampling.suppressed_token_ids.numel():
-            logits = logits.clone()
-            logits.index_fill_(-1, sampling.suppressed_token_ids, torch.finfo(logits.dtype).min)
-        return logits.argmax(dim=-1)
-    top_indices, probabilities = distribution(logits, sampling)
-    sampled = torch.multinomial(
-        probabilities,
-        num_samples=1,
-        generator=generator,
-    ).squeeze(-1)
-    return top_indices.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
-
-
-def _sample_factorized_text_ids(
-    logits: Tensor,
-    emit_logits: Tensor,
-    *,
-    silence_token_id: int,
-    sampling: TokenSamplingOptions,
-    emit_temperature: float,
-    generator: torch.Generator | None = None,
-    distribution: Callable[[Tensor, TokenSamplingOptions], tuple[Tensor, Tensor]] = content_distribution,
-) -> Tensor:
-    """Sample emit/silence independently from the conditional content ID."""
-    emit = _sample_emit(
-        emit_logits,
-        emit_temperature,
-        generator=generator,
-    )
-
-    content_ids = _sample_content_token_ids(
-        logits,
-        sampling,
-        generator=generator,
-        distribution=distribution,
-    )
-    return torch.where(
-        emit,
-        content_ids,
-        torch.full_like(content_ids, silence_token_id),
-    )
-
-
-def _sample_emit(
-    emit_logits: Tensor,
-    temperature: float,
-    *,
-    generator: torch.Generator | None = None,
-) -> Tensor:
-    if temperature == 0:
-        return emit_logits >= 0
-    return torch.bernoulli(
-        torch.sigmoid(emit_logits.float() / temperature),
-        generator=generator,
-    ).bool()
-
-
-def _exponential_race(probabilities: Tensor, generator: torch.Generator | None = None) -> Tensor:
-    """Sample each row's index, as vLLM does, without multinomial's validation sync."""
-    noise = torch.empty_like(probabilities).exponential_(generator=generator)
-    return probabilities.div(noise).argmax(dim=-1)
-
-
 def _to_device(values: list[Any], dtype: torch.dtype, device: torch.device) -> Tensor:
     """Upload host metadata without waiting for the queued backbone."""
     host = torch.tensor(values, dtype=dtype, pin_memory=device.type == "cuda")
     return host.to(device, non_blocking=True)
-
-
-def sample_tool_token(
-    logits: Tensor,
-    *,
-    constraint: ToolCallConstraintState | None,
-    emit: bool,
-    sampling: TokenSamplingOptions,
-    generator: torch.Generator | None = None,
-    distribution: Callable[[Tensor, TokenSamplingOptions], tuple[Tensor, Tensor]] = content_distribution,
-) -> ToolTokenSample | None:
-    """Sample and score the grammar-constrained distribution in one draw."""
-    if constraint is None or not constraint.enabled:
-        return None
-
-    if not constraint.active:
-        if not emit:
-            return None
-        constraint.begin()
-
-    constrained_logits = logits.clone()
-    bitmask = constraint.next_token_bitmask(
-        constrained_logits.shape[-1],
-        constrained_logits.device,
-    )
-    xgr.apply_token_bitmask_inplace(
-        constrained_logits,
-        bitmask,
-        vocab_size=constrained_logits.shape[-1],
-    )
-    if sampling.temperature == 0:
-        token_id = _sample_content_token_ids(constrained_logits, sampling, generator=generator)
-        return ToolTokenSample(token_id=token_id, logprob=torch.zeros_like(token_id, dtype=torch.float32))
-    indices, probabilities = distribution(constrained_logits, sampling)
-    selected = _exponential_race(probabilities, generator).unsqueeze(-1)
-    return ToolTokenSample(
-        token_id=indices.gather(-1, selected).squeeze(-1),
-        logprob=probabilities.gather(-1, selected).squeeze(-1).float().log(),
-    )
-
-
-def to_host(outputs: Mapping[str, Any]) -> dict[str, Any]:
-    """Copy ``outputs``, nested dicts of per-request tensor lists, to the host.
-
-    Device values that share a dtype cross in one transfer and come back as views
-    of it in their original shapes. Host tensors pass through untouched.
-    """
-    groups: dict[tuple[torch.device, torch.dtype], list[tuple[list[Tensor], int, Tensor]]] = {}
-
-    def lists(values: Mapping[str, Any]) -> dict[str, Any]:
-        host: dict[str, Any] = {}
-        for name, value in values.items():
-            if isinstance(value, Mapping):
-                host[name] = lists(value)
-                continue
-            host[name] = value = list(value)
-            for row, tensor in enumerate(value):
-                if tensor.device.type != "cpu":
-                    groups.setdefault((tensor.device, tensor.dtype), []).append((value, row, tensor))
-        return host
-
-    host = lists(outputs)
-    for items in groups.values():
-        packed = torch.cat([tensor.detach().reshape(-1) for _, _, tensor in items]).cpu()
-        parts = packed.split([tensor.numel() for _, _, tensor in items])
-        for (values, row, tensor), part in zip(items, parts, strict=True):
-            values[row] = part.view(tensor.shape)
-    return host
 
 
 class PendingHostOutputs:
@@ -1787,15 +1558,15 @@ def serialize_tool_call(tool_call: Mapping[str, Any] | None, sequence: int) -> T
 
 def _validate_vllm_runtime_contract(vllm_config: VllmConfig) -> None:
     if vllm_config.quant_config is not None:
-        raise ValueError("DuplexIO requires unquantized backbone weights to preserve training's fused MLP math")
+        raise ValueError("DuplexIO requires unquantized backbone weights")
     if vllm_config.model_config.head_dtype not in (None, torch.float32):
         raise ValueError("DuplexIO vocabulary logits require FP32 accumulation")
     if vllm_config.parallel_config.pipeline_parallel_size != 1:
-        raise ValueError("Native DuplexIO does not support pipeline parallelism")
+        raise ValueError("DuplexIO does not support pipeline parallelism")
     if vllm_config.speculative_config is not None:
-        raise ValueError("Native DuplexIO does not support speculative decoding")
+        raise ValueError("DuplexIO does not support speculative decoding")
     if vllm_config.cache_config.enable_prefix_caching:
-        raise ValueError("Native DuplexIO requires prefix caching to be disabled")
+        raise ValueError("DuplexIO requires prefix caching to be disabled")
     scheduler = vllm_config.scheduler_config
     # All appends contain whole frames. Aligned budgets preserve that invariant
     # when the scheduler splits a prefill or mixes it with live requests.
@@ -1808,9 +1579,9 @@ def _validate_vllm_runtime_contract(vllm_config: VllmConfig) -> None:
         vllm_config.parallel_config.decode_context_parallel_size != 1
         or vllm_config.parallel_config.prefill_context_parallel_size != 1
     ):
-        raise ValueError("Native DuplexIO does not support context parallelism")
+        raise ValueError("DuplexIO does not support context parallelism")
     if vllm_config.parallel_config.use_ubatching:
-        raise ValueError("Native DuplexIO does not support microbatching")
+        raise ValueError("DuplexIO does not support microbatching")
     compilation = vllm_config.compilation_config
     if compilation.cudagraph_mode == CUDAGraphMode.FULL:
         if vllm_config.scheduler_config.max_num_seqs != 1:

@@ -12,6 +12,8 @@ from torch import Tensor, nn
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from tests.model_executor.models.duplexio.reference_attention import attention_visible
+from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
 from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
     DuplexIOFrameMetadata,
     DuplexIOKVCacheSpec,
@@ -23,8 +25,6 @@ from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
     DuplexIOFlashAttentionMetadataBuilder,
     DuplexIOPagedAttention,
 )
-from tests.model_executor.models.duplexio.reference_attention import attention_visible
-from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS, NUM_TEXT_CELLS
 
 WINDOW = 2
 BLOCK_SIZE = 64

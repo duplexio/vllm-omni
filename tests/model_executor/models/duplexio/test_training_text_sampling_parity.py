@@ -1,28 +1,11 @@
-"""The serving argmax mode must not randomly suppress emitted text."""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""The reference sampler that batched serving is checked against draws as training does."""
 
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
-    TokenSamplingOptions,
-    _sample_factorized_text_ids,
-)
-
-
-def test_argmax_emission_is_deterministic_at_default_temperature() -> None:
-    generator = torch.Generator().manual_seed(37)
-    initial_rng = generator.get_state().clone()
-    logits = torch.tensor([[0.0, 1.0, 3.0]]).expand(128, -1)
-    result = _sample_factorized_text_ids(
-        logits,
-        torch.full((128,), 0.01),
-        silence_token_id=0,
-        sampling=TokenSamplingOptions(0.0, None, None, torch.tensor([0], dtype=torch.long)),
-        emit_temperature=0.0,
-        generator=generator,
-    )
-    assert result.tolist() == [2] * 128
-    assert torch.equal(initial_rng, generator.get_state())
+from tests.model_executor.models.duplexio.reference_sampling import ReferenceSampling, sample_factorized_text_ids
 
 
 @pytest.mark.parametrize("mode", ["argmax", "top_k", "top_p"])
@@ -31,19 +14,15 @@ def test_factorized_tokens_match_training(mode: str) -> None:
     torch.manual_seed(12)
     logits = torch.randn(7, 31)
     emit_logits = torch.randn(7)
-    options = training.TokenSamplingOptions(
-        temperature=0.0 if mode == "argmax" else 0.8,
-        top_k=12,
-        top_p=0.9 if mode == "top_p" else None,
-        emit_temperature=1.0,
-    )
+    temperature, top_p = 0.0 if mode == "argmax" else 0.8, 0.9 if mode == "top_p" else None
+    options = training.TokenSamplingOptions(temperature=temperature, top_k=12, top_p=top_p, emit_temperature=1.0)
     torch.manual_seed(37)
     expected = training._sample_factorized_token_ids(logits, emit_logits, 0, options)
-    actual = _sample_factorized_text_ids(
+    actual = sample_factorized_text_ids(
         logits,
         emit_logits,
         silence_token_id=0,
-        sampling=TokenSamplingOptions(0.0 if mode == "argmax" else 0.8, 12, 0.9 if mode == "top_p" else None, torch.tensor([0], dtype=torch.long)),
+        sampling=ReferenceSampling(temperature, 12, top_p, torch.tensor([0], dtype=torch.long)),
         emit_temperature=1.0,
         generator=torch.Generator().manual_seed(37),
     )

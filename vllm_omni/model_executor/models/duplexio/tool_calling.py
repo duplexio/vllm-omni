@@ -419,13 +419,6 @@ class ToolCallConstraintState:
             )
         return self.start_bitmask
 
-    def next_token_bitmask(self, vocab_size: int, device: torch.device) -> torch.Tensor:
-        if self.matcher is None:
-            raise RuntimeError("DuplexIO tool-call grammar is not active")
-        bitmask = xgr.allocate_token_bitmask(1, vocab_size)
-        self.matcher.fill_next_token_bitmask(bitmask)
-        return bitmask.to(device=device, non_blocking=True)
-
     def accept(self, token_id: int) -> bool:
         if self.matcher is None or not self.matcher.accept_token(token_id):
             raise RuntimeError(f"DuplexIO tool grammar rejected sampled token {token_id}")

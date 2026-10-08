@@ -2,7 +2,6 @@
 """Follow real preprocess/sample/output feedback across staged policy commits."""
 
 import base64
-import copy
 from contextlib import nullcontext
 from threading import Event
 from types import SimpleNamespace
@@ -65,64 +64,23 @@ def feedback_model():
 
 
 def runtime():
-    return {
-        "duplexio_record_inputs": True,
-        "duplexio_scheduler_token_id": 1,
-        "duplexio_text_sampling": {"temperature": 1.0, "top_k": 1, "top_p": 1.0},
-        "duplexio_user_sampling": {"content": {"temperature": 1.0, "top_k": 1, "top_p": 1.0}},
-        "duplexio_emit_temperatures": {"user": 1.0, "agent": 0.0, "tool_call": 0.0},
-    }
+    return {"duplexio_record_inputs": True, "duplexio_scheduler_token_id": 1}
 
 
-@torch.inference_mode()
-def test_sampling_cache_reuses_settings_and_tracks_session_updates():
-    model = feedback_model()
+def feedback_state(model):
+    """Greedy agent and tool streams; the user stream draws its one top token."""
     state = request_state(model)
-    settings = runtime()
-    info = {"duplexio_working_state": state, "duplex": {"runtime_config": settings}}
-    logits, emissions = torch.zeros(1, 3, 32), torch.zeros(1, 3)
-    model.sample_text_batch(logits, emissions, [info])
-    initial = state.sampling
-    assert initial.agent.suppressed_token_ids is model.agent_suppressed_token_ids
-    assert initial.tool.suppressed_token_ids is model.tool_suppressed_token_ids
-    assert initial.user.suppressed_token_ids is model.user_suppressed_token_ids
-
-    # Appends arrive with fresh wire dictionaries, including unrelated metadata.
-    settings = copy.deepcopy(settings)
-    settings["duplexio_record_hiddens"] = True
-    info["duplex"]["runtime_config"] = settings
-    model.sample_text_batch(logits, emissions, [info])
-    assert state.sampling is initial
-
-    working = state.fork()
-    info["duplexio_working_state"] = working
-    settings["duplexio_text_sampling"]["temperature"] = 0.3
-    settings["duplexio_user_sampling"]["content"]["temperature"] = 0.0
-    settings["duplexio_emit_temperatures"]["user"] = 0.0
-    model.sample_text_batch(logits, emissions, [info])
-    updated = working.sampling
-    assert updated is not initial
-    assert updated.agent.temperature == updated.tool.temperature == 0.3
-    assert updated.user.temperature == updated.emission.user == 0.0
-    assert state.sampling is initial
-    assert initial.agent.temperature == initial.user.temperature == initial.emission.user == 1.0
-    model.sample_text_batch(logits, emissions, [info])
-    assert working.sampling is updated
-    settings["duplexio_text_sampling"]["temperature"] = 0.9
-    model.sample_text_batch(logits, emissions, [info])
-    assert working.sampling.agent.temperature == 0.9
-    assert updated.agent.temperature == 0.3
-    valid = working.sampling
-    settings["duplexio_emit_temperatures"]["user"] = -1.0
-    with pytest.raises(ValueError):
-        model.sample_text_batch(logits, emissions, [info])
-    assert working.sampling is valid
+    content = {"temperature": 1.0, "top_k": 1, "top_p": 1.0}
+    state.sampling = model.resolve_sampling({
+        "agent": {"content": content}, "user": {"emission": {"temperature": 1.0}, "content": content},
+    })
+    return state
 
 
 @torch.inference_mode()
 def test_feedback_actions_and_versions_span_staging_then_commit(monkeypatch):
     model = feedback_model()
-    state = request_state(model)
+    state = feedback_state(model)
     recorder = TrajectoryRecorder()
     consumed_user_ids = []
 
@@ -217,7 +175,7 @@ def test_feedback_actions_and_versions_span_staging_then_commit(monkeypatch):
 @torch.inference_mode()
 def test_raw_audio_keeps_encoder_features_without_transcript_commits():
     model = feedback_model()
-    state = request_state(model)
+    state = feedback_state(model)
     state.text_input_ids = (state.text_input_ids[0], 7, *state.text_input_ids[2:])
     plan = DuplexIODuplexPlugin(lambda *args: None).plan_append(
         request_id="raw-frame", fence=DuplexFence("session"),
@@ -242,7 +200,7 @@ def test_raw_audio_keeps_encoder_features_without_transcript_commits():
 @torch.inference_mode()
 def test_chunked_appends_record_all_rows_and_sample_only_at_their_end():
     model = feedback_model()
-    state = request_state(model)
+    state = feedback_state(model)
     recorder = TrajectoryRecorder()
     for prefix in (True, False):
         prompt_len = (state.frames_seen + 6) * 6

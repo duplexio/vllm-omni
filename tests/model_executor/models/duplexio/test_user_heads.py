@@ -11,6 +11,7 @@ from torch.nn import functional as F
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
 
+from tests.model_executor.models.duplexio.reference_sampling import sample_text_batch
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
 )
@@ -54,29 +55,22 @@ def sample_user(model, logits, emissions, infos):
     """The user stream of a batch draw; other streams wait and extra ids are impossible."""
     padded = F.pad(logits, (0, 64 - logits.shape[-1]), value=-torch.inf)
     silent = torch.full_like(emissions, -100.0)
-    sampled = model.sample_text_batch(
-        padded.unsqueeze(1).expand(-1, 3, -1), torch.stack((silent, silent, emissions), dim=1), infos,
+    sampled = sample_text_batch(
+        model, padded.unsqueeze(1).expand(-1, 3, -1), torch.stack((silent, silent, emissions), dim=1), infos,
     )
     return sampled.text_ids[:, 0], sampled.frame_logprobs[:, 4], sampled.frame_logprobs[:, 5]
 
 
 def sampling_info(model, device="cpu", mode="top_k", emit_temperature=0.7):
-    info = {
-        "duplexio_working_state": SimpleNamespace(tool_call_constraint=None),
-        "duplex": {
-            "runtime_config": {
-                "duplexio_text_sampling": {"temperature": 0.6, "top_k": 4, "top_p": 0.8},
-                "duplexio_user_sampling": {"content": {
-                    "temperature": 0.0 if mode == "argmax" else 0.65,
-                    "top_k": None if mode == "sample" else 4,
-                    "top_p": 0.8 if mode == "top_p" else None,
-                }},
-                "duplexio_emit_temperatures": {"agent": 1.0, "tool_call": 1.0, "user": emit_temperature},
-            }
-        },
-    }
-    info["duplexio_working_state"].sampling = model.resolve_sampling(info["duplex"]["runtime_config"])
-    return info
+    sampling = model.resolve_sampling({
+        "agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.6, "top_k": 4, "top_p": 0.8}},
+        "user": {"emission": {"temperature": emit_temperature}, "content": {
+            "temperature": 0.0 if mode == "argmax" else 0.65,
+            "top_k": None if mode == "sample" else 4,
+            "top_p": 0.8 if mode == "top_p" else None,
+        }},
+    })
+    return {"duplexio_working_state": SimpleNamespace(tool_call_constraint=None, sampling=sampling)}
 
 
 @pytest.mark.parametrize(

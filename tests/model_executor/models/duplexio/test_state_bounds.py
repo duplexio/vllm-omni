@@ -41,6 +41,7 @@ def test_gdn_request_state_shape_is_fixed_for_the_session_lifetime() -> None:
 
 def test_request_state_fork_shares_immutable_prefix_and_codec_state() -> None:
     codec_state = object()  # Pocket Mimi states are replaced, never mutated.
+    sampling = object()  # Fixed when the session starts.
     state = DuplexIORequestState(
         text_input_ids=(0, 0, 0, 0),
         agent_latent=torch.zeros(32),
@@ -49,6 +50,7 @@ def test_request_state_fork_shares_immutable_prefix_and_codec_state() -> None:
         output_mimi=codec_state,
         voice_prompt=torch.zeros(1_920),
         system_token_ids=(1, 2, 3),
+        sampling=sampling,
         frames_seen=100_000,
         audio_position=99_000,
         persistent_keys=250_000,
@@ -62,3 +64,4 @@ def test_request_state_fork_shares_immutable_prefix_and_codec_state() -> None:
     # The pinned prompt is immutable for the session, so a fork shares it.
     assert fork.voice_prompt is state.voice_prompt
     assert fork.output_mimi is codec_state
+    assert fork.sampling is sampling

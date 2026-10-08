@@ -13,7 +13,6 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-
 LATENT_DIM = 32  # Channels of the continuous latent between encoder and decoder.
 
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Training-ordered attention reductions for the native paged cache."""
+"""Attention over DuplexIO's paged cache, with the checkpoint's rounding."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
 def cached_rotary_pos_emb(
     query: Tensor, key: Tensor, positions: Tensor, cos_sin_cache: Tensor
 ) -> tuple[Tensor, Tensor]:
-    """Apply training's fused rotation to (T, H, D) Q/K using cached phases."""
+    """Apply half-split RoPE to (T, H, D) Q/K using cached phases."""
     cos, sin = cos_sin_cache[positions].chunk(2, dim=-1)
     query, key = apply_rotary_pos_emb(
         query.transpose(0, 1)[None],
@@ -33,7 +33,7 @@ def cached_rotary_pos_emb(
 
 @torch.compile(dynamic=True, fullgraph=True)
 def gated_attention_output(output: Tensor, gate: Tensor) -> Tensor:
-    """Use the same fused sigmoid/product rounding in training and decoding."""
+    """Sigmoid output gating as one fused kernel, so it rounds as the checkpoint was trained."""
     return output * gate.sigmoid()
 
 
