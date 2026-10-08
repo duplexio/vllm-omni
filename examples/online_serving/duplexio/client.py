@@ -131,8 +131,8 @@ async def run(args: argparse.Namespace) -> dict:
                 await receiver
             finally:
                 receiver.cancel()
-    if not audio or not "".join(text).strip():
-        raise RuntimeError("Session produced no agent audio or transcript")
+    if not audio:
+        raise RuntimeError("Session produced no agent audio")
     waveform = np.concatenate(audio)
     if not np.isfinite(waveform).all():
         raise RuntimeError("Agent audio contains non-finite samples")

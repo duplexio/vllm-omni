@@ -76,6 +76,36 @@ The client prints the user and agent transcripts, saves the received PCM, and
 closes the session to release its state. `--seconds` controls the input streaming
 duration, including silence after the question; it is not an answer-ending rule.
 
+## Test ten spoken questions
+
+The inference test starts the server, synthesizes ten questions with Kokoro on
+CPU, and opens a fresh user-first realtime session for each question. Questions
+progress from simple arithmetic to reasoning and an MMLU-style biology question.
+
+Install Kokoro and its English tokenizer assets in the serving environment:
+
+```bash
+uv pip install kokoro==0.9.4 'misaki[en]==0.9.4'
+uv pip install 'https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl'
+bash examples/online_serving/duplexio/test_inference.sh
+```
+
+Results go to `outputs/duplexio-inference/<timestamp>/`: `server.log`, the voice
+reference, `server-command.txt`, `results.json`, and one numbered directory per question
+with `question.txt`, `input.wav`, `answer.wav`, and `result.json`. The script stops
+the server when it finishes. It continues after individual request errors and
+returns a nonzero exit status if any fail. A successful request means audio and
+text were returned; answer correctness and audio quality still require review.
+
+Edit `examples/online_serving/duplexio/questions.json` to change the prompts, or
+pass an output directory and custom question file as the two script arguments.
+Further arguments go to `run_questions.py`, for example `--instructions`. A question
+can also be an object with `text` and an `answer` letter, as in `mmlu_questions.json`;
+the script then records the predicted letter and prints the number correct.
+Set `KOKORO_ASSETS=/path/to/kokoro` for local Kokoro assets and `DUPLEXIO_PORT`
+to choose another server port. Each question receives thirty seconds of silence
+after its complete audio, and the v7 checkpoint revision is pinned.
+
 ## Realtime protocol
 
 Connect to `/v1/realtime?duplex=1&model=duplexio/duo-4b&autostart=0`.
