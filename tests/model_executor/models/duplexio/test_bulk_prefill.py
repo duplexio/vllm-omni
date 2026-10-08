@@ -132,7 +132,7 @@ def append_info(
             "turn_id": 0,
             "final": False,
             "pcm": torch.zeros(1920).numpy().tobytes() if pcm is None else pcm,
-            "runtime_config": {"duplexio_record_inputs": True},
+            "runtime_config": {"duplexio_record_inputs": True, "duplexio_record_hiddens": False},
         },
     }
 

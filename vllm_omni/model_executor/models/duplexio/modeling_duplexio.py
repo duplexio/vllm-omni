@@ -761,7 +761,7 @@ class DuplexIOForConditionalGeneration(
                 strict=True,
             )
         )
-        records = [info["duplex"]["runtime_config"].get("duplexio_record_inputs", False) for _, info in requests]
+        records = [info["duplex"]["runtime_config"]["duplexio_record_inputs"] for _, info in requests]
         packed_replay = (
             {
                 "text_ids": text_ids,
@@ -895,7 +895,7 @@ class DuplexIOForConditionalGeneration(
             [predicted_audio[row] for row in decode_rows],
             [states[batch.indices[row]] for row in decode_rows],
         )
-        record_hiddens = [info["duplex"]["runtime_config"].get("duplexio_record_hiddens", False) for info in infos]
+        record_hiddens = [info["duplex"]["runtime_config"]["duplexio_record_hiddens"] for info in infos]
         sampled: dict[str, list[Tensor]] = {}
         if batch is not None:
             text = batch.text

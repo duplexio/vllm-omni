@@ -62,6 +62,7 @@ def feedback_model():
 def runtime():
     return {
         "duplexio_record_inputs": True,
+        "duplexio_record_hiddens": False,
         "duplexio_scheduler_token_id": 1,
         "duplexio_tool_generation": 0,
         "duplexio_tool_results": [],

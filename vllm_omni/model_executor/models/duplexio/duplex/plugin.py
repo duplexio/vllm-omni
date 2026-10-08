@@ -59,6 +59,8 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "duplexio_tool_choice",
         "duplexio_tool_generation",
         "duplexio_tool_results",
+        "duplexio_record_inputs",
+        "duplexio_record_hiddens",
     }
 )
 
@@ -248,40 +250,13 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
         self.validate_client_extra_body(config.extra_body)
         require_full_duplex(config)
         assert model_config is not None
-        hf_config = model_config.hf_config
-        start_role = parse_start_role(config.extra_body)
-        self.voice_prompt_max_frames = hf_config.voice_prompt_max_frames
-        voice_prompt, voice_prompt_frames = voice_prompt_from_session(config, self.voice_prompt_max_frames)
-        tokenizer = cached_tokenizer_from_config(model_config)
-        self.tokenizer = tokenizer
-        self.data_plane.configure(tokenizer.backend_tokenizer, silence_token_id=hf_config.silence_token_id)
-        tools = normalize_tools(config.extra_body.get("realtime_tools"))
-        tool_choice = normalize_tool_choice(config.extra_body.get("realtime_tool_choice"), tools)
-        try:
-            tool_call_grammar(tools, tool_choice)
-        except ValueError as exc:
-            raise DuplexRuntimeConfigError(str(exc), code="invalid_tools") from exc
-        system_prompt = config.instructions or hf_config.default_system_prompt
-        if tools:
-            system_prompt = render_tool_system_prompt(tokenizer, system_prompt, tools)
-        initial_prefix = INITIAL_PREFIXES[start_role]
-        system_token_ids = [
-            *tokenizer.encode(system_prompt, add_special_tokens=False),
-            *tokenizer.encode(initial_prefix, add_special_tokens=False),
-        ]
-        return {
-            "instructions": config.instructions,
-            "duplexio_sampling": session_sampling(config),
-            "duplexio_system_token_ids": system_token_ids,
-            "duplexio_start_role": start_role,
-            "duplexio_voice_prompt_pcm": voice_prompt,
-            "duplexio_voice_prompt_frames": voice_prompt_frames,
-            "duplexio_scheduler_token_id": hf_config.pad_token_id,
-            "duplexio_tools": tools,
-            "duplexio_tool_choice": tool_choice,
-            "duplexio_tool_generation": 0,
-            "duplexio_tool_results": [],
-        }
+        runtime_config = session_runtime_config(config, model_config)
+        self.tokenizer = cached_tokenizer_from_config(model_config)
+        self.voice_prompt_max_frames = model_config.hf_config.voice_prompt_max_frames
+        self.data_plane.configure(
+            self.tokenizer.backend_tokenizer, silence_token_id=model_config.hf_config.silence_token_id
+        )
+        return runtime_config
 
     def runtime_config_for_update(
         self,
@@ -345,7 +320,7 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
                 code="invalid_function_call_output",
             )
         assert self.tokenizer is not None
-        token_ids = self.tokenizer.encode(f"<tool_response>\n{output}\n</tool_response>", add_special_tokens=False)
+        token_ids = tool_result_token_ids(self.tokenizer, output)
         results = current["duplexio_tool_results"]
         if len(results) >= MAX_PENDING_TOOL_RESULTS:
             raise DuplexRuntimeConfigError(
@@ -373,6 +348,49 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
         if len(remaining) == len(results):
             return None
         return {**current, "duplexio_tool_results": remaining}
+
+
+def session_runtime_config(config: DuplexSessionConfig, model_config: ModelConfig) -> dict[str, object]:
+    """Validate a session and render its prompt, voice, tools and sampling; realtime and offline sessions share it."""
+    hf_config = model_config.hf_config
+    start_role = parse_start_role(config.extra_body)
+    voice_prompt, voice_prompt_frames = voice_prompt_from_session(config, hf_config.voice_prompt_max_frames)
+    tokenizer = cached_tokenizer_from_config(model_config)
+    tools = normalize_tools(config.extra_body.get("realtime_tools"))
+    tool_choice = normalize_tool_choice(config.extra_body.get("realtime_tool_choice"), tools)
+    try:
+        tool_call_grammar(tools, tool_choice)
+    except ValueError as exc:
+        raise DuplexRuntimeConfigError(str(exc), code="invalid_tools") from exc
+    system_prompt = config.instructions or hf_config.default_system_prompt
+    if tools:
+        system_prompt = render_tool_system_prompt(tokenizer, system_prompt, tools)
+    initial_prefix = INITIAL_PREFIXES[start_role]
+    system_token_ids = [
+        *tokenizer.encode(system_prompt, add_special_tokens=False),
+        *tokenizer.encode(initial_prefix, add_special_tokens=False),
+    ]
+    return {
+        "instructions": config.instructions,
+        "duplexio_sampling": session_sampling(config),
+        "duplexio_system_token_ids": system_token_ids,
+        "duplexio_start_role": start_role,
+        "duplexio_voice_prompt_pcm": voice_prompt,
+        "duplexio_voice_prompt_frames": voice_prompt_frames,
+        "duplexio_scheduler_token_id": hf_config.pad_token_id,
+        "duplexio_tools": tools,
+        "duplexio_tool_choice": tool_choice,
+        "duplexio_tool_generation": 0,
+        "duplexio_tool_results": [],
+        # Rollouts that train on their own trajectories switch these on.
+        "duplexio_record_inputs": False,
+        "duplexio_record_hiddens": False,
+    }
+
+
+def tool_result_token_ids(tokenizer: Any, output: str) -> list[int]:
+    """The rows a tool result is fed as, after the live frame."""
+    return tokenizer.encode(f"<tool_response>\n{output}\n</tool_response>", add_special_tokens=False)
 
 
 def require_full_duplex(config: DuplexSessionConfig) -> None:
