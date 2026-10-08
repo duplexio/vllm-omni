@@ -8,9 +8,6 @@ from typing import Any
 
 from transformers import AutoConfig, PretrainedConfig
 
-INITIAL_AGENT_PREFIX = "<|im_start|>assistant\n"
-INITIAL_USER_PREFIX = "<|im_start|>user\n"
-
 
 class DuplexIOConfig(PretrainedConfig):
     """A Qwen3.5 text backbone with a streaming user ASR encoder and a FlowMap agent-audio head."""
@@ -22,21 +19,21 @@ class DuplexIOConfig(PretrainedConfig):
     def __init__(
         self,
         *,
-        text_config: dict[str, Any] | PretrainedConfig | None = None,
-        user_asr_config: dict[str, Any] | None = None,
-        flowmap_config: dict[str, Any] | None = None,
+        text_config: dict[str, Any] | PretrainedConfig,
+        user_asr_config: dict[str, Any],
+        flowmap_config: dict[str, Any],
+        silence_token_id: int,
         audio_adapter_config: dict[str, Any] | None = None,
         audio_attention_window_frames: int = 4_096,
         voice_prompt_max_frames: int = 125,
-        silence_token_id: int | None = None,
         default_system_prompt: str = "",
         head_dtype: str = "float32",
         **kwargs: Any,
     ) -> None:
         self.text_config = _text_config(text_config)
         super().__init__(head_dtype=head_dtype, **kwargs)
-        self.user_asr_config = dict(user_asr_config or {})
-        self.flowmap_config = dict(flowmap_config or {})
+        self.user_asr_config = dict(user_asr_config)
+        self.flowmap_config = dict(flowmap_config)
         self.audio_adapter_config = dict(audio_adapter_config or {})
         self.audio_attention_window_frames = audio_attention_window_frames
         self.voice_prompt_max_frames = voice_prompt_max_frames
@@ -49,8 +46,8 @@ class DuplexIOConfig(PretrainedConfig):
         return self.text_config
 
     def validate(self) -> None:
-        if self.pad_token_id is None or self.silence_token_id is None:
-            raise ValueError("DuplexIO requires pad_token_id and silence_token_id")
+        if self.pad_token_id is None:
+            raise ValueError("DuplexIO requires a pad_token_id")
         if self.user_asr_config.get("model_type") != "nemotron_asr_streaming":
             raise ValueError("DuplexIO requires a streaming Nemotron RNN-T user ASR encoder")
         for name in ("mlp_dim", "mlp_depth", "inference_steps"):
@@ -77,9 +74,9 @@ class DuplexIOConfig(PretrainedConfig):
             raise ValueError("DuplexIO requires one full- or linear-attention type per layer, using both")
 
 
-def _text_config(value: dict[str, Any] | PretrainedConfig | None) -> PretrainedConfig:
+def _text_config(value: dict[str, Any] | PretrainedConfig) -> PretrainedConfig:
     if not isinstance(value, PretrainedConfig):
-        config = dict(value or {"model_type": "qwen3_5_text"})
+        config = dict(value)
         value = AutoConfig.for_model(config.pop("model_type"), **config)
     # DuplexIO positions are 1-D frame indices. Qwen3.5's M-RoPE keys would make
     # vLLM feed (3, num_tokens) positions; M-RoPE over identical position streams

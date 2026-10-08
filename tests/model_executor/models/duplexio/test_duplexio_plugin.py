@@ -19,7 +19,7 @@ from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_reque
 from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext, DuplexRuntimeConfigError
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.model_executor.models.duplexio.duplex import DuplexIODuplexPlugin
-from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields, pack_frame
+from vllm_omni.model_executor.models.duplexio.frame_output import FRAME_FIELDS, frame_fields
 from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -31,6 +31,12 @@ REQUEST_ID = duplex_resource_request_id(DuplexFence("session", epoch=0, turn_id=
 
 def pcm(frames: float, value: float = 0.25) -> bytes:
     return torch.full((round(frames * 1920),), value).numpy().tobytes()
+
+
+def pack_frame(**fields: int | bool) -> torch.Tensor:
+    """A ``frame`` from named fields; unnamed fields are zero."""
+    assert fields.keys() <= set(FRAME_FIELDS)
+    return torch.tensor([int(fields.get(name, 0)) for name in FRAME_FIELDS], dtype=torch.long)
 
 
 def reference_audio(frames: float = REFERENCE_FRAMES) -> str:

@@ -1,4 +1,6 @@
-"""Deterministic token filtering, separate from request-owned random draws."""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Batched factorized sampling of the agent, tool-call and user text streams."""
 
 from dataclasses import dataclass
 
@@ -21,7 +23,6 @@ TEMPERATURE, TOP_K, TOP_P, EMIT_TEMPERATURE = slice(0, 3), slice(3, 6), slice(6,
 FLOW_TEMPERATURE = 12
 # 0: no tool grammar, 1: inside or forced into a call, 2: idle and free to start one.
 TOOL_STATE = 13
-SAMPLING_PARAMETERS = 14
 NO_TOP_P = 2.0  # A cumulative probability never exceeds it.
 
 

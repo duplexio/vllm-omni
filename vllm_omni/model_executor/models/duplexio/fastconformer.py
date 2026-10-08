@@ -26,6 +26,11 @@ def graph_batch_size(rows: int) -> int:
     return next((size for size in GRAPH_BATCH_SIZES if size >= rows), rows)
 
 
+def graph_batch_sizes(max_rows: int) -> tuple[int, ...]:
+    """The sizes that batches of at most ``max_rows`` replay."""
+    return tuple(sorted({graph_batch_size(rows) for rows in range(1, max_rows + 1)}))
+
+
 class FastConformerStreamState:
     """Explicit upstream encoder caches for one streaming utterance.
 
@@ -385,6 +390,7 @@ class FastConformerEncoder(nn.Module):
     @classmethod
     def from_checkpoint(
         cls, config: dict[str, Any], checkpoint: str, *, revision: str | None, use_cuda_graph: bool = False,
+        max_rows: int = GRAPH_BATCH_SIZES[-1],
     ) -> FastConformerEncoder:
         """Build the encoder from its config and the checkpoint's ``user_asr`` processor; the model loader supplies weights."""
         from transformers import AutoConfig, AutoProcessor
@@ -395,13 +401,17 @@ class FastConformerEncoder(nn.Module):
         values = dict(config)
         encoder = NemotronAsrStreamingEncoder(AutoConfig.for_model(values.pop("model_type"), **values).encoder_config)
         processor = AutoProcessor.from_pretrained(checkpoint, subfolder="user_asr", revision=revision)
-        return cls(encoder, processor, use_cuda_graph=use_cuda_graph)
+        return cls(encoder, processor, use_cuda_graph=use_cuda_graph, max_rows=max_rows)
 
-    def __init__(self, encoder: Any, processor: Any, *, use_cuda_graph: bool = False) -> None:
+    def __init__(
+        self, encoder: Any, processor: Any, *, use_cuda_graph: bool = False, max_rows: int = GRAPH_BATCH_SIZES[-1],
+    ) -> None:
         super().__init__()
         self.encoder = encoder
         self.processor = processor
         self.use_cuda_graph = use_cuda_graph
+        # Batches never exceed the scheduler's request count, so neither do graphs.
+        self.graph_batch_sizes = graph_batch_sizes(max_rows)
         self.graphs: dict[int, FastConformerGraph] = {}
         self.processor.set_num_lookahead_tokens(NUM_LOOKAHEAD_TOKENS)
         self.output_dim = encoder.config.hidden_size
@@ -609,7 +619,7 @@ class FastConformerEncoder(nn.Module):
         """
         if not self.use_cuda_graph or self.graphs:
             return
-        streams = GRAPH_BATCH_SIZES[-1]
+        streams = self.graph_batch_sizes[-1]
         states = [FastConformerAudioStreamState() for _ in range(streams)]
         silence = [torch.zeros(FRAME_SAMPLES, device=self.mel_filters.device) for _ in range(streams)]
         self.use_cuda_graph = False
@@ -619,9 +629,9 @@ class FastConformerEncoder(nn.Module):
         finally:
             self.use_cuda_graph = True
         # Size one specializes; the second size compiles once for all the rest.
-        for size in GRAPH_BATCH_SIZES:
+        for size in self.graph_batch_sizes:
             _, states[:size] = self.encode_audio_batch(silence[:size], states[:size])
-        assert set(self.graphs) == set(GRAPH_BATCH_SIZES)
+        assert set(self.graphs) == set(self.graph_batch_sizes)
 
 # Only captured steady windows compile: their shapes differ in batch alone, and
 # fusing the encoder's elementwise work shortens every replay.

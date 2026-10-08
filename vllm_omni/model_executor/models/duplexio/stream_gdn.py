@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Packed GDN prefill and recurrent six-cell decode."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Packed GDN prefill and recurrent six-cell decode.
+
+The recurrent kernel adapts flash-linear-attention's fused recurrent gated delta
+rule (MIT; see GDN_LICENSE).
+"""
 
 import torch
 import torch.nn.functional as F
@@ -57,7 +62,7 @@ def prepare_gdn_inputs(
     key_dim: int,
     value_dim: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """L2-normalize Q and K and compute the decay gate in FP32, as the checkpoint was trained."""
+    """L2-normalize Q and K in FP32, rounded back to their dtype; the decay gate stays FP32."""
     key_width = key_heads * key_dim
     q, k, v = qkv.split((key_width, key_width, qkv.shape[1] - key_width * 2), -1)
     q = normalize_gdn_qk(q.view(qkv.shape[0], key_heads, key_dim))

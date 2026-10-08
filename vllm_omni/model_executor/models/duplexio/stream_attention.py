@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Attention over DuplexIO's paged cache, with the checkpoint's rounding."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Attention over DuplexIO's paged cache."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def cached_rotary_pos_emb(
 
 @torch.compile(dynamic=True, fullgraph=True)
 def gated_attention_output(output: Tensor, gate: Tensor) -> Tensor:
-    """Sigmoid output gating as one fused kernel, so it rounds as the checkpoint was trained."""
+    """Sigmoid output gating as one fused kernel, rounding once to the activation dtype."""
     return output * gate.sigmoid()
 
 

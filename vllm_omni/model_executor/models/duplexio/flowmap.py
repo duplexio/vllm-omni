@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright (c) Kyutai, all rights reserved.
 # See PocketTTSLicense.txt in this directory.
 """Batched inference for DuplexIO's Pocket-TTS FlowMap checkpoints."""
@@ -154,8 +156,8 @@ class FlowMap(nn.Module):
             [AdaLNResBlock(model_channels) for _ in range(num_res_blocks)]
         )
         self.final_layer = FinalLayer(model_channels, in_channels)
-        # vLLM constructs the backbone under a BF16 default; the trained
-        # FlowMap parameters and integration are FP32; linears obey autocast.
+        # vLLM constructs the backbone under a BF16 default; FlowMap parameters
+        # and integration stay FP32, and its linears follow the ambient autocast.
         self.float()
 
     def forward(self, x: Tensor, cond: Tensor, s: Tensor, t: Tensor) -> Tensor:

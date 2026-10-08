@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Bounded paged-KV layout for DuplexIO full-attention layers."""
 
 from __future__ import annotations
@@ -79,14 +79,6 @@ class DuplexIOKVLayout:
     @property
     def max_blocks(self) -> int:
         return cdiv(self.max_compact_slots, self.block_size)
-
-    def audio_slot(self, audio_position: int, audio_cell: int) -> int:
-        assert audio_position >= 1 and 0 <= audio_cell < self.num_audio_cells
-        return ((audio_position - 1) * self.num_audio_cells + audio_cell) % self.persistent_base
-
-    def persistent_slot(self, ordinal: int) -> int:
-        assert 0 <= ordinal < self.max_persistent_keys
-        return self.persistent_base + ordinal
 
 
 class DuplexIOFrameMetadata:
@@ -240,9 +232,6 @@ class DuplexIOKVCacheManager(FullAttentionManager):
                 "DuplexIO compact KV requires vLLM's hybrid-cache block zeroing"
             )
         super().__init__(kv_cache_spec, **kwargs)
-        # vLLM records only exact built-in full-attention spec types.
-        # This registered full-attention subtype needs the same lifecycle.
-        self._record_new_block_ids = True
         self.layout = kv_cache_spec.layout
 
     def get_num_blocks_to_allocate(
@@ -315,8 +304,6 @@ def make_duplexio_kv_cache_spec(
             "DuplexIO paged FlashAttention needs a KV block size divisible by 16; "
             f"got {base.block_size}. Pin `block_size` in the deployment config."
         )
-    if audio_window_frames < 0:
-        raise ValueError("DuplexIO audio attention window must be non-negative")
     return DuplexIOKVCacheSpec(
         block_size=base.block_size,
         num_kv_heads=base.num_kv_heads,

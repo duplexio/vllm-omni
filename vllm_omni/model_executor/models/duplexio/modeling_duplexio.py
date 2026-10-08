@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """DuplexIO, a full-duplex speech model that listens and speaks in the same 80 ms frames."""
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLMBase
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
-from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import TokenizerLike, cached_tokenizer_from_config
 from vllm.v1.sample.metadata import SamplingMetadata
 
@@ -56,6 +55,7 @@ from vllm_omni.model_executor.models.duplexio.frame_layout import (
     TEXT_STREAM_NAMES,
     TOOL_CALL_CELL,
 )
+from vllm_omni.model_executor.models.duplexio.frame_output import frame_row
 from vllm_omni.model_executor.models.duplexio.pocket_mimi import LATENT_DIM, ContinuousMimiState, PocketMimi
 from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
     DuplexIOQwenModel,
@@ -104,7 +104,7 @@ class TextSamplingResult:
 class SamplingInputs:
     """A batch's per-row policy and tool state, uploaded before the draws."""
 
-    parameters: Tensor  # [rows, SAMPLING_PARAMETERS], see text_sampling.
+    parameters: Tensor  # [rows, columns], with the columns text_sampling names.
     tool_bitmask: Tensor
     top_k: int | None
     support_width: int
@@ -381,9 +381,6 @@ class DuplexIOForConditionalGeneration(
         )
         self.frame_input_graphs: dict[int, FrameInputGraph] = {}
         self.sampling_graphs: dict[tuple[int, int | None], FrameInputGraph] = {}
-        # Addressing and replay inputs are PackedRows, which the runner holds by
-        # reference; nothing needs a per-request device copy.
-        self.gpu_resident_buffer_keys: set[tuple[str, str]] = set()
         self.pad_token_id = config.pad_token_id
         self.silence_token_id = config.silence_token_id
 
@@ -398,7 +395,7 @@ class DuplexIOForConditionalGeneration(
         adapter_hidden_size = config.audio_adapter_config.get("hidden_size") or hidden_size
         self.user_asr = FastConformerEncoder.from_checkpoint(
             config.user_asr_config, vllm_config.model_config.model, revision=vllm_config.model_config.revision,
-            use_cuda_graph=self.full_cudagraph_enabled,
+            use_cuda_graph=self.full_cudagraph_enabled, max_rows=vllm_config.scheduler_config.max_num_seqs,
         )
         self.user_audio_resampler = Resample(SAMPLE_RATE, ASR_SAMPLE_RATE, dtype=torch.float32).to(
             device=self.llm.channel_emb.device,
@@ -428,7 +425,6 @@ class DuplexIOForConditionalGeneration(
         self.agent_emit_head = nn.Linear(NUM_CELLS * hidden_size, 1)
         self.tool_call_emit_head = nn.Linear(NUM_CELLS * hidden_size, 1)
         self.logits_processor = LogitsProcessor(self.text_config.vocab_size)
-        self.make_empty_intermediate_tensors = self.llm.base_model.model.make_empty_intermediate_tensors
         self._forced_next_token_ids: list[int] | Tensor | None = None
         self.tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
         agent_suppressed, tool_suppressed = text_suppression_ids(self.tokenizer, self.silence_token_id)
@@ -518,8 +514,8 @@ class DuplexIOForConditionalGeneration(
         frame_end = frame_start + frame_count
         assert 0 <= frame_start < frame_end <= append_frames
         prefix = duplex["duplexio_prefix"]
-        state = info.get("duplexio_model_state")
-        if not isinstance(state, DuplexIORequestState):
+        state = info.get("duplexio_model_state")  # Absent until the request's first append.
+        if state is None:
             if not prefix:
                 raise ValueError("DuplexIO requires the voice and system prefix before live input")
             state = self._new_request_state(duplex["runtime_config"], device)
@@ -536,7 +532,7 @@ class DuplexIOForConditionalGeneration(
         if prefix and state.frames_seen != frame_start:
             raise ValueError("DuplexIO prefix must lead the request exactly once")
         live_row = prefix_count - frame_start if frame_start <= prefix_count < frame_end else None
-        given = duplex.get("duplexio_given_frame")
+        given = duplex["duplexio_given_frame"]
         if live_row is not None:
             if given is None:
                 state.history_open = False
@@ -576,7 +572,7 @@ class DuplexIOForConditionalGeneration(
         # Agent audio of the given live frames, heard instead of the last prediction.
         given = {
             index: info["duplex"]["duplexio_given_frame"]["agent_pcm"] for index, (_, info) in enumerate(requests)
-            if prepared[index].live_row is not None and info["duplex"].get("duplexio_given_frame") is not None
+            if prepared[index].live_row is not None and info["duplex"]["duplexio_given_frame"] is not None
         }
         # The user encoder reads only this step's audio and its own caches, so on
         # CUDA it runs on a side stream, overlapping the previous step's backbone.
@@ -706,7 +702,7 @@ class DuplexIOForConditionalGeneration(
                 elif frame < item.prefix_count:
                     text.append((state.system_token_ids[frame - item.prompt_count], *quiet))
                 elif frame == item.prefix_count:
-                    given = duplex.get("duplexio_given_frame")
+                    given = duplex["duplexio_given_frame"]
                     if given is None:
                         text.append((silence, *state.text_input_ids[1:]))
                     else:
@@ -782,7 +778,7 @@ class DuplexIOForConditionalGeneration(
         default dtype that serving runs with (weight loading changes it, which
         compiled code guards on). Sampling graphs also key on the batch's top-k,
         which only requests know; they are captured here for the default
-        sampling policy, which the demo page and unconfigured sessions use.
+        sampling policy, which unconfigured sessions use.
         """
         if not self.full_cudagraph_enabled or self.frame_input_graphs:
             return
@@ -810,11 +806,7 @@ class DuplexIOForConditionalGeneration(
         """Tensor-only packed projections and frame construction, shared by all requests."""
         # Split here, so eager and captured calls hand frame_inputs the same strides.
         text_ids, metadata = packed[:, :len(TEXT_STREAM_NAMES)], packed[:, len(TEXT_STREAM_NAMES):]
-        with torch.autocast(
-            device_type=text_ids.device.type,
-            dtype=self.vllm_config.model_config.dtype,
-            enabled=text_ids.is_cuda and self.vllm_config.model_config.dtype != torch.float32,
-        ):
+        with self.autocast(text_ids):
             user_hidden = self.user_audio_input_adapter(user_features)
             agent_hidden = self.agent_audio_input_adapter(agent_latents)
         text_hidden = self.llm.base_model.model.embed_input_ids(text_ids.flatten()).view(
@@ -832,84 +824,33 @@ class DuplexIOForConditionalGeneration(
         self,
         input_ids: Tensor,
         positions: Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
+        intermediate_tensors: None = None,
         inputs_embeds: Tensor | None = None,
-        model_intermediate_buffer: list[dict[str, Any]] | None = None,
-        request_token_spans: list[tuple[int, int]] | None = None,
-        request_sample_eligible: list[bool] | None = None,
         **kwargs: object,
-    ) -> Tensor | IntermediateTensors:
-        del input_ids, request_token_spans, request_sample_eligible, kwargs
-        if inputs_embeds is None:
-            raise ValueError("DuplexIO requires precomputed frame embeddings")
-        del model_intermediate_buffer
+    ) -> Tensor:
+        """Run the backbone over the frame embeddings ``preprocess`` built; the frame holds the addressing."""
+        del input_ids, positions, intermediate_tensors, kwargs
+        assert inputs_embeds is not None
         with torch.profiler.record_function("duplexio.backbone"):
             return self.llm.base_model.model(
                 positions=self.frame.positions[:inputs_embeds.shape[0]] // NUM_CELLS,
                 key_active=self.frame.key_active[: inputs_embeds.shape[0]],
-                intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
             )
 
-    def make_omni_output(
-        self,
-        model_output: Tensor | IntermediateTensors,
-        **kwargs: Any,
-    ) -> OmniOutput | IntermediateTensors:
+    def make_omni_output(self, model_output: Tensor, **kwargs: Any) -> OmniOutput:
         """Sample the three text streams and audio outside the model graph."""
-        if isinstance(model_output, IntermediateTensors):
-            return model_output
-
         hidden_states = model_output
-        raw_infos = kwargs.get("model_intermediate_buffer")
-        if raw_infos is None:
-            infos: list[dict[str, Any]] = []
-        else:
-            assert isinstance(raw_infos, list)
-            infos = cast(list[dict[str, Any]], raw_infos)
-        if not infos:
+        infos: list[dict[str, Any]] = kwargs["model_intermediate_buffer"]
+        if not infos:  # Warm-up and profiling runs carry no requests.
             self._forced_next_token_ids = None
-            return OmniOutput(
-                text_hidden_states=hidden_states,
-                multimodal_outputs={},
-            )
-
-        raw_request_token_spans = kwargs.get("request_token_spans")
-        if not isinstance(raw_request_token_spans, list):
-            raise RuntimeError("DuplexIO live execution requires request_token_spans")
-        request_token_spans = cast(
-            list[tuple[int, int]],
-            raw_request_token_spans,
+            return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs={})
+        batch = self.sample_frames(
+            hidden_states, kwargs["request_token_spans"], infos, kwargs["request_sample_eligible"],
         )
-        if len(request_token_spans) != len(infos):
-            raise RuntimeError(f"DuplexIO received {len(request_token_spans)} spans for {len(infos)} requests")
-        raw_request_sample_eligible = kwargs.get("request_sample_eligible")
-        if not isinstance(raw_request_sample_eligible, list):
-            raise RuntimeError("DuplexIO live execution requires request_sample_eligible")
-        request_sample_eligible = cast(
-            list[bool],
-            raw_request_sample_eligible,
-        )
-        if len(request_sample_eligible) != len(infos):
-            raise RuntimeError(
-                f"DuplexIO received {len(request_sample_eligible)} sampling flags for {len(infos)} requests"
-            )
-
-        batch = self.sample_frames(hidden_states, request_token_spans, infos, request_sample_eligible)
-        states: list[DuplexIORequestState] = []
-        for request_index, info in enumerate(infos):
-            state = info.get("duplexio_working_state")
-            if not isinstance(state, DuplexIORequestState):
-                raise RuntimeError(f"DuplexIO request {request_index} is missing working state")
-            duplex = info.get("duplex", {})
-            if not isinstance(duplex, Mapping):
-                raise RuntimeError(f"DuplexIO request {request_index} is missing duplex metadata")
-            start, end = request_token_spans[request_index]
-            if end - start < NUM_CELLS or (end - start) % NUM_CELLS:
-                raise ValueError(f"DuplexIO request span must contain complete frames, got ({start}, {end})")
-            states.append(state)
+        states: list[DuplexIORequestState] = [info["duplexio_working_state"] for info in infos]
         rows = {} if batch is None else {index: row for row, index in enumerate(batch.indices)}
-        decode_rows = [row for index, row in rows.items() if infos[index]["duplex"].get("decode_audio", True)]
+        decode_rows = [row for index, row in rows.items() if infos[index]["duplex"]["decode_audio"]]
         predicted_audio = [] if batch is None else batch.audio.unbind(0)
         waveforms = self.decode_agent_audio_batch(
             [predicted_audio[row] for row in decode_rows],
@@ -933,7 +874,7 @@ class DuplexIOForConditionalGeneration(
                 sampled["predictor_hiddens"] = [batch.hiddens.detach()]
         replay_names = ("text_ids", "user_features", "agent_audio", "audio_mask", "prompt_frames")
         empty = torch.empty(0, dtype=hidden_states.dtype)
-        replays = [info.get("duplexio_replay", {}) for info in infos]
+        replays = [info["duplexio_replay"] for info in infos]
         packed_replay = shared_packed(replays, contiguous=False)
         if packed_replay is None:
             replay = {name: [value.get(name, empty) for value in replays] for name in replay_names}
@@ -1051,19 +992,28 @@ class DuplexIOForConditionalGeneration(
                 if tool_call is not None:
                     state.tool_call_sequence += 1
                 chunk["tool_call_json"].append(serialize_tool_call(tool_call, state.tool_call_sequence))
-            # Order follows frame_output.FRAME_FIELDS.
-            frames.append([
-                duplex.get("epoch", 0), duplex.get("turn_id", 0),
-                duplex["duplexio_prefix"], bool(duplex["duplexio_tool_token_ids"]), duplex["duplexio_tool_generation"],
-                duplex.get("duplexio_given_frame") is not None,
-                bool(duplex.get("final", False)), predicting,
-                predicting and agent_token_id == silence and tool_token_id == silence,
-                tool_call is not None, row in drawn_tool_emits, predicting and user_token_id != silence,
-                user_token_id, agent_token_id, tool_token_id, policy_version, SAMPLE_RATE,
-            ])
+            frames.append(frame_row(
+                duplex_epoch=duplex["epoch"],
+                duplex_turn_id=duplex["turn_id"],
+                prefix=duplex["duplexio_prefix"],
+                tool_result=bool(duplex["duplexio_tool_token_ids"]),
+                tool_generation=duplex["duplexio_tool_generation"],
+                given=duplex["duplexio_given_frame"] is not None,
+                end_of_turn=duplex["final"],
+                predicted=predicting,
+                model_listen=predicting and agent_token_id == silence and tool_token_id == silence,
+                tool_call_complete=tool_call is not None,
+                tool_emit_sampled=row in drawn_tool_emits,
+                user_emit=predicting and user_token_id != silence,
+                user_token_id=user_token_id,
+                agent_token_id=agent_token_id,
+                tool_call_token_id=tool_token_id,
+                policy_version=policy_version,
+                sample_rate_hz=SAMPLE_RATE,
+            ))
 
         replay: dict[str, list[Tensor]] = {}
-        if any(info.get("duplexio_replay") for info in infos):
+        if any(info["duplexio_replay"] for info in infos):
             replay = {f"replay_{name}": values for name, values in host["replay"].items()}
         return {
             "audio": audio_outputs,
@@ -1220,11 +1170,11 @@ class DuplexIOForConditionalGeneration(
         infos: list[dict[str, Any]],
         host_ids: list[list[int]],
         tool_starts: list[bool],
-    ) -> list[int]:
+    ) -> None:
         """Start sampled calls and advance constraints once the draws reach the host.
 
         Host-only: a started call's first token was drawn with the batch. Fills
-        ``text.tool_calls`` and returns the rows that started a call.
+        ``text.tool_calls``.
         """
         started = [row for row in text.pending_tool_starts if tool_starts[row]]
         for row in started:
@@ -1233,7 +1183,6 @@ class DuplexIOForConditionalGeneration(
             constraint = infos[row]["duplexio_working_state"].tool_call_constraint
             if constraint.accept(host_ids[row][2]):
                 text.tool_calls[row] = self.tool_call_compiler.take_completed_call(constraint)
-        return started
 
     def resolve_sampling(self, sampling: Mapping[str, Any]) -> RequestSampling:
         """Validate a session's sampling once; agent text and tool calls share the agent policy."""
@@ -1402,17 +1351,15 @@ class DuplexIOForConditionalGeneration(
 
 
 def text_suppression_ids(tokenizer: TokenizerLike, silence_token_id: int) -> tuple[list[int], list[int]]:
-    """Derive immutable vocabulary policy for the agent and tool heads."""
-    tool_ids = set(tokenizer.all_special_ids) | {silence_token_id}
-    for text in ("<|im_start|>", "<|im_end|>", "<think>", "</think>"):
-        encoded = tokenizer.encode(text, add_special_tokens=False)
-        if len(encoded) == 1:
-            tool_ids.add(encoded[0])
-    agent_ids = tool_ids.copy()
-    for text in ("<tool_call>", "</tool_call>"):
-        encoded = tokenizer.encode(text, add_special_tokens=False)
-        if len(encoded) == 1:
-            agent_ids.add(encoded[0])
+    """The ids the agent and tool heads never sample: chat markup, and for the agent tool-call markup."""
+
+    def token_id(text: str) -> int:
+        (encoded,) = tokenizer.encode(text, add_special_tokens=False)
+        return encoded
+
+    tool_ids = {*tokenizer.all_special_ids, silence_token_id}
+    tool_ids |= {token_id(text) for text in ("<|im_start|>", "<|im_end|>", "<think>", "</think>")}
+    agent_ids = tool_ids | {token_id(text) for text in ("<tool_call>", "</tool_call>")}
     return sorted(agent_ids), sorted(tool_ids)
 
 

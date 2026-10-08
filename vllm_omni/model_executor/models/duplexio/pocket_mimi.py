@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright (c) Kyutai, all rights reserved.
 # See PocketTTSLicense.txt in this directory.
 """Inference-only Pocket Mimi, with explicit functional stream state."""
@@ -278,21 +280,13 @@ class SEANetDecoder(nn.Module):
         return (x, SEANetState(layer_states=layer_states))
 
 
-def apply_rope(
-    q: Tensor,
-    k: Tensor,
-    offset: int = 0,
-    max_period: float = 10000.0,
-    positions: Tensor | None = None,
-) -> tuple[Tensor, Tensor]:
+def apply_rope(q: Tensor, k: Tensor, positions: Tensor, max_period: float = 10000.0) -> tuple[Tensor, Tensor]:
     b, t, h, d = q.shape
     assert (b, t, d) == (k.shape[0], k.shape[1], k.shape[3])
     freqs = torch.exp(
         torch.arange(d // 2, device=q.device, dtype=torch.float32)
         * (-math.log(max_period) * 2 / d)
     )
-    if positions is None:
-        positions = torch.arange(t, device=q.device, dtype=torch.float32) + offset
     ts = positions[..., None, None]
     q = q.view(b, t, h, d // 2, 2)
     k = k.view(b, t, k.shape[2], d // 2, 2)
@@ -357,7 +351,7 @@ class StreamingMultiheadAttention(nn.Module):
             .unbind(dim=2)
         )
         positions = state.seq_len[:, None] + torch.arange(t, device=x.device)
-        q, k = apply_rope(q, k, positions=positions)
+        q, k = apply_rope(q, k, positions)
         k_cache = torch.cat([state.k, k], dim=1)
         v_cache = torch.cat([state.v, v], dim=1)
         pos_q = torch.arange(t, device=x.device)

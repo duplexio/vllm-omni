@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Constrained sampling and semantic materialization for tool calls."""
 
@@ -131,9 +131,9 @@ def parameter_value_grammar(schema: Mapping[str, Any]) -> xgr.Grammar:
                 if isinstance(alternative, Mapping)
             )
         )
-    schema_type = schema.get("type", "string")
     if "type" not in schema:
         raise ValueError("DuplexIO tool parameters must declare a JSON Schema type")
+    schema_type = schema["type"]
     if isinstance(schema_type, list):
         return xgr.Grammar.union(
             *(
@@ -152,20 +152,13 @@ def parameter_value_grammar(schema: Mapping[str, Any]) -> xgr.Grammar:
 
 
 def tool_function_grammar(tool: Mapping[str, Any]) -> xgr.Grammar:
-    function = tool.get("function")
-    if not isinstance(function, Mapping):
-        raise ValueError("DuplexIO tools must contain a function object")
-    name = function.get("name")
-    if not isinstance(name, str) or not name:
-        raise ValueError("DuplexIO tool names must be non-empty strings")
-    if any(character in name for character in "<>=\n\r"):
-        raise ValueError(f"DuplexIO tool name contains an XML delimiter: {name!r}")
-
-    parameters = function.get("parameters") or {
-        "type": "object",
-        "properties": {},
-    }
-    if not isinstance(parameters, Mapping) or parameters.get("type", "object") != "object":
+    """The grammar of one call to a tool, as the session normalized it."""
+    function = tool["function"]
+    name = function["name"]
+    if not name or any(character in name for character in "<>=\n\r"):
+        raise ValueError(f"DuplexIO tool names must be non-empty and free of XML delimiters: {name!r}")
+    parameters = function["parameters"]
+    if parameters.get("type", "object") != "object":
         raise ValueError(f"DuplexIO tool {name!r} parameters must be an object schema")
     validator_for(parameters).check_schema(dict(parameters))
     unsupported_parameter_keys = {
@@ -219,7 +212,7 @@ def selected_tools(
     if mode != "named":
         return list(tools)
     name = tool_choice.get("name")
-    selected = [tool for tool in tools if tool.get("function", {}).get("name") == name]
+    selected = [tool for tool in tools if tool["function"]["name"] == name]
     if not selected:
         raise ValueError(f"DuplexIO tool_choice selected unknown function {name!r}")
     return selected
@@ -277,21 +270,8 @@ class ToolCallCapture:
                 prefix = "<function="
                 assert self.buffer.startswith(prefix)
                 self.function_name = self.buffer[len(prefix) : header_end]
-                tool = next(
-                    tool
-                    for tool in self.tools
-                    if tool.get("function", {}).get("name") == self.function_name
-                )
-                function = tool["function"]
-                assert isinstance(function, Mapping)
-                parameters = function.get("parameters") or {
-                    "type": "object",
-                    "properties": {},
-                }
-                assert isinstance(parameters, Mapping)
-                properties = parameters.get("properties", {})
-                assert isinstance(properties, Mapping)
-                self.properties = properties
+                tool = next(tool for tool in self.tools if tool["function"]["name"] == self.function_name)
+                self.properties = tool["function"]["parameters"].get("properties", {})
                 self.buffer = self.buffer[header_end + 2 :]
                 self.stage = "parameter"
                 continue
@@ -457,7 +437,6 @@ def token_bitmasks(
 
 class ToolCallConstraintCompiler:
     def __init__(self, tokenizer: PreTrainedTokenizerBase, vocab_size: int) -> None:
-        self.tokenizer = tokenizer
         tokenizer_info = xgr.TokenizerInfo.from_huggingface(
             tokenizer,
             vocab_size=vocab_size,

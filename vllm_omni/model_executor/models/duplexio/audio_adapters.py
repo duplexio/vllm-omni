@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Inference-only MLP audio adapters used by DuplexIO."""
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from torch import Tensor
 
 
 def audio_adapter_hidden(gate_up: Tensor) -> Tensor:
-    """Keep gate and normalization identical in train/decode."""
+    """SwiGLU, then an FP32 RMS norm."""
     gate, value = gate_up.chunk(2, dim=-1)
     hidden = F.silu(gate) * value
     # Normalize in FP32 with a row-local reduction independent of batch size.
@@ -27,11 +27,7 @@ def audio_adapter(audio_features: Tensor, gate_up_weight: Tensor, output_weight:
 
 
 class AudioInputAdapter(nn.Module):
-    """Map one frame of audio features into Qwen.
-
-    Both audio cells use it: the agent's voice comes from the pinned prompt in
-    its own cell, so nothing is injected here.
-    """
+    """Map one frame of audio features into Qwen; each audio cell has its own."""
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int) -> None:
         super().__init__()

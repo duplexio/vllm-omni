@@ -120,6 +120,7 @@ def paged_backend(
     layer.frame = frame
     vllm_config = SimpleNamespace(
         compilation_config=SimpleNamespace(static_forward_context={"attn": layer}),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=frame.cell.shape[0]),
     )
     builder = DuplexIOFlashAttentionMetadataBuilder(spec, ["attn"], vllm_config, device)
     impl = DuplexIOFlashAttentionImpl(heads, spec.head_size, spec.head_size**-0.5, spec.num_kv_heads, None, None, "auto")

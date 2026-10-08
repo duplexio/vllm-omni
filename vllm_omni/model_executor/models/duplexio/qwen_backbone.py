@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3.5 backbone layers over DuplexIO's six-cell frames."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
-from itertools import accumulate, islice
+from itertools import accumulate
 from typing import Any, cast
 
 import torch
@@ -16,9 +16,8 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated
 from vllm._custom_ops import reshape_and_cache_flash
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config import VllmConfig
 from vllm.distributed import (
-    get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -36,14 +35,10 @@ from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
-    PPMissingLayer,
     WeightsMapper,
     extract_layer_index,
-    make_empty_intermediate_tensors_factory,
-    make_layers,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backend import (
@@ -252,11 +247,11 @@ class DuplexIOFlashAttentionMetadataBuilder(AttentionMetadataBuilder[DuplexIOAtt
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         if kv_cache_spec.sliding_window is not None:
             raise ValueError("DuplexIO applies its own audio window, not a sliding window")
-        layers = get_layers_from_vllm_config(vllm_config, Attention, layer_names)
-        frame = next(iter(layers.values())).frame
         # vLLM settles a hybrid model's block size only after building it, so
         # the cache spec, not the model, owns the layout.
-        self.reads = DuplexIORowReads(kv_cache_spec.layout, frame.cell.shape[0], device)
+        self.reads = DuplexIORowReads(
+            kv_cache_spec.layout, vllm_config.scheduler_config.max_num_batched_tokens, device,
+        )
 
     def build(
         self,
@@ -519,12 +514,15 @@ class DuplexIOGDNAttentionBackend(GDNAttentionBackend):
 
 
 class DuplexIOPagedAttention(Attention):
-    """Attention layer that declares DuplexIO's cache layout."""
+    """Attention layer that declares DuplexIO's cache layout; its impl addresses slots from ``frame``."""
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+    def __init__(self, *args: Any, frame: DuplexIOFrameMetadata, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.frame = frame
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         base = super().get_kv_cache_spec(vllm_config)
-        if not isinstance(base, FullAttentionSpec):
-            return base
+        assert isinstance(base, FullAttentionSpec)
         config = vllm_config.model_config.hf_config
         return make_duplexio_kv_cache_spec(
             base,
@@ -564,14 +562,13 @@ class DuplexIOQwenAttention(nn.Module):
         )
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.attn_output_gate = getattr(config, "attn_output_gate", True)
-
+        # Qwen3.5 attention is gated and bias-free: queries carry their gates.
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
-            self.total_num_heads * (1 + self.attn_output_gate),
+            self.total_num_heads * 2,
             self.total_num_kv_heads,
-            bias=getattr(config, "qkv_bias", False),
+            bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
@@ -591,9 +588,8 @@ class DuplexIOQwenAttention(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.attn",
             attn_backend=DuplexIOFlashAttentionBackend,
+            frame=frame,
         )
-        # The impl addresses cache slots from the frame.
-        self.attn.frame = frame
         self.q_norm = DuplexIORMSNorm(
             self.head_dim, eps=config.rms_norm_eps, dtype=vllm_config.model_config.dtype,
         )
@@ -607,25 +603,11 @@ class DuplexIOQwenAttention(nn.Module):
         cos_sin_cache: Tensor,
         hidden_states: Tensor,
     ) -> Tensor:
-        qkv = F.linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
-        if self.attn_output_gate:
-            q_gate, key, value = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size],
-                dim=-1,
-            )
-            query, gate = torch.chunk(
-                q_gate.view(-1, self.num_heads, 2 * self.head_dim),
-                2,
-                dim=-1,
-            )
-            query = query.reshape(-1, self.q_size)
-            gate = gate.reshape(-1, self.q_size)
-        else:
-            query, key, value = qkv.split(
-                [self.q_size, self.kv_size, self.kv_size],
-                dim=-1,
-            )
-            gate = None
+        qkv = F.linear(hidden_states, self.qkv_proj.weight)
+        q_gate, key, value = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        query, gate = torch.chunk(q_gate.view(-1, self.num_heads, 2 * self.head_dim), 2, dim=-1)
+        query = query.reshape(-1, self.q_size)
+        gate = gate.reshape(-1, self.q_size)
 
         query = self.q_norm(
             query.view(-1, self.num_heads, self.head_dim)
@@ -641,8 +623,7 @@ class DuplexIOQwenAttention(nn.Module):
             key,
             value.view(-1, self.num_kv_heads, self.head_dim),
         )
-        if gate is not None:
-            attended = call_compiled_function(gated_attention_output, attended, gate)
+        attended = call_compiled_function(gated_attention_output, attended, gate)
         output = F.linear(attended, self.o_proj.weight)
         if get_tensor_model_parallel_world_size() > 1:
             output = tensor_model_parallel_all_reduce(output)
@@ -835,13 +816,8 @@ class DuplexIOQwenDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_text_config
-        if config.model_type != "qwen3_5_text":
-            raise ValueError(
-                "DuplexIO requires the dense qwen3_5_text backbone"
-            )
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
-        self.use_attn_reduce_scatter_for_moe = False
         if layer_type == "linear_attention":
             self.linear_attn = DuplexIOQwenGatedDeltaNetAttention(
                 config,
@@ -874,14 +850,6 @@ class DuplexIOQwenDecoderLayer(nn.Module):
             eps=config.rms_norm_eps,
             dtype=vllm_config.model_config.dtype,
         )
-        self.layer_scale = getattr(config, "layer_scale", False)
-        if self.layer_scale:
-            self.attn_layer_scale = nn.Parameter(
-                torch.zeros(1, 1, config.hidden_size)
-            )
-            self.ffn_layer_scale = nn.Parameter(
-                torch.zeros(1, 1, config.hidden_size)
-            )
 
     def forward(
         self,
@@ -892,7 +860,7 @@ class DuplexIOQwenDecoderLayer(nn.Module):
         key_active: Tensor,
     ) -> tuple[Tensor, Tensor]:
         if residual is not None:
-            # Round the previous MLP residual sum to the activation dtype before the next norm, as the checkpoint was trained.
+            # Round the previous MLP residual sum to the activation dtype before the next norm.
             hidden_states = hidden_states + residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -907,19 +875,11 @@ class DuplexIOQwenDecoderLayer(nn.Module):
                 cos_sin_cache,
                 hidden_states,
             )
-        if self.layer_scale:
-            hidden_states = hidden_states * (
-                self.attn_layer_scale[0].to(hidden_states.dtype) + 1
-            )
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states,
             residual,
         )
         hidden_states = self.mlp(hidden_states)
-        if self.layer_scale:
-            hidden_states = hidden_states * (
-                self.ffn_layer_scale[0].to(hidden_states.dtype) + 1
-            )
         return hidden_states, residual
 
 
@@ -927,7 +887,6 @@ class DuplexIOQwenDecoderLayer(nn.Module):
     dynamic_arg_dims={
         "positions": 0,
         "key_active": 0,
-        "intermediate_tensors": 0,
         "inputs_embeds": 0,
     }
 )
@@ -968,24 +927,10 @@ class DuplexIOQwenModel(nn.Module):
                 prefix,
             )
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
-            get_layer,
-            prefix=f"{prefix}.layers",
+        self.layers = nn.ModuleList(
+            get_layer(f"{prefix}.layers.{index}") for index in range(config.num_hidden_layers)
         )
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual"],
-                config.hidden_size,
-            )
-        )
-        self.norm = (
-            DuplexIORMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps, dtype=vllm_config.model_config.dtype,
-            )
-            if get_pp_group().is_last_rank
-            else PPMissingLayer()
-        )
+        self.norm = DuplexIORMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=vllm_config.model_config.dtype)
 
     def embed_input_ids(self, input_ids: Tensor) -> Tensor:
         return self.embed_tokens(input_ids)
@@ -994,29 +939,16 @@ class DuplexIOQwenModel(nn.Module):
         self,
         positions: Tensor,
         key_active: Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: Tensor | None = None,
-    ) -> Tensor | IntermediateTensors:
-        if get_pp_group().is_first_rank:
-            assert inputs_embeds is not None
-            hidden_states = inputs_embeds
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        inputs_embeds: Tensor,
+    ) -> Tensor:
+        hidden_states, residual = inputs_embeds, None
+        for layer in self.layers:
             hidden_states, residual = layer(
                 positions=positions,
                 cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 hidden_states=hidden_states,
                 residual=residual,
                 key_active=key_active,
-            )
-        assert residual is not None
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
             )
         return self.norm(hidden_states + residual)
 

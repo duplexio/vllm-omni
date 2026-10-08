@@ -316,10 +316,13 @@ def test_token_heads_load_without_weight_name_mapping() -> None:
 def test_only_the_tool_stream_may_emit_tool_call_markers() -> None:
     encoded = {
         "<|im_start|>": [11], "<|im_end|>": [12],
-        "<think>": [14, 15], "</think>": [16, 17],
+        "<think>": [14], "</think>": [15],
         "<tool_call>": [18], "</tool_call>": [19],
     }
     tokenizer = SimpleNamespace(all_special_ids=[11, 12], encode=lambda text, **_: encoded[text])
     agent_ids, tool_ids = text_suppression_ids(tokenizer, 13)
-    assert agent_ids == [11, 12, 13, 18, 19]
-    assert tool_ids == [11, 12, 13]
+    assert agent_ids == [11, 12, 13, 14, 15, 18, 19]
+    assert tool_ids == [11, 12, 13, 14, 15]
+    encoded["<think>"] = [14, 16]
+    with pytest.raises(ValueError):
+        text_suppression_ids(tokenizer, 13)

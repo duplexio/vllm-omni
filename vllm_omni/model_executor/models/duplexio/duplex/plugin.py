@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """DuplexIO full-duplex model plugin: engine policy and session policy in one class.
 
 Every append is one 80 ms client (or silence) frame. The first append of an
@@ -32,7 +32,6 @@ from vllm_omni.engine.duplex.plugin import (
 )
 from vllm_omni.model_executor.common.duplex.payload import decode_pcm_f32le_payload
 from vllm_omni.model_executor.common.duplex.pcm_buffer import FixedFramePcmAppendBuffer
-from vllm_omni.model_executor.models.duplexio.configuration_duplexio import INITIAL_AGENT_PREFIX, INITIAL_USER_PREFIX
 from vllm_omni.model_executor.models.duplexio.duplex.data_plane import DuplexIODataPlane
 from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_SIZE, NUM_CELLS, SAMPLE_RATE
 from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
@@ -45,6 +44,9 @@ if TYPE_CHECKING:
 CHUNK_PERIOD_MS = 80
 #: Tool results the session may queue before the model has taken the oldest.
 MAX_PENDING_TOOL_RESULTS = 8
+
+# The chat turn the system prompt opens, by which role speaks first.
+INITIAL_PREFIXES = {"agent": "<|im_start|>assistant\n", "user": "<|im_start|>user\n"}
 
 PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
     {
@@ -159,9 +161,7 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
         del sampling_params
         pcm = decode_pcm_f32le_payload(payload, sample_rate_hz=SAMPLE_RATE, exact_samples=FRAME_SIZE, model="DuplexIO")
         assert isinstance(payload, Mapping)
-        pending = runtime_config.get("duplexio_tool_results", [])
-        assert isinstance(pending, list)
-        results = self.data_plane.take_tool_results(request_id, pending)
+        results = self.data_plane.take_tool_results(request_id, runtime_config["duplexio_tool_results"])
         prompt_token_ids, fields = append_fields(
             runtime_config,
             pcm,
@@ -264,7 +264,7 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
         system_prompt = config.instructions or hf_config.default_system_prompt
         if tools:
             system_prompt = render_tool_system_prompt(tokenizer, system_prompt, tools)
-        initial_prefix = INITIAL_AGENT_PREFIX if start_role == "agent" else INITIAL_USER_PREFIX
+        initial_prefix = INITIAL_PREFIXES[start_role]
         system_token_ids = [
             *tokenizer.encode(system_prompt, add_special_tokens=False),
             *tokenizer.encode(initial_prefix, add_special_tokens=False),
@@ -279,6 +279,8 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
             "duplexio_scheduler_token_id": hf_config.pad_token_id,
             "duplexio_tools": tools,
             "duplexio_tool_choice": tool_choice,
+            "duplexio_tool_generation": 0,
+            "duplexio_tool_results": [],
         }
 
     def runtime_config_for_update(
@@ -344,16 +346,13 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
             )
         assert self.tokenizer is not None
         token_ids = self.tokenizer.encode(f"<tool_response>\n{output}\n</tool_response>", add_special_tokens=False)
-        results = current.get("duplexio_tool_results", [])
-        assert isinstance(results, list)
+        results = current["duplexio_tool_results"]
         if len(results) >= MAX_PENDING_TOOL_RESULTS:
             raise DuplexRuntimeConfigError(
                 f"DuplexIO has {MAX_PENDING_TOOL_RESULTS} tool results the model has not consumed yet",
                 code="function_response_backlog",
             )
-        generation = current.get("duplexio_tool_generation", 0)
-        assert isinstance(generation, int)
-        generation += 1
+        generation = current["duplexio_tool_generation"] + 1
         return {
             **current,
             "duplexio_tool_generation": generation,
@@ -366,8 +365,7 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
         output_metadata: Mapping[str, object],
     ) -> dict[str, object] | None:
         """Retire tool results once the worker has fed them."""
-        results = current.get("duplexio_tool_results", [])
-        assert isinstance(results, list)
+        results = current["duplexio_tool_results"]
         if not results or "frame" not in output_metadata:
             return None
         consumed = frame_fields(output_metadata)["tool_generation"]

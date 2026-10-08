@@ -60,7 +60,10 @@ def feedback_model():
 
 
 def runtime():
-    return {"duplexio_record_inputs": True, "duplexio_scheduler_token_id": 1}
+    return {
+        "duplexio_record_inputs": True, "duplexio_scheduler_token_id": 1,
+        "duplexio_tool_generation": 0, "duplexio_tool_results": [],
+    }
 
 
 def feedback_state(model):
@@ -96,6 +99,9 @@ def test_feedback_actions_and_versions_follow_a_weight_update():
                 "duplexio_prefix": prefix,
                 "duplexio_tool_token_ids": [],
                 "duplexio_tool_generation": 0,
+                "duplexio_given_frame": None,
+                "epoch": 0,
+                "turn_id": 0,
             },
         }
         _, _, updates = model.preprocess(torch.zeros(frames * 6, dtype=torch.long), None, **info)
@@ -176,6 +182,7 @@ def test_chunked_appends_record_all_rows_and_sample_only_at_their_end():
                 "duplex_prompt_len": prompt_len,
                 "duplex": {"frame_count": 6, "duplexio_prefix": prefix, "decode_audio": False,
                            "duplexio_tool_token_ids": [] if prefix else [6, 7, 8, 9, 10], "duplexio_tool_generation": 0,
+                           "duplexio_given_frame": None, "epoch": 0, "turn_id": 0, "final": False,
                            "pcm": torch.zeros(1920).numpy().tobytes(), "runtime_config": runtime()},
             }
             keys = state.persistent_keys

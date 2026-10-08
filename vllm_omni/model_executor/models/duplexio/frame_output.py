@@ -1,20 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Packed per-frame DuplexIO outputs.
 
 Each request's per-frame scalars travel as one int64 ``frame`` tensor and, when
-the frame predicted, one float32 ``frame_logprobs`` tensor. Every tensor in an
-output is encoded, sent, decoded and copied separately, so thirty scalar
-tensors per request made the driver's host work scale with fields, not bytes.
+the frame predicted, one float32 ``frame_logprobs`` tensor with the columns
+``FRAME_LOGPROBS``. Every tensor in an output is encoded, sent, decoded and copied
+separately, so thirty scalar tensors per request made the driver's host work
+scale with fields, not bytes.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
-
-import torch
-from torch import Tensor
 
 FRAME_FIELDS = (
     "duplex_epoch",
@@ -42,6 +40,7 @@ FRAME_FLAGS = frozenset({
 })
 # ``tool_emit_sampled`` marks frames whose tool emit was drawn; inside a call or
 # without a grammar it is forced, and its logprob is only the raw head's score.
+
 # Columns of ``frame_logprobs``.
 FRAME_LOGPROBS = (
     "agent_emit_logprob", "agent_token_logprob", "tool_emit_logprob", "tool_token_logprob",
@@ -58,9 +57,8 @@ def frame_fields(output: Mapping[str, Any]) -> dict[str, int | bool]:
     }
 
 
-def pack_frame(**fields: int | bool) -> Tensor:
-    """Build a ``frame`` from named fields; unnamed fields are zero."""
-    unknown = fields.keys() - FRAME_INDEX.keys()
-    if unknown:
-        raise KeyError(f"Unknown DuplexIO frame fields: {sorted(unknown)}")
-    return torch.tensor([int(fields.get(name, 0)) for name in FRAME_FIELDS], dtype=torch.long)
+def frame_row(**fields: int | bool) -> list[int]:
+    """A ``frame``'s values in field order; every field must be named."""
+    if fields.keys() != FRAME_INDEX.keys():
+        raise KeyError(f"DuplexIO frame fields differ: {sorted(fields.keys() ^ FRAME_INDEX.keys())}")
+    return [int(fields[name]) for name in FRAME_FIELDS]
