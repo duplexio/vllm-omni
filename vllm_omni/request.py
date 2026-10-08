@@ -3,7 +3,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -40,6 +40,7 @@ class OmniRequest(Request):
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
+        payload_sender_info: dict[str, Any] | None = None,
         **kwargs,
     ):
         if prompt_embeds is not None:
@@ -62,6 +63,8 @@ class OmniRequest(Request):
         # Only models owning their cache addressing may compact scheduler history.
         self.streaming_retained_tokens: int | None = None
         self.streaming_position_budget: int | None = None
+        # Sender's connector address for this request's stage payload.
+        self.payload_sender_info: dict[str, Any] | None = payload_sender_info
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -109,6 +112,7 @@ class OmniRequest(Request):
             block_hasher=block_hasher,
             additional_information=request.additional_information,
             model_intermediate_buffer=deserialize_additional_information(request.model_intermediate_buffer),
+            payload_sender_info=request.payload_sender_info,
             resumable=request.resumable,
             session_id=request.session_id,
             kv_hints=request.kv_hints,
