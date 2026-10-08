@@ -51,24 +51,16 @@ class TimestepEmbedder(nn.Module):
 class PocketLayerNorm(nn.Module):
     """Preserve the training model's activation-dtype normalization arithmetic."""
 
-    def __init__(self, dim: int, *, elementwise_affine: bool = True) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim)) if elementwise_affine else None
-        self.bias = nn.Parameter(torch.zeros(dim)) if elementwise_affine else None
-
     def forward(self, hidden: Tensor) -> Tensor:
         mean = hidden.mean(dim=-1, keepdim=True)
         variance = hidden.var(dim=-1, unbiased=False, keepdim=True)
-        normalized = (hidden - mean) / torch.sqrt(variance + 1e-6)
-        if self.weight is not None:
-            normalized = normalized * self.weight + self.bias
-        return normalized
+        return (hidden - mean) / torch.sqrt(variance + 1e-6)
 
 
 class AdaLNResBlock(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
-        self.norm = PocketLayerNorm(dim)
+        self.norm = PocketLayerNorm()
         self.linear1 = nn.Linear(dim, dim)
         self.linear2 = nn.Linear(dim, dim)
         self.adaln_projection = nn.Linear(dim, 3 * dim)
@@ -84,7 +76,7 @@ class AdaLNResBlock(nn.Module):
 class FinalLayer(nn.Module):
     def __init__(self, dim: int, output_dim: int) -> None:
         super().__init__()
-        self.norm = PocketLayerNorm(dim, elementwise_affine=False)
+        self.norm = PocketLayerNorm()
         self.linear = nn.Linear(dim, output_dim)
         self.adaln_projection = nn.Linear(dim, 2 * dim)
 

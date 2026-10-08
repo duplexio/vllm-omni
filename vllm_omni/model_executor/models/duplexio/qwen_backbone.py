@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
-from itertools import accumulate, islice
+from itertools import islice
 from typing import Any, cast
 
 import torch
@@ -117,7 +117,6 @@ class DuplexIORMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.eps = eps
 
-    @torch.compile(dynamic=True, fullgraph=True, options={"triton.cudagraphs": False})
     def forward(
         self, hidden: Tensor, residual: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
@@ -481,23 +480,6 @@ class DuplexIOGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             num_decode_draft_tokens_cpu,
             fast_build,
         )
-        token_boundaries = common_attn_metadata.query_start_loc_cpu.tolist()
-        chunk_counts = [
-            ((end - start) // DUPLEXIO_NUM_CELLS + 63) // 64
-            for start, end in zip(token_boundaries, token_boundaries[1:])
-        ]
-        chunks = [
-            (request, chunk)
-            for request, count in enumerate(chunk_counts)
-            for chunk in range(count)
-        ]
-        metadata.chunk_indices = torch.tensor(
-            chunks, dtype=torch.int32, device=common_attn_metadata.query_start_loc.device,
-        )
-        metadata.chunk_offsets = torch.tensor(
-            list(accumulate(chunk_counts, initial=0)),
-            dtype=torch.int32, device=common_attn_metadata.query_start_loc.device,
-        )
         if self.is_full_graph_frame(common_attn_metadata):
             return self.retain_full_graph_metadata(metadata)
         return metadata
@@ -755,7 +737,7 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             boundaries = torch.tensor((0, tokens), device=mixed_qkv.device, dtype=torch.int32)
             state_indices = torch.zeros(1, device=mixed_qkv.device, dtype=torch.int32)
             has_initial_state = torch.zeros(1, device=mixed_qkv.device, dtype=torch.bool)
-            blocks = torch.arange((tokens // DUPLEXIO_NUM_CELLS + 63) // 64, device=mixed_qkv.device, dtype=torch.int32)
+            blocks = torch.arange((tokens + 63) // 64, device=mixed_qkv.device, dtype=torch.int32)
             chunk_indices = torch.stack((torch.zeros_like(blocks), blocks), 1)
             cache = tuple(torch.empty((1, *shape), device=mixed_qkv.device, dtype=dtype)
                           for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype(), strict=True))

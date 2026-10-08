@@ -29,7 +29,7 @@ class TestOmniBaseProfiler:
     def omni_base_instance(self, mock_engine, mocker: MockerFixture):
         """Create an OmniBase instance with mocked dependencies."""
         mocker.patch("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", return_value=mock_engine)
-        mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", side_effect=lambda x: x)
+        mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", side_effect=lambda x, **kwargs: x)
         mocker.patch("vllm_omni.entrypoints.omni_base.weakref.finalize")
         from vllm_omni.entrypoints.omni_base import OmniBase
 

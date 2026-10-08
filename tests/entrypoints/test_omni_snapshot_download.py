@@ -36,7 +36,7 @@ def download_backend(monkeypatch: pytest.MonkeyPatch):
     picked: list[str] = []
 
     snapshot_module = types.ModuleType("modelscope.hub.snapshot_download")
-    snapshot_module.snapshot_download = lambda model_id: picked.append("modelscope") or model_id
+    snapshot_module.snapshot_download = lambda model_id, **kwargs: picked.append("modelscope") or model_id
     hub_module = types.ModuleType("modelscope.hub")
     hub_module.snapshot_download = snapshot_module
     root_module = types.ModuleType("modelscope")
@@ -82,3 +82,18 @@ def test_unset_defaults_to_huggingface(monkeypatch, download_backend):
     monkeypatch.delenv("VLLM_USE_MODELSCOPE", raising=False)
 
     assert download_backend() == "huggingface"
+
+
+@pytest.mark.parametrize("revision", [None, "v7", "80de418a31334c737100afe767a08b1a27f6ee1a"])
+def test_huggingface_download_honors_revision(monkeypatch, revision):
+    monkeypatch.delenv("VLLM_USE_MODELSCOPE", raising=False)
+    envs.disable_envs_cache()
+    calls = []
+    monkeypatch.setattr(
+        omni_base,
+        "download_weights_from_hf_specific",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    assert omni_base.omni_snapshot_download(MODEL_ID, revision=revision) == MODEL_ID
+    assert calls[0]["revision"] == revision

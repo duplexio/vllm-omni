@@ -28,6 +28,12 @@ def test_time_normalization_preserves_bf16_activations() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_v7_audio_normalization_has_no_checkpoint_parameters() -> None:
+    flow = make_flow()
+    for block in (*flow.blocks, flow.final_layer):
+        assert dict(block.norm.named_parameters()) == {}
+
+
 def test_block_normalization_matches_training_bf16_statistics() -> None:
     flow = make_flow()
     hidden = torch.randn(7, 16, dtype=torch.bfloat16)
@@ -35,7 +41,9 @@ def test_block_normalization_matches_training_bf16_statistics() -> None:
         hidden.var(-1, unbiased=False, keepdim=True) + 1e-6
     )
     for norm in (flow.blocks[0].norm, flow.final_layer.norm):
-        torch.testing.assert_close(norm(hidden), expected, atol=1e-5, rtol=1e-5)
+        actual = norm(hidden)
+        assert actual.dtype == hidden.dtype
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("steps", [1, 2, 4])

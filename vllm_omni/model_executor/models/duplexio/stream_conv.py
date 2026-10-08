@@ -5,8 +5,6 @@ import torch
 from torch import Tensor
 from vllm.triton_utils import tl, triton
 
-from vllm_omni.model_executor.models.duplexio.row_semantics import DUPLEXIO_NUM_CELLS
-
 
 @triton.jit
 def stream_conv_kernel(
@@ -14,25 +12,25 @@ def stream_conv_kernel(
     channels: tl.constexpr, history: tl.constexpr, slot_stride: tl.constexpr,
     x_row: tl.constexpr, x_col: tl.constexpr, weight_row: tl.constexpr,
     state_slot: tl.constexpr, state_channel: tl.constexpr, state_time: tl.constexpr,
-    has_bias: tl.constexpr, cells: tl.constexpr, block_d: tl.constexpr,
+    has_bias: tl.constexpr, block_d: tl.constexpr,
 ):
     request = tl.load(chunks + tl.program_id(0) * 2)
     chunk = tl.load(chunks + tl.program_id(0) * 2 + 1)
     start, end = tl.load(boundaries + request), tl.load(boundaries + request + 1)
     slot = tl.load(slots + request * slot_stride).to(tl.int64)
     valid_state = tl.load(has_state + request)
-    tokens = start + (chunk * 64 + tl.arange(0, 64)) * cells + tl.program_id(2)
+    tokens = start + chunk * 64 + tl.arange(0, 64)
     dims = tl.program_id(1) * block_d + tl.arange(0, block_d)
     valid = (tokens[:, None] < end) & (dims[None, :] < channels)
     acc = tl.zeros((64, block_d), tl.float32)
-    for offset in tl.static_range(history // cells + 1):
-        source = tokens - offset * cells
+    for offset in tl.static_range(history // 6 + 1):
+        source = tokens - offset * 6
         current = tl.load(x + source[:, None] * x_row + dims[None, :] * x_col,
                           mask=valid & (source[:, None] >= start), other=0).to(tl.float32)
         previous = tl.load(state + slot * state_slot + dims[None, :] * state_channel
                            + (source[:, None] - start + history) * state_time,
                            mask=valid & (source[:, None] < start) & valid_state, other=0).to(tl.float32)
-        w = tl.load(weight + dims * weight_row + history - offset * cells,
+        w = tl.load(weight + dims * weight_row + history - offset * 6,
                     mask=dims < channels, other=0).to(tl.float32)
         acc += (current + previous) * w[None, :]
     if has_bias:
@@ -76,7 +74,7 @@ def stream_causal_conv(
     x: Tensor, weight: Tensor, bias: Tensor | None, state: Tensor, slots: Tensor,
     boundaries: Tensor, has_state: Tensor, chunk_indices: Tensor,
 ) -> Tensor:
-    """Use GDN's 64-frame chunk index, then advance request-local state.
+    """Use GDN's existing 64-token chunk index, then advance request-local state.
 
     ``x`` is packed (tokens, channels); ``weight`` has taps spaced six cells
     apart; ``state`` is (cache_slots, channels, history_cells). State advances
@@ -84,10 +82,9 @@ def stream_causal_conv(
     """
     channels, history = x.shape[1], state.shape[2]
     output = torch.empty_like(x, memory_format=torch.contiguous_format)
-    stream_conv_kernel[(chunk_indices.shape[0], triton.cdiv(channels, 32), DUPLEXIO_NUM_CELLS)](
+    stream_conv_kernel[(chunk_indices.shape[0], triton.cdiv(channels, 32))](
         x, weight, bias, state, slots, boundaries, has_state, chunk_indices, output,
-        channels, history, slots.stride(0), *x.stride(), weight.stride(0), *state.stride(), bias is not None,
-        DUPLEXIO_NUM_CELLS, 32,
+        channels, history, slots.stride(0), *x.stride(), weight.stride(0), *state.stride(), bias is not None, 32,
     )
     update_stream_conv_state_kernel[(boundaries.shape[0] - 1, triton.cdiv(channels, 32))](
         x, state, slots, boundaries, has_state, channels, history, slots.stride(0), *x.stride(), *state.stride(),

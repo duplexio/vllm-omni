@@ -116,3 +116,23 @@ def test_emit_projection_batch_matches_individual_frames() -> None:
     expected = torch.stack([head(row.flatten()) for row in rows])
     for requests in (1, 2, 4, 8, 16, 32):
         torch.testing.assert_close(head(rows[:requests].flatten(1)), expected[:requests], rtol=0, atol=0)
+
+
+def test_norm_handles_prefill_decode_and_sampler_tensor_modes() -> None:
+    """vLLM warmup mixes ordinary buffer views with inference tensors."""
+    for context in (torch.inference_mode, torch.no_grad):
+        with context():
+            for rows in (6144, 6, 1):
+                for shape in ((rows, 2560), (rows, 20, 128), (rows, 4, 128)):
+                    norm = DuplexIORMSNorm(shape[-1], eps=1e-6, dtype=torch.bfloat16).cuda()
+                    norm.weight.normal_(1, 0.2)
+                    hidden = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+                    for residual in (None, torch.randn_like(hidden)):
+                        combined = hidden.float() if residual is None else hidden.float() + residual.float()
+                        expected = combined * torch.rsqrt(combined.square().mean(-1, keepdim=True) + 1e-6)
+                        expected = (expected * norm.weight.float()).to(hidden.dtype)
+                        actual = norm(hidden, residual)
+                        if residual is not None:
+                            actual, summed = actual
+                            torch.testing.assert_close(summed, combined.to(residual.dtype), atol=0, rtol=0)
+                        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-2)

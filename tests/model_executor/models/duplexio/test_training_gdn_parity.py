@@ -16,7 +16,13 @@ from vllm_omni.model_executor.models.duplexio.stream_gdn import (
 
 pytest.importorskip("duplexio")
 
-from duplexio.modules.qwen3_5_stream_delta import _qwen_beta_gate, l2_normalize
+from duplexio.modules.fla_block_gated_delta_rule.chunk import (
+    block_causal_chunk_gated_delta_rule as training_gdn,
+)
+from duplexio.modules.fla_block_gated_delta_rule.chunk import (
+    l2_normalize,
+)
+from duplexio.modules.qwen3_5_stream_delta import _qwen_beta_gate
 
 
 def make_state(aliased_storage: bool, slots: int = 3) -> torch.Tensor:
@@ -40,6 +46,31 @@ def make_state(aliased_storage: bool, slots: int = 3) -> torch.Tensor:
         )
         offset += math.prod(shape) * size
     return views[1]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("length", (6, 66, 138))
+@torch.inference_mode()
+def test_native_gdn_matches_training(length: int) -> None:
+    torch.manual_seed(27)
+    q = l2_normalize(torch.randn(1, length, 2, 128, device="cuda", dtype=torch.bfloat16))
+    k = l2_normalize(torch.randn_like(q))
+    v = torch.randn(1, length, 4, 128, device="cuda", dtype=torch.bfloat16)
+    g = -torch.rand(1, length, 4, device="cuda", dtype=torch.float32)
+    beta = torch.rand(1, length, 4, device="cuda", dtype=torch.bfloat16)
+    expected, final = training_gdn(
+        q, k, v, g, beta, num_channels=6, chunk_size=64, output_final_state=True,
+    )
+    state = torch.empty(1, 4, 128, 128, device="cuda", dtype=torch.float32)
+    actual = append_gdn(
+        *(value[0] for value in (q, k, v, g, beta)), state,
+        torch.tensor([0], device="cuda", dtype=torch.int32),
+        torch.tensor([0, length], device="cuda", dtype=torch.int32),
+        torch.tensor([False], device="cuda"),
+        torch.tensor([(0, i) for i in range((length + 63) // 64)], device="cuda", dtype=torch.int32),
+    )
+    assert_recurrence_close(actual, expected[0])
+    torch.testing.assert_close(state, final, atol=1e-5, rtol=1e-4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -67,7 +98,7 @@ def test_native_gdn_preparation_matches_training(length: int) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("prefixes", ((6, 12), (378, 384), (384, 390), (6, 12, 18, 24, 60, 66, 132, 138)))
+@pytest.mark.parametrize("prefixes", ((6, 12), (60, 66), (132, 138), (378, 384), (384, 390), (6, 12, 18, 24, 60, 66, 132, 138)))
 @pytest.mark.parametrize("aliased_storage", (False, True))
 @torch.inference_mode()
 def test_append_gdn_independent_slots_and_reset(prefixes: tuple[int, ...], aliased_storage: bool) -> None:
@@ -99,7 +130,7 @@ def test_append_gdn_independent_slots_and_reset(prefixes: tuple[int, ...], alias
             packed = (*packed[:2], packed_v.view_as(packed[2]).copy_(packed[2]), *packed[3:])
             boundaries = torch.tensor([0, *torch.tensor(sizes).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
             chunks = torch.tensor(
-                [(i, chunk) for i, size in enumerate(sizes) for chunk in range((size // 6 + 63) // 64)],
+                [(i, chunk) for i, size in enumerate(sizes) for chunk in range((size + 63) // 64)],
                 device="cuda",
                 dtype=torch.int32,
             )
@@ -140,7 +171,7 @@ def test_slot_recurrence_matches_fla_on_gathered_state(aliased_storage: bool, le
     if inactive:
         g[:, :2] = 0
         beta[:, :2] = 0
-    state = make_state(aliased_storage, requests + 2)[:, :4]
+    state = make_state(aliased_storage, requests + 2)
     state.copy_(torch.randn_like(state))
     reference = state.clone()
     slots = torch.tensor([6, 0, 3, 5, 1], device="cuda", dtype=torch.int32)
@@ -211,11 +242,10 @@ def dense_recurrence(
 ) -> torch.Tensor:
     """Literal FP64 state update, independent of either CUDA implementation."""
     batches, length, value_heads, value_dim = v.shape
-    states = torch.zeros(batches, 6, value_heads, k.shape[-1], value_dim, device=q.device, dtype=torch.float64)
+    state = torch.zeros(batches, value_heads, k.shape[-1], value_dim, device=q.device, dtype=torch.float64)
     groups = value_heads // k.shape[-2]
     outputs = []
     for index in range(length):
-        state = states[:, index % 6]
         key = k[:, index].double().repeat_interleave(groups, 1)
         query = q[:, index].double().repeat_interleave(groups, 1) * q.shape[-1] ** -0.5
         state *= g[:, index, :, None, None].double().exp()

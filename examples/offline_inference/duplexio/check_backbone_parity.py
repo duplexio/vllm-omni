@@ -26,7 +26,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForRNNT, Aut
 class ReferenceExport(BaseModel):
     """Portable metadata needed by the training-side checker, without vLLM."""
 
-    duplexio_export_version: Literal[6]
+    duplexio_export_version: Literal[7]
     emit_head_input: Literal["full_frame"]
     audio_conditioning: Literal["agent_audio_cell"]
     text_config: dict[str, Any]
