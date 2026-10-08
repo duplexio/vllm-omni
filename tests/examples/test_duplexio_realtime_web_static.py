@@ -118,7 +118,7 @@ def test_frontend_registers_tools_and_returns_function_outputs() -> None:
     assert "const sessionTools = enabledTools();" in app
     assert "tools: sessionTools" in app
     assert "tool_choice: sessionTools.length ? 'auto' : 'none'" in app
-    assert "response.function_call_arguments.done" in app
+    assert "event.type === 'response.output_item.done' && event.item && event.item.type === 'function_call'" in app
     assert "type: 'function_call_output'" in app
     assert "Tool response → model" in app
     assert "`<tool_response>\\n${item.output}\\n</tool_response>`" in app

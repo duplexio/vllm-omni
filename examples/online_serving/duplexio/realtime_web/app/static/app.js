@@ -908,17 +908,19 @@
       appendTranscript('user', event.delta || '');
       return;
     }
-    if (event.type === 'response.function_call_arguments.done') {
+    // The finished function_call item carries the tool's name; the arguments events do not.
+    if (event.type === 'response.output_item.done' && event.item && event.item.type === 'function_call') {
+      const call = event.item;
       let args;
       try {
-        args = JSON.parse(event.arguments || '{}');
+        args = JSON.parse(call.arguments || '{}');
       } catch (error) {
         log(`invalid tool arguments: ${error.message}`);
         return;
       }
       appendToolCall({
-        id: event.call_id,
-        name: event.name,
+        id: call.call_id,
+        name: call.name,
         arguments: args,
       });
       return;
