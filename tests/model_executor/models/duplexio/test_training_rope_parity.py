@@ -36,10 +36,15 @@ def test_qwen_rotary_matches_training(frequency_dtype: torch.dtype) -> None:
     native = DuplexIORotaryEmbedding(64, 262144, torch.bfloat16).cuda()
     model = torch.nn.Module()
     model.add_module("rotary_emb", native)
-    loaded = AutoWeightsLoader(model).load_weights([
-        ("rotary_emb.inverse_frequencies", training.inv_freq),
-        ("rotary_emb.attention_scaling", torch.tensor(training.attention_scaling, device="cuda", dtype=torch.float32)),
-    ])
+    loaded = AutoWeightsLoader(model).load_weights(
+        [
+            ("rotary_emb.inverse_frequencies", training.inv_freq),
+            (
+                "rotary_emb.attention_scaling",
+                torch.tensor(training.attention_scaling, device="cuda", dtype=torch.float32),
+            ),
+        ]
+    )
     assert loaded == {"rotary_emb.inverse_frequencies", "rotary_emb.attention_scaling"}
     positions = torch.tensor([0, 1, 3, 723, 724, 1023, 4096, 8192], device="cuda").repeat_interleave(6)
     q = torch.randn(positions.numel(), 16, 256, device="cuda", dtype=torch.bfloat16)

@@ -78,12 +78,16 @@ async def prewarm(
 
             async def send_frames() -> None:
                 for frame in frames:
-                    await websocket.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": frame,
-                        "format": "pcm_f32le",
-                        "sample_rate_hz": SAMPLE_RATE,
-                    }))
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "type": "input_audio_buffer.append",
+                                "audio": frame,
+                                "format": "pcm_f32le",
+                                "sample_rate_hz": SAMPLE_RATE,
+                            }
+                        )
+                    )
                     await asyncio.sleep(SEND_INTERVAL_SECONDS)
 
             # The model answers every user frame with one audio frame.

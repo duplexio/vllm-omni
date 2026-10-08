@@ -16,19 +16,25 @@ def test_frame_projection_graph_matches_independent_requests_and_weight_refresh(
     model.model.cuda()
     model.vllm_config.model_config.dtype = torch.bfloat16
     model.frame_inputs = torch.compile(
-        frame_inputs, fullgraph=True, dynamic=True, options={"emulate_precision_casts": True},
+        frame_inputs,
+        fullgraph=True,
+        dynamic=True,
+        options={"emulate_precision_casts": True},
     )
     for size in (1, 3, 15):
         ids = torch.randint(1, 20, (size, 4), device="cuda")
         ids[:, 0] = model.silence_token_id
         metadata = torch.tensor(
             [(index * 17, index * 9, True, False, index * 20) for index in range(size)],
-            dtype=torch.long, device="cuda",
+            dtype=torch.long,
+            device="cuda",
         )
         user = torch.randn(size, 8, device="cuda")
         agent = torch.randn(size, LATENT_DIM, device="cuda")
-        references = [model.project_frames(torch.cat((ids, metadata), 1)[i:i+1], user[i:i+1], agent[i:i+1])
-                      for i in range(size)]
+        references = [
+            model.project_frames(torch.cat((ids, metadata), 1)[i : i + 1], user[i : i + 1], agent[i : i + 1])
+            for i in range(size)
+        ]
         preceding = ((ids != 1) & (ids != 2)).sum(1).cumsum(0)
         metadata[1:, 0] -= preceding[:-1]
         inputs = (torch.cat((ids, metadata), 1), user, agent)
@@ -36,7 +42,9 @@ def test_frame_projection_graph_matches_independent_requests_and_weight_refresh(
         actual = graph(inputs)
         expected = [torch.cat(parts) for parts in zip(*references, strict=True)]
         for index, (output, reference) in enumerate(zip(actual, expected, strict=True)):
-            torch.testing.assert_close(output, reference, rtol=0.02 if index == 0 else 0, atol=0.02 if index == 0 else 0)
+            torch.testing.assert_close(
+                output, reference, rtol=0.02 if index == 0 else 0, atol=0.02 if index == 0 else 0
+            )
         saved = tuple(value.clone() for value in actual)
         inputs[0][:, 1] = 21
         user.mul_(2)

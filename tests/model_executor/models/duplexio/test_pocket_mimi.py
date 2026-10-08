@@ -43,8 +43,12 @@ def test_request_batching_preserves_different_ages_and_forks(operation, dtype):
         expected = [forward(value, state)[0] for value, state in zip(inputs, previous, strict=True)]
         actual, updated = batch_forward(inputs, previous)
         for index, value, reference, state in zip(order, actual, expected, updated, strict=True):
-            torch.testing.assert_close(value, reference, atol=0.005 if dtype == torch.bfloat16 else 1e-5,
-                                       rtol=0.04 if dtype == torch.bfloat16 else 1e-3)
+            torch.testing.assert_close(
+                value,
+                reference,
+                atol=0.005 if dtype == torch.bfloat16 else 1e-5,
+                rtol=0.04 if dtype == torch.bfloat16 else 1e-3,
+            )
             states[index] = state
         # A speculative batch must not change the accepted states it read.
         replay, _ = batch_forward(inputs, previous)

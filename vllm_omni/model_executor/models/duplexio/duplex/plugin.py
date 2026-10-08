@@ -403,6 +403,7 @@ def session_sampling(config: DuplexSessionConfig) -> dict[str, Any]:
         sampling.agent.content.temperature = config.temperature
     return sampling.model_dump()
 
+
 def voice_prompt_from_session(config: DuplexSessionConfig, max_frames: int) -> tuple[bytes, int]:
     """Decode the reference PCM (``extra_body.ref_audio_data``) and its pinned frame count."""
     extra_body = config.extra_body

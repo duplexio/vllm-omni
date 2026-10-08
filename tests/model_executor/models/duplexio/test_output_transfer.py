@@ -60,7 +60,9 @@ def test_compute_logits_forces_host_or_device_ids(on_device):
     hidden = torch.zeros(3, 2, device="cuda")
     forced = [4, 9, 3]
     object.__setattr__(
-        model, "_forced_next_token_ids", torch.tensor(forced, device="cuda") if on_device else forced,
+        model,
+        "_forced_next_token_ids",
+        torch.tensor(forced, device="cuda") if on_device else forced,
     )
 
     torch.cuda.set_sync_debug_mode("error")  # the batch queue overlaps only if the host never waits here

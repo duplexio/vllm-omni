@@ -168,7 +168,9 @@ async def test_runtime_config_rejects_server_owned_keys(model_config) -> None:
 @pytest.mark.asyncio
 async def test_updates_change_nothing(model_config) -> None:
     plugin, runtime = await open_session(model_config, duplexio_sampling={"agent": {"content": {"temperature": 0.2}}})
-    unchanged = plugin.runtime_config_for_update(session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}}), runtime)
+    unchanged = plugin.runtime_config_for_update(
+        session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}}), runtime
+    )
     assert unchanged == runtime
     same = session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}})
     same.temperature = runtime["duplexio_sampling"]["agent"]["content"]["temperature"]
@@ -178,8 +180,16 @@ async def test_updates_change_nothing(model_config) -> None:
     for config, code in [
         (warmer, "sampling_update_unsupported"),
         (session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.3}}}), "sampling_update_unsupported"),
-        (session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}}, start_role="agent"), "start_role_update_unsupported"),
-        (session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}}, ref_audio_data=reference_audio(4)), "voice_update_unsupported"),
+        (
+            session_config(duplexio_sampling={"agent": {"content": {"temperature": 0.2}}}, start_role="agent"),
+            "start_role_update_unsupported",
+        ),
+        (
+            session_config(
+                duplexio_sampling={"agent": {"content": {"temperature": 0.2}}}, ref_audio_data=reference_audio(4)
+            ),
+            "voice_update_unsupported",
+        ),
     ]:
         with pytest.raises(DuplexRuntimeConfigError) as error:
             plugin.runtime_config_for_update(config, runtime)

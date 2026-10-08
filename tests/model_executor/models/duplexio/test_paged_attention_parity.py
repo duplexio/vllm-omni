@@ -46,7 +46,10 @@ def cells(values: Tensor) -> Tensor:
 
 
 def session_fields(
-    audio_active: Tensor, text_active: Tensor, prompt_frames: int = 0, window: int = WINDOW,
+    audio_active: Tensor,
+    text_active: Tensor,
+    prompt_frames: int = 0,
+    window: int = WINDOW,
 ) -> dict[str, Tensor]:
     """Per-token frame fields for a whole session, as ``frame_inputs`` derives them.
 
@@ -58,18 +61,12 @@ def session_fields(
     pinned = torch.arange(rows) < prompt_frames
     text_active = text_active & ~pinned[:, None]
     audio_position = audio_active.cumsum(0, dtype=torch.int32)
-    persistent = torch.cat(
-        (text_active, torch.zeros(rows, 1, dtype=torch.bool), pinned[:, None]), 1
-    )
+    persistent = torch.cat((text_active, torch.zeros(rows, 1, dtype=torch.bool), pinned[:, None]), 1)
     ordinal = persistent.int().flatten().cumsum(0, dtype=torch.int32).view(rows, -1)
     return {
-        "key_active": torch.cat(
-            (text_active, torch.stack((audio_active, audio_active | pinned), -1)), 1
-        ).flatten(),
+        "key_active": torch.cat((text_active, torch.stack((audio_active, audio_active | pinned), -1)), 1).flatten(),
         "persistent_ordinal": torch.where(persistent, ordinal, 0).flatten(),
-        "persistent_last": cells(
-            torch.cat((torch.zeros(1, dtype=torch.int32), ordinal[:-1, -1]))
-        ),
+        "persistent_last": cells(torch.cat((torch.zeros(1, dtype=torch.int32), ordinal[:-1, -1]))),
         "audio_first": cells((audio_position - window).clamp_min(1)),
         "audio_last": cells(audio_position - audio_active.int()),
         "pinned": cells(pinned),
@@ -80,13 +77,16 @@ def session_fields(
 
 def batched(source: Sequence[Tensor], live: list[int], used: list[Tensor]) -> Tensor:
     """Concatenate each live session's slice of a per-session tensor."""
-    return torch.cat(
-        [source[request][rows] for request, rows in zip(live, used, strict=True)]
-    )
+    return torch.cat([source[request][rows] for request, rows in zip(live, used, strict=True)])
 
 
 def dense_attention(
-    query: Tensor, key: Tensor, value: Tensor, fields: dict[str, Tensor], scale: float, window: int,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    fields: dict[str, Tensor],
+    scale: float,
+    window: int,
 ) -> Tensor:
     """Reduce the exact visibility relation in fp32 over every session token."""
     positions = torch.arange(query.shape[0], device=query.device)
@@ -103,13 +103,13 @@ def dense_attention(
     keys = key.float().repeat_interleave(groups, 1)
     values = value.float().repeat_interleave(groups, 1)
     scores = torch.einsum("thd,shd->hts", query.float(), keys) * scale
-    return torch.einsum(
-        "hts,shd->thd", scores.masked_fill(~visible, -torch.inf).softmax(-1), values
-    )
+    return torch.einsum("hts,shd->thd", scores.masked_fill(~visible, -torch.inf).softmax(-1), values)
 
 
 def paged_backend(
-    spec: DuplexIOKVCacheSpec, frame: DuplexIOFrameMetadata, heads: int,
+    spec: DuplexIOKVCacheSpec,
+    frame: DuplexIOFrameMetadata,
+    heads: int,
 ) -> tuple[nn.Module, DuplexIOFlashAttentionMetadataBuilder, DuplexIOFlashAttentionImpl]:
     """Wire the real builder and impl to one attention layer's frame metadata."""
     device = frame.cell.device
@@ -123,7 +123,9 @@ def paged_backend(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=frame.cell.shape[0]),
     )
     builder = DuplexIOFlashAttentionMetadataBuilder(spec, ["attn"], vllm_config, device)
-    impl = DuplexIOFlashAttentionImpl(heads, spec.head_size, spec.head_size**-0.5, spec.num_kv_heads, None, None, "auto")
+    impl = DuplexIOFlashAttentionImpl(
+        heads, spec.head_size, spec.head_size**-0.5, spec.num_kv_heads, None, None, "auto"
+    )
     return layer, builder, impl
 
 
@@ -203,15 +205,14 @@ def run_session(
         {
             name: field.to(device)
             for name, field in session_fields(
-                *session_activity(rows, prefix, request), prompt_frames, window,
+                *session_activity(rows, prefix, request),
+                prompt_frames,
+                window,
             ).items()
         }
         for request, prefix in enumerate(prefixes)
     ]
-    expected = [
-        dense_attention(query[i], key[i], value[i], fields[i], dim**-0.5, window)
-        for i in range(requests)
-    ]
+    expected = [dense_attention(query[i], key[i], value[i], fields[i], dim**-0.5, window) for i in range(requests)]
 
     pages = layout.max_blocks * requests
     frame = DuplexIOFrameMetadata(sum(prefixes) * NUM_CELLS, device)
@@ -219,13 +220,9 @@ def run_session(
     # Page 0 belongs to no request: a page outside the block table must never be
     # read. vLLM zeroes the pages it does hand out, which is what keeps
     # masked-out slots from poisoning the reduction.
-    cache = torch.zeros(
-        pages + 1, BLOCK_SIZE, kv_heads, 2 * dim, device=device, dtype=dtype
-    ).transpose(1, 2)
+    cache = torch.zeros(pages + 1, BLOCK_SIZE, kv_heads, 2 * dim, device=device, dtype=dtype).transpose(1, 2)
     cache[0].fill_(torch.nan)
-    block_table = (torch.randperm(pages, device=device, dtype=torch.int32) + 1).view(
-        requests, layout.max_blocks
-    )
+    block_table = (torch.randperm(pages, device=device, dtype=torch.int32) + 1).view(requests, layout.max_blocks)
 
     # Every session prefills its text-only prefix in the first step, then walks
     # one row per step until it runs out of rows.
@@ -242,20 +239,12 @@ def run_session(
             for request, step in zip(live, steps, strict=True)
         ]
 
-        frame.update(
-            **{
-                name: batched([field[name] for field in fields], live, used)
-                for name in FRAME_FIELDS
-            }
-        )
+        frame.update(**{name: batched([field[name] for field in fields], live, used) for name in FRAME_FIELDS})
         sizes = [step * NUM_CELLS for step in steps]
         metadata = step_metadata(
             builder,
             sizes,
-            [
-                (consumed[request] + step) * NUM_CELLS
-                for request, step in zip(live, steps, strict=True)
-            ],
+            [(consumed[request] + step) * NUM_CELLS for request, step in zip(live, steps, strict=True)],
             block_table[live],
         )
         batch = batched(query, live, used)
@@ -268,9 +257,7 @@ def run_session(
             metadata,
             torch.empty_like(batch),
         )
-        for request, rows_used, part in zip(
-            live, used, output.split(sizes), strict=True
-        ):
+        for request, rows_used, part in zip(live, used, output.split(sizes), strict=True):
             torch.testing.assert_close(
                 part.float(),
                 expected[request][rows_used],
@@ -299,9 +286,7 @@ def run_session(
     ),
 )
 @torch.inference_mode()
-def test_paged_session_matches_dense_attention(
-    dim: int, heads: int, kv_heads: int, rows: int, window: int
-) -> None:
+def test_paged_session_matches_dense_attention(dim: int, heads: int, kv_heads: int, rows: int, window: int) -> None:
     run_session([3], rows, torch.bfloat16, dim, heads, kv_heads, window=window)
 
 

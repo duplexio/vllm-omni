@@ -11,7 +11,10 @@ from vllm_omni.model_executor.models.duplexio.modeling_duplexio import frame_inp
 def test_compiled_frame_inputs_preserve_layout() -> None:
     torch.manual_seed(43)
     compiled = torch.compile(
-        frame_inputs, fullgraph=True, dynamic=True, options={"emulate_precision_casts": True},
+        frame_inputs,
+        fullgraph=True,
+        dynamic=True,
+        options={"emulate_precision_casts": True},
     )
     for frames, live, prompt_count in (
         (1, True, 0),
@@ -28,13 +31,22 @@ def test_compiled_frame_inputs_preserve_layout() -> None:
         agent = torch.randn_like(user)
         prompt = torch.arange(frames, device="cuda") < prompt_count
         for start in (0, 1, 9, 1057):
-            metadata = torch.tensor([
-                (start, start // 4 + (row if live else 0), live, row < prompt_count, row)
-                for row in range(frames)
-            ], dtype=torch.int32, device="cuda")
+            metadata = torch.tensor(
+                [(start, start // 4 + (row if live else 0), live, row < prompt_count, row) for row in range(frames)],
+                dtype=torch.int32,
+                device="cuda",
+            )
             # Audio time is frozen on a text-only append, which `live` selects.
             arguments = (
-                ids, text, channels, user, agent, 0, 1, metadata, 3,
+                ids,
+                text,
+                channels,
+                user,
+                agent,
+                0,
+                1,
+                metadata,
+                3,
             )
             expected = frame_inputs(*arguments)
             actual = compiled(*arguments)

@@ -61,8 +61,10 @@ def feedback_model():
 
 def runtime():
     return {
-        "duplexio_record_inputs": True, "duplexio_scheduler_token_id": 1,
-        "duplexio_tool_generation": 0, "duplexio_tool_results": [],
+        "duplexio_record_inputs": True,
+        "duplexio_scheduler_token_id": 1,
+        "duplexio_tool_generation": 0,
+        "duplexio_tool_results": [],
     }
 
 
@@ -70,9 +72,12 @@ def feedback_state(model):
     """Greedy agent and tool streams; the user stream draws its one top token."""
     state = request_state(model)
     content = {"temperature": 1.0, "top_k": 1, "top_p": 1.0}
-    state.sampling = model.resolve_sampling({
-        "agent": {"content": content}, "user": {"emission": {"temperature": 1.0}, "content": content},
-    })
+    state.sampling = model.resolve_sampling(
+        {
+            "agent": {"content": content},
+            "user": {"emission": {"temperature": 1.0}, "content": content},
+        }
+    )
     return state
 
 
@@ -112,7 +117,14 @@ def test_feedback_actions_and_versions_follow_a_weight_update():
             request_token_spans=[(0, frames * 6)],
             request_sample_eligible=[True],
         )
-        payload = MultimodalPayload.from_dict({name: values[0] for name, values in flatten_payload(model.finalize_multimodal_outputs_from_cpu_snapshot(output.multimodal_outputs)).items()})
+        payload = MultimodalPayload.from_dict(
+            {
+                name: values[0]
+                for name, values in flatten_payload(
+                    model.finalize_multimodal_outputs_from_cpu_snapshot(output.multimodal_outputs)
+                ).items()
+            }
+        )
         assert {"user_action_eligible", "user_token_eligible", "user_action_logprob"}.isdisjoint(payload)
         recorder.append(payload, version=model.policy_version)
         consumed_user_ids.append(updates["duplexio_replay"]["text_ids"][-1, 1].item())
@@ -149,10 +161,17 @@ def test_raw_audio_keeps_encoder_features_without_transcript_commits():
     state = feedback_state(model)
     state.text_input_ids = (state.text_input_ids[0], 7, *state.text_input_ids[2:])
     plan = DuplexIODuplexPlugin(lambda *args: None).plan_append(
-        request_id="raw-frame", fence=DuplexFence("session"),
-        session_config={}, runtime_config=runtime(), seq=2, turn_seq=1, final=False, sampling_params=None,
+        request_id="raw-frame",
+        fence=DuplexFence("session"),
+        session_config={},
+        runtime_config=runtime(),
+        seq=2,
+        turn_seq=1,
+        final=False,
+        sampling_params=None,
         payload={
-            "format": "pcm_f32le", "sample_rate_hz": 24000,
+            "format": "pcm_f32le",
+            "sample_rate_hz": 24000,
             "audio": base64.b64encode(torch.zeros(1920).numpy().tobytes()).decode(),
         },
     )
@@ -160,7 +179,8 @@ def test_raw_audio_keeps_encoder_features_without_transcript_commits():
         torch.zeros(6, dtype=torch.long),
         None,
         duplexio_model_state=state,
-        duplex_token_offset=0, duplex_prompt_len=6,
+        duplex_token_offset=0,
+        duplex_prompt_len=6,
         **plan.prompt["model_intermediate_buffer"],
     )
     # CountingASR has an encoder only: calling any RNN-T transcript code fails.
@@ -180,10 +200,19 @@ def test_chunked_appends_record_all_rows_and_sample_only_at_their_end():
                 "duplexio_model_state": state,
                 "duplex_token_offset": state.frames_seen * 6,
                 "duplex_prompt_len": prompt_len,
-                "duplex": {"frame_count": 6, "duplexio_prefix": prefix, "decode_audio": False,
-                           "duplexio_tool_token_ids": [] if prefix else [6, 7, 8, 9, 10], "duplexio_tool_generation": 0,
-                           "duplexio_given_frame": None, "epoch": 0, "turn_id": 0, "final": False,
-                           "pcm": torch.zeros(1920).numpy().tobytes(), "runtime_config": runtime()},
+                "duplex": {
+                    "frame_count": 6,
+                    "duplexio_prefix": prefix,
+                    "decode_audio": False,
+                    "duplexio_tool_token_ids": [] if prefix else [6, 7, 8, 9, 10],
+                    "duplexio_tool_generation": 0,
+                    "duplexio_given_frame": None,
+                    "epoch": 0,
+                    "turn_id": 0,
+                    "final": False,
+                    "pcm": torch.zeros(1920).numpy().tobytes(),
+                    "runtime_config": runtime(),
+                },
             }
             keys = state.persistent_keys
             _, _, updates = model.preprocess(torch.zeros(frames * 6, dtype=torch.long), None, **info)
@@ -193,10 +222,19 @@ def test_chunked_appends_record_all_rows_and_sample_only_at_their_end():
                 assert updates["duplexio"]["persistent_last"][0].item() == keys
             info.update(updates)
             output = model.make_omni_output(
-                torch.randn(frames * 6, 11), model_intermediate_buffer=[info],
-                request_token_spans=[(0, frames * 6)], request_sample_eligible=[index == 2],
+                torch.randn(frames * 6, 11),
+                model_intermediate_buffer=[info],
+                request_token_spans=[(0, frames * 6)],
+                request_sample_eligible=[index == 2],
             )
-            payload = MultimodalPayload.from_dict({name: values[0] for name, values in flatten_payload(model.finalize_multimodal_outputs_from_cpu_snapshot(output.multimodal_outputs)).items()})
+            payload = MultimodalPayload.from_dict(
+                {
+                    name: values[0]
+                    for name, values in flatten_payload(
+                        model.finalize_multimodal_outputs_from_cpu_snapshot(output.multimodal_outputs)
+                    ).items()
+                }
+            )
             recorder.append(payload, version=0)
             state = model.postprocess(None, **info)["duplexio_model_state"]
             fields = frame_fields(payload)

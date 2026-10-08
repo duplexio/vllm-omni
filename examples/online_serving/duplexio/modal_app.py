@@ -65,9 +65,7 @@ repo_root = Path(__file__).resolve().parents[3] if modal.is_local() else APP_ROO
 # 2.11+cu130, the PyPI vLLM 0.26.0 wheel (a CUDA 13 build pinned to that torch),
 # and the quack/FLA kernels the model calls directly.
 model_image = (
-    modal.Image.from_registry(
-        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.13"
-    )
+    modal.Image.from_registry("nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.13")
     .apt_install("git", "ninja-build")
     .uv_pip_install(
         "torch==2.11.0",
@@ -211,9 +209,7 @@ def backend_command(*, enable_sleep_mode: bool) -> list[str]:
 
 def start_backend(*, enable_sleep_mode: bool) -> subprocess.Popen[bytes]:
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = ":".join(
-        filter(None, (str(APP_ROOT), environment.get("PYTHONPATH")))
-    )
+    environment["PYTHONPATH"] = ":".join(filter(None, (str(APP_ROOT), environment.get("PYTHONPATH"))))
     environment["VLLM_USE_AOT_COMPILE"] = "0"
     if enable_sleep_mode:
         environment["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
@@ -258,14 +254,7 @@ def prewarm_backend() -> None:
     subprocess.run(
         [
             sys.executable,
-            str(
-                APP_ROOT
-                / "examples"
-                / "online_serving"
-                / "duplexio"
-                / "realtime_web"
-                / "prewarm.py"
-            ),
+            str(APP_ROOT / "examples" / "online_serving" / "duplexio" / "realtime_web" / "prewarm.py"),
             "--backend",
             LOCAL_BACKEND_WEBSOCKET_URL,
             "--model",
@@ -273,14 +262,7 @@ def prewarm_backend() -> None:
             "--ref-audio",
             str(PREWARM_AUDIO_PATH),
             "--tools",
-            str(
-                APP_ROOT
-                / "examples"
-                / "online_serving"
-                / "duplexio"
-                / "realtime_web"
-                / "tools.json"
-            ),
+            str(APP_ROOT / "examples" / "online_serving" / "duplexio" / "realtime_web" / "tools.json"),
             "--timeout-seconds",
             "300",
         ],
@@ -337,7 +319,6 @@ def check_model_present() -> None:
         )
     if not PREWARM_AUDIO_PATH.is_file():
         raise RuntimeError(f"Upload a mono 24 kHz startup reference clip to {PREWARM_AUDIO_PATH}")
-
 
 
 @app.cls(
@@ -405,6 +386,7 @@ class SnapshotModelServer:
     @modal.asgi_app(label=MODEL_WEB_LABEL, requires_proxy_auth=False)
     def web(self) -> object:
         return build_model_app(self.backend, os.environ[AUTH_PASSWORD_HASH_ENV])
+
 
 @app.function(
     image=frontend_image,

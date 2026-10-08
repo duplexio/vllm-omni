@@ -94,9 +94,7 @@ def merge_row_attention(
     missing = (slots < 0)[:, :, None, None]
     extra_key = keys[slots.clamp_min(0)].float()
     extra_value = values[slots.clamp_min(0)].float().masked_fill(missing, 0)
-    extra_key, extra_value = (
-        tensor.transpose(1, 2)[:, None, :, None] for tensor in (extra_key, extra_value)
-    )
+    extra_key, extra_value = (tensor.transpose(1, 2)[:, None, :, None] for tensor in (extra_key, extra_value))
     extra = ((grouped.unsqueeze(-2) * extra_key).sum(-1) * scale).masked_fill(
         (slots < 0)[:, None, None, None], -torch.inf
     )

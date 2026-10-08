@@ -28,11 +28,7 @@ def test_gdn_request_state_shape_is_fixed_for_the_session_lifetime() -> None:
         parallel_config=SimpleNamespace(tensor_parallel_size=2),
     )
 
-    convolution, recurrent = (
-        DuplexIOForConditionalGeneration.get_mamba_state_shape_from_config(
-            cast(Any, vllm_config)
-        )
-    )
+    convolution, recurrent = DuplexIOForConditionalGeneration.get_mamba_state_shape_from_config(cast(Any, vllm_config))
 
     assert set(convolution) == {18, 48}
     # Two value heads per TP rank, one recurrent group per stream.

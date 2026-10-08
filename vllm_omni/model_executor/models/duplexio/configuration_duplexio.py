@@ -69,7 +69,8 @@ class DuplexIOConfig(PretrainedConfig):
             raise ValueError("DuplexIO requires a dense qwen3_5_text backbone")
         layer_types = text_config.layer_types
         if len(layer_types) != text_config.num_hidden_layers or set(layer_types) != {
-            "full_attention", "linear_attention",
+            "full_attention",
+            "linear_attention",
         }:
             raise ValueError("DuplexIO requires one full- or linear-attention type per layer, using both")
 

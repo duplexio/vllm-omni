@@ -92,16 +92,12 @@ class StreamingConvTranspose1d(nn.Module):
         bias: bool = True,
     ):
         super().__init__()
-        self.convtr = nn.ConvTranspose1d(
-            in_channels, out_channels, kernel_size, stride, groups=groups, bias=bias
-        )
+        self.convtr = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride, groups=groups, bias=bias)
 
     def get_initial_state(self) -> ConvTranspose1dState:
         return ConvTranspose1dState(partial=None)
 
-    def step(
-        self, x: Tensor, state: ConvTranspose1dState
-    ) -> tuple[Tensor, ConvTranspose1dState]:
+    def step(self, x: Tensor, state: ConvTranspose1dState) -> tuple[Tensor, ConvTranspose1dState]:
         y = self.convtr(x)
         crop = self.convtr.kernel_size[0] - self.convtr.stride[0]
         if not crop:
@@ -134,16 +130,10 @@ class SEANetResnetBlock(nn.Module):
 
     def get_initial_state(self) -> SEANetResnetBlockState:
         return SEANetResnetBlockState(
-            conv_states=[
-                layer.get_initial_state()
-                for layer in self.block
-                if isinstance(layer, StreamingConv1d)
-            ]
+            conv_states=[layer.get_initial_state() for layer in self.block if isinstance(layer, StreamingConv1d)]
         )
 
-    def step(
-        self, x: Tensor, state: SEANetResnetBlockState
-    ) -> tuple[Tensor, SEANetResnetBlockState]:
+    def step(self, x: Tensor, state: SEANetResnetBlockState) -> tuple[Tensor, SEANetResnetBlockState]:
         y = x
         conv_states = []
         idx = 0
@@ -283,10 +273,7 @@ class SEANetDecoder(nn.Module):
 def apply_rope(q: Tensor, k: Tensor, positions: Tensor, max_period: float = 10000.0) -> tuple[Tensor, Tensor]:
     b, t, h, d = q.shape
     assert (b, t, d) == (k.shape[0], k.shape[1], k.shape[3])
-    freqs = torch.exp(
-        torch.arange(d // 2, device=q.device, dtype=torch.float32)
-        * (-math.log(max_period) * 2 / d)
-    )
+    freqs = torch.exp(torch.arange(d // 2, device=q.device, dtype=torch.float32) * (-math.log(max_period) * 2 / d))
     ts = positions[..., None, None]
     q = q.view(b, t, h, d // 2, 2)
     k = k.view(b, t, k.shape[2], d // 2, 2)
@@ -333,9 +320,7 @@ class StreamingMultiheadAttention(nn.Module):
         self.in_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
 
-    def get_initial_state(
-        self, batch_size: int, device: torch.device, dtype: torch.dtype
-    ) -> AttentionState:
+    def get_initial_state(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> AttentionState:
         shape = (batch_size, 0, self.num_heads, self.dim_per_head)
         return AttentionState(
             k=torch.empty(shape, device=device, dtype=dtype),
@@ -345,11 +330,7 @@ class StreamingMultiheadAttention(nn.Module):
 
     def step(self, x: Tensor, state: AttentionState) -> tuple[Tensor, AttentionState]:
         b, t, _ = x.shape
-        q, k, v = (
-            self.in_proj(x)
-            .view(b, t, 3, self.num_heads, self.dim_per_head)
-            .unbind(dim=2)
-        )
+        q, k, v = self.in_proj(x).view(b, t, 3, self.num_heads, self.dim_per_head).unbind(dim=2)
         positions = state.seq_len[:, None] + torch.arange(t, device=x.device)
         q, k = apply_rope(q, k, positions)
         k_cache = torch.cat([state.k, k], dim=1)
@@ -396,16 +377,10 @@ class StreamingTransformerLayer(nn.Module):
         self.layer_scale_1 = LayerScale(512)
         self.layer_scale_2 = LayerScale(512)
 
-    def get_initial_state(
-        self, batch_size: int, device: torch.device, dtype: torch.dtype
-    ) -> TransformerLayerState:
-        return TransformerLayerState(
-            self_attn=self.self_attn.get_initial_state(batch_size, device, dtype)
-        )
+    def get_initial_state(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> TransformerLayerState:
+        return TransformerLayerState(self_attn=self.self_attn.get_initial_state(batch_size, device, dtype))
 
-    def step(
-        self, x: Tensor, state: TransformerLayerState
-    ) -> tuple[Tensor, TransformerLayerState]:
+    def step(self, x: Tensor, state: TransformerLayerState) -> tuple[Tensor, TransformerLayerState]:
         attn, attn_state = self.self_attn.step(self.norm1(x), state.self_attn)
         x = x + self.layer_scale_1(attn)
         x = x + self.layer_scale_2(self.linear2(F.gelu(self.linear1(self.norm2(x)))))
@@ -422,9 +397,7 @@ class StreamingTransformer(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([StreamingTransformerLayer() for _ in range(2)])
 
-    def get_initial_state(
-        self, batch_size: int, device: torch.device, dtype: torch.dtype
-    ) -> TransformerState:
+    def get_initial_state(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> TransformerState:
         return TransformerState(
             layers=[
                 layer.get_initial_state(batch_size, device, dtype)
@@ -433,9 +406,7 @@ class StreamingTransformer(nn.Module):
             ]
         )
 
-    def step(
-        self, x: Tensor, state: TransformerState
-    ) -> tuple[Tensor, TransformerState]:
+    def step(self, x: Tensor, state: TransformerState) -> tuple[Tensor, TransformerState]:
         states = []
         for layer, layer_state in zip(self.layers, state.layers):
             assert isinstance(layer, StreamingTransformerLayer)
@@ -455,15 +426,9 @@ class ProjectedTransformer(nn.Module):
         self.transformer = StreamingTransformer()
 
     def get_initial_state(self, x: Tensor) -> ProjectedTransformerState:
-        return ProjectedTransformerState(
-            transformer=self.transformer.get_initial_state(
-                x.shape[0], x.device, x.dtype
-            )
-        )
+        return ProjectedTransformerState(transformer=self.transformer.get_initial_state(x.shape[0], x.device, x.dtype))
 
-    def step(
-        self, x: Tensor, state: ProjectedTransformerState
-    ) -> tuple[list[Tensor], ProjectedTransformerState]:
+    def step(self, x: Tensor, state: ProjectedTransformerState) -> tuple[list[Tensor], ProjectedTransformerState]:
         y, new_state = self.transformer.step(x.transpose(1, 2), state.transformer)
         return ([y.transpose(1, 2)], ProjectedTransformerState(transformer=new_state))
 
@@ -471,9 +436,7 @@ class ProjectedTransformer(nn.Module):
 class ConvDownsample1d(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv = StreamingConv1d(
-            512, 32, kernel_size=32, stride=16, bias=False, pad_mode="replicate"
-        )
+        self.conv = StreamingConv1d(512, 32, kernel_size=32, stride=16, bias=False, pad_mode="replicate")
 
     def get_initial_state(self) -> Conv1dState:
         return self.conv.get_initial_state()
@@ -485,16 +448,12 @@ class ConvDownsample1d(nn.Module):
 class ConvTrUpsample1d(nn.Module):
     def __init__(self):
         super().__init__()
-        self.convtr = StreamingConvTranspose1d(
-            512, 512, kernel_size=32, stride=16, groups=512, bias=False
-        )
+        self.convtr = StreamingConvTranspose1d(512, 512, kernel_size=32, stride=16, groups=512, bias=False)
 
     def get_initial_state(self) -> ConvTranspose1dState:
         return self.convtr.get_initial_state()
 
-    def step(
-        self, x: Tensor, state: ConvTranspose1dState
-    ) -> tuple[Tensor, ConvTranspose1dState]:
+    def step(self, x: Tensor, state: ConvTranspose1dState) -> tuple[Tensor, ConvTranspose1dState]:
         return self.convtr.step(x, state)
 
 
@@ -531,15 +490,19 @@ def map_mimi_tensors(function: Callable[..., Tensor], *states):
     if isinstance(first, ConvTranspose1dState):
         return ConvTranspose1dState(map_mimi_tensors(function, *(state.partial for state in states)))
     if isinstance(first, SEANetResnetBlockState):
-        return SEANetResnetBlockState([
-            map_mimi_tensors(function, *(state.conv_states[i] for state in states))
-            for i in range(len(first.conv_states))
-        ])
+        return SEANetResnetBlockState(
+            [
+                map_mimi_tensors(function, *(state.conv_states[i] for state in states))
+                for i in range(len(first.conv_states))
+            ]
+        )
     if isinstance(first, SEANetState):
-        return SEANetState([
-            map_mimi_tensors(function, *(state.layer_states[i] for state in states))
-            for i in range(len(first.layer_states))
-        ])
+        return SEANetState(
+            [
+                map_mimi_tensors(function, *(state.layer_states[i] for state in states))
+                for i in range(len(first.layer_states))
+            ]
+        )
     if isinstance(first, AttentionState):
         return AttentionState(
             function(*(state.k for state in states)),
@@ -549,10 +512,9 @@ def map_mimi_tensors(function: Callable[..., Tensor], *states):
     if isinstance(first, TransformerLayerState):
         return TransformerLayerState(map_mimi_tensors(function, *(state.self_attn for state in states)))
     if isinstance(first, TransformerState):
-        return TransformerState([
-            map_mimi_tensors(function, *(state.layers[i] for state in states))
-            for i in range(len(first.layers))
-        ])
+        return TransformerState(
+            [map_mimi_tensors(function, *(state.layers[i] for state in states)) for i in range(len(first.layers))]
+        )
     if isinstance(first, ProjectedTransformerState):
         return ProjectedTransformerState(map_mimi_tensors(function, *(state.transformer for state in states)))
     assert isinstance(first, ContinuousMimiState)
@@ -596,13 +558,17 @@ class PocketMimi(nn.Module):
         )
 
     def encode_batch(
-        self, waveforms: list[Tensor], states: list[ContinuousMimiState],
+        self,
+        waveforms: list[Tensor],
+        states: list[ContinuousMimiState],
     ) -> tuple[list[Tensor], list[ContinuousMimiState]]:
         """Encode independent requests together, without padding audio."""
         return self.run_batch(self.encode, waveforms, states)
 
     def decode_batch(
-        self, latents: list[Tensor], states: list[ContinuousMimiState],
+        self,
+        latents: list[Tensor],
+        states: list[ContinuousMimiState],
     ) -> tuple[list[Tensor], list[ContinuousMimiState]]:
         """Decode independent requests together, retaining per-request positions."""
         return self.run_batch(self.decode, latents, states)
@@ -630,8 +596,8 @@ class PocketMimi(nn.Module):
                 batch, state = operation(torch.cat([inputs[index] for index in indices]), state)
             with torch.profiler.record_function("duplexio.mimi_cache_split"):
                 for row, index in enumerate(indices):
-                    outputs[index] = batch[row:row + 1]
-                    updated[index] = map_mimi_tensors(lambda value: value[row:row + 1], state)
+                    outputs[index] = batch[row : row + 1]
+                    updated[index] = map_mimi_tensors(lambda value: value[row : row + 1], state)
         return [outputs[index] for index in range(len(inputs))], [updated[index] for index in range(len(inputs))]
 
     def encode(

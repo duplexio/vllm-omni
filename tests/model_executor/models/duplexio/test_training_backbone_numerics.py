@@ -53,10 +53,7 @@ def test_attention_qkv_fusion_preserves_projection_values() -> None:
 
     torch.manual_seed(60)
     hidden = torch.randn(1536, 2560, device="cuda", dtype=torch.bfloat16)
-    weights = [
-        torch.randn(width, 2560, device="cuda", dtype=torch.bfloat16) * 0.02
-        for width in (8192, 1024, 1024)
-    ]
+    weights = [torch.randn(width, 2560, device="cuda", dtype=torch.bfloat16) * 0.02 for width in (8192, 1024, 1024)]
     expected = torch.cat([linear(hidden, weight) for weight in weights], -1)
     fused_weight = torch.cat(weights)
     for rows in (6, 768, 1536):

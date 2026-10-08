@@ -8,10 +8,7 @@ from pathlib import Path
 import pytest
 import websockets
 
-PREWARM_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "examples/online_serving/duplexio/realtime_web/prewarm.py"
-)
+PREWARM_PATH = Path(__file__).resolve().parents[2] / "examples/online_serving/duplexio/realtime_web/prewarm.py"
 spec = importlib.util.spec_from_file_location(
     "duplexio_realtime_prewarm_test",
     PREWARM_PATH,

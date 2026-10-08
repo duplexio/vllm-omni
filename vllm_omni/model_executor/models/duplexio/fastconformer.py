@@ -85,15 +85,15 @@ class FastConformerStreamState:
         kv.layers = []
         for layer in batch._past_key_values.layers:
             single = copy.copy(layer)
-            single.keys = layer.keys[index:index + 1]
-            single.values = layer.values[index:index + 1]
+            single.keys = layer.keys[index : index + 1]
+            single.values = layer.values[index : index + 1]
             single.cumulative_length = self.length
             kv.layers.append(single)
         padding = copy.copy(batch._padding_cache)
         padding.layers = {}
         for name, layer in batch._padding_cache.layers.items():
             single = copy.copy(layer)
-            single.cache = layer.cache[index:index + 1]
+            single.cache = layer.cache[index : index + 1]
             padding.layers[name] = single
         self._past_key_values, self._padding_cache, self.batch = kv, padding, None
 
@@ -109,9 +109,9 @@ class FastConformerStreamState:
         """Initialized cache storage, in layer order."""
         if self.flat is not None:
             return self.layout.views(self.flat)
-        return [
-            tensor for layer in self.past_key_values.layers for tensor in (layer.keys, layer.values)
-        ] + [layer.cache for layer in self.padding_cache.layers.values()]
+        return [tensor for layer in self.past_key_values.layers for tensor in (layer.keys, layer.values)] + [
+            layer.cache for layer in self.padding_cache.layers.values()
+        ]
 
     @staticmethod
     def copy_rows(states: list[FastConformerStreamState], destination: FastConformerStreamState) -> None:
@@ -134,15 +134,15 @@ class FastConformerStreamState:
         unpacked: dict[int, list[Tensor]] = {}
         for start, source, first, length in runs:
             if source.flat is not None and source.layout.key == destination.layout.key:
-                targets.append(destination.flat[start:start + length])
-                values.append(source.flat[first:first + length])
+                targets.append(destination.flat[start : start + length])
+                values.append(source.flat[first : first + length])
                 continue
             if not unpacked:
                 unpacked[id(destination)] = destination.tensors()
             if id(source) not in unpacked:
                 unpacked[id(source)] = source.tensors()
-            targets += [tensor[start:start + length] for tensor in unpacked[id(destination)]]
-            values += [tensor[first:first + length] for tensor in unpacked[id(source)]]
+            targets += [tensor[start : start + length] for tensor in unpacked[id(destination)]]
+            values += [tensor[first : first + length] for tensor in unpacked[id(source)]]
         torch._foreach_copy_(targets, values)
 
     @property
@@ -185,8 +185,7 @@ class FastConformerStreamState:
     def unbind(self, previous: list[FastConformerStreamState], frames: int) -> list[FastConformerStreamState]:
         """Restore request-owned cache containers after one batched forward."""
         return [
-            FastConformerStreamState.row_of(self, index, old.seq_length + frames)
-            for index, old in enumerate(previous)
+            FastConformerStreamState.row_of(self, index, old.seq_length + frames) for index, old in enumerate(previous)
         ]
 
 
@@ -287,7 +286,9 @@ def streaming_resample_chunk(
 
 
 def streaming_resample_batch(
-    chunks: list[Tensor], tails: list[Tensor | None], resampler: Resample,
+    chunks: list[Tensor],
+    tails: list[Tensor | None],
+    resampler: Resample,
 ) -> tuple[list[Tensor], list[Tensor]]:
     """Share resampling launches across equal-sized chunks, not audio histories."""
     groups = defaultdict(list)
@@ -298,7 +299,9 @@ def streaming_resample_batch(
     for (_, tail_size), indices in groups.items():
         tail = torch.stack([tails[index] for index in indices]) if tail_size else None
         batch, new_tail = streaming_resample_chunk(
-            torch.stack([chunks[index] for index in indices]), tail, resampler,
+            torch.stack([chunks[index] for index in indices]),
+            tail,
+            resampler,
         )
         for row, index in enumerate(indices):
             outputs[index] = batch[row]
@@ -364,7 +367,9 @@ class FastConformerGraph:
         self.hidden_size = hidden[0].numel()
 
     def __call__(
-        self, features: Tensor, states: list[FastConformerStreamState],
+        self,
+        features: Tensor,
+        states: list[FastConformerStreamState],
     ) -> tuple[Tensor, FastConformerStreamState]:
         # Rows past the batch replay whatever an earlier batch left there.
         rows = features.shape[0]
@@ -374,8 +379,8 @@ class FastConformerGraph:
         # Both features and caches must survive subsequent replays for other requests.
         flat = self.output[:rows].clone()
         return (
-            flat[:, :self.hidden_size].view(rows, *self.hidden_shape[1:]),
-            FastConformerStreamState.packed(self.output_layout, flat[:, self.hidden_size:]),
+            flat[:, : self.hidden_size].view(rows, *self.hidden_shape[1:]),
+            FastConformerStreamState.packed(self.output_layout, flat[:, self.hidden_size :]),
         )
 
 
@@ -389,10 +394,18 @@ class FastConformerEncoder(nn.Module):
 
     @classmethod
     def from_checkpoint(
-        cls, config: dict[str, Any], checkpoint: str, *, revision: str | None, use_cuda_graph: bool = False,
+        cls,
+        config: dict[str, Any],
+        checkpoint: str,
+        *,
+        revision: str | None,
+        use_cuda_graph: bool = False,
         max_rows: int = GRAPH_BATCH_SIZES[-1],
     ) -> FastConformerEncoder:
-        """Build the encoder from its config and the checkpoint's ``user_asr`` processor; the model loader supplies weights."""
+        """Build the encoder from its config and the checkpoint's ``user_asr`` processor.
+
+        The model loader supplies the weights.
+        """
         from transformers import AutoConfig, AutoProcessor
         from transformers.models.nemotron_asr_streaming.modeling_nemotron_asr_streaming import (
             NemotronAsrStreamingEncoder,
@@ -404,7 +417,12 @@ class FastConformerEncoder(nn.Module):
         return cls(encoder, processor, use_cuda_graph=use_cuda_graph, max_rows=max_rows)
 
     def __init__(
-        self, encoder: Any, processor: Any, *, use_cuda_graph: bool = False, max_rows: int = GRAPH_BATCH_SIZES[-1],
+        self,
+        encoder: Any,
+        processor: Any,
+        *,
+        use_cuda_graph: bool = False,
+        max_rows: int = GRAPH_BATCH_SIZES[-1],
     ) -> None:
         super().__init__()
         self.encoder = encoder
@@ -424,15 +442,19 @@ class FastConformerEncoder(nn.Module):
         self.feature_preemphasis = feature_extractor.preemphasis
         # Signal-processing constants stay FP32, independently of model precision.
         self.register_buffer("mel_filters", feature_extractor.mel_filters.float())
-        self.register_buffer("stft_window", torch.hann_window(feature_extractor.win_length, periodic=False, dtype=torch.float32))
+        self.register_buffer(
+            "stft_window", torch.hann_window(feature_extractor.win_length, periodic=False, dtype=torch.float32)
+        )
 
     @cached_property
     def chunk_sizes(self) -> StreamingChunkSizes:
         # The processor re-merges its kwargs on every access; the lookahead is fixed.
         processor = self.processor
         return StreamingChunkSizes(
-            processor.num_samples_first_audio_chunk, processor.num_samples_per_audio_chunk,
-            processor.num_mel_frames_first_audio_chunk, processor.num_mel_frames_per_audio_chunk,
+            processor.num_samples_first_audio_chunk,
+            processor.num_samples_per_audio_chunk,
+            processor.num_mel_frames_first_audio_chunk,
+            processor.num_mel_frames_per_audio_chunk,
         )
 
     def encode_feature_chunk(
@@ -462,42 +484,39 @@ class FastConformerEncoder(nn.Module):
         waveform = waveform.unsqueeze(0) if waveform.ndim == 1 else waveform
         with torch.autocast(waveform.device.type, enabled=False):
             if self.feature_preemphasis is not None:
-                waveform = torch.cat((
-                    waveform[:, :1], waveform[:, 1:] - self.feature_preemphasis * waveform[:, :-1],
-                ), dim=-1)
+                waveform = torch.cat(
+                    (
+                        waveform[:, :1],
+                        waveform[:, 1:] - self.feature_preemphasis * waveform[:, :-1],
+                    ),
+                    dim=-1,
+                )
             spectrum = torch.stft(
-                waveform, self.feature_n_fft, hop_length=self.feature_hop_length,
-                win_length=self.feature_win_length, window=window,
-                return_complex=True, pad_mode="constant", center=first,
+                waveform,
+                self.feature_n_fft,
+                hop_length=self.feature_hop_length,
+                win_length=self.feature_win_length,
+                window=window,
+                return_complex=True,
+                pad_mode="constant",
+                center=first,
             )
             # Preserve the upstream sqrt-then-square rounding, not abs().square().
             magnitudes = torch.view_as_real(spectrum).pow(2).sum(-1).sqrt().pow(2)
             features = (mel_filters @ magnitudes + 2**-24).log().transpose(1, 2)
-        required_frames = (
-            self.chunk_sizes.first_mel_frames
-            if first
-            else self.chunk_sizes.mel_frames
-        )
+        required_frames = self.chunk_sizes.first_mel_frames if first else self.chunk_sizes.mel_frames
         actual_frames = features.shape[1]
-        if actual_frames < required_frames or (
-            not first and actual_frames != required_frames
-        ):
-            raise ValueError(
-                f"Streaming audio chunk produced {actual_frames} mel frames; expected {required_frames}"
-            )
+        if actual_frames < required_frames or (not first and actual_frames != required_frames):
+            raise ValueError(f"Streaming audio chunk produced {actual_frames} mel frames; expected {required_frames}")
         model_param = next(self.encoder.parameters())
-        return features[:, :required_frames].to(
-            device=model_param.device, dtype=model_param.dtype
-        )
+        return features[:, :required_frames].to(device=model_param.device, dtype=model_param.dtype)
 
     def take_audio_windows(
         self, waveform: Tensor, state: FastConformerAudioStreamState
     ) -> tuple[list[Tensor], FastConformerAudioStreamState]:
         """Collect complete STFT windows, retaining only the unfinished tail."""
         if waveform.ndim != 1:
-            raise ValueError(
-                f"Live FastConformer input must be one waveform chunk, got shape {tuple(waveform.shape)}"
-            )
+            raise ValueError(f"Live FastConformer input must be one waveform chunk, got shape {tuple(waveform.shape)}")
         if state.audio_buffer is None:
             audio_buffer = waveform
         else:
@@ -513,10 +532,7 @@ class FastConformerEncoder(nn.Module):
                 raw_start = 0
                 raw_size = self.chunk_sizes.first_samples
             else:
-                raw_start = (
-                    next_mel_frame * self.feature_hop_length
-                    - self.feature_n_fft // 2
-                )
+                raw_start = next_mel_frame * self.feature_hop_length - self.feature_n_fft // 2
                 raw_size = self.chunk_sizes.samples
             raw_end = raw_start + raw_size
             available_end = buffer_start + audio_buffer.shape[0]
@@ -529,25 +545,25 @@ class FastConformerEncoder(nn.Module):
             if raw_start < 0:
                 raw_chunk = torch.cat((raw_chunk.new_zeros(-raw_start), raw_chunk))
             raw_chunks.append(raw_chunk)
-            next_mel_frame += (
-                self.chunk_sizes.first_mel_frames
-                if first else self.chunk_sizes.mel_frames
-            )
+            next_mel_frame += self.chunk_sizes.first_mel_frames if first else self.chunk_sizes.mel_frames
             next_raw_start = max(
-                next_mel_frame * self.feature_hop_length
-                - self.feature_n_fft // 2,
+                next_mel_frame * self.feature_hop_length - self.feature_n_fft // 2,
                 0,
             )
             drop = next_raw_start - buffer_start
             audio_buffer = audio_buffer[drop:]
             buffer_start = next_raw_start
         return raw_chunks, replace(
-            state, audio_buffer=audio_buffer, buffer_start_sample=buffer_start,
+            state,
+            audio_buffer=audio_buffer,
+            buffer_start_sample=buffer_start,
             next_mel_frame=next_mel_frame,
         )
 
     def encode_audio_batch(
-        self, waveforms: list[Tensor], states: list[FastConformerAudioStreamState],
+        self,
+        waveforms: list[Tensor],
+        states: list[FastConformerAudioStreamState],
     ) -> tuple[list[Tensor], list[FastConformerAudioStreamState]]:
         """Batch frontends and equal-sized encoder windows across live streams."""
         windows = []
@@ -595,7 +611,8 @@ class FastConformerEncoder(nn.Module):
                             partial(steady_encode, self),
                             torch.cat([features, features[-1:].expand(padding, -1, -1)]),
                             FastConformerStreamState.stack(previous + previous[-1:] * padding),
-                            first and first.graph.pool(), first and first.stream,
+                            first and first.graph.pool(),
+                            first and first.stream,
                         )
                     encoded, cache = self.graphs[batch_size](features, previous)
                 else:
@@ -605,7 +622,7 @@ class FastConformerEncoder(nn.Module):
             with torch.profiler.record_function("duplexio.asr_cache_split"):
                 caches = cache.unbind(previous, encoded.shape[1])
             for row, (index, encoder_state) in enumerate(zip(indices, caches, strict=True)):
-                outputs[index] = encoded[row:row + 1]
+                outputs[index] = encoded[row : row + 1]
                 updated[index].encoder = encoder_state
         return outputs, updated
 
@@ -632,6 +649,7 @@ class FastConformerEncoder(nn.Module):
         for size in self.graph_batch_sizes:
             _, states[:size] = self.encode_audio_batch(silence[:size], states[:size])
         assert set(self.graphs) == set(self.graph_batch_sizes)
+
 
 # Only captured steady windows compile: their shapes differ in batch alone, and
 # fusing the encoder's elementwise work shortens every replay.

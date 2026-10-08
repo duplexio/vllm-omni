@@ -20,10 +20,10 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
-
 # Found beside this file: run as a script, the file's directory is on sys.path.
 from realtime_relay import INPUT_SAMPLE_RATE, backend_query, issue_ticket, relay, ticket_key
+
+from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
 
 logger = logging.getLogger(__name__)
 APP_DIR = Path(__file__).parent / "app"
@@ -67,9 +67,7 @@ def list_sample_clips(directory: Path | None) -> list[dict[str, str]]:
 
 
 def load_sampling_defaults(config_path: Path) -> dict[str, object]:
-    checkpoint = CheckpointSamplingDefaults.model_validate_json(
-        config_path.read_text(encoding="utf-8")
-    )
+    checkpoint = CheckpointSamplingDefaults.model_validate_json(config_path.read_text(encoding="utf-8"))
     # The page shows the defaults a session gets when it overrides nothing.
     return {**SamplingConfig().model_dump(), "audio": {"temperature": checkpoint.flowmap_config.sampling_temperature}}
 
@@ -123,9 +121,7 @@ def build_app(
     app_version = app_version_hash.hexdigest()[:12]
 
     def is_authenticated(cookie: str | None) -> bool:
-        return session_token is None or (
-            cookie is not None and hmac.compare_digest(cookie, session_token)
-        )
+        return session_token is None or (cookie is not None and hmac.compare_digest(cookie, session_token))
 
     def login_page_response(*, invalid_password: bool = False) -> HTMLResponse:
         error = "Incorrect password." if invalid_password else ""
@@ -169,7 +165,9 @@ def build_app(
         if password_hash is None or not is_authenticated(request.cookies.get(SESSION_COOKIE_NAME)):
             return Response(status_code=401)
         ticket = issue_ticket(ticket_key(password_hash))
-        return Response(json.dumps({"ticket": ticket}), media_type="application/json", headers={"Cache-Control": "no-store"})
+        return Response(
+            json.dumps({"ticket": ticket}), media_type="application/json", headers={"Cache-Control": "no-store"}
+        )
 
     @app.get("/login", response_class=HTMLResponse)
     def login_page(request: Request) -> Response:
@@ -239,6 +237,7 @@ def build_app(
         if sample_clip_dir is None or name not in clip_names:
             return Response(status_code=404)
         return FileResponse(sample_clip_dir / name)
+
     return app
 
 

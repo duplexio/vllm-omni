@@ -187,9 +187,7 @@ def test_access_password_protects_page_and_websocket(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         server,
         "password_matches",
-        lambda password, password_hash: (
-            password == "test-password" and password_hash == "test-verifier"
-        ),
+        lambda password, password_hash: password == "test-password" and password_hash == "test-verifier",
     )
     app = server.build_app(
         ws_backend="ws://127.0.0.1:8099",
@@ -311,9 +309,7 @@ def test_session_cookie_survives_frontend_restart(monkeypatch: pytest.MonkeyPatc
     app_args = {
         "ws_backend": "wss://backend.example",
         "model": "checkpoint",
-        "sample_clips": [
-            {"id": "alice.wav", "label": "alice", "url": "/voices/alice.wav"}
-        ],
+        "sample_clips": [{"id": "alice.wav", "label": "alice", "url": "/voices/alice.wav"}],
         "sample_clip_dir": None,
         "sampling": {},
         "password_hash": "test-verifier",
@@ -354,12 +350,14 @@ def opus_packets(samples: np.ndarray, frame_ms: int) -> list[bytes]:
 def decode_opus(packets: list[bytes]) -> np.ndarray:
     decoder = av.CodecContext.create("opus", "r")
     resampler = av.AudioResampler(format="flt", layout="mono", rate=realtime_relay.INPUT_SAMPLE_RATE)
-    return np.concatenate([
-        frame.to_ndarray().reshape(-1)
-        for packet in packets
-        for decoded in decoder.decode(av.Packet(packet))
-        for frame in resampler.resample(decoded)
-    ])
+    return np.concatenate(
+        [
+            frame.to_ndarray().reshape(-1)
+            for packet in packets
+            for decoded in decoder.decode(av.Packet(packet))
+            for frame in resampler.resample(decoded)
+        ]
+    )
 
 
 def tone(seconds: float) -> np.ndarray:
@@ -378,11 +376,17 @@ def test_opus_microphone_packets_reach_the_backend_as_pcm() -> None:
     transcoder = realtime_relay.OpusTranscoder()
     reference = tone(0.4)
     appends = [
-        json.loads(transcoder.to_backend(json.dumps({
-            "type": "input_audio_buffer.append",
-            "audio": base64.b64encode(packet).decode(),
-            "format": "opus",
-        })))
+        json.loads(
+            transcoder.to_backend(
+                json.dumps(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(packet).decode(),
+                        "format": "opus",
+                    }
+                )
+            )
+        )
         for packet in opus_packets(reference, frame_ms=20)
     ]
 
@@ -399,20 +403,28 @@ def test_model_audio_reaches_the_page_as_opus_packets() -> None:
     reference = tone(0.4)
     events = []
     for offset in range(0, 1_920 * 4, 1_920):
-        events += transcoder.to_client(json.dumps({
-            "type": "response.output_audio.delta",
-            "response_id": "resp_1",
-            "delta": base64.b64encode(reference[offset : offset + 1_920].tobytes()).decode(),
-            "format": "pcm_s16le",
-            "sample_rate_hz": 24_000,
-            "metadata": {"playback": {"generated_ms": 80}},
-        }))
+        events += transcoder.to_client(
+            json.dumps(
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": "resp_1",
+                    "delta": base64.b64encode(reference[offset : offset + 1_920].tobytes()).decode(),
+                    "format": "pcm_s16le",
+                    "sample_rate_hz": 24_000,
+                    "metadata": {"playback": {"generated_ms": 80}},
+                }
+            )
+        )
     # A trailing partial frame is flushed, padded, ahead of the done event.
-    events += transcoder.to_client(json.dumps({
-        "type": "response.output_audio.delta",
-        "response_id": "resp_1",
-        "delta": base64.b64encode(reference[1_920 * 4 :].tobytes()).decode(),
-    }))
+    events += transcoder.to_client(
+        json.dumps(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp_1",
+                "delta": base64.b64encode(reference[1_920 * 4 :].tobytes()).decode(),
+            }
+        )
+    )
     events += transcoder.to_client('{"type":"response.output_audio.done","response_id":"resp_1"}')
 
     deltas = [json.loads(event) for event in events[:-1]]
@@ -435,10 +447,12 @@ def test_proxy_transcodes_only_sessions_that_ask_for_opus(monkeypatch: pytest.Mo
                 raise StopAsyncIteration
             self.message_sent = True
             await asyncio.sleep(0.2)
-            return json.dumps({
-                "type": "response.output_audio.delta",
-                "delta": base64.b64encode(tone(0.08).tobytes()).decode(),
-            })
+            return json.dumps(
+                {
+                    "type": "response.output_audio.delta",
+                    "delta": base64.b64encode(tone(0.08).tobytes()).decode(),
+                }
+            )
 
         async def send(self, message: str) -> None:
             self.sent.append(message)
@@ -456,11 +470,15 @@ def test_proxy_transcodes_only_sessions_that_ask_for_opus(monkeypatch: pytest.Mo
     )
     packet = opus_packets(tone(0.02), frame_ms=20)[0]
     with TestClient(app).websocket_connect("/v1/realtime?duplex=1&codec=opus") as websocket:
-        websocket.send_text(json.dumps({
-            "type": "input_audio_buffer.append",
-            "audio": base64.b64encode(packet).decode(),
-            "format": "opus",
-        }))
+        websocket.send_text(
+            json.dumps(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(packet).decode(),
+                    "format": "opus",
+                }
+            )
+        )
         delta = json.loads(websocket.receive_text())
 
     assert urls == ["ws://backend/v1/realtime?duplex=1"]

@@ -50,7 +50,10 @@ def content_distribution(logits: Tensor, sampling: ReferenceSampling) -> tuple[T
 
 
 def sample_content_token_ids(
-    logits: Tensor, sampling: ReferenceSampling, *, generator: torch.Generator | None = None,
+    logits: Tensor,
+    sampling: ReferenceSampling,
+    *,
+    generator: torch.Generator | None = None,
 ) -> Tensor:
     if sampling.temperature == 0:
         if sampling.suppressed_token_ids.numel():
@@ -69,8 +72,13 @@ def sample_emit(emit_logits: Tensor, temperature: float, *, generator: torch.Gen
 
 
 def sample_factorized_text_ids(
-    logits: Tensor, emit_logits: Tensor, *, silence_token_id: int, sampling: ReferenceSampling,
-    emit_temperature: float, generator: torch.Generator | None = None,
+    logits: Tensor,
+    emit_logits: Tensor,
+    *,
+    silence_token_id: int,
+    sampling: ReferenceSampling,
+    emit_temperature: float,
+    generator: torch.Generator | None = None,
 ) -> Tensor:
     """Draw speak-versus-silence independently of the content token."""
     emit = sample_emit(emit_logits, emit_temperature, generator=generator)
@@ -84,7 +92,11 @@ def exponential_race(probabilities: Tensor, generator: torch.Generator | None = 
 
 
 def sample_tool_token(
-    logits: Tensor, *, constraint: ToolCallConstraintState | None, emit: bool, sampling: ReferenceSampling,
+    logits: Tensor,
+    *,
+    constraint: ToolCallConstraintState | None,
+    emit: bool,
+    sampling: ReferenceSampling,
     generator: torch.Generator | None = None,
 ) -> ToolTokenSample | None:
     """Sample and score the grammar-constrained distribution in one draw."""
@@ -98,7 +110,9 @@ def sample_tool_token(
     bitmask = xgr.allocate_token_bitmask(1, constrained_logits.shape[-1])
     constraint.matcher.fill_next_token_bitmask(bitmask)
     xgr.apply_token_bitmask_inplace(
-        constrained_logits, bitmask.to(constrained_logits.device), vocab_size=constrained_logits.shape[-1],
+        constrained_logits,
+        bitmask.to(constrained_logits.device),
+        vocab_size=constrained_logits.shape[-1],
     )
     if sampling.temperature == 0:
         token_id = sample_content_token_ids(constrained_logits, sampling, generator=generator)
@@ -112,16 +126,29 @@ def sample_tool_token(
 
 
 def sample_text_batch(
-    model: DuplexIOForConditionalGeneration, logits: Tensor, emit_logits: Tensor, infos: list[dict[str, Any]],
+    model: DuplexIOForConditionalGeneration,
+    logits: Tensor,
+    emit_logits: Tensor,
+    infos: list[dict[str, Any]],
 ) -> TextSamplingResult:
     """Run the model's batched text sampling outside a frame step, then apply the host's tool decisions."""
     inputs = model.sampling_inputs(infos, logits.device)
     text_ids, tool_starts, frame_logprobs, support_ids = model.sample_text(
-        logits, emit_logits, inputs.parameters, inputs.tool_bitmask, top_k=inputs.top_k,
+        logits,
+        emit_logits,
+        inputs.parameters,
+        inputs.tool_bitmask,
+        top_k=inputs.top_k,
         support_width=inputs.support_width,
     )
     text = TextSamplingResult(
-        text_ids, tool_starts, frame_logprobs, support_ids, inputs.pending, inputs.calling, [None] * len(infos),
+        text_ids,
+        tool_starts,
+        frame_logprobs,
+        support_ids,
+        inputs.pending,
+        inputs.calling,
+        [None] * len(infos),
     )
     model.finish_text_batch(text, infos, text_ids.tolist(), tool_starts.tolist())
     return text

@@ -18,19 +18,37 @@ def key_in_window(q_audio: Tensor, k_audio: Tensor, k_cells: Tensor, k_pinned: T
 
 
 def key_visible(
-    q_frames: Tensor, k_frames: Tensor, q_audio: Tensor, k_audio: Tensor, k_cells: Tensor, k_active: Tensor,
-    k_pinned: Tensor, window_frames: int,
+    q_frames: Tensor,
+    k_frames: Tensor,
+    q_audio: Tensor,
+    k_audio: Tensor,
+    k_cells: Tensor,
+    k_active: Tensor,
+    k_pinned: Tensor,
+    window_frames: int,
 ) -> Tensor:
     """Visibility of keys in earlier frames; a query's own cell is the caller's to add."""
     return (k_frames < q_frames) & k_active & key_in_window(q_audio, k_audio, k_cells, k_pinned, window_frames)
 
 
 def attention_visible(
-    query_positions: Tensor, key_positions: Tensor, query_audio: Tensor, key_audio: Tensor, key_active: Tensor,
-    key_pinned: Tensor, *, window_frames: int,
+    query_positions: Tensor,
+    key_positions: Tensor,
+    query_audio: Tensor,
+    key_audio: Tensor,
+    key_active: Tensor,
+    key_pinned: Tensor,
+    *,
+    window_frames: int,
 ) -> Tensor:
     """Visibility between flattened cell positions, six cells per frame."""
     return key_visible(
-        query_positions // NUM_CELLS, key_positions // NUM_CELLS, query_audio, key_audio, key_positions % NUM_CELLS,
-        key_active, key_pinned, window_frames,
+        query_positions // NUM_CELLS,
+        key_positions // NUM_CELLS,
+        query_audio,
+        key_audio,
+        key_positions % NUM_CELLS,
+        key_active,
+        key_pinned,
+        window_frames,
     ) | (query_positions == key_positions)

@@ -38,9 +38,11 @@ class SamplingConfig(BaseModel):
     """Per-stream sampling: the agent's text and tool calls share its policy; the user stream transcribes."""
 
     model_config = ConfigDict(extra="forbid")
-    agent: SamplingPolicy = Field(default_factory=lambda: SamplingPolicy(
-        emission=EmissionPolicy(temperature=1.0),
-        content=ContentPolicy(temperature=0.6, top_k=20, top_p=0.95),
-    ))
+    agent: SamplingPolicy = Field(
+        default_factory=lambda: SamplingPolicy(
+            emission=EmissionPolicy(temperature=1.0),
+            content=ContentPolicy(temperature=0.6, top_k=20, top_p=0.95),
+        )
+    )
     user: SamplingPolicy = Field(default_factory=SamplingPolicy)
     audio: AudioPolicy = Field(default_factory=AudioPolicy)

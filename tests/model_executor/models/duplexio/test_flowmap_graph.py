@@ -15,7 +15,12 @@ from vllm_omni.model_executor.models.duplexio.modeling_duplexio import FrameInpu
 def test_flowmap_graph_replays_owned_outputs(steps: int) -> None:
     torch.manual_seed(23)
     sampler = FlowMapSampler(
-        4, 12, 32, 2, inference_steps=steps, compile=True,
+        4,
+        12,
+        32,
+        2,
+        inference_steps=steps,
+        compile=True,
     ).cuda()
     graphs = {}
     for batch in (1, 8, 3, 8):
@@ -24,7 +29,9 @@ def test_flowmap_graph_replays_owned_outputs(steps: int) -> None:
         temperature = torch.rand(batch, device="cuda")
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if batch not in graphs:
-                graphs[batch] = FrameInputGraph(lambda *inputs: (sampler.sample(*inputs),), (conditioning, noise, temperature))
+                graphs[batch] = FrameInputGraph(
+                    lambda *inputs: (sampler.sample(*inputs),), (conditioning, noise, temperature)
+                )
 
             def sample(conditioning, noise, graph=graphs[batch]):
                 return graph((conditioning, noise, temperature))[0]
@@ -36,8 +43,12 @@ def test_flowmap_graph_replays_owned_outputs(steps: int) -> None:
             conditioning.normal_()
             noise.normal_()
             second = sample(conditioning, noise)
-            torch.testing.assert_close(second, sampler.sample_function(conditioning, noise, temperature), rtol=0, atol=0)
+            torch.testing.assert_close(
+                second, sampler.sample_function(conditioning, noise, temperature), rtol=0, atol=0
+            )
             torch.testing.assert_close(actual, saved, rtol=0, atol=0)
             sampler.flow.final_layer.linear.weight.add_(0.01)
             updated = sample(conditioning, noise)
-            torch.testing.assert_close(updated, sampler.sample_function(conditioning, noise, temperature), rtol=0, atol=0)
+            torch.testing.assert_close(
+                updated, sampler.sample_function(conditioning, noise, temperature), rtol=0, atol=0
+            )

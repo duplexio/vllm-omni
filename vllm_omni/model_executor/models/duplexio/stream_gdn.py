@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# ruff: noqa: N803  (Triton constexpr arguments keep their kernel names)
 """Packed GDN prefill and recurrent six-cell decode.
 
 The recurrent kernel adapts flash-linear-attention's fused recurrent gated delta
@@ -33,8 +34,13 @@ def gdn_cache_shapes(
 ) -> tuple[tuple[int, ...], ...]:
     """Keep convolution history and six independent recurrent head groups."""
     conv_shape, recurrent_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
-        tp_size, key_heads, value_heads, key_dim, value_dim,
-        (conv_kernel_size - 1) * NUM_CELLS + 1, 0,
+        tp_size,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        (conv_kernel_size - 1) * NUM_CELLS + 1,
+        0,
     )
     return conv_shape, (recurrent_shape[0] * NUM_CELLS, *recurrent_shape[1:])
 
@@ -83,9 +89,27 @@ def initial_gdn_state(cache: Tensor, slots: Tensor, has_state: Tensor) -> Tensor
 
 @triton.jit
 def slot_recurrent_gdn_kernel(
-    q, k, v, g, beta, o, state, slots, has_state, cu_seqlens, scale,
-    stride_q, stride_k, stride_v, stride_slot,
-    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    o,
+    state,
+    slots,
+    has_state,
+    cu_seqlens,
+    scale,
+    stride_q,
+    stride_k,
+    stride_v,
+    stride_slot,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
     SINGLE_FRAME: tl.constexpr = False,
 ):
     """fla's fused recurrent gated delta rule, reading and writing each request's cache slot in place.
@@ -140,8 +164,15 @@ def slot_recurrent_gdn_kernel(
 
 
 def slot_recurrent_gdn(
-    q: Tensor, k: Tensor, v: Tensor, g: Tensor, beta: Tensor,
-    cache: Tensor, slots: Tensor, boundaries: Tensor, has_state: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    g: Tensor,
+    beta: Tensor,
+    cache: Tensor,
+    slots: Tensor,
+    boundaries: Tensor,
+    has_state: Tensor,
 ) -> Tensor:
     """Advance each request's recurrent state in its cache slot; return the outputs."""
     tokens, heads, key_dim = k.shape
@@ -149,17 +180,39 @@ def slot_recurrent_gdn(
     assert q.stride()[1:] == k.stride()[1:] == (key_dim, 1) and v.stride()[1:] == (value_dim, 1)
     assert g.is_contiguous() and beta.is_contiguous() and g.shape == beta.shape == (tokens, value_heads)
     assert cache.shape[1:] == (value_heads, key_dim, value_dim) and cache.stride()[1:] == (
-        key_dim * value_dim, value_dim, 1,
+        key_dim * value_dim,
+        value_dim,
+        1,
     )
     output = torch.empty((tokens, value_heads, value_dim), dtype=v.dtype, device=v.device)
     single_frame = tokens == slots.shape[0]
     block_v = min(32 if single_frame else 8, triton.next_power_of_2(value_dim))
     grid = (triton.cdiv(value_dim, block_v), slots.shape[0] * value_heads)
     slot_recurrent_gdn_kernel[grid](
-        q, k, v, g, beta, output, cache, slots, has_state, boundaries, key_dim ** -0.5,
-        q.stride(0), k.stride(0), v.stride(0), cache.stride(0),
-        H=heads, HV=value_heads, K=key_dim, V=value_dim, BK=triton.next_power_of_2(key_dim), BV=block_v,
-        SINGLE_FRAME=single_frame, num_warps=2 if single_frame else 1, num_stages=3,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        output,
+        cache,
+        slots,
+        has_state,
+        boundaries,
+        key_dim**-0.5,
+        q.stride(0),
+        k.stride(0),
+        v.stride(0),
+        cache.stride(0),
+        H=heads,
+        HV=value_heads,
+        K=key_dim,
+        V=value_dim,
+        BK=triton.next_power_of_2(key_dim),
+        BV=block_v,
+        SINGLE_FRAME=single_frame,
+        num_warps=2 if single_frame else 1,
+        num_stages=3,
     )
     return output
 
@@ -195,8 +248,16 @@ def append_gdn(
     # Its forward assumes the contiguous layout the wrapper enforces; V is a strided split of QKV.
     q, k, v, g, beta = (tensor.unsqueeze(0).contiguous() for tensor in (q, k, v, g, beta))
     _, output, _, final, _, _ = chunk_gated_delta_rule_fwd(
-        q, k, v, g, beta, k.shape[-1] ** -0.5, initial, True,
-        cu_seqlens=boundaries, chunk_indices=chunks,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        k.shape[-1] ** -0.5,
+        initial,
+        True,
+        cu_seqlens=boundaries,
+        chunk_indices=chunks,
     )
     # Cache views alias vLLM's mixed-dtype allocation; mutate outside compilation.
     cache[slots] = final

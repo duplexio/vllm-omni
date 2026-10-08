@@ -26,8 +26,9 @@ TOOL_STATE = 13
 NO_TOP_P = 2.0  # A cumulative probability never exceeds it.
 
 
-def sampling_parameters(agent: TokenSamplingOptions, user: TokenSamplingOptions, emit: tuple[float, float, float],
-                        vocab_size: int) -> tuple[float, ...]:
+def sampling_parameters(
+    agent: TokenSamplingOptions, user: TokenSamplingOptions, emit: tuple[float, float, float], vocab_size: int
+) -> tuple[float, ...]:
     """A request's row of ``sample_streams`` parameters, without its tool state."""
     streams = (agent, agent, user)
     return (
@@ -64,8 +65,14 @@ def support_width(agents: list[TokenSamplingOptions], top_k: int | None) -> int:
 
 
 def sample_streams(
-    logits: Tensor, emit_logits: Tensor, parameters: Tensor, blocked: Tensor, *, top_k: int | None,
-    support_width: int, silence_token_id: int,
+    logits: Tensor,
+    emit_logits: Tensor,
+    parameters: Tensor,
+    blocked: Tensor,
+    *,
+    top_k: int | None,
+    support_width: int,
+    silence_token_id: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Draw every row's three emit decisions and content tokens in one pass.
 
@@ -83,7 +90,8 @@ def sample_streams(
     temperature, emit_temperature = parameters[:, TEMPERATURE], parameters[:, EMIT_TEMPERATURE]
     greedy = temperature == 0
     scaled = (logits.float() / temperature.masked_fill(greedy, 1).unsqueeze(-1)).masked_fill(
-        blocked, torch.finfo(torch.float32).min,
+        blocked,
+        torch.finfo(torch.float32).min,
     )
     if top_k is None:
         indices, probabilities = None, torch.softmax(scaled, dim=-1)
@@ -119,13 +127,20 @@ def sample_streams(
     emitted = torch.stack((emitted[:, 0], tool_emitted, emitted[:, 2]), dim=1)
     # Score the tool decision with the raw head, even when serving forced it.
     start_logits = emit_logits[:, 1]
-    emit_logprobs = torch.stack((
-        emit_logprobs[:, 0], F.logsigmoid(torch.where(tool_emitted, start_logits, -start_logits)), emit_logprobs[:, 2],
-    ), dim=1)
+    emit_logprobs = torch.stack(
+        (
+            emit_logprobs[:, 0],
+            F.logsigmoid(torch.where(tool_emitted, start_logits, -start_logits)),
+            emit_logprobs[:, 2],
+        ),
+        dim=1,
+    )
     ids = torch.where(emitted, content, silence_token_id)
     # A discarded content draw on a wait frame is not an action.
     token_logprobs = torch.where(emitted, token_logprobs, 0)
     return (
-        torch.stack((ids[:, 2], ids[:, 0], ids[:, 1]), dim=1), tool_starts,
-        torch.stack((emit_logprobs, token_logprobs), dim=-1).flatten(1), support,
+        torch.stack((ids[:, 2], ids[:, 0], ids[:, 1]), dim=1),
+        tool_starts,
+        torch.stack((emit_logprobs, token_logprobs), dim=-1).flatten(1),
+        support,
     )

@@ -33,9 +33,7 @@ class TimestepEmbedder(nn.Module):
         super().__init__()
         self.register_buffer(
             "frequencies",
-            torch.exp(
-                -math.log(10_000.0) * torch.arange(128, dtype=torch.float32) / 128
-            ),
+            torch.exp(-math.log(10_000.0) * torch.arange(128, dtype=torch.float32) / 128),
             persistent=False,
         )
         self.input_projection = nn.Linear(256, dim)
@@ -45,9 +43,7 @@ class TimestepEmbedder(nn.Module):
     def forward(self, time: Tensor) -> Tensor:
         angles = time.unsqueeze(-1) * self.frequencies
         embedding = torch.cat((torch.cos(angles), torch.sin(angles)), dim=-1)
-        return self.norm(
-            self.output_projection(F.silu(self.input_projection(embedding)))
-        )
+        return self.norm(self.output_projection(F.silu(self.input_projection(embedding))))
 
 
 class PocketLayerNorm(nn.Module):
@@ -76,9 +72,7 @@ class AdaLNResBlock(nn.Module):
         self.adaln_projection = nn.Linear(dim, 3 * dim)
 
     def forward(self, hidden: Tensor, conditioning: Tensor) -> Tensor:
-        shift, scale, gate = self.adaln_projection(F.silu(conditioning)).chunk(
-            3, dim=-1
-        )
+        shift, scale, gate = self.adaln_projection(F.silu(conditioning)).chunk(3, dim=-1)
         residual = self.norm(hidden) * (1 + scale) + shift
         return hidden + gate * self.linear2(F.silu(self.linear1(residual)))
 
@@ -119,10 +113,13 @@ class FlowMapSampler(nn.Module):
         # Compiled for serving, where the model captures it with text sampling.
         self.sample_function = (
             torch.compile(
-                self.flow.sample, fullgraph=True, dynamic=True,
+                self.flow.sample,
+                fullgraph=True,
+                dynamic=True,
                 options={"emulate_precision_casts": True},
             )
-            if compile else self.flow.sample
+            if compile
+            else self.flow.sample
         )
 
     def sample(self, conditioning: Tensor, noise: Tensor, temperature: Tensor) -> Tensor:
@@ -152,18 +149,16 @@ class FlowMap(nn.Module):
         self.start_time_embedding = TimestepEmbedder(model_channels)
         self.target_time_embedding = TimestepEmbedder(model_channels)
         self.conditioning_embedding = nn.Linear(cond_channels, model_channels)
-        self.blocks = nn.ModuleList(
-            [AdaLNResBlock(model_channels) for _ in range(num_res_blocks)]
-        )
+        self.blocks = nn.ModuleList([AdaLNResBlock(model_channels) for _ in range(num_res_blocks)])
         self.final_layer = FinalLayer(model_channels, in_channels)
         # vLLM constructs the backbone under a BF16 default; FlowMap parameters
         # and integration stay FP32, and its linears follow the ambient autocast.
         self.float()
 
     def forward(self, x: Tensor, cond: Tensor, s: Tensor, t: Tensor) -> Tensor:
-        modulation = (
-            self.start_time_embedding(s) + self.target_time_embedding(t)
-        ) / 2 + self.conditioning_embedding(cond)
+        modulation = (self.start_time_embedding(s) + self.target_time_embedding(t)) / 2 + self.conditioning_embedding(
+            cond
+        )
         hidden = self.input_projection(x)
         for block in self.blocks:
             hidden = block(hidden, modulation)
@@ -176,11 +171,7 @@ class FlowMap(nn.Module):
         """
         current = temperature.sqrt().unsqueeze(-1) * noise
         for step in range(self.inference_steps):
-            s = conditioning.new_full(
-                conditioning.shape[:-1], step / self.inference_steps
-            )
-            t = conditioning.new_full(
-                conditioning.shape[:-1], (step + 1) / self.inference_steps
-            )
+            s = conditioning.new_full(conditioning.shape[:-1], step / self.inference_steps)
+            t = conditioning.new_full(conditioning.shape[:-1], (step + 1) / self.inference_steps)
             current = current + self(current, conditioning, s, t) / self.inference_steps
         return current

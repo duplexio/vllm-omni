@@ -25,7 +25,9 @@ def reference_case(dtype):
     model.user_emit_head = nn.Linear(6 * 32, 1)
     model.silence_token_id = 0
     model.linear_ce_options = nn.LinearCrossEntropyOptions(
-        batch_chunk_size=16, acc_policy="accurate", acc_dtype=torch.float32,
+        batch_chunk_size=16,
+        acc_policy="accurate",
+        acc_dtype=torch.float32,
     )
     model.cuda()
     # The pretrained vocabulary weights have the backbone's dtype in training;
@@ -39,7 +41,10 @@ def reference_case(dtype):
         emit_logits = model.user_emit_head(hidden.flatten(-2)).squeeze(-1)
         content_loss = model.user_content_loss(hidden, user_ids, token_rows)
         emit_loss, _, _ = model.user_emit_loss(
-            hidden, user_ids, token_rows, torch.tensor([1, 3, 4, 6, 7], device="cuda"),
+            hidden,
+            user_ids,
+            token_rows,
+            torch.tensor([1, 3, 4, 6, 7], device="cuda"),
         )
     with torch.no_grad():
         logits = nn.functional.linear(projected.float(), model.token_head.weight.float())

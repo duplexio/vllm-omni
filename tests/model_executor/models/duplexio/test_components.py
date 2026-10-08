@@ -86,8 +86,6 @@ def test_duplexio_text_config_uses_one_dimensional_rope() -> None:
     assert rope_parameters["partial_rotary_factor"] == 0.25
 
 
-
-
 def test_duplexio_installs_cell_addressing_at_stable_buffers() -> None:
     model = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
     nn.Module.__init__(model)
@@ -161,18 +159,9 @@ def test_duplexio_cudagraph_supports_uniform_six_cell_batches() -> None:
     # Paged attention masks by slot address, so any batch shape replays; the GDN
     # recurrence still needs one graph per batch size.
     for config in (single, multiple):
-        assert (
-            DuplexIOFlashAttentionMetadataBuilder.get_cudagraph_support(config, None)
-            is AttentionCGSupport.ALWAYS
-        )
-    assert (
-        DuplexIOGDNAttentionMetadataBuilder.get_cudagraph_support(single, None)
-        is AttentionCGSupport.ALWAYS
-    )
-    assert (
-        DuplexIOGDNAttentionMetadataBuilder.get_cudagraph_support(multiple, None)
-        is AttentionCGSupport.UNIFORM_BATCH
-    )
+        assert DuplexIOFlashAttentionMetadataBuilder.get_cudagraph_support(config, None) is AttentionCGSupport.ALWAYS
+    assert DuplexIOGDNAttentionMetadataBuilder.get_cudagraph_support(single, None) is AttentionCGSupport.ALWAYS
+    assert DuplexIOGDNAttentionMetadataBuilder.get_cudagraph_support(multiple, None) is AttentionCGSupport.UNIFORM_BATCH
 
 
 def test_duplexio_gdn_cache_allocation_preserves_fp32_recurrence() -> None:
@@ -181,8 +170,13 @@ def test_duplexio_gdn_cache_allocation_preserves_fp32_recurrence() -> None:
     nn.Module.__init__(attention)
     attention.model_config = config.model_config
     planned = DuplexIOForConditionalGeneration.get_mamba_state_dtype_from_config(config)
-    assert planned == attention.get_state_dtype() == (
-        torch.bfloat16, torch.float32,
+    assert (
+        planned
+        == attention.get_state_dtype()
+        == (
+            torch.bfloat16,
+            torch.float32,
+        )
     )
 
 
@@ -197,13 +191,9 @@ def test_duplexio_gdn_chunks_by_frames_without_full_graphs_too() -> None:
 def test_duplexio_gdn_graph_refreshes_every_recurrent_state_input(
     monkeypatch,
 ) -> None:
-    builder = DuplexIOGDNAttentionMetadataBuilder.__new__(
-        DuplexIOGDNAttentionMetadataBuilder
-    )
+    builder = DuplexIOGDNAttentionMetadataBuilder.__new__(DuplexIOGDNAttentionMetadataBuilder)
     builder.kv_cache_spec = object()
-    builder.vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(mamba_cache_mode="align")
-    )
+    builder.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(mamba_cache_mode="align"))
     metadata = SimpleNamespace(
         non_spec_state_indices_tensor=torch.zeros(1, dtype=torch.long),
         has_initial_state=torch.zeros(1, dtype=torch.bool),
@@ -218,8 +208,7 @@ def test_duplexio_gdn_graph_refreshes_every_recurrent_state_input(
         compute_num_computed_tokens=lambda: torch.tensor([6]),
     )
     monkeypatch.setattr(
-        "vllm_omni.model_executor.models.duplexio.qwen_backbone."
-        "mamba_get_block_table_tensor",
+        "vllm_omni.model_executor.models.duplexio.qwen_backbone.mamba_get_block_table_tensor",
         lambda *args: torch.tensor([[7]], dtype=torch.long),
     )
 
@@ -250,9 +239,13 @@ def test_gdn_graph_buffers_are_independent_per_batch_size() -> None:
     for requests in (1, 3, 8):
         boundaries = torch.arange(requests + 1, dtype=torch.int32) * 6
         metadata = GDNAttentionMetadata(
-            num_prefills=requests, num_prefill_tokens=requests * 6,
-            num_decodes=0, num_decode_tokens=0, num_spec_decodes=0,
-            num_spec_decode_tokens=0, num_actual_tokens=requests * 6,
+            num_prefills=requests,
+            num_prefill_tokens=requests * 6,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_spec_decodes=0,
+            num_spec_decode_tokens=0,
+            num_actual_tokens=requests * 6,
             non_spec_query_start_loc=boundaries,
             non_spec_state_indices_tensor=torch.arange(requests, dtype=torch.int32),
             has_initial_state=torch.ones(requests, dtype=torch.bool),
@@ -283,9 +276,7 @@ def test_mlp_adapters_return_backbone_inputs_without_a_skip() -> None:
 
 
 def test_unfinished_tool_context_does_not_run_prediction_heads() -> None:
-    model = DuplexIOForConditionalGeneration.__new__(
-        DuplexIOForConditionalGeneration
-    )
+    model = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
 
     predictions = model.sample_frames(
         torch.zeros(6, 4),
@@ -306,8 +297,13 @@ def test_checkpoint_names_map_onto_the_flat_heads() -> None:
     model.user_emit_head = nn.Linear(24, 1)
     weights = {name: torch.randn_like(value) for name, value in model.state_dict().items()}
     checkpoint = {
-        ("llm.base_model." + name if name.startswith("lm_head") else
-         "llm." + name if name.startswith(("channel_emb", "output_head_proj")) else name): value
+        (
+            "llm.base_model." + name
+            if name.startswith("lm_head")
+            else "llm." + name
+            if name.startswith(("channel_emb", "output_head_proj"))
+            else name
+        ): value
         for name, value in weights.items()
     }
     checkpoint["user_asr.model.decoder.weight"] = torch.zeros(1)  # The ASR decoder is never loaded.
@@ -319,9 +315,12 @@ def test_checkpoint_names_map_onto_the_flat_heads() -> None:
 
 def test_only_the_tool_stream_may_emit_tool_call_markers() -> None:
     encoded = {
-        "<|im_start|>": [11], "<|im_end|>": [12],
-        "<think>": [14], "</think>": [15],
-        "<tool_call>": [18], "</tool_call>": [19],
+        "<|im_start|>": [11],
+        "<|im_end|>": [12],
+        "<think>": [14],
+        "</think>": [15],
+        "<tool_call>": [18],
+        "</tool_call>": [19],
     }
     tokenizer = SimpleNamespace(all_special_ids=[11, 12], encode=lambda text, **_: encoded[text])
     agent_ids, tool_ids = text_suppression_ids(tokenizer, 13)

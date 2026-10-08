@@ -34,17 +34,30 @@ FRAME_FIELDS = (
     "sample_rate_hz",
 )
 FRAME_INDEX = {name: index for index, name in enumerate(FRAME_FIELDS)}
-FRAME_FLAGS = frozenset({
-    "prefix", "tool_result", "given", "end_of_turn", "predicted", "model_listen", "tool_call_complete",
-    "tool_emit_sampled", "user_emit",
-})
+FRAME_FLAGS = frozenset(
+    {
+        "prefix",
+        "tool_result",
+        "given",
+        "end_of_turn",
+        "predicted",
+        "model_listen",
+        "tool_call_complete",
+        "tool_emit_sampled",
+        "user_emit",
+    }
+)
 # ``tool_emit_sampled`` marks frames whose tool emit was drawn; inside a call or
 # without a grammar it is forced, and its logprob is only the raw head's score.
 
 # Columns of ``frame_logprobs``.
 FRAME_LOGPROBS = (
-    "agent_emit_logprob", "agent_token_logprob", "tool_emit_logprob", "tool_token_logprob",
-    "user_emit_logprob", "user_token_logprob",
+    "agent_emit_logprob",
+    "agent_token_logprob",
+    "tool_emit_logprob",
+    "tool_token_logprob",
+    "user_emit_logprob",
+    "user_token_logprob",
 )
 
 
@@ -52,8 +65,7 @@ def frame_fields(output: Mapping[str, Any]) -> dict[str, int | bool]:
     """Unpack an output's ``frame`` into named Python scalars with one read."""
     values = output["frame"].tolist()
     return {
-        name: bool(value) if name in FRAME_FLAGS else value
-        for name, value in zip(FRAME_FIELDS, values, strict=True)
+        name: bool(value) if name in FRAME_FLAGS else value for name, value in zip(FRAME_FIELDS, values, strict=True)
     }
 
 

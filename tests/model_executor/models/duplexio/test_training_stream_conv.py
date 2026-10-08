@@ -22,7 +22,10 @@ def test_large_cache_offsets_match_contiguous_state() -> None:
     """vLLM's interleaved layer storage can put a slot beyond 32-bit offsets."""
     channels, history = 32, 18
     state = torch.empty_strided(
-        (5, channels, history), (1 << 30, history, 1), device="cuda", dtype=torch.bfloat16,
+        (5, channels, history),
+        (1 << 30, history, 1),
+        device="cuda",
+        dtype=torch.bfloat16,
     )
     state.fill_(1)
     state[0].fill_(2)
@@ -50,8 +53,18 @@ def test_empty_request_does_not_reset_convolution_state(padding_slot: int) -> No
     boundaries = torch.tensor([0, 6, 6], device="cuda", dtype=torch.int32)
     has_state = torch.zeros(2, device="cuda", dtype=torch.bool)
     update_stream_conv_state_kernel[(2, 1)](
-        x, state, slots, boundaries, has_state, channels, history, slots.stride(0),
-        *x.stride(), *state.stride(), 32, 32,
+        x,
+        state,
+        slots,
+        boundaries,
+        has_state,
+        channels,
+        history,
+        slots.stride(0),
+        *x.stride(),
+        *state.stride(),
+        32,
+        32,
     )
     torch.testing.assert_close(state[0], torch.zeros_like(state[0]), rtol=0, atol=0)
     torch.testing.assert_close(state[1], torch.ones_like(state[1]), rtol=0, atol=0)
@@ -73,7 +86,18 @@ def test_batched_in_place_history_shift(time_major: bool) -> None:
     for _ in range(100):
         expected = torch.cat((state[:, :, 6:].clone(), x.view(requests, 6, channels).transpose(1, 2)), -1)
         update_stream_conv_state_kernel[(requests, channels // 32)](
-            x, state, slots, boundaries, active, channels, history, slots.stride(0), *x.stride(), *state.stride(), 32, 32,
+            x,
+            state,
+            slots,
+            boundaries,
+            active,
+            channels,
+            history,
+            slots.stride(0),
+            *x.stride(),
+            *state.stride(),
+            32,
+            32,
         )
         torch.testing.assert_close(state, expected, rtol=0, atol=0)
         x.add_(0.01)
@@ -84,7 +108,9 @@ def test_batched_in_place_history_shift(time_major: bool) -> None:
 @pytest.mark.parametrize("slot_stride", [1, 2])
 @torch.inference_mode()
 def test_streaming_matches_packed_training_and_resets_reused_slots(
-    lengths: list[int], capture_graph: bool, slot_stride: int,
+    lengths: list[int],
+    capture_graph: bool,
+    slot_stride: int,
 ) -> None:
     torch.manual_seed(613)
     channels, history_length = 32, 18
@@ -93,8 +119,7 @@ def test_streaming_matches_packed_training_and_resets_reused_slots(
     nn.Module.__init__(native)
     native.full_cudagraph_enabled = False
     native.activation = "silu"
-    native.conv1d = nn.Conv1d(channels, channels, 19, groups=channels, bias=False,
-                            device="cuda", dtype=torch.bfloat16)
+    native.conv1d = nn.Conv1d(channels, channels, 19, groups=channels, bias=False, device="cuda", dtype=torch.bfloat16)
     native.conv1d.weight.copy_(expand_stream_conv_weight(source.weight))
     state = torch.randn(3, channels, history_length, device="cuda", dtype=torch.bfloat16)
     original_state = state.clone()
@@ -110,13 +135,21 @@ def test_streaming_matches_packed_training_and_resets_reused_slots(
     # Its FP32 reference conv avoids a causal_conv1d build against this venv's torch.
     reference_lengths = [part.shape[0] for part in segments]
     seq_idx = torch.repeat_interleave(torch.arange(2, dtype=torch.int32), torch.tensor(reference_lengths) // 6)[None]
-    expected = training.stream_causal_conv1d(
-        torch.cat(segments).float().cpu().view(1, -1, 6 * channels),
-        source.weight.squeeze(1).repeat(6, 1).float().cpu(), seq_idx,
-    ).view(-1, channels).cuda()
+    expected = (
+        training.stream_causal_conv1d(
+            torch.cat(segments).float().cpu().view(1, -1, 6 * channels),
+            source.weight.squeeze(1).repeat(6, 1).float().cpu(),
+            seq_idx,
+        )
+        .view(-1, channels)
+        .cuda()
+    )
     expected = torch.cat([part[history_length:] for part in expected.split(reference_lengths)])
-    chunks = torch.tensor([[request, chunk] for request, length in enumerate(lengths)
-                           for chunk in range((length // 6 + 63) // 64)], device="cuda", dtype=torch.int32)
+    chunks = torch.tensor(
+        [[request, chunk] for request, length in enumerate(lengths) for chunk in range((length // 6 + 63) // 64)],
+        device="cuda",
+        dtype=torch.int32,
+    )
     actual = native.apply_stream_causal_conv(x, state, slots, boundaries, has_state, chunks)
     if capture_graph:
         stream = torch.cuda.Stream()

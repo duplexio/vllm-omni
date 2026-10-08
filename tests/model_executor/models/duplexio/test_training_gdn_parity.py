@@ -149,8 +149,12 @@ def test_slot_recurrence_matches_fla_on_gathered_state(aliased_storage: bool, le
 
     initial = torch.where(has_state[:, None, None, None], reference[slots], 0)
     expected, final = fused_recurrent_gated_delta_rule(
-        *(tensor.unsqueeze(0) for tensor in (q, k, v)), g=g.unsqueeze(0), beta=beta.unsqueeze(0),
-        initial_state=initial, output_final_state=True, cu_seqlens=boundaries,
+        *(tensor.unsqueeze(0) for tensor in (q, k, v)),
+        g=g.unsqueeze(0),
+        beta=beta.unsqueeze(0),
+        initial_state=initial,
+        output_final_state=True,
+        cu_seqlens=boundaries,
     )
     reference[slots] = final
     actual = slot_recurrent_gdn(q, k, v, g, beta, state, slots, boundaries, has_state)
@@ -207,7 +211,11 @@ def assert_recurrence_close(actual: torch.Tensor, expected: torch.Tensor) -> Non
 
 @torch.inference_mode()
 def dense_recurrence(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
 ) -> torch.Tensor:
     """Literal FP64 state update, independent of either CUDA implementation."""
     batches, length, value_heads, value_dim = v.shape

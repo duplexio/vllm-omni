@@ -95,7 +95,8 @@ def test_sampling_captures_as_one_graph_without_random_state() -> None:
     random_state = torch.random.get_rng_state()
     compiled = torch.compile(flow.sample, fullgraph=True, backend="eager")
     torch.testing.assert_close(
-        compiled(conditioning, noise, temperatures(3)), flow.sample(conditioning, noise, temperatures(3)),
+        compiled(conditioning, noise, temperatures(3)),
+        flow.sample(conditioning, noise, temperatures(3)),
     )
     torch.testing.assert_close(torch.random.get_rng_state(), random_state)
 

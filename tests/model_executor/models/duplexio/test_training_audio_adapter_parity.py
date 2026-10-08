@@ -42,12 +42,7 @@ def test_audio_adapter_partition_invariance(
     features = torch.randn(736, input_dim, device="cuda", dtype=torch.bfloat16)
     with torch.autocast("cuda", dtype=torch.bfloat16):
         expected = training(features)
-        actual = torch.cat(
-            [
-                native(chunk)
-                for chunk in features.split([256, 256, 212, *([1] * 12)])
-            ]
-        )
+        actual = torch.cat([native(chunk) for chunk in features.split([256, 256, 212, *([1] * 12)])])
     # Different packed GEMM shapes may round a few BF16 outputs differently.
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=1e-6)
     assert (actual.float() - expected.float()).norm() / expected.float().norm() < 1e-4

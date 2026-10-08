@@ -54,10 +54,21 @@ def test_reference_matches_literal_truth_table() -> None:
         case = (q_frame, k_frame, q_audio, k_audio, k_cell, k_active, k_pinned)
         q_audio, k_audio, k_cell, k_pinned = map(torch.tensor, (q_audio, k_audio, k_cell, k_pinned))
         assert bool(key_in_window(q_audio, k_audio, k_cell, k_pinned, WINDOW)) is in_window, case
-        assert bool(key_visible(
-            torch.tensor(q_frame), torch.tensor(k_frame), q_audio, k_audio, k_cell, torch.tensor(k_active), k_pinned,
-            WINDOW,
-        )) is visible, case
+        assert (
+            bool(
+                key_visible(
+                    torch.tensor(q_frame),
+                    torch.tensor(k_frame),
+                    q_audio,
+                    k_audio,
+                    k_cell,
+                    torch.tensor(k_active),
+                    k_pinned,
+                    WINDOW,
+                )
+            )
+            is visible
+        ), case
 
 
 def test_reference_visibility_freezes_the_window_over_frames_without_audio() -> None:
@@ -65,9 +76,7 @@ def test_reference_visibility_freezes_the_window_over_frames_without_audio() -> 
     # Frame 3 is a token-only burst: audio time freezes, so the window is
     # measured over audio positions [1, 2, 3, 3, 4], not frame indices.
     frame_audio_positions = torch.tensor([1, 1, 1, 0, 1]).cumsum(0)
-    audio_positions = frame_audio_positions.repeat_interleave(
-        NUM_CELLS
-    )
+    audio_positions = frame_audio_positions.repeat_interleave(NUM_CELLS)
     query = positions[:, None]
     key = positions[None, :]
     key_active = torch.ones_like(key, dtype=torch.bool)
@@ -91,17 +100,9 @@ def test_reference_visibility_freezes_the_window_over_frames_without_audio() -> 
             query_frame, _ = divmod(query_position, NUM_CELLS)
             key_frame, key_cell = divmod(key_position, NUM_CELLS)
             active = key_position != 1
-            audio_distance = int(
-                frame_audio_positions[query_frame]
-                - frame_audio_positions[key_frame]
-            )
-            expected[query_position, key_position] = (
-                query_position == key_position
-                or (
-                    key_frame < query_frame
-                    and active
-                    and (key_cell < 4 or audio_distance <= 2)
-                )
+            audio_distance = int(frame_audio_positions[query_frame] - frame_audio_positions[key_frame])
+            expected[query_position, key_position] = query_position == key_position or (
+                key_frame < query_frame and active and (key_cell < 4 or audio_distance <= 2)
             )
 
     torch.testing.assert_close(visible, expected)

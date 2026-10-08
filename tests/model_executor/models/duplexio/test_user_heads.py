@@ -53,20 +53,28 @@ def sample_user(model, logits, emissions, infos):
     padded = F.pad(logits, (0, 64 - logits.shape[-1]), value=-torch.inf)
     silent = torch.full_like(emissions, -100.0)
     sampled = sample_text_batch(
-        model, padded.unsqueeze(1).expand(-1, 3, -1), torch.stack((silent, silent, emissions), dim=1), infos,
+        model,
+        padded.unsqueeze(1).expand(-1, 3, -1),
+        torch.stack((silent, silent, emissions), dim=1),
+        infos,
     )
     return sampled.text_ids[:, 0], sampled.frame_logprobs[:, 4], sampled.frame_logprobs[:, 5]
 
 
 def sampling_info(model, device="cpu", mode="top_k", emit_temperature=0.7):
-    sampling = model.resolve_sampling({
-        "agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.6, "top_k": 4, "top_p": 0.8}},
-        "user": {"emission": {"temperature": emit_temperature}, "content": {
-            "temperature": 0.0 if mode == "argmax" else 0.65,
-            "top_k": None if mode == "sample" else 4,
-            "top_p": 0.8 if mode == "top_p" else None,
-        }},
-    })
+    sampling = model.resolve_sampling(
+        {
+            "agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.6, "top_k": 4, "top_p": 0.8}},
+            "user": {
+                "emission": {"temperature": emit_temperature},
+                "content": {
+                    "temperature": 0.0 if mode == "argmax" else 0.65,
+                    "top_k": None if mode == "sample" else 4,
+                    "top_p": 0.8 if mode == "top_p" else None,
+                },
+            },
+        }
+    )
     return {"duplexio_working_state": SimpleNamespace(tool_call_constraint=None, sampling=sampling)}
 
 
@@ -115,7 +123,10 @@ def test_user_behavior_probabilities_include_waits_and_actual_truncation(mode, t
 def test_saturated_bernoulli_probabilities_are_recorded_exactly():
     model = head_model()
     ids, emit_logprobs, _ = sample_user(
-        model, torch.ones(2, 6), torch.tensor([100.0, -100.0]), [sampling_info(model), sampling_info(model)],
+        model,
+        torch.ones(2, 6),
+        torch.tensor([100.0, -100.0]),
+        [sampling_info(model), sampling_info(model)],
     )
     assert ids[0].item() != 0 and ids[1].item() == 0
     assert emit_logprobs.tolist() == [0.0, 0.0]

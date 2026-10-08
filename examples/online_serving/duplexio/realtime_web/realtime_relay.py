@@ -129,11 +129,7 @@ class OpusTranscoder:
     def _opus_delta(event: dict, packet: bytes) -> str:
         # Per-frame backend metadata (token ids, playback counters) would be
         # larger than the audio itself, and the page does not read it.
-        delta = {
-            key: value
-            for key, value in event.items()
-            if key not in {"format", "sample_rate_hz", "metadata"}
-        }
+        delta = {key: value for key, value in event.items() if key not in {"format", "sample_rate_hz", "metadata"}}
         delta.update(type="response.output_audio.delta", delta=base64.b64encode(packet).decode(), format="opus")
         return json.dumps(delta)
 

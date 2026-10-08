@@ -26,16 +26,22 @@ from vllm_omni.model_executor.models.duplexio.fastconformer import (
 )
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param(
-    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-)])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
 def test_batched_resampling_keeps_each_stream_history(device):
     torch.manual_seed(29)
     chunks = [torch.randn(length, device=device) for length in (1920, 3840, 1920, 1920)]
     tails = [torch.randn(48, device=device), None, torch.randn(48, device=device), None]
     resampler = Resample(24_000, 16_000, dtype=torch.float32).to(device)
-    expected = [streaming_resample_chunk(chunk, tail, resampler)
-                for chunk, tail in zip(chunks, tails, strict=True)]
+    expected = [streaming_resample_chunk(chunk, tail, resampler) for chunk, tail in zip(chunks, tails, strict=True)]
     actual, updated = streaming_resample_batch(chunks, tails, resampler)
     for (reference, tail), output, new_tail in zip(expected, actual, updated, strict=True):
         torch.testing.assert_close(output, reference)
@@ -43,7 +49,7 @@ def test_batched_resampling_keeps_each_stream_history(device):
     for chunk, tail, value in zip(chunks, tails, actual, strict=True):
         buffer = chunk if tail is None else torch.cat((tail, chunk))
         start = 0 if tail is None else tail.numel() * 2 // 3
-        reference = AF.resample(buffer, 24_000, 16_000)[start:start + chunk.numel() * 2 // 3]
+        reference = AF.resample(buffer, 24_000, 16_000)[start : start + chunk.numel() * 2 // 3]
         torch.testing.assert_close(value, reference, atol=1e-6, rtol=1e-5)
 
 
@@ -72,7 +78,9 @@ def test_model_preprocess_batches_audio_without_persisting_prepared_results(enco
     assert batch_sizes == [3]
     for request_id, info in infos.items():
         assert "prepared_audio" not in info
-        _, embeddings, updates = model.preprocess(torch.zeros(36, dtype=torch.long), None, **info, **prepared[request_id])
+        _, embeddings, updates = model.preprocess(
+            torch.zeros(36, dtype=torch.long), None, **info, **prepared[request_id]
+        )
         torch.testing.assert_close(embeddings, expected[request_id][1], atol=2e-5, rtol=2e-4)
         assert updates["duplexio_working_state"].frames_seen == 6
         assert info["duplexio_model_state"].frames_seen == 0
@@ -89,16 +97,23 @@ def test_batched_streams_preserve_age_order_and_accepted_state(encoder):
     for order in ([3, 0, 2, 1], [2, 1, 3], [3, 2]):
         waveforms = [torch.randn(FRAME_SAMPLES) * 0.1 for _ in order]
         previous = [states[index] for index in order]
-        expected = [encode_one(encoder, waveform, state)[0]
-                    for waveform, state in zip(waveforms, previous, strict=True)]
+        expected = [
+            encode_one(encoder, waveform, state)[0] for waveform, state in zip(waveforms, previous, strict=True)
+        ]
         batch_sizes = []
-        hook = encoder.encoder.register_forward_hook(lambda module, args, result: batch_sizes.append(result.last_hidden_state.shape[0]))
+        hook = encoder.encoder.register_forward_hook(
+            lambda module, args, result: batch_sizes.append(result.last_hidden_state.shape[0])
+        )
         actual, updated = encoder.encode_audio_batch(waveforms, previous)
         hook.remove()
         assert 2 in batch_sizes  # Unequal ages beyond the cache window batch together.
         for index, reference, output, state in zip(order, expected, actual, updated, strict=True):
             torch.testing.assert_close(output, reference, atol=2e-5, rtol=2e-4)
-            old_length = states[index].encoder.past_key_values.get_seq_length() if states[index].encoder.past_key_values is not None else 0
+            old_length = (
+                states[index].encoder.past_key_values.get_seq_length()
+                if states[index].encoder.past_key_values is not None
+                else 0
+            )
             assert state.encoder.past_key_values.get_seq_length() == old_length + 1
             states[index] = state
         replay, _ = encoder.encode_audio_batch(waveforms, previous)
@@ -116,11 +131,18 @@ def encoder() -> FastConformerEncoder:
     torch.manual_seed(9)
     config = NemotronAsrStreamingConfig(
         encoder_config=NemotronAsrStreamingEncoderConfig(
-            hidden_size=16, num_hidden_layers=2, num_attention_heads=2,
-            intermediate_size=32, subsampling_conv_channels=4, num_mel_bins=8,
+            hidden_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            intermediate_size=32,
+            subsampling_conv_channels=4,
+            num_mel_bins=8,
             sliding_window=7,
         ),
-        vocab_size=2, blank_token_id=0, decoder_hidden_size=8, num_decoder_layers=1,
+        vocab_size=2,
+        blank_token_id=0,
+        decoder_hidden_size=8,
+        num_decoder_layers=1,
     )
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=Tokenizer(models.WordLevel({"<blank>": 0, "<unk>": 1}, unk_token="<unk>")),
@@ -131,22 +153,36 @@ def encoder() -> FastConformerEncoder:
 
 
 @pytest.mark.parametrize("first", [False, True])
-@pytest.mark.parametrize("device", ["cpu", pytest.param(
-    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-)])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
 @torch.inference_mode()
 def test_cached_frontend_matches_upstream_processor(encoder, first, device):
     encoder = encoder.to(device)
-    mel_frames = (encoder.processor.num_mel_frames_first_audio_chunk if first
-                  else encoder.processor.num_mel_frames_per_audio_chunk)
+    mel_frames = (
+        encoder.processor.num_mel_frames_first_audio_chunk
+        if first
+        else encoder.processor.num_mel_frames_per_audio_chunk
+    )
     samples = (mel_frames - 1) * encoder.feature_hop_length + encoder.feature_n_fft
     if first:
         samples -= encoder.feature_n_fft // 2
     waveform = torch.randn(4, samples, device=device) * 0.1
     for value in (waveform, waveform * 0):
         expected = encoder.processor(
-            value.unbind(0), sampling_rate=16_000, is_streaming=True,
-            is_first_audio_chunk=first, return_tensors="pt", device=device,
+            value.unbind(0),
+            sampling_rate=16_000,
+            is_streaming=True,
+            is_first_audio_chunk=first,
+            return_tensors="pt",
+            device=device,
         ).input_features[:, :mel_frames]
         actual = encoder.prepare_streaming_audio_chunk(value, first=first)
         # The upstream processor returns CPU features even for CUDA waveforms.
@@ -197,14 +233,16 @@ def test_encoder_graph_rebatches_groups_without_restacking(encoder, monkeypatch)
     expected_states = copy.deepcopy(actual_states)
     stack = FastConformerStreamState.stack.__func__
     packed = []
-    monkeypatch.setattr(FastConformerStreamState, "stack", classmethod(
-        lambda cls, states: packed.append(len(states)) or stack(cls, states)
-    ))
+    monkeypatch.setattr(
+        FastConformerStreamState,
+        "stack",
+        classmethod(lambda cls, states: packed.append(len(states)) or stack(cls, states)),
+    )
     foreach_copy = torch._foreach_copy_
     copies = []
-    monkeypatch.setattr(torch, "_foreach_copy_", lambda targets, values: (
-        copies.append(len(targets)) or foreach_copy(targets, values)
-    ))
+    monkeypatch.setattr(
+        torch, "_foreach_copy_", lambda targets, values: copies.append(len(targets)) or foreach_copy(targets, values)
+    )
     snapshot = None
     # Steady from step 13: a regrouped subset, a merge of rows from two earlier
     # batches, and a reordering must all feed a captured graph without restacking.
@@ -272,7 +310,9 @@ def test_graphs_captured_before_serving_cover_every_batch(encoder, monkeypatch):
 @pytest.mark.parametrize("frames", [1, 4, 16])
 @torch.inference_mode()
 def test_parallel_prefill_matches_streaming_and_continuation(
-    encoder: FastConformerEncoder, frames: int, monkeypatch: pytest.MonkeyPatch,
+    encoder: FastConformerEncoder,
+    frames: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     waveform = torch.randn(frames * FRAME_SAMPLES) * 0.1
     serial_state = FastConformerAudioStreamState()
@@ -319,12 +359,16 @@ def test_tool_burst_leaves_real_asr_continuation_unchanged(encoder: FastConforme
     model = model_fixture()
     model.user_asr = encoder
     model.user_audio_input_adapter = torch.nn.Linear(encoder.output_dim, 11)
-    _, _, update = model.preprocess(torch.zeros(36, dtype=torch.long), None, **append_info(request_state(model), prefix=True))
+    _, _, update = model.preprocess(
+        torch.zeros(36, dtype=torch.long), None, **append_info(request_state(model), prefix=True)
+    )
     before = update["duplexio_working_state"]
     live = (torch.randn(1920) * 0.1).numpy().tobytes()
     _, _, update = model.preprocess(torch.zeros(6, dtype=torch.long), None, **append_info(before, pcm=live))
     plain = update["duplexio_working_state"]
-    _, _, update = model.preprocess(torch.zeros(24, dtype=torch.long), None, **append_info(before, tool=(6, 7, 8), pcm=live))
+    _, _, update = model.preprocess(
+        torch.zeros(24, dtype=torch.long), None, **append_info(before, tool=(6, 7, 8), pcm=live)
+    )
     after_tool = update["duplexio_working_state"]
     waveform = (torch.randn(1920) * 0.1).numpy().tobytes()
     continuations = []

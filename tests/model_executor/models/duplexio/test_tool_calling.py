@@ -90,7 +90,9 @@ def test_session_grammar_compiles_without_blocking_its_request() -> None:
     vocab = ["<silence>", *sorted(set("<function=ping>\n</function>"))]
     compiler = object.__new__(ToolCallConstraintCompiler)
     compiler.decoded_vocab = tuple(value.encode() for value in vocab)
-    compiler.compiler = xgr.GrammarCompiler(xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=len(vocab)))
+    compiler.compiler = xgr.GrammarCompiler(
+        xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=len(vocab))
+    )
     compiler.executor = ThreadPoolExecutor(max_workers=1)
     release = threading.Event()
     compiler.executor.submit(release.wait)

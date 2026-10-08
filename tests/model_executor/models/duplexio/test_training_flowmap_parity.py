@@ -63,10 +63,12 @@ def test_fixed_conditioning_and_noise_match_training_exactly(batch_size: int) ->
     with torch.autocast("cuda", dtype=torch.bfloat16):
         expected = initial + reference(initial, conditioning, start, end)
         actual = native.sample(conditioning, noise, temperature)
-        individual = torch.cat([
-            native.sample(conditioning[row : row + 1], noise[row : row + 1], temperature[row : row + 1])
-            for row in range(batch_size)
-        ])
+        individual = torch.cat(
+            [
+                native.sample(conditioning[row : row + 1], noise[row : row + 1], temperature[row : row + 1])
+                for row in range(batch_size)
+            ]
+        )
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     torch.testing.assert_close(actual, individual, atol=0, rtol=0)
 

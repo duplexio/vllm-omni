@@ -153,9 +153,8 @@ class DuplexIOFrameMetadata:
             audio_last * layout.num_audio_cells + cell - NUM_TEXT_CELLS,
             layout.persistent_base,
         )
-        return (
-            torch.where(persistent, layout.persistent_base + ordinal - 1, audio_slot)
-            .masked_fill(~(persistent | audio), -1)
+        return torch.where(persistent, layout.persistent_base + ordinal - 1, audio_slot).masked_fill(
+            ~(persistent | audio), -1
         )
 
     def row_reads(self, tokens: int) -> tuple[Tensor, Tensor, Tensor]:
@@ -228,9 +227,7 @@ class DuplexIOKVCacheManager(FullAttentionManager):
         if kwargs.get("enable_caching"):
             raise ValueError("DuplexIO role-aware KV does not support prefix caching")
         if not kwargs.get("needs_kv_cache_zeroing"):
-            raise ValueError(
-                "DuplexIO compact KV requires vLLM's hybrid-cache block zeroing"
-            )
+            raise ValueError("DuplexIO compact KV requires vLLM's hybrid-cache block zeroing")
         super().__init__(kv_cache_spec, **kwargs)
         self.layout = kv_cache_spec.layout
 

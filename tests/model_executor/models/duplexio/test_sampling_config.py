@@ -10,9 +10,11 @@ from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingCon
 
 def test_user_sampling_is_independent_of_the_agent_default() -> None:
     serving = SamplingConfig()
-    exploring = SamplingConfig.model_validate({
-        "user": {"emission": {"temperature": 1.0}, "content": {"temperature": 1.0}},
-    })
+    exploring = SamplingConfig.model_validate(
+        {
+            "user": {"emission": {"temperature": 1.0}, "content": {"temperature": 1.0}},
+        }
+    )
     assert exploring.agent == serving.agent
     assert serving.agent.content.model_dump() == {"temperature": 0.6, "top_k": 20, "top_p": 0.95}
     assert exploring.user.content.model_dump() == {"temperature": 1.0, "top_k": None, "top_p": None}

@@ -57,16 +57,9 @@ def empty_grammar() -> xgr.Grammar:
 
 
 def string_value_grammar(schema: Mapping[str, Any]) -> xgr.Grammar:
-    unsupported = {
-        key
-        for key in schema
-        if key not in STRING_SCHEMA_KEYS and not key.startswith("x-")
-    }
+    unsupported = {key for key in schema if key not in STRING_SCHEMA_KEYS and not key.startswith("x-")}
     if unsupported:
-        raise ValueError(
-            "DuplexIO string parameters use unsupported constraints: "
-            f"{sorted(unsupported)}"
-        )
+        raise ValueError(f"DuplexIO string parameters use unsupported constraints: {sorted(unsupported)}")
     min_length = schema.get("minLength", 0)
     max_length = schema.get("maxLength", TOOL_CALL_STRING_LIMIT)
     if not isinstance(min_length, int) or not isinstance(max_length, int):
@@ -95,52 +88,30 @@ def string_value_grammar(schema: Mapping[str, Any]) -> xgr.Grammar:
         const = schema["const"]
         if not isinstance(const, str):
             raise ValueError("DuplexIO string const values must be strings")
-        if (
-            not min_length <= len(const) <= max_length
-            or "<" in const
-            or "\n" in const
-            or "\r" in const
-        ):
+        if not min_length <= len(const) <= max_length or "<" in const or "\n" in const or "\r" in const:
             raise ValueError("DuplexIO string const is not representable")
         return literal_grammar(const)
 
-    return xgr.Grammar.from_ebnf(
-        f"root ::= [^<\\n\\r]{{{min_length},{max_length}}}"
-    )
+    return xgr.Grammar.from_ebnf(f"root ::= [^<\\n\\r]{{{min_length},{max_length}}}")
 
 
 def parameter_value_grammar(schema: Mapping[str, Any]) -> xgr.Grammar:
     alternatives = schema.get("anyOf")
     if isinstance(alternatives, list) and alternatives:
         unsupported = {
-            key
-            for key in schema
-            if key != "anyOf"
-            and key not in SCHEMA_ANNOTATION_KEYS
-            and not key.startswith("x-")
+            key for key in schema if key != "anyOf" and key not in SCHEMA_ANNOTATION_KEYS and not key.startswith("x-")
         }
         if unsupported:
-            raise ValueError(
-                "DuplexIO anyOf parameters cannot carry sibling constraints: "
-                f"{sorted(unsupported)}"
-            )
+            raise ValueError(f"DuplexIO anyOf parameters cannot carry sibling constraints: {sorted(unsupported)}")
         return xgr.Grammar.union(
-            *(
-                parameter_value_grammar(alternative)
-                for alternative in alternatives
-                if isinstance(alternative, Mapping)
-            )
+            *(parameter_value_grammar(alternative) for alternative in alternatives if isinstance(alternative, Mapping))
         )
     if "type" not in schema:
         raise ValueError("DuplexIO tool parameters must declare a JSON Schema type")
     schema_type = schema["type"]
     if isinstance(schema_type, list):
         return xgr.Grammar.union(
-            *(
-                parameter_value_grammar({**schema, "type": value})
-                for value in schema_type
-                if isinstance(value, str)
-            )
+            *(parameter_value_grammar({**schema, "type": value}) for value in schema_type if isinstance(value, str))
         )
     if schema_type == "string":
         return string_value_grammar(schema)
@@ -162,14 +133,11 @@ def tool_function_grammar(tool: Mapping[str, Any]) -> xgr.Grammar:
         raise ValueError(f"DuplexIO tool {name!r} parameters must be an object schema")
     validator_for(parameters).check_schema(dict(parameters))
     unsupported_parameter_keys = {
-        key
-        for key in parameters
-        if key not in TOOL_PARAMETER_KEYS and not key.startswith("x-")
+        key for key in parameters if key not in TOOL_PARAMETER_KEYS and not key.startswith("x-")
     }
     if unsupported_parameter_keys:
         raise ValueError(
-            f"DuplexIO tool {name!r} uses unsupported object constraints: "
-            f"{sorted(unsupported_parameter_keys)}"
+            f"DuplexIO tool {name!r} uses unsupported object constraints: {sorted(unsupported_parameter_keys)}"
         )
     properties = parameters.get("properties", {})
     required = parameters.get("required", [])
@@ -185,19 +153,13 @@ def tool_function_grammar(tool: Mapping[str, Any]) -> xgr.Grammar:
         if not isinstance(parameter_name, str) or not isinstance(parameter_schema, Mapping):
             raise ValueError(f"DuplexIO tool {name!r} has an invalid parameter schema")
         if any(character in parameter_name for character in "<>=\n\r"):
-            raise ValueError(
-                f"DuplexIO parameter name contains an XML delimiter: {parameter_name!r}"
-            )
+            raise ValueError(f"DuplexIO parameter name contains an XML delimiter: {parameter_name!r}")
         parameter = xgr.Grammar.concat(
             literal_grammar(f"<parameter={parameter_name}>\n"),
             parameter_value_grammar(parameter_schema),
             literal_grammar("\n</parameter>\n"),
         )
-        parts.append(
-            parameter
-            if parameter_name in required_names
-            else xgr.Grammar.union(empty_grammar(), parameter)
-        )
+        parts.append(parameter if parameter_name in required_names else xgr.Grammar.union(empty_grammar(), parameter))
     parts.append(literal_grammar("</function>"))
     return xgr.Grammar.concat(*parts)
 
@@ -233,9 +195,7 @@ class ToolCallCapture:
     """Capture tool-call fields as grammar-constrained bytes are accepted."""
 
     tools: tuple[Mapping[str, Any], ...]
-    decoder: Any = field(
-        default_factory=lambda: codecs.getincrementaldecoder("utf-8")()
-    )
+    decoder: Any = field(default_factory=lambda: codecs.getincrementaldecoder("utf-8")())
     buffer: str = ""
     stage: str = "function"
     function_name: str | None = None
@@ -291,9 +251,7 @@ class ToolCallCapture:
                 header_end = self.buffer.find(">\n")
                 if header_end < 0:
                     return
-                self.parameter_name = self.buffer[
-                    len(parameter_prefix) : header_end
-                ]
+                self.parameter_name = self.buffer[len(parameter_prefix) : header_end]
                 assert self.parameter_name in self.properties
                 self.buffer = self.buffer[header_end + 2 :]
                 self.stage = "value"
@@ -351,11 +309,7 @@ class ToolCallConstraintState:
             force_next_call=self.force_next_call,
             matcher=self.matcher.fork() if self.matcher is not None else None,
             capture=self.capture.fork() if self.capture is not None else None,
-            completed_call=(
-                dict(self.completed_call)
-                if self.completed_call is not None
-                else None
-            ),
+            completed_call=(dict(self.completed_call) if self.completed_call is not None else None),
             start_bitmask=self.start_bitmask,
         )
 
@@ -414,19 +368,26 @@ class ToolCallConstraintState:
 
 
 def token_bitmasks(
-    constraints: Sequence[ToolCallConstraintState | None], vocab_size: int, device: torch.device,
+    constraints: Sequence[ToolCallConstraintState | None],
+    vocab_size: int,
+    device: torch.device,
 ) -> torch.Tensor:
     """Row ``i`` masks constraint ``i``'s next token: an active call's next one, an
     idle grammar's first one, or nothing where there is no constraint."""
     allow_all = torch.full(xgr.get_bitmask_shape(1, vocab_size), -1, dtype=torch.int32)
     # Pinned, so the upload never waits behind queued device work.
     bitmask = torch.empty(
-        xgr.get_bitmask_shape(len(constraints), vocab_size), dtype=torch.int32, pin_memory=device.type == "cuda",
+        xgr.get_bitmask_shape(len(constraints), vocab_size),
+        dtype=torch.int32,
+        pin_memory=device.type == "cuda",
     )
-    torch.cat([
-        allow_all if constraint is None or constraint.active else constraint.first_token_bitmask(vocab_size)
-        for constraint in constraints
-    ], out=bitmask)
+    torch.cat(
+        [
+            allow_all if constraint is None or constraint.active else constraint.first_token_bitmask(vocab_size)
+            for constraint in constraints
+        ],
+        out=bitmask,
+    )
     # One fill per row: a fill takes microseconds, while BatchGrammarMatcher's
     # thread handoff costs about a millisecond even at 32 rows.
     for row, constraint in enumerate(constraints):
@@ -451,9 +412,17 @@ class ToolCallConstraintCompiler:
         # parallel. The first tool grammar pays a one-time setup of about a
         # second, spent here rather than in a live session.
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="duplexio-grammar")
-        warmup = {"type": "function", "function": {"name": "warmup", "parameters": {
-            "type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"],
-        }}}
+        warmup = {
+            "type": "function",
+            "function": {
+                "name": "warmup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                },
+            },
+        }
         self.executor.submit(self.compiler.compile_grammar, tool_function_grammar(warmup))
 
     def new_state(
@@ -483,10 +452,7 @@ class ToolCallConstraintCompiler:
 
 
 def decode_constrained_parameter(value: str, schema: Mapping[str, Any]) -> Any:
-    if any(
-        string_value_matches_schema(value, alternative)
-        for alternative in string_schema_alternatives(schema)
-    ):
+    if any(string_value_matches_schema(value, alternative) for alternative in string_schema_alternatives(schema)):
         return value
     return json.loads(value)
 
@@ -504,11 +470,7 @@ def string_schema_alternatives(
         ]
     schema_type = schema.get("type")
     if isinstance(schema_type, list):
-        return (
-            [{**schema, "type": "string"}]
-            if "string" in schema_type
-            else []
-        )
+        return [{**schema, "type": "string"}] if "string" in schema_type else []
     return [schema] if schema_type == "string" else []
 
 

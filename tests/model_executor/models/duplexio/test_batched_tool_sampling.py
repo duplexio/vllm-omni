@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Batch every stream's draws and read tool starts once, after all sampling is queued."""
+
 from concurrent.futures import Future
 from dataclasses import replace
 from functools import partial
@@ -34,11 +35,17 @@ USER_EMIT_TEMPERATURE = 0.6
 
 
 def session_sampling(model, row: int, temperature: float):
-    content = {"temperature": temperature, "top_k": model.text_config.vocab_size, "top_p": 0.9 if row % 3 == 2 else None}
-    return model.resolve_sampling({
-        "agent": {"emission": {"temperature": AGENT_EMIT_TEMPERATURE}, "content": content},
-        "user": {"emission": {"temperature": USER_EMIT_TEMPERATURE}, "content": content},
-    })
+    content = {
+        "temperature": temperature,
+        "top_k": model.text_config.vocab_size,
+        "top_p": 0.9 if row % 3 == 2 else None,
+    }
+    return model.resolve_sampling(
+        {
+            "agent": {"emission": {"temperature": AGENT_EMIT_TEMPERATURE}, "content": content},
+            "user": {"emission": {"temperature": USER_EMIT_TEMPERATURE}, "content": content},
+        }
+    )
 
 
 def reference(options, suppressed_token_ids):
@@ -61,9 +68,15 @@ def sampling_model(vocab_size: int, device: str):
 
 
 def fixture(device: str, *, mixed: bool):
-    tools = [{"type": "function", "function": {
-        "name": "ping", "parameters": {"type": "object", "properties": {}},
-    }}]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "ping",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
     vocab = ["<silence>", *sorted(set("<function=ping>\n</function>"))]
     tokenizer = xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=len(vocab))
     grammar = xgr.GrammarCompiler(tokenizer).compile_grammar(tool_call_grammar(tools, {"mode": "auto"}))
@@ -71,7 +84,9 @@ def fixture(device: str, *, mixed: bool):
     infos = []
     for index in range(8):
         constraint = ToolCallConstraintState(
-            compiled_grammar=grammar, decoded_vocab=tuple(token.encode() for token in vocab), tools=tuple(tools),
+            compiled_grammar=grammar,
+            decoded_vocab=tuple(token.encode() for token in vocab),
+            tools=tuple(tools),
         )
         if mixed:
             if index == 0:
@@ -82,10 +97,14 @@ def fixture(device: str, *, mixed: bool):
                 constraint.begin()
             elif index == 3:
                 constraint.force_next_call = True
-        infos.append({"duplexio_working_state": SimpleNamespace(
-            tool_call_constraint=constraint,
-            sampling=session_sampling(model, index, 0.8 if mixed and index % 3 else 0.0),
-        )})
+        infos.append(
+            {
+                "duplexio_working_state": SimpleNamespace(
+                    tool_call_constraint=constraint,
+                    sampling=session_sampling(model, index, 0.8 if mixed and index % 3 else 0.0),
+                )
+            }
+        )
     return model, infos, len(vocab)
 
 
@@ -93,7 +112,9 @@ def serial_sample(model, logits, emissions, info):
     """Per-request reference, including the synchronous tool read."""
     state = info["duplexio_working_state"]
     agent = sample_factorized_text_ids(
-        logits[:1], emissions[:1], silence_token_id=0,
+        logits[:1],
+        emissions[:1],
+        silence_token_id=0,
         sampling=reference(state.sampling.agent, model.agent_suppressed_token_ids),
         emit_temperature=AGENT_EMIT_TEMPERATURE,
     )
@@ -102,7 +123,9 @@ def serial_sample(model, logits, emissions, info):
     if constraint is not None and constraint.enabled and not constraint.active:
         emit = constraint.force_next_call or bool(sample_emit(emissions[1:2], AGENT_EMIT_TEMPERATURE).item())
     tool_sample = sample_tool_token(
-        logits[1:2], constraint=constraint, emit=emit,
+        logits[1:2],
+        constraint=constraint,
+        emit=emit,
         sampling=reference(state.sampling.agent, model.tool_suppressed_token_ids),
     )
     call = None
@@ -113,7 +136,9 @@ def serial_sample(model, logits, emissions, info):
         if constraint.accept(tool.item()):
             call = model.tool_call_compiler.take_completed_call(constraint)
     user = sample_factorized_text_ids(
-        logits[2:3], emissions[2:3], silence_token_id=0,
+        logits[2:3],
+        emissions[2:3],
+        silence_token_id=0,
         sampling=reference(state.sampling.user, model.user_suppressed_token_ids),
         emit_temperature=USER_EMIT_TEMPERATURE,
     )
@@ -131,9 +156,16 @@ def decided_inputs(rows, vocab, device, generator):
     return logits, signs * 100.0
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param(
-    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-)])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
 @pytest.mark.parametrize("graph", [False, True])
 def test_batched_tool_sampling_matches_per_request_tokens_and_calls(device, graph):
     if graph and device == "cpu":
@@ -175,9 +207,16 @@ class ScalarReads(TorchDispatchMode):
         return func(*args, **(kwargs or {}))
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param(
-    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-)])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
 def test_mixed_policies_return_rows_in_request_order(device):
     model, infos, vocab = fixture(device, mixed=True)
     inputs = torch.Generator(device=device).manual_seed(11)
@@ -187,7 +226,11 @@ def test_mixed_policies_return_rows_in_request_order(device):
         def sample(rows):
             sampling = model.sampling_inputs([infos[index] for index in rows], logits.device)
             return model.sample_text(
-                logits[rows], emissions[rows], sampling.parameters, sampling.tool_bitmask, top_k=sampling.top_k,
+                logits[rows],
+                emissions[rows],
+                sampling.parameters,
+                sampling.tool_bitmask,
+                top_k=sampling.top_k,
                 support_width=sampling.support_width,
             )
 
@@ -218,9 +261,16 @@ def test_tools_do_not_read_gpu_scalars_per_request(start_tool):
     assert batched.count == 0
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param(
-    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-)])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
 def test_agent_logprobs_match_the_distributions_actually_sampled(device):
     """Behaviour log-probs must equal the distributions the draws came from.
 
@@ -251,18 +301,19 @@ def test_agent_logprobs_match_the_distributions_actually_sampled(device):
             torch.testing.assert_close(
                 emit_logprob.reshape(()),
                 torch.nn.functional.logsigmoid(scaled if emitted else -scaled),
-                atol=1e-5, rtol=1e-4,
+                atol=1e-5,
+                rtol=1e-4,
             )
             assert float(emit_logprob) < 0.0
 
             support = sampled.support_ids[row, 0]
             support = support[support >= 0]
             if sampling.temperature == 0:
-                mode = content_distribution(logits[row:row + 1, 0], replace(sampling, temperature=1.0))[0][0, 0]
+                mode = content_distribution(logits[row : row + 1, 0], replace(sampling, temperature=1.0))[0][0, 0]
                 assert support.tolist() == [int(mode)]
             else:
                 # The recorded support is exactly the truncated distribution's.
-                indices, probabilities = content_distribution(logits[row:row + 1, 0], sampling)
+                indices, probabilities = content_distribution(logits[row : row + 1, 0], sampling)
                 assert support.tolist() == indices[0, probabilities[0] > 0].tolist()
             if not emitted or sampling.temperature == 0:
                 # A content draw discarded by a silent row took no action.
@@ -271,23 +322,34 @@ def test_agent_logprobs_match_the_distributions_actually_sampled(device):
             # Renormalizing the logits over the support recovers the behavior log-prob.
             renormalized = torch.log_softmax(logits[row, 0, support].float() / sampling.temperature, dim=-1)
             torch.testing.assert_close(
-                token_logprob.reshape(()), renormalized[support == int(ids[row])].reshape(()), atol=1e-5, rtol=1e-4,
+                token_logprob.reshape(()),
+                renormalized[support == int(ids[row])].reshape(()),
+                atol=1e-5,
+                rtol=1e-4,
             )
             position = (indices[0] == int(ids[row])).nonzero().flatten()
             assert position.numel() == 1, "sampled id must lie in the truncated support"
             torch.testing.assert_close(
                 token_logprob.reshape(()),
                 probabilities[0, int(position)].float().log(),
-                atol=1e-5, rtol=1e-4,
+                atol=1e-5,
+                rtol=1e-4,
             )
             checked_emitted += 1
 
     assert checked_emitted, "fixture produced no emitted agent row to verify"
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param(
-    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-)])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
 @pytest.mark.parametrize("mode", ["argmax", "top_k", "top_p"])
 def test_tool_emit_logprobs_score_all_decisions_including_forced_emit_and_wait(device, mode):
     model, infos, vocab = fixture(device, mixed=True)
@@ -333,9 +395,16 @@ def test_session_waits_to_start_a_call_until_its_grammar_compiles():
     assert sampled.tool_starts.all()
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param(
-    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-)])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
 @pytest.mark.parametrize("mode", ["argmax", "top_k", "top_p"])
 def test_forced_continuation_records_actual_constrained_token_probability(device, mode):
     vocab = ["<silence>", "a", "b", "c", "d"]

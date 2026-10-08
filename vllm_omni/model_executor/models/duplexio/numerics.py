@@ -14,4 +14,3 @@ T = TypeVar("T")
 def call_compiled_function(function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     with torch.compiler.set_stance("default"):
         return function(*args, **kwargs)
-

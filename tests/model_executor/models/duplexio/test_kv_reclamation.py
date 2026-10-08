@@ -31,9 +31,7 @@ def visible_slots(frame: DuplexIOFrameMetadata, layout: DuplexIOKVLayout, rows: 
     start, end, persistent = frame.row_reads(rows * NUM_CELLS)
     slots = torch.arange(layout.max_compact_slots)
     base = layout.persistent_base
-    audio = (slots < base) & (
-        torch.remainder(slots - start[:, None], base) < (end - start)[:, None]
-    )
+    audio = (slots < base) & (torch.remainder(slots - start[:, None], base) < (end - start)[:, None])
     return audio | ((slots >= base) & (slots - base < persistent[:, None]))
 
 
@@ -55,21 +53,13 @@ def install_row(
     the row. A ``pinned`` voice-prompt row writes its agent audio as one such key.
     """
     persistent = torch.cat((text_active, torch.tensor([False, pinned])))
-    ordinals = torch.where(
-        persistent, persistent_before + persistent.cumsum(0, dtype=torch.int32), 0
-    )
+    ordinals = torch.where(persistent, persistent_before + persistent.cumsum(0, dtype=torch.int32), 0)
     window = layout.audio_window_frames
     frame.update(
-        key_active=torch.cat(
-            (text_active, torch.tensor([audio_active, audio_active or pinned]))
-        ),
+        key_active=torch.cat((text_active, torch.tensor([audio_active, audio_active or pinned]))),
         persistent_ordinal=ordinals,
-        persistent_last=torch.full(
-            (NUM_CELLS,), persistent_before, dtype=torch.int32
-        ),
-        audio_first=torch.full(
-            (NUM_CELLS,), max(audio_frame - window, 1), dtype=torch.int32
-        ),
+        persistent_last=torch.full((NUM_CELLS,), persistent_before, dtype=torch.int32),
+        audio_first=torch.full((NUM_CELLS,), max(audio_frame - window, 1), dtype=torch.int32),
         audio_last=torch.full(
             (NUM_CELLS,),
             audio_frame - 1 if audio_active else audio_frame,
@@ -99,9 +89,7 @@ def test_compact_cache_attention_matches_logical_rows_across_audio_eviction() ->
 
     for row in range(8):
         audio_frame = row + 1
-        text_active = torch.tensor(
-            [row % 2 == 0, row % 3 != 0, row % 4 == 1, row in (2, 5, 7)]
-        )
+        text_active = torch.tensor([row % 2 == 0, row % 3 != 0, row % 4 == 1, row in (2, 5, 7)])
         install_row(
             frame,
             layout,
@@ -241,9 +229,7 @@ def test_padded_graph_tokens_neither_write_nor_see_a_slot() -> None:
     written = frame.write_slots(tokens, layout)
     visible = visible_slots(frame, layout, rows=2)[1]
 
-    assert torch.equal(
-        written[NUM_CELLS:], torch.full((NUM_CELLS,), -1)
-    )
+    assert torch.equal(written[NUM_CELLS:], torch.full((NUM_CELLS,), -1))
     assert not visible.any()
 
 
@@ -258,10 +244,7 @@ class _BlockPool:
         self.freed: list[object] = []
 
     def get_new_blocks(self, count: int) -> list[_Block]:
-        blocks = [
-            _Block(block_id)
-            for block_id in range(self.next_block, self.next_block + count)
-        ]
+        blocks = [_Block(block_id) for block_id in range(self.next_block, self.next_block + count)]
         self.next_block += count
         return blocks
 
@@ -326,9 +309,7 @@ def test_cache_spec_registers_native_manager_and_preserves_page_contract() -> No
         dtype=torch.bfloat16,
     )
 
-    spec = make_duplexio_kv_cache_spec(
-        base, audio_window_frames=8, max_model_len=600
-    )
+    spec = make_duplexio_kv_cache_spec(base, audio_window_frames=8, max_model_len=600)
 
     assert KVCacheSpecRegistry.get_manager_class(spec) is DuplexIOKVCacheManager
     assert spec.page_size_bytes == base.page_size_bytes
@@ -346,9 +327,7 @@ def test_cache_spec_rejects_pages_flash_attention_cannot_tile() -> None:
     )
 
     with pytest.raises(ValueError, match="divisible by 16"):
-        make_duplexio_kv_cache_spec(
-            base, audio_window_frames=8, max_model_len=600
-        )
+        make_duplexio_kv_cache_spec(base, audio_window_frames=8, max_model_len=600)
 
 
 def test_pinned_prompt_and_text_share_one_region_that_never_expires() -> None:

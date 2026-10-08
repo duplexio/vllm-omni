@@ -302,7 +302,6 @@ def test_playback_worklet_buffers_a_frame_more_after_each_underrun() -> None:
     )
 
 
-
 def test_playback_worklet_drops_silence_queued_after_a_stall() -> None:
     node = shutil.which("node")
     if node is None:
