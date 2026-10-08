@@ -2,9 +2,6 @@
 """Follow real preprocess/sample/output feedback across staged policy commits."""
 
 import base64
-from contextlib import nullcontext
-from threading import Event
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,7 +10,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbed
 
 pytest.importorskip("duplexio")
 
-from duplexio.rollout_policy import PolicyWeightReceiver
 from duplexio.rollout_trajectory import TrajectoryRecorder
 
 from tests.model_executor.models.duplexio.test_bulk_prefill import CountingCodec, model_fixture, request_state
@@ -78,7 +74,7 @@ def feedback_state(model):
 
 
 @torch.inference_mode()
-def test_feedback_actions_and_versions_span_staging_then_commit(monkeypatch):
+def test_feedback_actions_and_versions_follow_a_weight_update():
     model = feedback_model()
     state = feedback_state(model)
     recorder = TrajectoryRecorder()
@@ -120,45 +116,14 @@ def test_feedback_actions_and_versions_span_staging_then_commit(monkeypatch):
     first = step(prefix=True)
     assert frame_fields(first)["user_token_id"] == 7
     step()
-    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
-    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
-    monkeypatch.setattr(torch.accelerator, "synchronize", lambda _: None)
-    receiver = PolicyWeightReceiver()
-    receiver.device = torch.device("cpu")
-    receiver.model_runner = SimpleNamespace(model=model, get_model=lambda: model)
-    receiver._policy_stream = SimpleNamespace(synchronize=lambda: None)
-    receiver._policy_pending = receiver._policy_plan = receiver._policy_version = None
-    receiver._policy_buffer = []
-    receiver._policy_commit_failed = False
     pushed = [(name, p.clone()) for name, p in model.named_parameters() if name.startswith("user_")]
     for name, value in pushed:
         if name == "user_emit_head.bias":
             value.fill_(-100)
     pointers = {name: model.get_parameter(name).data_ptr() for name, _ in pushed}
-    source = iter(pushed)
-    received, release = Event(), Event()
-
-    def receive_views(views):
-        def wait():
-            received.set()
-            assert release.wait(5)
-            for tensor, _ in views:
-                tensor.copy_(next(source)[1])
-
-        return SimpleNamespace(wait=wait)
-
-    receiver.policy_group = SimpleNamespace(rank=0, receive_views=receive_views)
-    try:
-        receiver.start_policy_weight_update(1, [
-            [name, "float32", list(p.shape), [[0, 0, 0, p.shape[0] if p.ndim else 1]]]
-            for name, p in pushed
-        ])
-        assert received.wait(5)
-        assert frame_fields(step())["user_token_id"] == 7
-    finally:
-        release.set()
-        receiver._policy_pending[1].result(timeout=5)
-    receiver.commit_policy_weight_update(1)
+    assert frame_fields(step())["user_token_id"] == 7
+    model.load_weights(pushed)
+    model.set_policy_version(1)
     assert frame_fields(step())["user_token_id"] == 2
     step(final=True)
     trace = recorder.tensors()

@@ -1225,17 +1225,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     for req_id in req_ids[:num_reqs]
                 ]
                 update_graph_inputs(request_infos)
-                supports_cudagraph_replay = getattr(
-                    self.model,
-                    "supports_cudagraph_replay",
-                    None,
-                )
-                if (
-                    callable(supports_cudagraph_replay)
-                    and not supports_cudagraph_replay(request_infos)
-                ):
-                    cudagraph_mode = CUDAGraphMode.NONE
-                    runner_assisted_full_attn = False
 
         # Let the model adjust inputs before forward (e.g. restore input_ids
         # for multimodal position detection, fix decode position offsets).

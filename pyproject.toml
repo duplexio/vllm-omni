@@ -129,11 +129,8 @@ vsa = [
 ]
 
 duplexio = [
-    # Native parity requires vLLM built against the training compiler stack.
-    "torch==2.13.0",
-    "triton==3.7.1",
+    # DuplexIO's per-stream gated delta rule runs flash-linear-attention's kernels.
     "flash-linear-attention==0.5.2",
-    "fla-core==0.5.2",
 ]
 
 docs = [

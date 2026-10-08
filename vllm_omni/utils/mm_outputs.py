@@ -102,13 +102,10 @@ def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
     if not isinstance(multimodal_outputs, Mapping):
         logger.warning("Multimodal outputs are not a dict and will not be passed")
 
-    pending_devices: set[torch.device] = set()
     for k, v in multimodal_outputs.items():
-        cpu_v = _to_cpu(v, pending_devices)
+        cpu_v = _to_cpu(v)
         if cpu_v is not None:
             mm_cpu[k] = cpu_v
-    for device in pending_devices:
-        torch.cuda.current_stream(device).synchronize()
     return mm_cpu
 
 
@@ -166,35 +163,21 @@ def _snapshot_payload_value(value):
     return value
 
 
-def _to_cpu(value, pending_devices: set[torch.device]):
+def _to_cpu(value):
     """Recursively detach + move tensors to CPU; preserve dict/list nesting."""
     if isinstance(value, torch.Tensor):
-        if value.device.type == "cuda":
-            pending_devices.add(value.device)
-            # Make views contiguous on-device, before the asynchronous copy.
-            return value.detach().contiguous().to("cpu", non_blocking=True)
         return value.detach().to("cpu").contiguous()
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            cpu_v = _to_cpu(v, pending_devices)
+            cpu_v = _to_cpu(v)
             if cpu_v is not None:
                 out[k] = cpu_v
         return out or None
     if isinstance(value, list):
         if not value:
             return value
-        first = value[0]
-        if isinstance(first, torch.Tensor) and first.device.type == "cuda" and all(
-            isinstance(item, torch.Tensor)
-            and item.device == first.device
-            and item.dtype == first.dtype
-            and item.shape == first.shape
-            for item in value
-        ):
-            # A uniform per-request field needs one transfer for the batch.
-            return list(_to_cpu(torch.stack(value), pending_devices).unbind(0))
-        return [_to_cpu(v, pending_devices) for v in value]
+        return [_to_cpu(v) for v in value]
     return value
 
 

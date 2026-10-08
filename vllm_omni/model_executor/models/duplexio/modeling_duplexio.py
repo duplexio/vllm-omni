@@ -1366,6 +1366,12 @@ class DuplexIOForConditionalGeneration(
             self.user_asr.capture_graphs()
         return loaded
 
+    def set_policy_version(self, version: int) -> None:
+        """Tag every later frame with the weights just loaded; versions only increase."""
+        if version <= self.policy_version:
+            raise ValueError(f"Policy version {version} must exceed {self.policy_version}")
+        self.policy_version = version
+
     @classmethod
     def get_mamba_state_dtype_from_config(
         cls,
