@@ -51,11 +51,13 @@ def test_arbitrary_chunk_metadata_replaces_and_does_not_leak_into_next_delta():
     accumulated = MultimodalPayload()
     first_output = None
     for token_id in (11, 22):
-        incoming = MultimodalPayload.from_dict({
-            "audio": torch.ones(1920),
-            "chunk": {"new_model_field": torch.tensor(token_id)},
-            "meta.request_label": "keep",
-        })
+        incoming = MultimodalPayload.from_dict(
+            {
+                "audio": torch.ones(1920),
+                "chunk": {"new_model_field": torch.tensor(token_id)},
+                "meta.request_label": "keep",
+            }
+        )
         accumulated = accumulated.merged_with(incoming)
         assert accumulated["new_model_field"].item() == token_id
         if first_output is None:
@@ -68,10 +70,12 @@ def test_arbitrary_chunk_metadata_replaces_and_does_not_leak_into_next_delta():
 
 
 def test_chunk_snapshot_removes_fields_absent_from_next_chunk():
-    accumulated = MultimodalPayload.from_dict({
-        "chunk.optional_event": torch.tensor(1),
-        "chunk.current_value": torch.tensor(11),
-    })
+    accumulated = MultimodalPayload.from_dict(
+        {
+            "chunk.optional_event": torch.tensor(1),
+            "chunk.current_value": torch.tensor(11),
+        }
+    )
     incoming = MultimodalPayload.from_dict({"chunk.current_value": torch.tensor(22)})
     accumulated = accumulated.merged_with(incoming)
     assert "optional_event" not in accumulated

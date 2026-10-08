@@ -48,14 +48,19 @@ def test_strided_request_tensor_roundtrip(length, layout):
     source = torch.arange(12, dtype=torch.float32).view(4, 3)[:length, 0]
     payload = build_mm_cpu({"value": [source] if layout in ("list", "passthrough") else source})
     value = to_payload_element(
-        payload["value"], 0, 0, length,
+        payload["value"],
+        0,
+        0,
+        length,
         pass_lists_through=layout == "passthrough",
         seq_len=length if layout == "token_aligned" else None,
     )
     if layout == "passthrough":
         value = value[0]
     output = OmniEngineCoreOutput(
-        request_id="strided-output", new_token_ids=[], finish_reason=None,
+        request_id="strided-output",
+        new_token_ids=[],
+        finish_reason=None,
         multimodal_output={"value": value},
     )
     decoded = _roundtrip(OmniEngineCoreOutputs(outputs=[output]))

@@ -43,7 +43,7 @@ def test_producer_chunk_metadata_preserves_native_output_modes(kind, flat):
         audio = result["audio"]
         if isinstance(audio, list):
             audio = torch.cat(audio)
-        assert audio.numel() == (length if kind is RequestOutputKind.DELTA else sum((3, 5)[:step + 1]))
+        assert audio.numel() == (length if kind is RequestOutputKind.DELTA else sum((3, 5)[: step + 1]))
         if not step:
             first = result
     if kind is not RequestOutputKind.FINAL_ONLY:
@@ -51,6 +51,7 @@ def test_producer_chunk_metadata_preserves_native_output_modes(kind, flat):
         assert first["variable_shape"].shape == (1,)
     if kind is RequestOutputKind.DELTA:
         assert "new_field" not in state.mm_accumulated
+
 
 # Audio is explicitly listed as a drainable modality
 AUDIO = OutputModalityNames.AUDIO

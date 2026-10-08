@@ -706,7 +706,7 @@ def test_omni_async_output_builds_on_caller_thread_when_background_disabled(buil
 
     async_output = OmniAsyncGPUModelRunnerOutput(
         model_runner_output_builder=builder,
-        cuda_device=torch.device("cuda", torch.cuda.current_device()),
+        cuda_device=torch.device("cuda", torch.accelerator.current_device_index()),
         build_in_background=build_in_background,
         sampled_token_ids=torch.tensor([[7]], device="cuda"),
         logprobs_tensors=None,

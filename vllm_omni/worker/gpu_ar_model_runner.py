@@ -1220,10 +1220,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
             update_graph_inputs = getattr(self.model, "update_graph_inputs", None)
             if callable(update_graph_inputs):
-                request_infos = [
-                    self.model_intermediate_buffer.get(req_id, {})
-                    for req_id in req_ids[:num_reqs]
-                ]
+                request_infos = [self.model_intermediate_buffer.get(req_id, {}) for req_id in req_ids[:num_reqs]]
                 update_graph_inputs(request_infos)
 
         # Let the model adjust inputs before forward (e.g. restore input_ids
@@ -2055,11 +2052,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 inter_stage_outputs=inter_stage_outputs,
                 streaming_retained_tokens=(
                     dict(zip(req_ids_output_copy, streaming_retained_tokens, strict=True))
-                    if streaming_retained_tokens is not None else {}
+                    if streaming_retained_tokens is not None
+                    else {}
                 ),
                 streaming_position_budget=(
                     dict(zip(req_ids_output_copy, streaming_position_budget, strict=True))
-                    if streaming_position_budget is not None else {}
+                    if streaming_position_budget is not None
+                    else {}
                 ),
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,

@@ -1451,8 +1451,9 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
 
 
 def test_build_logical_stage_init_plans_applies_runtime_env_to_config_build(monkeypatch):
-    import vllm_omni.engine.stage_runtime as runtime_mod
     from omegaconf import OmegaConf
+
+    import vllm_omni.engine.stage_runtime as runtime_mod
 
     runtime = StageRuntime(
         stage_configs=[
@@ -1469,6 +1470,7 @@ def test_build_logical_stage_init_plans_applies_runtime_env_to_config_build(monk
         async_chunk=False,
     )
     monkeypatch.delenv("VLLM_OMNI_TEST_STAGE_ENV", raising=False)
+
     def metadata(cfg):
         # Real extraction carries the stage's runtime section, env included.
         stage = _make_llm_metadata(cfg.stage_id)

@@ -28,10 +28,16 @@ def test_model_buffer_survives_engine_wire_and_streaming_update(dtype, direct) -
         request = build_engine_core_request_from_tokens("wire-test", prompt, params, resumable=True)
     else:
         base = EngineCoreRequest(
-            request_id="wire-test", prompt_token_ids=prompt["prompt_token_ids"],
-            mm_features=None, sampling_params=params, pooling_params=None,
-            arrival_time=0.0, lora_request=None, cache_salt=None,
-            data_parallel_rank=None, resumable=True,
+            request_id="wire-test",
+            prompt_token_ids=prompt["prompt_token_ids"],
+            mm_features=None,
+            sampling_params=params,
+            pooling_params=None,
+            arrival_time=0.0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            resumable=True,
         )
         request = upgrade_to_omni_request(base, prompt)
     encoded = MsgpackEncoder().encode(request)
