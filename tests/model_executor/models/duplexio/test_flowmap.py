@@ -1,4 +1,4 @@
-"""Numerical and batching contracts for the native continuous audio head."""
+"""Numerical and batching contracts for the continuous audio head."""
 
 import pytest
 import torch
@@ -8,9 +8,13 @@ from vllm_omni.model_executor.models.duplexio.flowmap import FlowMap, PocketRMSN
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def make_flow(*, steps: int = 1, temperature: float = 0.3) -> FlowMap:
+def make_flow(*, steps: int = 1) -> FlowMap:
     torch.manual_seed(71)
-    return FlowMap(4, 16, 12, 2, inference_steps=steps, sampling_temperature=temperature)
+    return FlowMap(4, 16, 12, 2, inference_steps=steps)
+
+
+def temperatures(rows: int, value: float = 0.3) -> torch.Tensor:
+    return torch.full((rows,), value)
 
 
 def test_time_normalization_uses_sample_variance() -> None:
@@ -43,30 +47,20 @@ def test_block_normalization_matches_training_bf16_statistics() -> None:
 def test_flow_batch_slots_are_independent(steps: int) -> None:
     flow = make_flow(steps=steps)
     conditioning, noise = torch.randn(5, 12), torch.randn(5, 4)
-    batched = flow.sample(conditioning, noise)
-    individual = torch.cat([flow.sample(conditioning[i : i + 1], noise[i : i + 1]) for i in range(5)])
+    batched = flow.sample(conditioning, noise, temperatures(5))
+    individual = torch.cat([flow.sample(conditioning[i : i + 1], noise[i : i + 1], temperatures(1)) for i in range(5)])
     torch.testing.assert_close(batched, individual, atol=2e-6, rtol=2e-5)
 
     order = torch.tensor([4, 0, 2, 1, 3])
-    torch.testing.assert_close(flow.sample(conditioning[order], noise[order]), batched[order])
+    torch.testing.assert_close(flow.sample(conditioning[order], noise[order], temperatures(5)), batched[order])
     conditioning[1] = 100
     noise[1] = -100
     unchanged = torch.tensor([0, 2, 3, 4])
-    torch.testing.assert_close(flow.sample(conditioning, noise)[unchanged], batched[unchanged])
+    torch.testing.assert_close(flow.sample(conditioning, noise, temperatures(5))[unchanged], batched[unchanged])
 
 
-@pytest.mark.parametrize("temperature", [0.0, 0.3, 1.0])
-def test_temperature_is_noise_variance(temperature: float) -> None:
-    flow = make_flow(temperature=temperature)
-    with torch.no_grad():
-        flow.final_layer.linear.weight.zero_()
-        flow.final_layer.linear.bias.zero_()
-    noise = torch.randn(3, 4)
-    torch.testing.assert_close(flow.sample(torch.randn(3, 12), noise), temperature**0.5 * noise)
-
-
-def test_row_temperatures_override_the_checkpoint_temperature() -> None:
-    flow = make_flow(temperature=0.3)
+def test_row_temperatures_are_noise_variances() -> None:
+    flow = make_flow()
     with torch.no_grad():
         flow.final_layer.linear.weight.zero_()
         flow.final_layer.linear.bias.zero_()
@@ -92,7 +86,7 @@ def test_sampling_integrates_from_zero_to_one(steps: int) -> None:
             )
             / steps
         )
-    torch.testing.assert_close(flow.sample(conditioning, noise), expected)
+    torch.testing.assert_close(flow.sample(conditioning, noise, temperatures(3)), expected)
 
 
 def test_sampling_captures_as_one_graph_without_random_state() -> None:
@@ -100,7 +94,9 @@ def test_sampling_captures_as_one_graph_without_random_state() -> None:
     conditioning, noise = torch.randn(3, 12), torch.randn(3, 4)
     random_state = torch.random.get_rng_state()
     compiled = torch.compile(flow.sample, fullgraph=True, backend="eager")
-    torch.testing.assert_close(compiled(conditioning, noise), flow.sample(conditioning, noise))
+    torch.testing.assert_close(
+        compiled(conditioning, noise, temperatures(3)), flow.sample(conditioning, noise, temperatures(3)),
+    )
     torch.testing.assert_close(torch.random.get_rng_state(), random_state)
 
 

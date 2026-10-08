@@ -23,7 +23,7 @@ def test_matches_training_forward_and_sample(steps: int, temperature: float, dev
     with torch.no_grad():
         for parameter in reference.parameters():
             parameter.normal_(0, 0.1)
-    native = FlowMap(4, 16, 12, 2, inference_steps=steps, sampling_temperature=temperature).to(device)
+    native = FlowMap(4, 16, 12, 2, inference_steps=steps).to(device)
     state = reference.state_dict()
     del state["log_precision"]  # Training-only loss weighting.
     native.load_state_dict(state, strict=True)
@@ -37,7 +37,8 @@ def test_matches_training_forward_and_sample(steps: int, temperature: float, dev
         expected = reference.sample(conditioning, temperature=temperature)
         torch.manual_seed(32)
         noise = torch.randn(5, 4, device=device)
-        torch.testing.assert_close(native.sample(conditioning, noise), expected, atol=0, rtol=0)
+        rows = torch.full((5,), temperature, device=device)
+        torch.testing.assert_close(native.sample(conditioning, noise, rows), expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
@@ -49,7 +50,7 @@ def test_fixed_conditioning_and_noise_match_training_exactly(batch_size: int) ->
     with torch.no_grad():
         for parameter in reference.parameters():
             parameter.normal_(0, 0.03)
-    native = FlowMap(32, 512, 2560, 6, sampling_temperature=0.3).cuda()
+    native = FlowMap(32, 512, 2560, 6).cuda()
     state = reference.state_dict()
     del state["log_precision"]
     native.load_state_dict(state, strict=True)
@@ -57,12 +58,13 @@ def test_fixed_conditioning_and_noise_match_training_exactly(batch_size: int) ->
     noise = torch.randn(batch_size, 32, device="cuda")
     start = torch.zeros(batch_size, device="cuda")
     end = torch.ones(batch_size, device="cuda")
-    initial = 0.3**0.5 * noise
+    temperature = torch.full((batch_size,), 0.3, device="cuda")
+    initial = temperature.sqrt().unsqueeze(-1) * noise
     with torch.autocast("cuda", dtype=torch.bfloat16):
         expected = initial + reference(initial, conditioning, start, end)
-        actual = native.sample(conditioning, noise)
+        actual = native.sample(conditioning, noise, temperature)
         individual = torch.cat([
-            native.sample(conditioning[row : row + 1], noise[row : row + 1])
+            native.sample(conditioning[row : row + 1], noise[row : row + 1], temperature[row : row + 1])
             for row in range(batch_size)
         ])
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -75,11 +77,12 @@ def test_compiled_fp32_sampling_matches_eager_after_slot_replacement() -> None:
     native = FlowMap(32, 512, 2560, 6).cuda()
     conditioning = torch.randn(8, 2560, device="cuda")
     noise = torch.randn(8, 32, device="cuda")
+    temperature = torch.full((8,), 0.3, device="cuda")
     compiled = torch.compile(native.sample, fullgraph=True, mode="reduce-overhead")
     for _ in range(3):
         torch.compiler.cudagraph_mark_step_begin()
-        expected = native.sample(conditioning, noise)
-        torch.testing.assert_close(compiled(conditioning, noise), expected, atol=2e-5, rtol=2e-4)
+        expected = native.sample(conditioning, noise, temperature)
+        torch.testing.assert_close(compiled(conditioning, noise, temperature), expected, atol=2e-5, rtol=2e-4)
         conditioning[3].normal_()
         noise[3].normal_()
 
@@ -91,18 +94,19 @@ def test_cuda_graph_replays_exact_eager_kernels(autocast: bool) -> None:
     native = FlowMap(32, 512, 2560, 6).cuda()
     conditioning = torch.randn(8, 2560, device="cuda")
     noise = torch.randn(8, 32, device="cuda")
+    temperature = torch.full((8,), 0.3, device="cuda")
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream), torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast, cache_enabled=False):
         for _ in range(3):
-            native.sample(conditioning, noise)
+            native.sample(conditioning, noise, temperature)
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph), torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast, cache_enabled=False):
-        captured = native.sample(conditioning, noise)
+        captured = native.sample(conditioning, noise, temperature)
     for _ in range(3):
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
-            expected = native.sample(conditioning, noise)
+            expected = native.sample(conditioning, noise, temperature)
         graph.replay()
         torch.testing.assert_close(captured, expected, atol=0, rtol=0)
         conditioning[3].normal_()

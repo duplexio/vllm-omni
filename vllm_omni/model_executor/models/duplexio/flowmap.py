@@ -104,7 +104,6 @@ class FlowMapSampler(nn.Module):
         mlp_depth: int,
         *,
         inference_steps: int,
-        sampling_temperature: float,
         compile: bool = False,
     ) -> None:
         super().__init__()
@@ -114,7 +113,6 @@ class FlowMapSampler(nn.Module):
             conditioning_dim,
             mlp_depth,
             inference_steps=inference_steps,
-            sampling_temperature=sampling_temperature,
         )
         # Compiled for serving, where the model captures it with text sampling.
         self.sample_function = (
@@ -125,8 +123,8 @@ class FlowMapSampler(nn.Module):
             if compile else self.flow.sample
         )
 
-    def sample(self, conditioning: Tensor, noise: Tensor, temperature: Tensor | None = None) -> Tensor:
-        """Sample with explicit request-owned noise, at each row's temperature if given."""
+    def sample(self, conditioning: Tensor, noise: Tensor, temperature: Tensor) -> Tensor:
+        """Sample with explicit request-owned noise, at each row's temperature."""
         return self.sample_function(conditioning, noise, temperature)
 
 
@@ -145,11 +143,9 @@ class FlowMap(nn.Module):
         num_res_blocks: int,
         *,
         inference_steps: int = 1,
-        sampling_temperature: float = 0.3,
     ) -> None:
         super().__init__()
         self.inference_steps = inference_steps
-        self.sampling_temperature = sampling_temperature
         self.input_projection = nn.Linear(in_channels, model_channels)
         self.start_time_embedding = TimestepEmbedder(model_channels)
         self.target_time_embedding = TimestepEmbedder(model_channels)
@@ -171,14 +167,12 @@ class FlowMap(nn.Module):
             hidden = block(hidden, modulation)
         return self.final_layer(hidden, modulation)
 
-    def sample(self, conditioning: Tensor, noise: Tensor, temperature: Tensor | None = None) -> Tensor:
+    def sample(self, conditioning: Tensor, noise: Tensor, temperature: Tensor) -> Tensor:
         """Integrate from noise (time zero) to a normalized latent (time one).
 
-        ``temperature`` holds one value per row; without it every row samples at
-        the checkpoint's temperature.
+        ``temperature`` holds one value per row: the variance of its noise.
         """
-        scale = self.sampling_temperature**0.5 if temperature is None else temperature.sqrt().unsqueeze(-1)
-        current = scale * noise
+        current = temperature.sqrt().unsqueeze(-1) * noise
         for step in range(self.inference_steps):
             s = conditioning.new_full(
                 conditioning.shape[:-1], step / self.inference_steps

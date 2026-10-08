@@ -411,7 +411,6 @@ class DuplexIOForConditionalGeneration(
             config.flowmap_config["mlp_dim"],
             config.flowmap_config["mlp_depth"],
             inference_steps=config.flowmap_config["inference_steps"],
-            sampling_temperature=config.flowmap_config["sampling_temperature"],
             compile=self.full_cudagraph_enabled,
         )
         self.user_audio_input_adapter = AudioInputAdapter(

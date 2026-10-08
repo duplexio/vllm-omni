@@ -26,8 +26,8 @@ from vllm_omni.outputs.mm_outputs import MultimodalPayload
 
 
 class AudioSampler(nn.Module):
-    def sample(self, conditions, text, **kwargs):
-        return torch.tensor([[3, 4, 5]])
+    def sample(self, conditioning, noise, temperature):
+        return noise
 
 
 class Codec(CountingCodec):

@@ -447,7 +447,8 @@ class FastConformerEncoder(nn.Module):
 
     def prepare_streaming_audio_chunk(self, waveform: Tensor, *, first: bool) -> Tensor:
         """Extract exact streaming mels from one window or a batch of equal windows."""
-        mel_filters, window = self.mel_filters, self.stft_window
+        # The frontend runs in FP32 whatever the encoder's dtype.
+        mel_filters, window = self.mel_filters.float(), self.stft_window.float()
         waveform = waveform.unsqueeze(0) if waveform.ndim == 1 else waveform
         with torch.autocast(waveform.device.type, enabled=False):
             if self.feature_preemphasis is not None:

@@ -5,6 +5,7 @@ import torch
 
 from tests.model_executor.models.duplexio.test_bulk_prefill import model_fixture
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import FrameInputGraph, frame_inputs
+from vllm_omni.model_executor.models.duplexio.pocket_mimi import LATENT_DIM
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -25,7 +26,7 @@ def test_frame_projection_graph_matches_independent_requests_and_weight_refresh(
             dtype=torch.long, device="cuda",
         )
         user = torch.randn(size, 8, device="cuda")
-        agent = torch.randint(0, 64, (size, 3), device="cuda")
+        agent = torch.randn(size, LATENT_DIM, device="cuda")
         references = [model.project_frames(torch.cat((ids, metadata), 1)[i:i+1], user[i:i+1], agent[i:i+1])
                       for i in range(size)]
         preceding = ((ids != 1) & (ids != 2)).sum(1).cumsum(0)
