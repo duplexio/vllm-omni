@@ -30,7 +30,7 @@ DEFAULT_TOOLS_PATH = Path(__file__).parent / "tools.json"
 SESSION_COOKIE_NAME = "__Host-duplexio_session"
 DEFAULT_SAMPLING = {
     "agent": {
-        "emission": {"temperature": 0.8},
+        "emission": {"temperature": 1.0},
         "content": {"temperature": 0.7, "top_k": 20, "top_p": 0.95},
     },
     "user": {

@@ -162,6 +162,15 @@ async def test_runtime_config_rejects_invalid_sessions(model_config, extra_body,
 
 
 @pytest.mark.asyncio
+async def test_flowmap_checkpoint_rejects_audio_sampling(model_config) -> None:
+    model_config.hf_config.quantized_audio_config = {}
+    model_config.hf_config.depth_transformer_config = {}
+    with pytest.raises(DuplexRuntimeConfigError) as error:
+        await open_session(model_config, duplexio_sampling={"audio": {"temperature": 0.5}})
+    assert error.value.code == "invalid_sampling"
+
+
+@pytest.mark.asyncio
 async def test_runtime_config_rejects_server_owned_keys(model_config) -> None:
     with pytest.raises(DuplexRuntimeConfigError, match="duplexio_system_token_ids"):
         await open_session(model_config, duplexio_system_token_ids=[1])

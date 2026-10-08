@@ -156,7 +156,7 @@ def test_sampling_defaults_apply_serving_temperatures(tmp_path: Path) -> None:
     )
 
     assert server.load_sampling_defaults(config_path) == {
-        "agent": {"emission": {"temperature": 0.8}, "content": {"temperature": 0.7, "top_k": 20, "top_p": 0.95}},
+        "agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.7, "top_k": 20, "top_p": 0.95}},
         "user": {"emission": {"temperature": 0.0}, "content": {"temperature": 0.0, "top_k": None, "top_p": None}},
         "audio": {"temperature": 0.7, "top_k": 250},
     }
@@ -178,7 +178,7 @@ def test_sampling_defaults_omit_audio_for_continuous_checkpoint(
     )
 
     assert server.load_sampling_defaults(config_path) == {
-        "agent": {"emission": {"temperature": 0.8}, "content": {"temperature": 0.7, "top_k": 20, "top_p": 0.95}},
+        "agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.7, "top_k": 20, "top_p": 0.95}},
         "user": {"emission": {"temperature": 0.0}, "content": {"temperature": 0.0, "top_k": None, "top_p": None}},
     }
 

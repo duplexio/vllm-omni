@@ -285,6 +285,11 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
             policies["duplexio_text_sampling"]["temperature"] = config.temperature
         depth_sampling = {"temperature": 0.7, "top_k": hf_config.depth_transformer_config.get("sampling_top_k", 250)}
         if client_sampling.audio is not None:
+            if not hf_config.quantized_audio_config:
+                raise DuplexRuntimeConfigError(
+                    "This DuplexIO checkpoint samples audio with its flow-map head, which takes no client sampling",
+                    code="invalid_sampling",
+                )
             audio_sampling = client_sampling.audio.model_dump(exclude_none=True)
             codebook_size = hf_config.quantized_audio_config["codebook_size"]
             if audio_sampling.get("top_k", 0) > codebook_size:

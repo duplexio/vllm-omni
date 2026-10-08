@@ -285,9 +285,12 @@
       const value = samplingNumber(input);
       if (name !== 'temperature' || value !== null) text[name] = value;
     }
-    for (const [name, input] of audioValues) {
-      const value = samplingNumber(input);
-      if (value !== null) audio[name] = value;
+    // Hidden knobs may still hold values the browser restored from an older page.
+    if (config.sampling?.audio !== undefined) {
+      for (const [name, input] of audioValues) {
+        const value = samplingNumber(input);
+        if (value !== null) audio[name] = value;
+      }
     }
     const emitTemperature = samplingNumber(agentEmitTemperature);
     const seed = samplingNumber(samplingSeed);
