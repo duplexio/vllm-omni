@@ -150,6 +150,7 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
         _pooling_output_decoder=None,
         finished_req_ids=set(),
         finished_req_ids_dict=defaultdict(set),
+        streaming_context_errors={},
         kv_cache_manager=SimpleNamespace(take_events=lambda: None),
         kv_event_publisher=SimpleNamespace(publish=lambda _events: None),
         recompute_kv_load_failures=False,

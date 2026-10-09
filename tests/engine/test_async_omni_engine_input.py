@@ -268,8 +268,7 @@ def test_build_add_request_message_preserves_model_intermediate_buffer(mocker: M
     assert request.additional_information is not None
     assert request.additional_information.entries["global_request_id"].list_data == ["req-1"]
     assert request.additional_information.entries["omni_final_stage_id"].scalar_data == 0
-    assert isinstance(request.model_intermediate_buffer, dict)
-    info = request.model_intermediate_buffer
+    info = deserialize_additional_information(request.model_intermediate_buffer)
     assert info["ids"]["tts"] == [11, 12]
     assert torch.equal(info["hidden_states"]["tts"], hidden)
 

@@ -46,6 +46,7 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import (
     build_mm_cpu,
@@ -203,6 +204,7 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         *,
         model_runner_output_builder: Callable[[], OmniModelRunnerOutput],
         cuda_device: torch.device | int | str | None = None,
+        build_in_background: bool = True,
         **kwargs: Any,
     ) -> None:
         sampled_token_ids = kwargs.pop("sampled_token_ids")
@@ -249,6 +251,10 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self._background_exception: BaseException | None = None
         self._background_thread: threading.Thread | None = None
         self._cuda_device = cuda_device
+        if not build_in_background:
+            # get_output() builds on the engine thread, after the next step's
+            # launch, so a model's host finalize never races that step's prep.
+            return
         self._background_thread = threading.Thread(
             target=self._build_output_in_background,
             daemon=True,
@@ -349,6 +355,8 @@ class ExecuteModelState(NamedTuple):
     multimodal_outputs: Any
     # slot_mappings for attention/drafter (aligned with upstream v1 API)
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
+    streaming_retained_tokens: list[int] | None = None
+    streaming_position_budget: list[int] | None = None
     # OMNI: prefix-cache step id; the step context saved under it must be
     # consumed exactly once (materialize or discard_step) in sample_tokens.
     prefix_cache_step_id: int | None = None
@@ -564,7 +572,40 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def capture_model(self) -> int:
         result = super().capture_model()
         self._capture_talker_mtp_graphs()
+        self._replay_breakable_graphs()
+        # Model-owned graphs, captured under serving's default dtype.
+        capture_frame_graphs = getattr(self.get_model(), "capture_frame_graphs", None)
+        if capture_frame_graphs is not None:
+            capture_frame_graphs()
         return result
+
+    @torch.inference_mode()
+    def _replay_breakable_graphs(self) -> None:
+        """Replay each mixed-step graph once, with attention, before serving starts.
+
+        Breakable graphs defer their eager attention to replay, where it receives
+        weak references to the graph's tensors: different dispatch keys and
+        storage offsets than the warm-up runs gave it. Compiled code inside it
+        would otherwise recompile at the first mixed step, stalling live streams.
+        """
+        from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+
+        if not is_breakable_cudagraph_enabled():
+            return
+        for runtime_mode, batch_descs in self.cudagraph_dispatcher.get_capture_descs():
+            if runtime_mode != CUDAGraphMode.PIECEWISE:
+                continue
+            for desc in batch_descs:
+                self._dummy_run(
+                    desc.num_tokens,
+                    cudagraph_runtime_mode=runtime_mode,
+                    force_attention=True,
+                    uniform_decode=desc.uniform,
+                    skip_eplb=True,
+                    remove_lora=False,
+                    num_active_loras=desc.num_active_loras,
+                )
+        torch.accelerator.synchronize()
 
     def shutdown(self) -> None:
         """Release omni-specific GPU resources before upstream shutdown.
@@ -820,6 +861,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         sparse_mm_index: dict[str, int],
         hidden_seq_len: int,
         scheduled_seq_len: int,
+        clone: bool = True,
     ) -> dict[str, object]:
         payload: dict[str, object] = {}
         if not audio_sparse_output:
@@ -847,6 +889,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             sparse_mm_index=sparse_mm_index,
             hidden_seq_len=hidden_seq_len,
             scheduled_seq_len=scheduled_seq_len,
+            clone=clone,
         )
         payload.update(mm_payload)
         return payload
@@ -1175,6 +1218,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 ec_connector_output,
             ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
 
+            update_graph_inputs = getattr(self.model, "update_graph_inputs", None)
+            if callable(update_graph_inputs):
+                request_infos = [self.model_intermediate_buffer.get(req_id, {}) for req_id in req_ids[:num_reqs]]
+                update_graph_inputs(request_infos)
+
         # Let the model adjust inputs before forward (e.g. restore input_ids
         # for multimodal position detection, fix decode position offsets).
         prepare_runner_inputs = getattr(self.model, "prepare_runner_inputs", None)
@@ -1259,6 +1307,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            streaming_retained_tokens = (
+                model_output.streaming_retained_tokens if isinstance(model_output, OmniOutput) else None
+            )
+            streaming_position_budget = (
+                model_output.streaming_position_budget if isinstance(model_output, OmniOutput) else None
+            )
             # A pooling stage skips mm extraction + the omni prefix cache (both assume an AR
             # [n_tok, hidden] output) and exits through the shared _pool() branch below.
             if self.is_pooling_model:
@@ -1355,6 +1409,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             cudagraph_stats,
             multimodal_outputs,
             slot_mappings,  # OMNI: pass slot_mappings for drafter
+            streaming_retained_tokens,
+            streaming_position_budget,
             prefix_cache_step_id,
         )
         self.kv_connector_output = kv_connector_output
@@ -1667,6 +1723,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         )
         return inter_stage_outputs, multimodal_outputs
 
+    def _model_omni_host_owned_outputs(self) -> bool:
+        return self._runner_model_omni_flag("omni_host_owned_multimodal_outputs")
+
     def _should_use_async_omni_output(self) -> bool:
         if not self.use_async_scheduling:
             return False
@@ -1676,12 +1735,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         model_config = getattr(self, "model_config", None)
         if model_config is None:
             model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        model = getattr(self, "model", None)
         if not bool(getattr(model_config, "async_chunk", False)) and not self._model_omni_flag(
-            getattr(self, "model", None), "supports_async_whole_payload"
+            model, "supports_async_whole_payload"
         ):
             return False
 
-        model = getattr(self, "model", None)
         if not self._model_omni_flag(model, "use_async_omni_output"):
             return False
         if self._model_omni_flag(model, "has_postprocess") and not self._model_omni_flag(
@@ -1815,6 +1874,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         num_scheduled_tokens_np: np.ndarray,
         query_start_loc_cpu: Any,
         postprocess_already_applied: bool = False,
+        streaming_retained_tokens: list[int] | None = None,
+        streaming_position_budget: list[int] | None = None,
         prefix_cache_step_id: int | None = None,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
@@ -1872,6 +1933,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # OmniModelRunnerOutput.pooler_output (which is set to None below).
         # The actual multimodal wire transport uses multimodal_outputs instead.
         pooler_output: list[dict[str, object]] | None = None
+        # Models that already build fresh per-step host tensors skip the copy walk and clones.
+        host_owned_outputs = self._model_omni_host_owned_outputs()
         # Token-only steps have no pooler payload to construct. Keep the full
         # path for cached payloads and model postprocess, even without MM input.
         has_mm_payload = multimodal_outputs is not None and (
@@ -1898,7 +1961,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     step_id=prefix_cache_step_id,
                     req_ids=req_ids_output_copy,
                 )
-            if combined_multimodal_outputs is None:
+            if combined_multimodal_outputs is None and host_owned_outputs:
+                mm_cpu = flatten_payload(multimodal_outputs) if multimodal_outputs else {}
+            elif combined_multimodal_outputs is None:
                 flat_mm = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
                 if defer_full_payload_d2h:
                     with record_function_or_nullcontext("omni_output_builder:snapshot_mm_payload"):
@@ -1945,6 +2010,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         sparse_mm_index=sparse_mm_index,
                         hidden_seq_len=hidden_seq_len,
                         scheduled_seq_len=scheduled_seq_len,
+                        clone=not host_owned_outputs,
                     )
                     pooler_output.append(flatten_payload(payload))
 
@@ -1988,6 +2054,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 pooler_output=None,
                 multimodal_outputs=multimodal_outputs,
                 inter_stage_outputs=inter_stage_outputs,
+                streaming_retained_tokens=(
+                    dict(zip(req_ids_output_copy, streaming_retained_tokens, strict=True))
+                    if streaming_retained_tokens is not None
+                    else {}
+                ),
+                streaming_position_budget=(
+                    dict(zip(req_ids_output_copy, streaming_position_budget, strict=True))
+                    if streaming_position_budget is not None
+                    else {}
+                ),
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
@@ -2030,6 +2106,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             cudagraph_stats,
             multimodal_outputs,
             slot_mappings,  # OMNI: unpack slot_mappings for drafter
+            streaming_retained_tokens,
+            streaming_position_budget,
             prefix_cache_step_id,
         ) = self.execute_model_state
         self.execute_model_state = None
@@ -2259,6 +2337,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     query_start_loc_cpu=query_start_loc_cpu,
                     postprocess_already_applied=omni_postprocess_already_applied,
+                    streaming_retained_tokens=streaming_retained_tokens,
+                    streaming_position_budget=streaming_position_budget,
                     prefix_cache_step_id=prefix_cache_step_id,
                 )
             output.omni_connector_output = omni_connector_output
@@ -2283,6 +2363,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 async_output = async_output_cls(
                     model_runner_output_builder=output_builder,
                     cuda_device=self.device,
+                    build_in_background=self._runner_model_omni_flag(
+                        "omni_async_output_build_in_background", default=True
+                    ),
                     **async_output_kwargs,
                 )
             else:

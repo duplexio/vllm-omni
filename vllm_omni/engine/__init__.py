@@ -78,10 +78,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
 
     # Optional additional information dictionary (serialized)
     additional_information: AdditionalInformationPayload | None = None
-    # Runner-owned runtime payload. This is materialized directly into
-    # GPUModelRunner.model_intermediate_buffer instead of using the deprecated
-    # additional_information request transport.
-    model_intermediate_buffer: dict[str, Any] | None = None
+    # Typed wire payload; OmniRequest materializes the runner-owned dictionary.
+    model_intermediate_buffer: AdditionalInformationPayload | None = None
     payload_sender_info: dict[str, Any] | None = None
 
     @classmethod
@@ -91,7 +89,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         *,
         prompt_embeds: torch.Tensor | None = None,
         additional_information: AdditionalInformationPayload | None = None,
-        model_intermediate_buffer: dict[str, Any] | None = None,
+        model_intermediate_buffer: AdditionalInformationPayload | None = None,
         payload_sender_info: dict[str, Any] | None = None,
     ) -> "OmniEngineCoreRequest":
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""

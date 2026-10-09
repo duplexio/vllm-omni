@@ -487,6 +487,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             cudagraph_stats,
             multimodal_outputs_raw,
             slot_mappings,  # OMNI: unpack slot_mappings for upstream v1 API compatibility
+            _streaming_retained_tokens,  # generation stages take no streaming input
+            _streaming_position_budget,
             _prefix_cache_step_id,  # generation stages never save to the prefix cache
         ) = self.execute_model_state
         self.execute_model_state = None

@@ -97,12 +97,13 @@ class MultimodalPayload(Mapping):
 
     Attributes:
         tensors: Dictionary mapping modality/key names to their tensors.
-        metadata: Optional dictionary for non-tensor metadata
-            (e.g., sample rate for audio, image dimensions).
+        metadata: Snapshot and request metadata, which may also be tensors.
+        chunk_keys: Producer-declared snapshot keys, cleared after DELTA delivery.
     """
 
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    chunk_keys: set[str] = field(default_factory=set)
 
     @property
     def primary_tensor(self) -> torch.Tensor | None:
@@ -155,11 +156,9 @@ class MultimodalPayload(Mapping):
         """Merge *incoming* onto this payload and return the result.
 
         Content tensors accumulate into lists for deferred concatenation;
-        known sample-rate keys are snapshots replaced immediately, including
-        in DELTA streams that do not consolidate each emission. Missing keys
-        retain their previous value. Other values keep the existing merge
-        behavior. When this payload
-        is empty, *incoming* is returned as-is, so callers should use the
+        metadata replaces previous values regardless of its Python type, and
+        known sample-rate keys are snapshots that also replace accumulated
+        tensors. When this payload is empty, *incoming* is returned as-is, so callers should use the
         return value: ``accumulated = accumulated.merged_with(incoming)``.
         """
         if self.is_empty:
@@ -167,8 +166,12 @@ class MultimodalPayload(Mapping):
         # Capture before merging: incoming may be this payload. Store these
         # snapshots in only one partition even if their representation changes.
         snapshots = {key: incoming[key] for key in _METADATA_TENSOR_KEYS if key in incoming}
+        incoming_metadata = dict(incoming.metadata)
+        for key in self.chunk_keys:
+            self.metadata.pop(key, None)
+        self.chunk_keys = incoming.chunk_keys.copy()
         _append_entries(self.tensors, incoming.tensors)
-        _append_entries(self.metadata, incoming.metadata)
+        self.metadata.update(incoming_metadata)
         for key, value in snapshots.items():
             self.tensors.pop(key, None)
             self.metadata[key] = value
@@ -225,21 +228,31 @@ class MultimodalPayload(Mapping):
     def from_dict(cls, data: dict[str, Any] | None) -> MultimodalPayload | None:
         """Create a MultimodalPayload from a raw dictionary.
 
-        Separates torch.Tensor values into tensors and everything
-        else into metadata.
+        The producer's `chunk` group declares per-chunk snapshots. Its keys
+        retain their public names; the grouping only controls accumulation.
         """
         if not data:
             return None
         tensors: dict[str, torch.Tensor] = {}
         metadata: dict[str, Any] = {}
+        chunk_keys: set[str] = set()
         for k, v in data.items():
-            if isinstance(v, torch.Tensor):
+            if k == "chunk":
+                metadata.update(v)
+                chunk_keys.update(v)
+            elif k.startswith("chunk."):
+                key = k.removeprefix("chunk.")
+                metadata[key] = v
+                chunk_keys.add(key)
+            elif k.startswith("meta."):
+                metadata[k] = v
+            elif isinstance(v, torch.Tensor):
                 tensors[k] = v
             else:
                 metadata[k] = v
         if not tensors and not metadata:
             return None
-        return cls(tensors=tensors, metadata=metadata)
+        return cls(tensors=tensors, metadata=metadata, chunk_keys=chunk_keys)
 
     @classmethod
     def from_raw(cls, payload: Any, modality_key: str) -> MultimodalPayload | None:

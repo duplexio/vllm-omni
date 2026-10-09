@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine.serialization import deserialize_additional_information
 
 
 class OmniRequest(Request):
@@ -59,6 +60,9 @@ class OmniRequest(Request):
         self.additional_information: AdditionalInformationPayload | None = additional_information
         # Runner-owned runtime payload.
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
+        # Only models owning their cache addressing may compact scheduler history.
+        self.streaming_retained_tokens: int | None = None
+        self.streaming_position_budget: int | None = None
         # Sender's connector address for this request's stage payload.
         self.payload_sender_info: dict[str, Any] | None = payload_sender_info
 
@@ -107,7 +111,7 @@ class OmniRequest(Request):
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
             additional_information=request.additional_information,
-            model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            model_intermediate_buffer=deserialize_additional_information(request.model_intermediate_buffer),
             payload_sender_info=request.payload_sender_info,
             resumable=request.resumable,
             session_id=request.session_id,

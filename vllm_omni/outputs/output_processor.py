@@ -26,7 +26,6 @@ from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalP
 from vllm_omni.outputs.multimodal_accumulation import (
     drain_delta_payload,
     is_non_final_delta_audio_chunk,
-    replace_snapshot_keys,
 )
 from vllm_omni.outputs.output_modality import OutputModality
 
@@ -135,7 +134,6 @@ class OmniRequestState(RequestState):
 
             incoming = MultimodalPayload.from_raw(payload, modality_key)
             if incoming is not None:
-                replace_snapshot_keys(self.mm_accumulated, incoming)
                 self.mm_accumulated = self.mm_accumulated.merged_with(incoming)
         except (ValueError, TypeError, RuntimeError):
             logger.exception("Error accumulating multimodal tensor")
