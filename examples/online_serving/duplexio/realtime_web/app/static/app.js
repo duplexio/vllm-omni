@@ -925,11 +925,9 @@
       });
       return;
     }
-    if (
-      (event.type === 'conversation.item.added' || event.type === 'conversation.item.created')
-      && event.item
-      && event.item.type === 'function_call_output'
-    ) {
+    // Items arrive as both conversation.item.added and its legacy twin
+    // conversation.item.created; draw each one once.
+    if (event.type === 'conversation.item.added' && event.item && event.item.type === 'function_call_output') {
       appendToolResponse(event.item);
       return;
     }

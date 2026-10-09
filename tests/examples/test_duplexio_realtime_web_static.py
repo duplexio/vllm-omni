@@ -120,6 +120,9 @@ def test_frontend_registers_tools_and_returns_function_outputs() -> None:
     assert "tool_choice: sessionTools.length ? 'auto' : 'none'" in app
     assert "event.type === 'response.output_item.done' && event.item && event.item.type === 'function_call'" in app
     assert "type: 'function_call_output'" in app
+    # The server sends each item twice (added and its legacy twin created); the page draws it once.
+    assert "event.type === 'conversation.item.added' && event.item && event.item.type === 'function_call_output'" in app
+    assert "conversation.item.created'" not in app
     assert "Tool response → model" in app
     assert "`<tool_response>\\n${item.output}\\n</tool_response>`" in app
     assert "toolPicker.disabled = true" in app
