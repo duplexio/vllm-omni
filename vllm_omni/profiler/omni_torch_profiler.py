@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 from datetime import datetime
 from typing import Any, Literal
 
@@ -128,16 +129,11 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         base_name = self._trace_filename or self._worker_name
 
-        if os.path.dirname(base_name):
-            parent_dir = os.path.dirname(base_name)
-            leaf_name = os.path.basename(base_name)
-            session_name = f"{ts}_{leaf_name}"
-            self._session_dir = os.path.join(parent_dir, session_name)
-        else:
-            session_name = f"{ts}_{base_name}"
-            self._session_dir = os.path.join(self._trace_dir, session_name)
-
-        os.makedirs(self._session_dir, exist_ok=True)
+        parent_dir, leaf_name = os.path.split(base_name)
+        parent_dir = parent_dir or self._trace_dir
+        os.makedirs(parent_dir, exist_ok=True)
+        # Replicas can share stage/rank names and start within the same second.
+        self._session_dir = tempfile.mkdtemp(prefix=f"{ts}_{leaf_name}_pid{os.getpid()}_", dir=parent_dir)
         self._artifact_paths["session_dir"] = self._session_dir
         return self._session_dir
 
