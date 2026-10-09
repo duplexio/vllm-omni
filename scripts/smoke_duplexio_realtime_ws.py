@@ -1,0 +1,420 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""GPU smoke: the FULL realtime websocket path, judged by independent ASR.
+
+Boots the actual `vllm-omni serve` realtime endpoint, opens a browser-shaped
+session (f32 24 kHz input frames, ``response_format: "pcm"``, agent-first),
+streams silence so the model narrates, and reassembles the emitted
+``response.output_audio.delta`` chunks EXACTLY the way the web client does
+(format/rate fields per event, int16 default). The reassembled waveform is
+then transcribed with offline Whisper (large-v3-turbo) and must fuzzily match
+the session's own ``response.output_audio_transcript.delta`` text. A duration check
+catches duplicated/overlapping chunks that a text-alignment gate cannot see.
+
+It exercises websocket serialization and the wire audio encoding:
+everything a browser receives.
+
+Invocation (1 GPU node):
+
+  PYTHONPATH=$PWD .venv/bin/python scripts/smoke_duplexio_realtime_ws.py \\
+    --model /dcai/users/thuand/perf/exports/grpoasropd516200_step300 --voice VOICE_24K.wav
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import json
+import subprocess
+import sys
+import time
+import traceback
+import urllib.request
+from pathlib import Path
+from urllib.parse import urlencode
+
+import numpy as np
+
+FRAME_SIZE = 1_920
+SAMPLE_RATE = 24_000
+
+
+def fail(message: str) -> None:
+    print(f"SMOKE FAIL: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+# Whisper canonicalizes speech orthography ("gonna" -> "going to",
+# "I'm" -> "I am" or vice versa); expand both sides so the word-level
+# ratio measures intelligibility, not transcription style.
+CONTRACTIONS = {
+    "gonna": "going to",
+    "wanna": "want to",
+    "gotta": "got to",
+    "cannot": "can not",
+    "can't": "can not",
+    "won't": "will not",
+    "n't": " not",
+    "'m": " am",
+    "'re": " are",
+    "'ve": " have",
+    "'ll": " will",
+    "'d": " would",
+    "it's": "it is",
+    "that's": "that is",
+    "what's": "what is",
+    "let's": "let us",
+}
+
+
+def normalized_words(text: str) -> list[str]:
+    lowered = text.lower()
+    for contraction, expansion in CONTRACTIONS.items():
+        lowered = lowered.replace(contraction, expansion)
+    cleaned = "".join(
+        c if c.isalnum() or c.isspace() else " " for c in lowered
+    )
+    return cleaned.split()
+
+
+def reference_audio(path: Path) -> str:
+    """Base64 pcm_f32le of the agent's reference voice."""
+    import soundfile
+
+    samples, rate = soundfile.read(path, dtype="float32", always_2d=True)
+    if rate != SAMPLE_RATE:
+        fail(f"reference voice must be {SAMPLE_RATE} Hz, got {rate} Hz")
+    return base64.b64encode(samples[:, 0].tobytes()).decode()
+
+
+def user_audio_frames(path: Path) -> list[np.ndarray]:
+    """Split a 24 kHz wav's first channel into browser-sized input frames.
+
+    A trajectory wav carries the user on channel one and the agent on channel
+    two, so the first channel is the side a real speaker would send.
+    """
+    import wave
+
+    with wave.open(str(path)) as handle:
+        rate = handle.getframerate()
+        channels = handle.getnchannels()
+        if rate != SAMPLE_RATE or handle.getsampwidth() != 2:
+            fail(f"user audio must be 16-bit {SAMPLE_RATE} Hz, got {handle.getsampwidth() * 8}-bit {rate} Hz")
+        pcm = np.frombuffer(handle.readframes(handle.getnframes()), dtype="<i2")
+    samples = pcm.reshape(-1, channels)[:, 0].astype(np.float32) / 32768.0
+    frame_count = len(samples) // FRAME_SIZE
+    return list(samples[: frame_count * FRAME_SIZE].reshape(frame_count, FRAME_SIZE))
+
+
+def browser_decode(chunks: list[dict]) -> tuple[np.ndarray, int]:
+    """Reassemble audio deltas exactly like the web client's app.js."""
+    pcm_parts: list[np.ndarray] = []
+    rate = SAMPLE_RATE
+    for chunk in chunks:
+        data = base64.b64decode(chunk["delta"])
+        fmt = str(chunk.get("format", "")).lower()
+        rate = int(chunk.get("sample_rate_hz") or rate)
+        if "f32" in fmt:
+            samples = np.frombuffer(data, dtype="<f4").astype(np.float32)
+        else:
+            samples = (
+                np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
+            )
+        pcm_parts.append(samples)
+    if not pcm_parts:
+        return np.zeros(0, dtype=np.float32), rate
+    return np.concatenate(pcm_parts), rate
+
+
+async def run_client(args: argparse.Namespace) -> None:
+    import websockets
+
+    query = urlencode({"duplex": 1, "model": args.model, "autostart": 0})
+    base = args.url.rstrip("/") if args.url else f"ws://127.0.0.1:{args.port}"
+    url = f"{base}/v1/realtime?{query}"
+    print(f"[ws] connecting: {url}")
+    connect_started = time.monotonic()
+    audio_chunks: list[dict] = []
+    transcript_parts: list[str] = []
+    user_transcript_parts: list[str] = []
+    event_counts: dict[str, int] = {}
+    session_ready = asyncio.Event()
+    done = asyncio.Event()
+
+    headers = [tuple(h.split("=", 1)) for h in args.header]
+    async with websockets.connect(
+        url,
+        max_size=64 * 1024 * 1024,
+        open_timeout=args.connect_timeout,
+        additional_headers=headers,
+    ) as ws:
+        print(f"[ws] connected after {time.monotonic() - connect_started:.1f}s "
+              "(includes any cold start)")
+        async def reader() -> None:
+            try:
+                while True:
+                    event = json.loads(await ws.recv())
+                    event_type = event.get("type")
+                    event_counts[event_type] = event_counts.get(event_type, 0) + 1
+                    if event_type == "error":
+                        print(f"[ws] error event: {event}", file=sys.stderr)
+                    elif event_type == "session.updated":
+                        session_ready.set()
+                    elif event_type == "response.output_audio.delta":
+                        audio_chunks.append(event)
+                    elif event_type == "response.output_audio_transcript.delta":
+                        transcript_parts.append(event.get("delta") or "")
+                    elif event_type == "conversation.item.input_audio_transcription.delta":
+                        user_transcript_parts.append(event.get("delta") or "")
+            except websockets.ConnectionClosed:
+                done.set()
+
+        reader_task = asyncio.create_task(reader())
+        await ws.send(json.dumps({
+            "type": "session.update",
+            "session": {
+                "model": args.model,
+                "modalities": ["audio", "text"],
+                "response_format": "pcm",
+                # The model decides when to speak; server VAD would hold input for commits.
+                "turn_detection": None,
+                "tools": [],
+                "tool_choice": "none",
+                "extra_body": {
+                    "auto_response": True,
+                    "start_role": "agent",
+                    "ref_audio_data": reference_audio(args.voice),
+                    "ref_audio_format": "pcm_f32le",
+                },
+            },
+        }))
+        # The web client and prewarm both wait for session readiness before
+        # sending audio; frames sent earlier reach a not-yet-duplex session.
+        await asyncio.wait_for(session_ready.wait(), timeout=120.0)
+        print("[ws] session ready")
+        # Stream f32 frames at the browser cadence (80 ms): the user's speech
+        # if given, then silence for the rest of the session.
+        silent = base64.b64encode(bytes(FRAME_SIZE * 4)).decode()
+        speech = [
+            base64.b64encode(frame.astype("<f4").tobytes()).decode()
+            for frame in (
+                user_audio_frames(Path(args.user_audio)) if args.user_audio else []
+            )
+        ]
+        frames = max(int(args.seconds / 0.08), len(speech))
+        start = time.monotonic()
+        for index in range(frames):
+            await ws.send(json.dumps({
+                "type": "input_audio_buffer.append",
+                "audio": speech[index] if index < len(speech) else silent,
+                "format": "pcm_f32le",
+                "sample_rate_hz": SAMPLE_RATE,
+            }))
+            target = start + (index + 1) * 0.08
+            delay = target - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+        # The first frames include one-time compilation; wait for the agent to catch up.
+        deadline = time.monotonic() + 180.0
+        while len(audio_chunks) < 0.9 * frames and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+        await ws.send(json.dumps({"type": "session.close"}))
+        try:
+            await asyncio.wait_for(done.wait(), timeout=10.0)
+        except TimeoutError:
+            pass
+        reader_task.cancel()
+
+    transcript = "".join(transcript_parts).strip()
+    user_transcript = "".join(user_transcript_parts).strip()
+    print(f"[ws] event counts: {event_counts}")
+    if args.user_audio:
+        print(f"[ws] user transcript (streaming RNN-T): {user_transcript!r}")
+    print(f"[ws] audio.delta chunks: {len(audio_chunks)}")
+    print(f"[ws] transcript deltas: {transcript!r}")
+    if not audio_chunks:
+        fail("no response.output_audio.delta events received")
+    if not transcript:
+        fail("no response.output_audio_transcript.delta text received")
+    if args.user_audio and not user_transcript:
+        fail("user speech produced no input_audio_transcription deltas")
+
+    waveform, rate = browser_decode(audio_chunks)
+    duration = len(waveform) / rate
+    print(f"[ws] reassembled audio: {len(waveform)} samples @ {rate} Hz "
+          f"= {duration:.2f}s over {len(audio_chunks)} chunks")
+    # Duplicated/overlapping chunks would inflate duration well beyond the
+    # session length; the session streams `frames` input frames total.
+    session_span = frames * 0.08
+    if duration > session_span + 3.0:
+        fail(
+            f"reassembled audio ({duration:.1f}s) exceeds the session span "
+            f"({session_span:.1f}s): duplicated or overlapping chunks"
+        )
+    if not np.isfinite(waveform).all():
+        fail("reassembled audio contains non-finite samples")
+
+    import wave
+
+    wav_path = Path(args.out_dir) / "realtime_ws_agent.wav"
+    with wave.open(str(wav_path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(
+            (np.clip(waveform, -1, 1) * 32767).astype("<i2").tobytes()
+        )
+    print(f"[ws] wav saved: {wav_path}")
+
+    from difflib import SequenceMatcher
+
+    import whisper
+    from scipy.signal import resample_poly
+
+    asr = whisper.load_model("large-v3-turbo")
+    audio_16k = resample_poly(waveform.astype(np.float64), 16_000, rate)
+    heard = asr.transcribe(
+        audio_16k.astype(np.float32),
+        language="en",
+        fp16=True,
+    )["text"].strip()
+    print(f"[ws] whisper heard: {heard!r}")
+    ratio = SequenceMatcher(
+        None,
+        normalized_words(transcript),
+        normalized_words(heard),
+    ).ratio()
+    print(f"[ws] whisper/transcript match ratio: {ratio:.2f}")
+    if ratio < 0.9:
+        fail(
+            f"browser-side audio does not transcribe to the agent text "
+            f"(ratio {ratio:.2f} < 0.90)"
+        )
+    print("[ws] browser-side audio is intelligible and matches the text")
+    print("SMOKE PASS")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--voice", type=Path, required=True, help="Reference voice: a mono 24 kHz wav or flac")
+    parser.add_argument("--seconds", type=float, default=15.0)
+    parser.add_argument(
+        "--user-audio",
+        default=None,
+        help="Wav of user speech to stream instead of silence (16-bit 24 kHz; "
+        "channel one is used). Also checks that the session transcribes it.",
+    )
+    parser.add_argument("--port", type=int, default=8099)
+    parser.add_argument(
+        "--url",
+        default=None,
+        help="Remote realtime endpoint base (e.g. "
+        "wss://duplexio--model-snapshot-staging.modal.run); skips booting a "
+        "local server",
+    )
+    parser.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra websocket handshake header (e.g. Modal proxy auth)",
+    )
+    parser.add_argument(
+        "--sleep-mode",
+        action="store_true",
+        help="Pass --enable-sleep-mode to the served engine (CLI route, as "
+        "the Modal app does)",
+    )
+    parser.add_argument(
+        "--sleep-cycle",
+        action="store_true",
+        help="After the server is healthy, sleep(level 1) + wakeup stage 0 "
+        "before the session — the Modal snapshot flow minus the snapshot",
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=900.0,
+        help="Websocket open timeout (covers remote cold starts)",
+    )
+    parser.add_argument(
+        "--deploy-config", type=Path, default=Path(__file__).parents[1] / "vllm_omni/deploy/duplexio.yaml",
+    )
+    parser.add_argument("--out-dir", default=".")
+    args = parser.parse_args()
+
+    if args.url is not None:
+        try:
+            asyncio.run(run_client(args))
+        except SystemExit:
+            raise
+        except BaseException:
+            traceback.print_exc()
+            fail("websocket session raised (see traceback above)")
+        return
+
+    command = [
+        sys.executable,
+        "-m",
+        "vllm_omni.entrypoints.cli.main",
+        "serve",
+        args.model,
+        "--omni",
+        "--deploy-config",
+        str(args.deploy_config),
+        "--trust-remote-code",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(args.port),
+    ]
+    if args.sleep_mode:
+        command.append("--enable-sleep-mode")
+    server = subprocess.Popen(command)
+    try:
+        deadline = time.monotonic() + 900
+        while time.monotonic() < deadline:
+            if server.poll() is not None:
+                fail(f"server exited early with {server.returncode}")
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{args.port}/health",
+                    timeout=2,
+                ):
+                    break
+            except OSError:
+                time.sleep(2)
+        else:
+            fail("server did not become healthy within 900s")
+        print("[ws] server healthy")
+        if args.sleep_cycle:
+            for path, payload in (
+                ("/v1/omni/sleep", {"stage_ids": [0], "level": 1}),
+                ("/v1/omni/wakeup", {"stage_ids": [0]}),
+            ):
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{args.port}{path}",
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=600) as reply:
+                    print(f"[ws] {path}: {json.load(reply)}")
+        asyncio.run(run_client(args))
+    except SystemExit:
+        raise
+    except BaseException:
+        traceback.print_exc()
+        fail("websocket session raised (see traceback above)")
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,169 @@
+"""Packed streaming convolution must match training, not round before SiLU."""
+
+from itertools import accumulate
+
+import pytest
+import torch
+from torch import nn
+
+from vllm_omni.model_executor.models.duplexio.qwen_backbone import DuplexIOQwenGatedDeltaNetAttention
+from vllm_omni.model_executor.models.duplexio.stream_conv import (
+    expand_stream_conv_weight,
+    stream_causal_conv,
+    update_stream_conv_state_kernel,
+)
+
+training = pytest.importorskip("duplexio.modules.qwen3_5_stream_delta")
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires packed CUDA convolution")
+
+
+@torch.inference_mode()
+def test_large_cache_offsets_match_contiguous_state() -> None:
+    """vLLM's interleaved layer storage can put a slot beyond 32-bit offsets."""
+    channels, history = 32, 18
+    state = torch.empty_strided(
+        (5, channels, history),
+        (1 << 30, history, 1),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    state.fill_(1)
+    state[0].fill_(2)
+    reference = state.clone()
+    x = torch.zeros(6, channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.ones(channels, history + 1, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([4], device="cuda", dtype=torch.int32)
+    boundaries = torch.tensor([0, 6], device="cuda", dtype=torch.int32)
+    has_state = torch.ones(1, device="cuda", dtype=torch.bool)
+    chunks = torch.tensor([[0, 0]], device="cuda", dtype=torch.int32)
+    expected = stream_causal_conv(x, weight, None, reference, slots, boundaries, has_state, chunks)
+    actual = stream_causal_conv(x, weight, None, state, slots, boundaries, has_state, chunks)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(state, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("padding_slot", [1, -1])
+@torch.inference_mode()
+def test_empty_request_does_not_reset_convolution_state(padding_slot: int) -> None:
+    """Scheduler padding has no tokens and must not read or write cache state."""
+    channels, history = 32, 18
+    state = torch.ones(2, channels, history, device="cuda", dtype=torch.bfloat16)
+    x = torch.zeros(6, channels, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([0, padding_slot], device="cuda", dtype=torch.int32)
+    boundaries = torch.tensor([0, 6, 6], device="cuda", dtype=torch.int32)
+    has_state = torch.zeros(2, device="cuda", dtype=torch.bool)
+    update_stream_conv_state_kernel[(2, 1)](
+        x,
+        state,
+        slots,
+        boundaries,
+        has_state,
+        channels,
+        history,
+        slots.stride(0),
+        *x.stride(),
+        *state.stride(),
+        32,
+        32,
+    )
+    torch.testing.assert_close(state[0], torch.zeros_like(state[0]), rtol=0, atol=0)
+    torch.testing.assert_close(state[1], torch.ones_like(state[1]), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("time_major", [False, True])
+@torch.inference_mode()
+def test_batched_in_place_history_shift(time_major: bool) -> None:
+    """Warp scheduling must not overwrite another warp's old history reads."""
+    torch.manual_seed(53)
+    requests, channels, history = 8, 8192, 18
+    state = torch.randn(requests, channels, history, device="cuda", dtype=torch.bfloat16)
+    if time_major:
+        state = state.transpose(1, 2).contiguous().transpose(1, 2)
+    slots = torch.arange(requests, device="cuda", dtype=torch.int32)
+    boundaries = torch.arange(requests + 1, device="cuda", dtype=torch.int32) * 6
+    active = torch.ones(requests, device="cuda", dtype=torch.bool)
+    x = torch.randn(requests * 6, channels, device="cuda", dtype=torch.bfloat16)
+    for _ in range(100):
+        expected = torch.cat((state[:, :, 6:].clone(), x.view(requests, 6, channels).transpose(1, 2)), -1)
+        update_stream_conv_state_kernel[(requests, channels // 32)](
+            x,
+            state,
+            slots,
+            boundaries,
+            active,
+            channels,
+            history,
+            slots.stride(0),
+            *x.stride(),
+            *state.stride(),
+            32,
+            32,
+        )
+        torch.testing.assert_close(state, expected, rtol=0, atol=0)
+        x.add_(0.01)
+
+
+@pytest.mark.parametrize("lengths", [[6, 6], [6, 78], [90, 6]])
+@pytest.mark.parametrize("capture_graph", [False, True])
+@pytest.mark.parametrize("slot_stride", [1, 2])
+@torch.inference_mode()
+def test_streaming_matches_packed_training_and_resets_reused_slots(
+    lengths: list[int],
+    capture_graph: bool,
+    slot_stride: int,
+) -> None:
+    torch.manual_seed(613)
+    channels, history_length = 32, 18
+    source = nn.Conv1d(channels, channels, 4, groups=channels, bias=False, device="cuda", dtype=torch.bfloat16)
+    native = DuplexIOQwenGatedDeltaNetAttention.__new__(DuplexIOQwenGatedDeltaNetAttention)
+    nn.Module.__init__(native)
+    native.full_cudagraph_enabled = False
+    native.activation = "silu"
+    native.conv1d = nn.Conv1d(channels, channels, 19, groups=channels, bias=False, device="cuda", dtype=torch.bfloat16)
+    native.conv1d.weight.copy_(expand_stream_conv_weight(source.weight))
+    state = torch.randn(3, channels, history_length, device="cuda", dtype=torch.bfloat16)
+    original_state = state.clone()
+    slot_table = torch.ones(2, slot_stride, device="cuda", dtype=torch.int32)
+    slot_table[:, 0] = torch.tensor([2, 0], device="cuda", dtype=torch.int32)
+    slots = slot_table[:, 0]
+    has_state = torch.tensor([True, False], device="cuda")
+    x = torch.randn(sum(lengths), channels, device="cuda", dtype=torch.bfloat16)
+    boundaries = torch.tensor([0, *accumulate(lengths)], device="cuda", dtype=torch.int32)
+    histories = [state[2].T.clone(), torch.zeros_like(state[0].T)]
+    segments = [torch.cat((history, part)) for history, part in zip(histories, x.split(lengths), strict=True)]
+    # Training folds each frame's six cells into channels: (cells, C) -> (1, frames, 6C).
+    # Its FP32 reference conv avoids a causal_conv1d build against this venv's torch.
+    reference_lengths = [part.shape[0] for part in segments]
+    seq_idx = torch.repeat_interleave(torch.arange(2, dtype=torch.int32), torch.tensor(reference_lengths) // 6)[None]
+    expected = (
+        training.stream_causal_conv1d(
+            torch.cat(segments).float().cpu().view(1, -1, 6 * channels),
+            source.weight.squeeze(1).repeat(6, 1).float().cpu(),
+            seq_idx,
+        )
+        .view(-1, channels)
+        .cuda()
+    )
+    expected = torch.cat([part[history_length:] for part in expected.split(reference_lengths)])
+    chunks = torch.tensor(
+        [[request, chunk] for request, length in enumerate(lengths) for chunk in range((length // 6 + 63) // 64)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    actual = native.apply_stream_causal_conv(x, state, slots, boundaries, has_state, chunks)
+    if capture_graph:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            native.apply_stream_causal_conv(x, state, slots, boundaries, has_state, chunks)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = native.apply_stream_causal_conv(x, state, slots, boundaries, has_state, chunks)
+        state.copy_(original_state)
+        graph.replay()
+    # One rounding of the FP32 result is within half a BF16 ulp; rounding before SiLU is not.
+    torch.testing.assert_close(actual.float(), expected, rtol=2**-8, atol=1e-6)
+    torch.testing.assert_close(state[2], segments[0][-history_length:].T, rtol=0, atol=0)
+    torch.testing.assert_close(state[0], segments[1][-history_length:].T, rtol=0, atol=0)
+    torch.testing.assert_close(state[1], original_state[1], rtol=0, atol=0)
