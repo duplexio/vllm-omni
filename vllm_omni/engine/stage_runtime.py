@@ -777,39 +777,41 @@ class StageRuntime:
             executor_class = None
             engine_args_dict = None
             if base_metadata.stage_type != "diffusion":
-                engine_args_dict = (
-                    build_engine_args_dict_from_omni_stage_config(
+                # Config validation reads env flags (e.g. VLLM_USE_BREAKABLE_CUDAGRAPH), so apply runtime.env first.
+                with stage_runtime_env(stage_id, base_metadata.runtime_cfg):
+                    engine_args_dict = (
+                        build_engine_args_dict_from_omni_stage_config(
+                            stage_cfg,
+                            self._model,
+                            stage_connector_spec=stage_connector_spec,
+                            cli_tokenizer=self._tokenizer,
+                        )
+                        if isinstance(stage_cfg, BaseVllmOmniStageConfig)
+                        else build_engine_args_dict(
+                            stage_cfg,
+                            self._model,
+                            stage_connector_spec=stage_connector_spec,
+                            cli_tokenizer=self._tokenizer,
+                        )
+                    )
+                    inject_omni_kv_connector_config(
+                        engine_args_dict,
+                        omni_kv_connector,
+                        stage_id,
+                    )
+                    _inject_inferred_kv_tp_topology(
+                        engine_args_dict.get("omni_kv_config"),
+                        stage_id,
+                        self._stage_configs,
+                    )
+                    stage_vllm_config, executor_class = build_vllm_config(
                         stage_cfg,
                         self._model,
                         stage_connector_spec=stage_connector_spec,
-                        cli_tokenizer=self._tokenizer,
+                        engine_args_dict=engine_args_dict,
+                        api_process_count=self._client_count,
+                        api_process_rank=self._api_process_rank,
                     )
-                    if isinstance(stage_cfg, BaseVllmOmniStageConfig)
-                    else build_engine_args_dict(
-                        stage_cfg,
-                        self._model,
-                        stage_connector_spec=stage_connector_spec,
-                        cli_tokenizer=self._tokenizer,
-                    )
-                )
-                inject_omni_kv_connector_config(
-                    engine_args_dict,
-                    omni_kv_connector,
-                    stage_id,
-                )
-                _inject_inferred_kv_tp_topology(
-                    engine_args_dict.get("omni_kv_config"),
-                    stage_id,
-                    self._stage_configs,
-                )
-                stage_vllm_config, executor_class = build_vllm_config(
-                    stage_cfg,
-                    self._model,
-                    stage_connector_spec=stage_connector_spec,
-                    engine_args_dict=engine_args_dict,
-                    api_process_count=self._client_count,
-                    api_process_rank=self._api_process_rank,
-                )
 
             for replica_id in range(num_replicas):
                 replica_cfg, native_kv = self._prepare_replica_stage_config(
