@@ -128,6 +128,11 @@ vsa = [
     "fastvideo-kernel==0.3.4",
 ]
 
+duplexio = [
+    # DuplexIO's per-stream gated delta rule runs flash-linear-attention's kernels.
+    "flash-linear-attention==0.5.2",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",
@@ -180,6 +185,7 @@ include = ["vllm_omni*"]
     "model_executor/models/step_audio2/assets/*.wav",
     "transformers_utils/chat_templates/*.jinja",
 ]
+"vllm_omni.model_executor.models.duplexio" = ["PocketTTSLicense.txt", "GDN_LICENSE"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm

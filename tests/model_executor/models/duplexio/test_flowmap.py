@@ -1,0 +1,112 @@
+"""Numerical and batching contracts for the continuous audio head."""
+
+import pytest
+import torch
+
+from vllm_omni.model_executor.models.duplexio.flowmap import FlowMap, PocketRMSNorm
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def make_flow(*, steps: int = 1) -> FlowMap:
+    torch.manual_seed(71)
+    return FlowMap(4, 16, 12, 2, inference_steps=steps)
+
+
+def temperatures(rows: int, value: float = 0.3) -> torch.Tensor:
+    return torch.full((rows,), value)
+
+
+def test_time_normalization_uses_sample_variance() -> None:
+    hidden = torch.tensor([[1.0, 2.0, 5.0, 9.0]])
+    expected = hidden / torch.sqrt(hidden.var(dim=-1, keepdim=True) + 1e-5)
+    torch.testing.assert_close(PocketRMSNorm(4)(hidden), expected)
+
+
+def test_time_normalization_preserves_bf16_activations() -> None:
+    norm = PocketRMSNorm(4)
+    hidden = torch.tensor([[1.0, 2.0, 5.0, 9.0]], dtype=torch.bfloat16)
+    expected = hidden * torch.rsqrt(hidden.var(dim=-1, keepdim=True) + 1e-5)
+    actual = norm(hidden)
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected)
+
+
+def test_block_normalization_matches_layer_norm_in_bf16() -> None:
+    # Serving loads every parameter in the model dtype, including the norms' affine ones.
+    flow = make_flow().to(torch.bfloat16)
+    hidden = torch.randn(7, 16, dtype=torch.bfloat16)
+    expected = (hidden - hidden.mean(-1, keepdim=True)) / torch.sqrt(
+        hidden.var(-1, unbiased=False, keepdim=True) + 1e-6
+    )
+    for norm in (flow.blocks[0].norm, flow.final_layer.norm):
+        torch.testing.assert_close(norm(hidden), expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("steps", [1, 2, 4])
+def test_flow_batch_slots_are_independent(steps: int) -> None:
+    flow = make_flow(steps=steps)
+    conditioning, noise = torch.randn(5, 12), torch.randn(5, 4)
+    batched = flow.sample(conditioning, noise, temperatures(5))
+    individual = torch.cat([flow.sample(conditioning[i : i + 1], noise[i : i + 1], temperatures(1)) for i in range(5)])
+    torch.testing.assert_close(batched, individual, atol=2e-6, rtol=2e-5)
+
+    order = torch.tensor([4, 0, 2, 1, 3])
+    torch.testing.assert_close(flow.sample(conditioning[order], noise[order], temperatures(5)), batched[order])
+    conditioning[1] = 100
+    noise[1] = -100
+    unchanged = torch.tensor([0, 2, 3, 4])
+    torch.testing.assert_close(flow.sample(conditioning, noise, temperatures(5))[unchanged], batched[unchanged])
+
+
+def test_row_temperatures_are_noise_variances() -> None:
+    flow = make_flow()
+    with torch.no_grad():
+        flow.final_layer.linear.weight.zero_()
+        flow.final_layer.linear.bias.zero_()
+    noise = torch.randn(3, 4)
+    temperature = torch.tensor([0.0, 0.5, 1.0])
+    expected = temperature.sqrt().unsqueeze(-1) * noise
+    torch.testing.assert_close(flow.sample(torch.randn(3, 12), noise, temperature), expected)
+
+
+@pytest.mark.parametrize("steps", [1, 3])
+def test_sampling_integrates_from_zero_to_one(steps: int) -> None:
+    flow = make_flow(steps=steps)
+    conditioning, noise = torch.randn(3, 12), torch.randn(3, 4)
+    expected = 0.3**0.5 * noise
+    for step in range(steps):
+        expected = (
+            expected
+            + flow(
+                expected,
+                conditioning,
+                torch.full((3,), step / steps),
+                torch.full((3,), (step + 1) / steps),
+            )
+            / steps
+        )
+    torch.testing.assert_close(flow.sample(conditioning, noise, temperatures(3)), expected)
+
+
+def test_sampling_captures_as_one_graph_without_random_state() -> None:
+    flow = make_flow(steps=2)
+    conditioning, noise = torch.randn(3, 12), torch.randn(3, 4)
+    random_state = torch.random.get_rng_state()
+    compiled = torch.compile(flow.sample, fullgraph=True, backend="eager")
+    torch.testing.assert_close(
+        compiled(conditioning, noise, temperatures(3)),
+        flow.sample(conditioning, noise, temperatures(3)),
+    )
+    torch.testing.assert_close(torch.random.get_rng_state(), random_state)
+
+
+def test_flowmap_keeps_fp32_parameters_under_bf16_model_initialization() -> None:
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        flow = make_flow()
+    finally:
+        torch.set_default_dtype(previous)
+    assert all(parameter.dtype == torch.float32 for parameter in flow.parameters())
+    assert flow.start_time_embedding.frequencies.dtype == torch.float32
