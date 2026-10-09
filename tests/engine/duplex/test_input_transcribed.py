@@ -47,3 +47,18 @@ def test_blank_input_transcribed_emits_nothing() -> None:
         {"type": "input.transcribed", "transcript": "  "},
     )
     assert events == []
+
+
+def test_input_transcript_delta_streams_the_heard_text_unstripped() -> None:
+    events = project_internal_event(
+        RealtimeProjectionState(session_id="s"),
+        {"type": "input.transcript.delta", "item_id": "item_input_s", "delta": " hel"},
+    )
+    assert len(events) == 1
+    assert events[0].to_realtime() == {
+        "type": "conversation.item.input_audio_transcription.delta",
+        "event_id": events[0].event_id,
+        "item_id": "item_input_s",
+        "content_index": 0,
+        "delta": " hel",
+    }
