@@ -484,3 +484,28 @@ def test_proxy_transcodes_only_sessions_that_ask_for_opus(monkeypatch: pytest.Mo
     assert urls == ["ws://backend/v1/realtime?duplex=1"]
     assert json.loads(backend.sent[0])["format"] == "pcm_f32le"
     assert delta["format"] == "opus"
+
+
+def test_index_versions_scripts_by_their_current_content(tmp_path, monkeypatch) -> None:
+    # Pulling new page code must reach browsers without restarting the server.
+    static = tmp_path / "static"
+    for name in ("app.js", "capture_worklet.js", "playback_worklet.js", "recording_worklet.js"):
+        static.mkdir(exist_ok=True)
+        (static / name).write_text(f"// {name}\n")
+    monkeypatch.setattr(server, "STATIC_DIR", static)
+    client = TestClient(
+        server.build_app(
+            ws_backend="ws://127.0.0.1:8099",
+            model="checkpoint",
+            sample_clips=[],
+            sample_clip_dir=None,
+            sampling={},
+        )
+    )
+
+    def script_version() -> str:
+        return client.get("/").text.split("static/app.js?v=", 1)[1].split('"', 1)[0]
+
+    before = script_version()
+    (static / "app.js").write_text("// updated\n")
+    assert script_version() != before

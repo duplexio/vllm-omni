@@ -110,15 +110,18 @@ def build_app(
         if password_hash is not None
         else None
     )
-    app_version_hash = hashlib.sha256()
-    for asset_path in (
-        STATIC_DIR / "app.js",
-        STATIC_DIR / "capture_worklet.js",
-        STATIC_DIR / "playback_worklet.js",
-        STATIC_DIR / "recording_worklet.js",
-    ):
-        app_version_hash.update(asset_path.read_bytes())
-    app_version = app_version_hash.hexdigest()[:12]
+
+    def app_version() -> str:
+        """A digest of the page's scripts, read per page load so an update reaches browsers without a restart."""
+        digest = hashlib.sha256()
+        for asset_path in (
+            STATIC_DIR / "app.js",
+            STATIC_DIR / "capture_worklet.js",
+            STATIC_DIR / "playback_worklet.js",
+            STATIC_DIR / "recording_worklet.js",
+        ):
+            digest.update(asset_path.read_bytes())
+        return digest.hexdigest()[:12]
 
     def is_authenticated(cookie: str | None) -> bool:
         return session_token is None or (cookie is not None and hmac.compare_digest(cookie, session_token))
@@ -139,6 +142,7 @@ def build_app(
     def index(request: Request) -> Response:
         if not is_authenticated(request.cookies.get(SESSION_COOKIE_NAME)):
             return RedirectResponse("/login", status_code=303)
+        version = app_version()
         config = json.dumps(
             {
                 "model": model,
@@ -148,7 +152,7 @@ def build_app(
                 "inputSampleRate": INPUT_SAMPLE_RATE,
                 "realtimePath": realtime_url,
                 "realtimeTicketPath": None if password_hash is None else "v1/realtime/ticket",
-                "appVersion": app_version,
+                "appVersion": version,
                 "tools": tools or [],
             },
             ensure_ascii=True,
@@ -156,7 +160,7 @@ def build_app(
         html = (
             index_path.read_text(encoding="utf-8")
             .replace("__DUPLEXIO_CONFIG__", config)
-            .replace("__DUPLEXIO_APP_VERSION__", app_version)
+            .replace("__DUPLEXIO_APP_VERSION__", version)
         )
         return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
