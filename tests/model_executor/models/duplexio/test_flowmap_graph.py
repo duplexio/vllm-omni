@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.duplexio.flowmap import FlowMapSampler
+from vllm_omni.model_executor.models.duplexio.flowmap import FlowMap
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import FrameInputGraph
 
 
@@ -14,14 +14,8 @@ from vllm_omni.model_executor.models.duplexio.modeling_duplexio import FrameInpu
 @torch.inference_mode()
 def test_flowmap_graph_replays_owned_outputs(steps: int) -> None:
     torch.manual_seed(23)
-    sampler = FlowMapSampler(
-        4,
-        12,
-        32,
-        2,
-        inference_steps=steps,
-        compile=True,
-    ).cuda()
+    flow = FlowMap(4, 32, 12, 2, inference_steps=steps).cuda()
+    compiled = torch.compile(flow.sample, fullgraph=True, dynamic=True)
     graphs = {}
     for batch in (1, 8, 3, 8):
         conditioning = torch.randn(batch, 12, device="cuda")
@@ -30,25 +24,21 @@ def test_flowmap_graph_replays_owned_outputs(steps: int) -> None:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if batch not in graphs:
                 graphs[batch] = FrameInputGraph(
-                    lambda *inputs: (sampler.sample(*inputs),), (conditioning, noise, temperature)
+                    lambda *inputs: (compiled(*inputs),), (conditioning, noise, temperature)
                 )
 
             def sample(conditioning, noise, graph=graphs[batch]):
                 return graph((conditioning, noise, temperature))[0]
 
-            expected = sampler.sample_function(conditioning, noise, temperature)
+            expected = compiled(conditioning, noise, temperature)
             actual = sample(conditioning, noise)
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             saved = actual.clone()
             conditioning.normal_()
             noise.normal_()
             second = sample(conditioning, noise)
-            torch.testing.assert_close(
-                second, sampler.sample_function(conditioning, noise, temperature), rtol=0, atol=0
-            )
+            torch.testing.assert_close(second, compiled(conditioning, noise, temperature), rtol=0, atol=0)
             torch.testing.assert_close(actual, saved, rtol=0, atol=0)
-            sampler.flow.final_layer.linear.weight.add_(0.01)
+            flow.final_layer.linear.weight.add_(0.01)
             updated = sample(conditioning, noise)
-            torch.testing.assert_close(
-                updated, sampler.sample_function(conditioning, noise, temperature), rtol=0, atol=0
-            )
+            torch.testing.assert_close(updated, compiled(conditioning, noise, temperature), rtol=0, atol=0)

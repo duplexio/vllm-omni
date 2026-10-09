@@ -14,18 +14,16 @@ from torch.nn import functional as F
 
 
 class PocketRMSNorm(nn.Module):
-    """Pocket uses sample variance, not mean square, for time embeddings."""
+    """Pocket's time-embedding norm: sample variance, not mean square, in FP32."""
 
     def __init__(self, dim: int) -> None:
         super().__init__()
         self.alpha = nn.Parameter(torch.ones(dim))
 
     def forward(self, hidden: Tensor) -> Tensor:
-        variance = hidden.var(dim=-1, keepdim=True) + 1e-5
-        # Match Pocket's AMP arithmetic: alpha is an FP32 parameter, but
-        # the normalization and its result retain the activation dtype.
-        scale = self.alpha.to(variance) * torch.rsqrt(variance)
-        return (hidden * scale).to(hidden.dtype)
+        value = hidden.float()
+        variance = value.var(dim=-1, keepdim=True) + 1e-5
+        return (value * torch.rsqrt(variance) * self.alpha.float()).to(hidden.dtype)
 
 
 class TimestepEmbedder(nn.Module):
@@ -46,27 +44,10 @@ class TimestepEmbedder(nn.Module):
         return self.norm(self.output_projection(F.silu(self.input_projection(embedding))))
 
 
-class PocketLayerNorm(nn.Module):
-    """LayerNorm computed in the activation dtype, without an FP32 upcast."""
-
-    def __init__(self, dim: int, *, elementwise_affine: bool = True) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim)) if elementwise_affine else None
-        self.bias = nn.Parameter(torch.zeros(dim)) if elementwise_affine else None
-
-    def forward(self, hidden: Tensor) -> Tensor:
-        mean = hidden.mean(dim=-1, keepdim=True)
-        variance = hidden.var(dim=-1, unbiased=False, keepdim=True)
-        normalized = (hidden - mean) / torch.sqrt(variance + 1e-6)
-        if self.weight is not None:
-            normalized = normalized * self.weight + self.bias
-        return normalized
-
-
 class AdaLNResBlock(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
-        self.norm = PocketLayerNorm(dim)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
         self.linear1 = nn.Linear(dim, dim)
         self.linear2 = nn.Linear(dim, dim)
         self.adaln_projection = nn.Linear(dim, 3 * dim)
@@ -80,51 +61,13 @@ class AdaLNResBlock(nn.Module):
 class FinalLayer(nn.Module):
     def __init__(self, dim: int, output_dim: int) -> None:
         super().__init__()
-        self.norm = PocketLayerNorm(dim, elementwise_affine=False)
+        self.norm = nn.LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.linear = nn.Linear(dim, output_dim)
         self.adaln_projection = nn.Linear(dim, 2 * dim)
 
     def forward(self, hidden: Tensor, conditioning: Tensor) -> Tensor:
         shift, scale = self.adaln_projection(F.silu(conditioning)).chunk(2, dim=-1)
         return self.linear(self.norm(hidden) * (1 + scale) + shift)
-
-
-class FlowMapSampler(nn.Module):
-    """The checkpoint's ``audio_sampler.flow`` module, optionally compiled for serving."""
-
-    def __init__(
-        self,
-        latent_dim: int,
-        conditioning_dim: int,
-        mlp_dim: int,
-        mlp_depth: int,
-        *,
-        inference_steps: int,
-        compile: bool = False,
-    ) -> None:
-        super().__init__()
-        self.flow = FlowMap(
-            latent_dim,
-            mlp_dim,
-            conditioning_dim,
-            mlp_depth,
-            inference_steps=inference_steps,
-        )
-        # Compiled for serving, where the model captures it with text sampling.
-        self.sample_function = (
-            torch.compile(
-                self.flow.sample,
-                fullgraph=True,
-                dynamic=True,
-                options={"emulate_precision_casts": True},
-            )
-            if compile
-            else self.flow.sample
-        )
-
-    def sample(self, conditioning: Tensor, noise: Tensor, temperature: Tensor) -> Tensor:
-        """Sample with explicit request-owned noise, at each row's temperature."""
-        return self.sample_function(conditioning, noise, temperature)
 
 
 class FlowMap(nn.Module):

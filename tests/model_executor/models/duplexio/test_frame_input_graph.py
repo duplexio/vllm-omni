@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from tests.model_executor.models.duplexio.test_bulk_prefill import model_fixture
-from vllm_omni.model_executor.models.duplexio.modeling_duplexio import FrameInputGraph, frame_inputs
+from vllm_omni.model_executor.models.duplexio.modeling_duplexio import FrameInputGraph
 from vllm_omni.model_executor.models.duplexio.pocket_mimi import LATENT_DIM
 
 
@@ -15,12 +15,7 @@ def test_frame_projection_graph_matches_independent_requests_and_weight_refresh(
     model.channel_emb = torch.nn.Parameter(model.channel_emb.cuda())
     model.model.cuda()
     model.vllm_config.model_config.dtype = torch.bfloat16
-    model.frame_inputs = torch.compile(
-        frame_inputs,
-        fullgraph=True,
-        dynamic=True,
-        options={"emulate_precision_casts": True},
-    )
+    model.project_frames = torch.compile(model.project_frames, fullgraph=True, dynamic=True)
     for size in (1, 3, 15):
         ids = torch.randint(1, 20, (size, 4), device="cuda")
         ids[:, 0] = model.silence_token_id

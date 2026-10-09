@@ -45,7 +45,7 @@ from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FastConformerEncoder,
     streaming_resample_batch,
 )
-from vllm_omni.model_executor.models.duplexio.flowmap import FlowMapSampler
+from vllm_omni.model_executor.models.duplexio.flowmap import FlowMap
 from vllm_omni.model_executor.models.duplexio.frame_layout import (
     AGENT_AUDIO_CELL,
     AGENT_CELL,
@@ -89,8 +89,8 @@ class TextSamplingResult:
 
     text_ids: Tensor
     tool_starts: Tensor  # Idle rows that started a call; the host reads only pending ones.
-    # Emit and token log probabilities of the agent, tool and user streams. The
-    # tool emit is scored with the raw head, including forced decisions.
+    # Emit and token log probabilities of the agent, tool and user streams. Each
+    # emit scores the decision taken under its tempered head, forced tool emits too.
     frame_logprobs: Tensor
     support_ids: Tensor  # [rows, 2, width] agent and tool content supports, see sample_streams.
     # Idle rows, the only ones whose tool emit was drawn rather than forced.
@@ -339,11 +339,10 @@ class DuplexIOForConditionalGeneration(
             vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
             and not vllm_config.model_config.enforce_eager
         )
-        self.frame_inputs = (
-            torch.compile(frame_inputs, fullgraph=True, dynamic=True, options={"emulate_precision_casts": True})
-            if self.full_cudagraph_enabled
-            else frame_inputs
-        )
+        if self.full_cudagraph_enabled:
+            # Frame construction and the draws each compile whole, then capture.
+            self.project_frames = torch.compile(self.project_frames, fullgraph=True, dynamic=True)
+            self.sample_rows = torch.compile(self.sample_rows, fullgraph=True, dynamic=True)
         self.frame_input_graphs: dict[int, FrameInputGraph] = {}
         self.sampling_graphs: dict[tuple[int, int | None], FrameInputGraph] = {}
         self.pad_token_id = config.pad_token_id
@@ -379,15 +378,15 @@ class DuplexIOForConditionalGeneration(
         self.user_audio_resampler = Resample(SAMPLE_RATE, ASR_SAMPLE_RATE, dtype=torch.float32).to(
             device=self.channel_emb.device,
         )
-        self.audio_codec = PocketMimi()
+        # FP32 like Pocket TTS and Mimi; encoding follows training's bf16 autocast.
+        self.audio_codec = PocketMimi().float()
         self.audio_representation = ContinuousAudioRepresentation(LATENT_DIM)
-        self.audio_sampler = FlowMapSampler(
+        self.audio_sampler = FlowMap(
             LATENT_DIM,
-            hidden_size,
             config.flowmap_config["mlp_dim"],
+            hidden_size,
             config.flowmap_config["mlp_depth"],
             inference_steps=config.flowmap_config["inference_steps"],
-            compile=self.full_cudagraph_enabled,
         )
         self.user_audio_input_adapter = AudioInputAdapter(
             self.user_asr.output_dim,
@@ -842,7 +841,7 @@ class DuplexIOForConditionalGeneration(
             user_hidden = self.user_audio_input_adapter(user_features)
             agent_hidden = self.agent_audio_input_adapter(agent_latents)
         text_hidden = self.model.embed_input_ids(text_ids.flatten()).view(text_ids.shape[0], len(TEXT_STREAM_NAMES), -1)
-        embeddings, *addressing = self.frame_inputs(
+        embeddings, *addressing = frame_inputs(
             text_ids,
             text_hidden,
             self.channel_emb,
@@ -1378,7 +1377,7 @@ class DuplexIOForConditionalGeneration(
     def decode_agent_audio_batch(self, latents: list[Tensor], states: list[DuplexIORequestState]) -> list[Tensor]:
         if not latents:
             return []
-        with torch.profiler.record_function("duplexio.output_codec_decode"), self.autocast(latents[0]):
+        with torch.profiler.record_function("duplexio.output_codec_decode"):
             raw = self.audio_representation.denormalize(torch.stack(latents))
             decoded, caches = self.audio_codec.decode_batch(
                 [latent[None, :, None] for latent in raw],
@@ -1402,6 +1401,7 @@ class DuplexIOForConditionalGeneration(
             "llm.": "",
             "user_asr.model.encoder.": "user_asr.encoder.",
             "user_asr.model.": None,
+            "audio_sampler.flow.": "audio_sampler.",
         }
     )
 

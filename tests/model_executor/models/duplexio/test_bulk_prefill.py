@@ -19,7 +19,6 @@ from vllm_omni.model_executor.models.duplexio.fastconformer import (
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
     DuplexIORequestState,
-    frame_inputs,
 )
 from vllm_omni.model_executor.models.duplexio.pocket_mimi import LATENT_DIM
 from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
@@ -38,10 +37,13 @@ class CountingASR:
     output_dim = 8
 
     def encode_audio_chunk(self, waveform, state):
-        frames = waveform.numel() // 1280
-        positions = torch.arange(state.next_mel_frame + 1, state.next_mel_frame + frames + 1)
+        # Nemotron's schedule: state k needs 16 kHz audio through 200 samples
+        # (k = 0) or 1280 * k + 304, so the resampler's lag delays none.
+        heard = state.buffer_start_sample + waveform.numel()
+        ready = 0 if heard < 200 else 1 + max(0, heard - 304) // 1280
+        positions = torch.arange(state.next_mel_frame + 1, ready + 1)
         return positions.float()[None, :, None].expand(1, -1, self.output_dim), replace(
-            state, next_mel_frame=state.next_mel_frame + frames
+            state, next_mel_frame=ready, buffer_start_sample=heard
         )
 
     def encode_audio_batch(self, waveforms, states):
@@ -79,7 +81,6 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
     model.pad_token_id = 1
     model.silence_token_id = 2
     model.full_cudagraph_enabled = False
-    model.frame_inputs = frame_inputs
     # Audio cells see a two-frame window here, so eviction shows up in the test.
     model.config = SimpleNamespace(audio_attention_window_frames=2, flowmap_config={"sampling_temperature": 1.0})
     model.text_config = SimpleNamespace(max_position_embeddings=262144, vocab_size=32)

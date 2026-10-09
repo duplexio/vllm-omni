@@ -361,9 +361,9 @@ def test_tool_emit_logprobs_score_all_decisions_including_forced_emit_and_wait(d
     sampled = sample_text_batch(model, logits, emissions, infos)
     for row in range(8):
         emitted = sampled.text_ids[row][2].item() != model.silence_token_id
-        # Score raw logits, independent of sampling temperature or forced actions.
-        signed_logit = emissions[row, 1] if emitted else -emissions[row, 1]
-        expected = -torch.logaddexp(torch.zeros_like(signed_logit), -signed_logit)
+        # Score the decision taken under the tempered head, forced actions included.
+        tempered = emissions[row, 1] / AGENT_EMIT_TEMPERATURE
+        expected = torch.nn.functional.logsigmoid(tempered if emitted else -tempered)
         torch.testing.assert_close(sampled.frame_logprobs[row, 2], expected)
         if not emitted or mode == "argmax":
             assert sampled.frame_logprobs[row, 3].item() == 0
@@ -373,7 +373,7 @@ def test_tool_emit_logprobs_score_all_decisions_including_forced_emit_and_wait(d
             assert not emitted
         elif row < 4:
             assert emitted  # active continuation / forced start ignores the negative emit logit
-            assert sampled.frame_logprobs[row, 2].item() == -100
+            assert sampled.frame_logprobs[row, 2].item() == pytest.approx(-100 / AGENT_EMIT_TEMPERATURE)
 
 
 def test_session_waits_to_start_a_call_until_its_grammar_compiles():
@@ -388,7 +388,7 @@ def test_session_waits_to_start_a_call_until_its_grammar_compiles():
     sampled = sample_text_batch(model, logits, emissions, infos)
     assert not sampled.tool_starts.any()
     assert (sampled.text_ids[:, 2] == model.silence_token_id).all()
-    torch.testing.assert_close(sampled.frame_logprobs[:, 2], torch.full((8,), -100.0))
+    torch.testing.assert_close(sampled.frame_logprobs[:, 2], torch.full((8,), -100.0 / AGENT_EMIT_TEMPERATURE))
 
     compiling.set_result(compiled)
     sampled = sample_text_batch(model, logits, emissions, infos)

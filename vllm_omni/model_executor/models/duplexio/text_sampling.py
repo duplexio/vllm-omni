@@ -115,26 +115,16 @@ def sample_streams(
         kept[..., 1:] &= ~greedy[:, :2, None]
         support = indices[:, :2, :support_width].masked_fill(~kept, -1).int()
 
-    emit_logits = emit_logits.float()
     emit_greedy = emit_temperature == 0
-    probability = torch.sigmoid(emit_logits / emit_temperature.masked_fill(emit_greedy, 1))
-    emitted = torch.where(emit_greedy, emit_logits >= 0, torch.rand_like(probability) < probability)
-    emit_logprobs = torch.where(emitted, probability, 1 - probability).log().masked_fill(emit_greedy, 0)
+    tempered = emit_logits.float() / emit_temperature.masked_fill(emit_greedy, 1)
+    emitted = torch.where(emit_greedy, tempered >= 0, torch.rand_like(tempered) < torch.sigmoid(tempered))
     # A call's rows always emit; an idle row's emit draw decides whether one starts.
     tool_state = parameters[:, TOOL_STATE]
     tool_starts = emitted[:, 1] & (tool_state == 2)
-    tool_emitted = (tool_state == 1) | tool_starts
-    emitted = torch.stack((emitted[:, 0], tool_emitted, emitted[:, 2]), dim=1)
-    # Score the tool decision with the raw head, even when serving forced it.
-    start_logits = emit_logits[:, 1]
-    emit_logprobs = torch.stack(
-        (
-            emit_logprobs[:, 0],
-            F.logsigmoid(torch.where(tool_emitted, start_logits, -start_logits)),
-            emit_logprobs[:, 2],
-        ),
-        dim=1,
-    )
+    emitted = torch.stack((emitted[:, 0], (tool_state == 1) | tool_starts, emitted[:, 2]), dim=1)
+    # Every stream scores the decision it took, drawn or forced, under its
+    # tempered head; a greedy decision has probability one.
+    emit_logprobs = F.logsigmoid(torch.where(emitted, tempered, -tempered)).masked_fill(emit_greedy, 0)
     ids = torch.where(emitted, content, silence_token_id)
     # A discarded content draw on a wait frame is not an action.
     token_logprobs = torch.where(emitted, token_logprobs, 0)

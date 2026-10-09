@@ -16,7 +16,6 @@ from torch import Tensor
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 
 from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
-from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_function
 
 
 def gdn_cache_dtypes(dtype: torch.dtype) -> tuple[torch.dtype, ...]:
@@ -46,18 +45,6 @@ def gdn_cache_shapes(
 
 
 @torch.compile(dynamic=True, fullgraph=True)
-def normalize_gdn_qk(x: Tensor) -> Tensor:
-    value = x.float()
-    return (value * torch.rsqrt(value.square().sum(-1, keepdim=True) + 1e-6)).to(x.dtype)
-
-
-@torch.compile(dynamic=True, fullgraph=True)
-def gdn_gates(b: Tensor, a: Tensor, a_log: Tensor, dt_bias: Tensor) -> tuple[Tensor, Tensor]:
-    beta = b.sigmoid()
-    g = -a_log.float().exp() * F.softplus(a.float() + dt_bias)
-    return beta, g
-
-
 def prepare_gdn_inputs(
     qkv: Tensor,
     a: Tensor,
@@ -71,11 +58,12 @@ def prepare_gdn_inputs(
     """L2-normalize Q and K in FP32, rounded back to their dtype; the decay gate stays FP32."""
     key_width = key_heads * key_dim
     q, k, v = qkv.split((key_width, key_width, qkv.shape[1] - key_width * 2), -1)
-    q = normalize_gdn_qk(q.view(qkv.shape[0], key_heads, key_dim))
-    k = normalize_gdn_qk(k.view(qkv.shape[0], key_heads, key_dim))
-    v = v.view(qkv.shape[0], -1, value_dim)
-    beta, g = call_compiled_function(gdn_gates, b, a, a_log, dt_bias)
-    return q, k, v, g, beta
+    # FLA's l2norm: x * rsqrt(sum(x^2) + eps).
+    q, k = (x.view(qkv.shape[0], key_heads, key_dim) for x in (q, k))
+    q, k = ((x.float() * torch.rsqrt(x.float().square().sum(-1, keepdim=True) + 1e-6)).to(x.dtype) for x in (q, k))
+    beta = b.sigmoid()
+    g = -a_log.float().exp() * F.softplus(a.float() + dt_bias)
+    return q, k, v.view(qkv.shape[0], -1, value_dim), g, beta
 
 
 def initial_gdn_state(cache: Tensor, slots: Tensor, has_state: Tensor) -> Tensor:

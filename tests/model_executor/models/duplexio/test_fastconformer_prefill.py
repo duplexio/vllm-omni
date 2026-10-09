@@ -39,17 +39,20 @@ from vllm_omni.model_executor.models.duplexio.fastconformer import (
 def test_batched_resampling_keeps_each_stream_history(device):
     torch.manual_seed(29)
     chunks = [torch.randn(length, device=device) for length in (1920, 3840, 1920, 1920)]
-    tails = [torch.randn(48, device=device), None, torch.randn(48, device=device), None]
+    tails = [torch.randn(60, device=device), None, torch.randn(60, device=device), None]
     resampler = Resample(24_000, 16_000, dtype=torch.float32).to(device)
     expected = [streaming_resample_chunk(chunk, tail, resampler) for chunk, tail in zip(chunks, tails, strict=True)]
     actual, updated = streaming_resample_batch(chunks, tails, resampler)
     for (reference, tail), output, new_tail in zip(expected, actual, updated, strict=True):
         torch.testing.assert_close(output, reference)
         torch.testing.assert_close(new_tail, tail)
+    # A tail ends with the 12 lookahead samples its push could not emit yet;
+    # each push emits up to its own last 12.
     for chunk, tail, value in zip(chunks, tails, actual, strict=True):
         buffer = chunk if tail is None else torch.cat((tail, chunk))
-        start = 0 if tail is None else tail.numel() * 2 // 3
-        reference = AF.resample(buffer, 24_000, 16_000)[start : start + chunk.numel() * 2 // 3]
+        start = 0 if tail is None else (tail.numel() - 12) * 2 // 3
+        emit = (chunk.numel() - (12 if tail is None else 0)) * 2 // 3
+        reference = AF.resample(buffer, 24_000, 16_000)[start : start + emit]
         torch.testing.assert_close(value, reference, atol=1e-6, rtol=1e-5)
 
 

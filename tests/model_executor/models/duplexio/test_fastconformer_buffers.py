@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""The ASR frontend tensors are loadable, persistent model state on the model's device."""
+"""The ASR frontend tensors come from the processor, on the model's device, outside the checkpoint."""
 
 from types import SimpleNamespace
 
 import torch
 from torch import nn
-from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.model_executor.models.duplexio.fastconformer import FastConformerEncoder
 
@@ -28,15 +27,12 @@ def encoder_parts() -> tuple[nn.Module, SimpleNamespace]:
     return model, processor
 
 
-def test_frontend_buffers_load_through_the_model_loader() -> None:
-    # Only serialization is under test; no encoder/processor arithmetic is mocked.
-    encoder = FastConformerEncoder(*encoder_parts())
-    filters = torch.randn_like(encoder.mel_filters)
-    window = torch.randn_like(encoder.stft_window)
-    loaded = AutoWeightsLoader(encoder).load_weights([("mel_filters", filters), ("stft_window", window)])
-    assert loaded == {"mel_filters", "stft_window"}
-    torch.testing.assert_close(encoder.state_dict()["mel_filters"], filters)
-    torch.testing.assert_close(encoder.state_dict()["stft_window"], window)
+def test_frontend_buffers_come_from_the_processor_not_the_checkpoint() -> None:
+    model, processor = encoder_parts()
+    encoder = FastConformerEncoder(model, processor)
+    assert "mel_filters" not in encoder.state_dict() and "stft_window" not in encoder.state_dict()
+    torch.testing.assert_close(encoder.mel_filters, processor.feature_extractor.mel_filters)
+    torch.testing.assert_close(encoder.stft_window, torch.hann_window(400, periodic=False))
 
 
 def test_frontend_buffers_live_on_the_device_the_model_is_built_on() -> None:

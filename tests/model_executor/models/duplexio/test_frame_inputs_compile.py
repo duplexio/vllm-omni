@@ -14,7 +14,6 @@ def test_compiled_frame_inputs_preserve_layout() -> None:
         frame_inputs,
         fullgraph=True,
         dynamic=True,
-        options={"emulate_precision_casts": True},
     )
     for frames, live, prompt_count in (
         (1, True, 0),

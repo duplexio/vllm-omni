@@ -25,7 +25,6 @@ stages:
     enforce_eager: false
     async_scheduling: false
     compilation_config:
-      mode: 0
       cudagraph_mode: FULL_DECODE_ONLY
       cudagraph_capture_sizes: [6, 12]
       cudagraph_copy_inputs: true

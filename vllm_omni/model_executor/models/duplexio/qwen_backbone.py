@@ -10,19 +10,15 @@ from itertools import accumulate
 from typing import Any, cast
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated
 from vllm._custom_ops import reshape_and_cache_flash
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import (
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
-)
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -30,12 +26,12 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 from vllm.model_executor.layers.mamba.mamba_utils import (
     is_conv_state_dim_first,
 )
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
-    WeightsMapper,
     extract_layer_index,
 )
 from vllm.model_executor.utils import set_weight_attrs
@@ -64,12 +60,7 @@ from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
     DuplexIOKVLayout,
     make_duplexio_kv_cache_spec,
 )
-from vllm_omni.model_executor.models.duplexio.numerics import call_compiled_function
-from vllm_omni.model_executor.models.duplexio.stream_attention import (
-    cached_rotary_pos_emb,
-    gated_attention_output,
-    merge_row_attention,
-)
+from vllm_omni.model_executor.models.duplexio.stream_attention import merge_row_attention
 from vllm_omni.model_executor.models.duplexio.stream_conv import expand_stream_conv_weight, stream_causal_conv
 from vllm_omni.model_executor.models.duplexio.stream_gdn import (
     append_gdn,
@@ -77,72 +68,6 @@ from vllm_omni.model_executor.models.duplexio.stream_gdn import (
     gdn_cache_shapes,
     prepare_gdn_inputs,
 )
-
-
-class DuplexIORotaryEmbedding(nn.Module):
-    """Cache RoPE phases from the checkpoint's frequencies rather than recomputing them."""
-
-    def __init__(self, rotary_dim: int, max_positions: int, dtype: torch.dtype) -> None:
-        super().__init__()
-        self.max_positions = max_positions
-        self.register_buffer("inverse_frequencies", torch.empty(rotary_dim // 2, dtype=torch.float32))
-        self.register_buffer("attention_scaling", torch.empty((), dtype=torch.float32))
-        self.register_buffer("cos_sin_cache", torch.empty(0, rotary_dim, dtype=dtype), persistent=False)
-
-    def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
-        loaded = AutoWeightsLoader(self).load_weights(weights)
-        if loaded != {"inverse_frequencies", "attention_scaling"}:
-            raise ValueError(f"Incomplete RoPE constants in the checkpoint: {sorted(loaded)}")
-        positions = torch.arange(self.max_positions, device=self.inverse_frequencies.device, dtype=torch.float32)
-        phases = torch.outer(positions, self.inverse_frequencies)
-        self.cos_sin_cache = (torch.cat((phases.cos(), phases.sin()), -1) * self.attention_scaling).to(
-            self.cos_sin_cache.dtype
-        )
-        return loaded
-
-
-class DuplexIORMSNorm(nn.Module):
-    """Use compute-dtype scales with FP32 normalization arithmetic."""
-
-    def __init__(self, hidden_size: int, eps: float, *, dtype: torch.dtype) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
-        self.eps = eps
-
-    @torch.compile(dynamic=True, fullgraph=True, options={"triton.cudagraphs": False})
-    def forward(
-        self,
-        hidden: Tensor,
-        residual: Tensor | None = None,
-    ) -> Tensor | tuple[Tensor, Tensor]:
-        combined = hidden.float()
-        if residual is not None:
-            combined = combined + residual.float()
-        output = F.rms_norm(combined, (combined.shape[-1],), self.weight.float(), self.eps).to(hidden.dtype)
-        if residual is not None:
-            return output, combined.to(residual.dtype)
-        return output
-
-
-@torch.compile(dynamic=True, fullgraph=True, options={"triton.cudagraphs": False})
-def swiglu_mlp(hidden: Tensor, gate_up_weight: Tensor, down_weight: Tensor) -> Tensor:
-    """Compute SwiGLU with packed projections and standard compiler optimizations."""
-    gate, up = F.linear(hidden, gate_up_weight).chunk(2, dim=-1)
-    return F.linear(F.silu(gate) * up, down_weight)
-
-
-class DuplexIOQwenMLP(Qwen3NextMLP):
-    """Keep vLLM's sharded weights with compiled standard SwiGLU operations."""
-
-    def forward(self, hidden: Tensor) -> Tensor:
-        output = swiglu_mlp(
-            hidden,
-            self.gate_up_proj.weight,
-            self.down_proj.weight,
-        )
-        if self.down_proj.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output)
-        return output
 
 
 class DuplexIORowReads:
@@ -606,41 +531,26 @@ class DuplexIOQwenAttention(nn.Module):
             attn_backend=DuplexIOFlashAttentionBackend,
             frame=frame,
         )
-        self.q_norm = DuplexIORMSNorm(
-            self.head_dim,
-            eps=config.rms_norm_eps,
-            dtype=vllm_config.model_config.dtype,
-        )
-        self.k_norm = DuplexIORMSNorm(
-            self.head_dim,
-            eps=config.rms_norm_eps,
-            dtype=vllm_config.model_config.dtype,
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.rotary_emb = get_rope(
+            head_size=self.head_dim,
+            max_position=config.max_position_embeddings,
+            rope_parameters=config.rope_parameters,
         )
 
-    def forward(
-        self,
-        positions: Tensor,
-        cos_sin_cache: Tensor,
-        hidden_states: Tensor,
-    ) -> Tensor:
-        qkv = F.linear(hidden_states, self.qkv_proj.weight)
+    def forward(self, positions: Tensor, hidden_states: Tensor) -> Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
         q_gate, key, value = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
         query, gate = torch.chunk(q_gate.view(-1, self.num_heads, 2 * self.head_dim), 2, dim=-1)
         query = query.reshape(-1, self.q_size)
         gate = gate.reshape(-1, self.q_size)
 
-        query = self.q_norm(query.view(-1, self.num_heads, self.head_dim))
-        key = self.k_norm(key.view(-1, self.num_kv_heads, self.head_dim))
-        query, key = call_compiled_function(cached_rotary_pos_emb, query, key, positions, cos_sin_cache)
-        attended = self.attn(
-            query,
-            key,
-            value.view(-1, self.num_kv_heads, self.head_dim),
-        )
-        attended = call_compiled_function(gated_attention_output, attended, gate)
-        output = F.linear(attended, self.o_proj.weight)
-        if get_tensor_model_parallel_world_size() > 1:
-            output = tensor_model_parallel_all_reduce(output)
+        query = self.q_norm(query.view(-1, self.num_heads, self.head_dim)).view(-1, self.q_size)
+        key = self.k_norm(key.view(-1, self.num_kv_heads, self.head_dim)).view(-1, self.kv_size)
+        query, key = self.rotary_emb(positions, query, key)
+        attended = self.attn(query, key, value)
+        output, _ = self.o_proj(attended * gate.sigmoid())
         return output
 
 
@@ -648,15 +558,6 @@ class DuplexIOQwenAttention(nn.Module):
 def gdn_attention_core(mixed_qkv: Tensor, b: Tensor, a: Tensor, output: Tensor, layer_name: str) -> None:
     """Variable-length GDN appends run eagerly between piecewise graph segments."""
     torch.ops.vllm.qwen_gdn_attention_core(mixed_qkv, b, a, output, layer_name=layer_name)
-
-
-class DuplexIOGatedRMSNorm(Qwen3_5RMSNormGated):
-    """Gated RMSNorm that normalizes before it gates.
-
-    vLLM's GDN kernel warmup reads that order from every GDN layer's norm.
-    """
-
-    norm_before_gate = True
 
 
 class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
@@ -674,10 +575,6 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             prefix=prefix,
             gqa_interleaved_layout=False,
         )
-        norm = DuplexIOGatedRMSNorm(self.head_v_dim, eps=self.layer_norm_epsilon)
-        norm.weight = self.norm.weight
-        self.norm = norm
-        self.norm.compile(dynamic=True, fullgraph=True)
         assert self.activation == "silu"
         original_weight = cast(Tensor, self.conv1d.weight)
         original_loader = cast(
@@ -810,8 +707,8 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         key_active: Tensor,
     ) -> Tensor:
         num_tokens = hidden_states.shape[0]
-        mixed_qkvz = F.linear(hidden_states, self.in_proj_qkvz.weight, self.in_proj_qkvz.bias)
-        projected_ba = F.linear(hidden_states, self.in_proj_ba.weight, self.in_proj_ba.bias)
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        projected_ba, _ = self.in_proj_ba(hidden_states)
         beta_logits, decay_logits = self.split_ba(projected_ba)
         beta_logits = beta_logits.contiguous()
         decay_logits = decay_logits.contiguous()
@@ -833,14 +730,11 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             self.head_v_dim,
         )
         gdn_attention_core(mixed_qkv, beta_logits, decay_logits, core_output, _encode_layer_name(self.prefix))
-        normalized = call_compiled_function(
-            self.norm,
+        normalized = self.norm(
             core_output.reshape(-1, self.head_v_dim),
             output_gate.reshape(-1, self.head_v_dim),
         ).view(num_tokens, -1)
-        output = F.linear(normalized, self.out_proj.weight, self.out_proj.bias)
-        if self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output)
+        output, _ = self.out_proj(normalized)
         return output
 
 
@@ -873,48 +767,35 @@ class DuplexIOQwenDecoderLayer(nn.Module):
             )
         else:
             raise ValueError(f"Invalid Qwen3.5 layer type {layer_type!r}")
-        self.mlp = DuplexIOQwenMLP(
+        self.mlp = Qwen3NextMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=vllm_config.quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = DuplexIORMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=vllm_config.model_config.dtype,
-        )
-        self.post_attention_layernorm = DuplexIORMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=vllm_config.model_config.dtype,
-        )
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
         hidden_states: Tensor,
         residual: Tensor | None,
         positions: Tensor,
-        cos_sin_cache: Tensor,
         key_active: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        if residual is not None:
-            # Round the previous MLP residual sum to the activation dtype before the next norm.
-            hidden_states = hidden_states + residual
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn.forward_with_key_activity(
                 hidden_states,
                 key_active,
             )
         else:
-            hidden_states = self.self_attn(
-                positions,
-                cos_sin_cache,
-                hidden_states,
-            )
+            hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states,
             residual,
@@ -933,20 +814,13 @@ class DuplexIOQwenDecoderLayer(nn.Module):
 class DuplexIOQwenModel(nn.Module):
     """Inference-only dense Qwen3.5 backbone of DuplexIO."""
 
-    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | WeightsMapper(
-        orig_to_new_suffix={".scale": ".weight"},
-    )
+    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_text_config
         self.config = config
         self.vocab_size = config.vocab_size
-        self.rotary_emb = DuplexIORotaryEmbedding(
-            int(config.head_dim * config.rope_parameters.get("partial_rotary_factor", 1.0)),
-            config.max_position_embeddings,
-            vllm_config.model_config.dtype,
-        )
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
@@ -968,7 +842,7 @@ class DuplexIOQwenModel(nn.Module):
             )
 
         self.layers = nn.ModuleList(get_layer(f"{prefix}.layers.{index}") for index in range(config.num_hidden_layers))
-        self.norm = DuplexIORMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=vllm_config.model_config.dtype)
+        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def embed_input_ids(self, input_ids: Tensor) -> Tensor:
         return self.embed_tokens(input_ids)
@@ -983,12 +857,12 @@ class DuplexIOQwenModel(nn.Module):
         for layer in self.layers:
             hidden_states, residual = layer(
                 positions=positions,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 hidden_states=hidden_states,
                 residual=residual,
                 key_active=key_active,
             )
-        return self.norm(hidden_states + residual)
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(

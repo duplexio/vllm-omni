@@ -32,17 +32,6 @@ def test_time_normalization_preserves_bf16_activations() -> None:
     torch.testing.assert_close(actual, expected)
 
 
-def test_block_normalization_matches_layer_norm_in_bf16() -> None:
-    # Serving loads every parameter in the model dtype, including the norms' affine ones.
-    flow = make_flow().to(torch.bfloat16)
-    hidden = torch.randn(7, 16, dtype=torch.bfloat16)
-    expected = (hidden - hidden.mean(-1, keepdim=True)) / torch.sqrt(
-        hidden.var(-1, unbiased=False, keepdim=True) + 1e-6
-    )
-    for norm in (flow.blocks[0].norm, flow.final_layer.norm):
-        torch.testing.assert_close(norm(hidden), expected, atol=1e-5, rtol=1e-5)
-
-
 @pytest.mark.parametrize("steps", [1, 2, 4])
 def test_flow_batch_slots_are_independent(steps: int) -> None:
     flow = make_flow(steps=steps)

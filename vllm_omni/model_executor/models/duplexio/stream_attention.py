@@ -6,37 +6,11 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor
-from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
 
 from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
 
 
-@torch.compile(dynamic=True, fullgraph=True)
-def cached_rotary_pos_emb(
-    query: Tensor, key: Tensor, positions: Tensor, cos_sin_cache: Tensor
-) -> tuple[Tensor, Tensor]:
-    """Apply half-split RoPE to (T, H, D) Q/K using cached phases."""
-    cos, sin = cos_sin_cache[positions].chunk(2, dim=-1)
-    query, key = apply_rotary_pos_emb(
-        query.transpose(0, 1)[None],
-        key.transpose(0, 1)[None],
-        torch.cat((cos, cos), dim=-1)[None],
-        torch.cat((sin, sin), dim=-1)[None],
-    )
-    # Row-major again, and contiguous: the cache-write kernel indexes each
-    # token's heads as one packed run.
-    return (
-        query[0].transpose(0, 1).contiguous(),
-        key[0].transpose(0, 1).contiguous(),
-    )
-
-
-@torch.compile(dynamic=True, fullgraph=True)
-def gated_attention_output(output: Tensor, gate: Tensor) -> Tensor:
-    """Sigmoid output gating as one fused kernel, rounding once to the activation dtype."""
-    return output * gate.sigmoid()
-
-
+# Runs inside the attention custom op, outside the model's compiled graph.
 @torch.compile(dynamic=True, fullgraph=True)
 def merge_row_attention(
     query: Tensor,

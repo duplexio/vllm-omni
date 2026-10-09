@@ -260,29 +260,29 @@ def streaming_resample_chunk(
     tail: Tensor | None,
     resampler: Resample,
 ) -> tuple[Tensor, Tensor]:
-    """Resample one source-rate chunk with left context from earlier audio.
+    """Resample one source-rate chunk with context from earlier audio.
 
-    Emits exactly ``len(chunk) * new / orig`` samples, phase-locked to the
-    whole-signal resample, up to floating-point rounding. The final sinc
-    half-width of each push sees zeros in place of the
-    not-yet-received future samples (the same zero padding the whole-signal
-    resample applies at the true end of the audio).
+    Output lags the input by ``lookahead`` source samples: a sample is emitted
+    once the sinc kernel's whole support has arrived, so every emitted sample
+    matches the whole-signal resample up to floating-point rounding. The tail
+    carries the left context plus the not-yet-emitted lookahead.
     """
     orig_stride = resampler.orig_freq // resampler.gcd
     new_stride = resampler.new_freq // resampler.gcd
-    if chunk.ndim not in (1, 2) or chunk.shape[-1] % orig_stride:
+    # Stride multiples keep the polyphase output on the whole-signal grid.
+    lookahead = -(-resampler.width // orig_stride) * orig_stride
+    context = 16 * orig_stride
+    if chunk.ndim not in (1, 2) or chunk.shape[-1] % orig_stride or (tail is None and chunk.shape[-1] < lookahead):
         raise ValueError(
             f"Streaming resample chunks must be 1-D or batched multiples of {orig_stride} "
-            f"source samples, got shape {tuple(chunk.shape)}"
+            f"source samples, the first at least {lookahead}, got shape {tuple(chunk.shape)}"
         )
-    # Comfortably beyond torchaudio's default sinc half-width, and a stride
-    # multiple so the polyphase output stays on the whole-signal grid.
-    context = 16 * orig_stride
+    pending = 0 if tail is None else lookahead
     buffer = chunk if tail is None else torch.cat((tail, chunk), dim=-1)
     resampled = resampler(buffer)
-    skip = (buffer.shape[-1] - chunk.shape[-1]) * new_stride // orig_stride
-    emit = chunk.shape[-1] * new_stride // orig_stride
-    return resampled[..., skip : skip + emit], buffer[..., -context:]
+    skip = (buffer.shape[-1] - chunk.shape[-1] - pending) * new_stride // orig_stride
+    emit = (chunk.shape[-1] + pending - lookahead) * new_stride // orig_stride
+    return resampled[..., skip : skip + emit], buffer[..., -(context + lookahead) :]
 
 
 def streaming_resample_batch(
@@ -440,14 +440,17 @@ class FastConformerEncoder(nn.Module):
         self.feature_n_fft = feature_extractor.n_fft
         self.feature_win_length = feature_extractor.win_length
         self.feature_preemphasis = feature_extractor.preemphasis
-        # Signal-processing constants stay FP32, independently of model precision,
-        # and live where the model is built, like the window.
+        # Signal-processing constants come from the processor, not the checkpoint,
+        # and stay FP32 independently of model precision.
         self.register_buffer(
             "mel_filters",
             torch.as_tensor(feature_extractor.mel_filters, dtype=torch.float32, device=torch.get_default_device()),
+            persistent=False,
         )
         self.register_buffer(
-            "stft_window", torch.hann_window(feature_extractor.win_length, periodic=False, dtype=torch.float32)
+            "stft_window",
+            torch.hann_window(feature_extractor.win_length, periodic=False, dtype=torch.float32),
+            persistent=False,
         )
 
     @cached_property

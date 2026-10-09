@@ -27,7 +27,4 @@ stages:
     enforce_eager: false
     async_scheduling: false
     compilation_config:
-      # A fullgraph dynamo trace rejects the model's torch.compiler.disable()d
-      # quack GEMMs, so compilation stops at graph capture (here: none).
-      mode: 0
       cudagraph_mode: NONE
