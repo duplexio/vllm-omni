@@ -1,0 +1,20 @@
+# Live DuplexIO demo on one H100: the realtime profile with eight sessions of
+# up to 16 minutes each. Used by examples/online_serving/duplexio/modal_app.py.
+base_config: duplexio-realtime.yaml
+active_stream_window: 8
+
+duplex_session:
+  max_sessions: 8
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    max_model_len: 73728
+    # Eight full-length sessions (8 x 73728 tokens) with a little headroom.
+    kv_cache_memory_bytes: 15300000000
+    # Replaces the base block whole: one decode graph per live session count.
+    compilation_config:
+      mode: 0
+      cudagraph_mode: FULL_DECODE_ONLY
+      cudagraph_capture_sizes: [6, 12, 18, 24, 30, 36, 42, 48]
+      cudagraph_copy_inputs: true
