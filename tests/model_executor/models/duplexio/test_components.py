@@ -293,7 +293,6 @@ def test_checkpoint_names_map_onto_the_flat_heads() -> None:
     nn.Module.__init__(model)
     model.lm_head = nn.Linear(4, 8, bias=False)
     model.channel_emb = nn.Parameter(torch.zeros(4, 4))
-    model.output_head_proj = nn.ModuleDict({name: nn.Linear(4, 4) for name in ("agent", "tool_call")})
     model.user_emit_head = nn.Linear(24, 1)
     weights = {name: torch.randn_like(value) for name, value in model.state_dict().items()}
     checkpoint = {
@@ -301,7 +300,7 @@ def test_checkpoint_names_map_onto_the_flat_heads() -> None:
             "llm.base_model." + name
             if name.startswith("lm_head")
             else "llm." + name
-            if name.startswith(("channel_emb", "output_head_proj"))
+            if name.startswith("channel_emb")
             else name
         ): value
         for name, value in weights.items()

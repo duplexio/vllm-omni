@@ -33,7 +33,6 @@ def head_model(device="cpu"):
     model.silence_token_id = 0
     model.lm_head = nn.Linear(32, 64, bias=False)
     model.lm_head.quant_method = UnquantizedEmbeddingMethod()
-    model.output_head_proj = nn.ModuleDict({name: nn.Linear(32, 32) for name in ("agent", "tool_call")})
     model.user_token_projection = nn.Linear(6 * 32, 32)
     model.user_emit_head = nn.Linear(6 * 32, 1)
     model.agent_emit_head = nn.Linear(6 * 32, 1)

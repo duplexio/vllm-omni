@@ -77,8 +77,6 @@ from vllm_omni.model_executor.models.duplexio.tool_calling import (
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-OUTPUT_STREAM_NAMES = ("agent", "tool_call")
-
 
 @dataclass
 class TextSamplingResult:
@@ -359,11 +357,8 @@ class DuplexIOForConditionalGeneration(
                 quant_config=vllm_config.quant_config,
                 prefix=f"{prefix}.lm_head" if prefix else "lm_head",
             )
-        # Each text cell's stream embedding, and the agent and tool heads' input projections.
+        # Each text cell's stream embedding.
         self.channel_emb = nn.Parameter(torch.zeros(len(TEXT_STREAM_NAMES), hidden_size))
-        self.output_head_proj = nn.ModuleDict(
-            {name: nn.Linear(hidden_size, hidden_size) for name in OUTPUT_STREAM_NAMES}
-        )
         # Cell addressing for the backbone's cache, filled once per step and
         # read by every full-attention layer.
         self.frame = self.model.frame
@@ -1157,13 +1152,12 @@ class DuplexIOForConditionalGeneration(
             return (*sampled, audio)
 
     def project_text(self, rows: Tensor) -> tuple[Tensor, Tensor]:
-        """Project the entire request batch before any CPU-side tool decisions."""
+        """Project the entire request batch before any CPU-side tool decisions.
+
+        The agent and tool-call cells feed the LM head directly; the user stream reads the whole frame.
+        """
         projected = torch.cat(
-            (
-                self.output_head_proj["agent"](rows[:, AGENT_CELL]),
-                self.output_head_proj["tool_call"](rows[:, TOOL_CALL_CELL]),
-                self.user_token_projection(rows.flatten(1)),
-            )
+            (rows[:, AGENT_CELL], rows[:, TOOL_CALL_CELL], self.user_token_projection(rows.flatten(1)))
         )
         logits = self.logits_processor(self.lm_head, projected)
         logits = logits.view(3, rows.shape[0], -1).transpose(0, 1)
