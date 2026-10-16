@@ -19,6 +19,7 @@ from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
     DuplexIOKVCacheSpec,
     make_duplexio_kv_cache_spec,
 )
+from vllm_omni.model_executor.models.duplexio.modeling_duplexio import audio_clock, frame_inputs
 from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
     DuplexIOAttentionMetadata,
     DuplexIOFlashAttentionImpl,
@@ -304,6 +305,26 @@ def test_long_prefill_matches_dense_attention() -> None:
 @torch.inference_mode()
 def test_batched_sessions_stay_isolated_in_a_shuffled_block_table(requests: int) -> None:
     run_session([3 + request % 3 for request in range(requests)], 20, torch.bfloat16, 128, 8, 2)
+
+
+def test_appended_tool_results_see_audio_like_training() -> None:
+    """Rows after an append's live frame keep its audio clock, so they attend to recent audio."""
+    appends = [[True], [True, False, False], [True], [True, False], [False]]
+    audio_active = torch.tensor([live for append in appends for live in append])
+    metadata, position = [], 0
+    for append in appends:
+        live_row = append.index(True) if True in append else None
+        metadata += [(0, audio_clock(position, row, live_row), live, 0, 0) for row, live in enumerate(append)]
+        position += live_row is not None
+    rows = len(metadata)
+    silence = torch.ones(rows, 4, dtype=torch.long)
+    *_, audio_first, audio_last = frame_inputs(
+        silence, torch.zeros(rows, 4, 8), torch.zeros(4, 8), torch.zeros(rows, 8), torch.zeros(rows, 8),
+        0, 1, torch.tensor(metadata), WINDOW,
+    )
+    expected = session_fields(audio_active, torch.zeros(rows, 4, dtype=torch.bool))
+    assert audio_first.tolist() == expected["audio_first"].tolist()
+    assert audio_last.tolist() == expected["audio_last"].tolist()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged cache")

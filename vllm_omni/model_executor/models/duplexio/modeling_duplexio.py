@@ -720,7 +720,7 @@ class DuplexIOForConditionalGeneration(
                 (
                     *ids,
                     state.persistent_keys - preceding_keys,
-                    state.audio_position if row == item.live_row else 0,
+                    audio_clock(state.audio_position, row, item.live_row),
                     row == item.live_row,
                     row < item.prompt_chunk_frames,
                     state.frames_seen + row,
@@ -1457,6 +1457,16 @@ def text_suppression_ids(tokenizer: TokenizerLike, silence_token_id: int) -> tup
     tool_ids |= {token_id(text) for text in ("<|im_start|>", "<|im_end|>", "<think>", "</think>")}
     agent_ids = tool_ids | {token_id(text) for text in ("<tool_call>", "</tool_call>")}
     return sorted(agent_ids), sorted(tool_ids)
+
+
+def audio_clock(audio_position: int, row: int, live_row: int | None) -> int:
+    """Audio frames a row of an append sees, as training's audio-time cumsum.
+
+    The live row sees the `audio_position` frames before it. Token-only rows
+    after it (spliced tool results) keep the clock frozen past the live frame,
+    so they also see it, and rows of a text-only append see every prior frame.
+    """
+    return audio_position + (live_row is not None and row > live_row)
 
 
 def frame_inputs(
