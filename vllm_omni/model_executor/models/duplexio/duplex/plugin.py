@@ -45,8 +45,8 @@ CHUNK_PERIOD_MS = 80
 #: Tool results the session may queue before the model has taken the oldest.
 MAX_PENDING_TOOL_RESULTS = 8
 
-# The chat turn the system prompt opens, by which role speaks first.
-INITIAL_PREFIXES = {"agent": "<|im_start|>assistant\n", "user": "<|im_start|>user\n"}
+# The chat role that opens the conversation, by DuplexIO start role.
+FIRST_SPEAKERS = {"agent": "assistant", "user": "user"}
 
 PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
     {
@@ -363,13 +363,7 @@ def session_runtime_config(config: DuplexSessionConfig, model_config: ModelConfi
     except ValueError as exc:
         raise DuplexRuntimeConfigError(str(exc), code="invalid_tools") from exc
     system_prompt = config.instructions or hf_config.default_system_prompt
-    if tools:
-        system_prompt = render_tool_system_prompt(tokenizer, system_prompt, tools)
-    initial_prefix = INITIAL_PREFIXES[start_role]
-    system_token_ids = [
-        *tokenizer.encode(system_prompt, add_special_tokens=False),
-        *tokenizer.encode(initial_prefix, add_special_tokens=False),
-    ]
+    system_token_ids = student_prompt_token_ids(tokenizer, system_prompt, tools, start_role)
     return {
         "instructions": config.instructions,
         "duplexio_sampling": session_sampling(config),
@@ -507,24 +501,22 @@ def normalize_tool_choice(value: object, tools: list[dict[str, Any]]) -> dict[st
     return {"mode": "named", "name": name}
 
 
-def render_tool_system_prompt(tokenizer: Any, system_prompt: str, tools: list[dict[str, Any]]) -> str:
-    """The system blocks the chat template renders for these tools."""
+def student_prompt_token_ids(
+    tokenizer: Any, system_prompt: str, tools: list[dict[str, Any]], start_role: str
+) -> list[int]:
+    """The system block and the first speaker's cue, rendered by the export's DuplexIO prompt template.
+
+    Training renders the same template, so served sessions open with the prefix the model learned.
+    """
+    if "first_speaker" not in (tokenizer.chat_template or ""):
+        raise ValueError("DuplexIO checkpoints ship their student prompt template; re-export this checkpoint")
     rendered = tokenizer.apply_chat_template(
-        [{"role": "system", "content": system_prompt}, {"role": "user", "content": ""}],
-        tools=tools,
+        [{"role": "system", "content": system_prompt}],
+        tools=tools or None,
+        first_speaker=FIRST_SPEAKERS[start_role],
         tokenize=False,
-        add_generation_prompt=False,
-        enable_thinking=False,
     )
-    blocks = []
-    for block in rendered.split("<|im_start|>")[1:]:
-        header, _, body = block.partition("\n")
-        content = body.split("<|im_end|>", 1)[0].strip()
-        if header.strip() == "system" and content:
-            blocks.append(content)
-    if not blocks:
-        raise ValueError("DuplexIO tool template did not render a system block")
-    return "\n".join(blocks)
+    return tokenizer.encode(rendered, add_special_tokens=False)
 
 
 __all__ = ["DuplexIODuplexPlugin", "GivenFrame", "append_fields", "stage_sampling_params"]

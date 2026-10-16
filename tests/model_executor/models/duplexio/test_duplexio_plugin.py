@@ -66,15 +66,22 @@ def byte_tokenizer() -> Tokenizer:
 @pytest.fixture
 def model_config(monkeypatch, byte_tokenizer):
     encoded = {
-        "system": [3, 4],
-        "<|im_start|>user\n": [5, 6],
-        "<|im_start|>assistant\n": [7, 8],
+        "<|im_start|>system\nsystem<|im_end|>\n<|im_start|>user\n": [3, 4, 5, 6],
+        "<|im_start|>system\nsystem<|im_end|>\n<|im_start|>assistant\n": [3, 4, 7, 8],
         "<tool_response>\nsunny\n</tool_response>": [20, 21, 22],
         "<tool_response>\nrainy\n</tool_response>": [23, 24],
     }
+
+    def apply_chat_template(messages, *, tools, first_speaker, tokenize):
+        # The export's DuplexIO student template: the system block, then the first speaker's cue.
+        assert not tools and not tokenize
+        return f"<|im_start|>system\n{messages[0]['content']}<|im_end|>\n<|im_start|>{first_speaker}\n"
+
     tokenizer = SimpleNamespace(
         encode=lambda text, add_special_tokens: encoded[text],
         backend_tokenizer=byte_tokenizer,
+        chat_template="{# DuplexIO student prompt #}{{ first_speaker }}",
+        apply_chat_template=apply_chat_template,
     )
     monkeypatch.setattr(f"{PLUGIN_MODULE}.cached_tokenizer_from_config", lambda config: tokenizer)
     return SimpleNamespace(
