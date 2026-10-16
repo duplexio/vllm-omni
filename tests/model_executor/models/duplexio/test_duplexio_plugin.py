@@ -68,6 +68,7 @@ def model_config(monkeypatch, byte_tokenizer):
     encoded = {
         "<|im_start|>system\nsystem<|im_end|>\n<|im_start|>user\n": [3, 4, 5, 6],
         "<|im_start|>system\nsystem<|im_end|>\n<|im_start|>assistant\n": [3, 4, 7, 8],
+        "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n": [5, 6],
         "<tool_response>\nsunny\n</tool_response>": [20, 21, 22],
         "<tool_response>\nrainy\n</tool_response>": [23, 24],
     }
@@ -118,6 +119,19 @@ def plan(plugin: DuplexIODuplexPlugin, runtime: dict[str, object], seq: int, req
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_an_empty_prompt_is_kept_rather_than_replaced_by_the_default(model_config) -> None:
+    # An empty prompt encodes to the bare cue, as the student template renders it.
+    _, runtime = await open_session(model_config, start_role="user")
+    assert runtime["duplexio_system_token_ids"] == [3, 4, 5, 6]  # no instructions: the default prompt
+    plugin = DuplexIODuplexPlugin(lambda audio, rate, fmt, speed: f"{fmt}:{rate}:{audio.numel()}")
+    session = DuplexSessionConfig(
+        instructions="", extra_body={"auto_response": True, "ref_audio_data": reference_audio()}
+    )
+    runtime = await plugin.prepare_runtime_config(session, model_config=model_config)
+    assert runtime["duplexio_system_token_ids"] == [5, 6]
+
+
 @pytest.mark.parametrize(("start_role", "prefix_ids"), [(None, [5, 6]), ("user", [5, 6]), ("agent", [7, 8])])
 async def test_runtime_config_pins_the_reference_audio_and_prompt(model_config, start_role, prefix_ids) -> None:
     extra = {} if start_role is None else {"start_role": start_role}

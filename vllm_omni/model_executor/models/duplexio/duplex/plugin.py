@@ -362,7 +362,8 @@ def session_runtime_config(config: DuplexSessionConfig, model_config: ModelConfi
         tool_call_grammar(tools, tool_choice)
     except ValueError as exc:
         raise DuplexRuntimeConfigError(str(exc), code="invalid_tools") from exc
-    system_prompt = config.instructions or hf_config.default_system_prompt
+    # An empty prompt is a prompt, as in training; only a session without one gets the default.
+    system_prompt = hf_config.default_system_prompt if config.instructions is None else config.instructions
     system_token_ids = student_prompt_token_ids(tokenizer, system_prompt, tools, start_role)
     return {
         "instructions": config.instructions,
