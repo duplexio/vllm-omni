@@ -57,6 +57,8 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
 
     multimodal_outputs: list[dict[str, object]] | None = None
     inter_stage_outputs: list[dict[str, Any] | None] | None = None
+    streaming_retained_tokens: dict[str, int] = field(default_factory=dict)
+    streaming_position_budget: dict[str, int] = field(default_factory=dict)
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None

@@ -619,6 +619,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
+            retained = getattr(model_runner_output, "streaming_retained_tokens", {}).get(req_id)
+            if retained is not None:
+                request.streaming_retained_tokens = retained
+            position_budget = getattr(model_runner_output, "streaming_position_budget", {}).get(req_id)
+            if position_budget is not None:
+                request.streaming_position_budget = position_budget
             kv_transfer_params = None
             ec_transfer_params = None
             finish_reason = None
@@ -1085,6 +1091,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return
+        retained = getattr(session, "streaming_retained_tokens", None)
+        if retained is not None:
+            assert 0 < retained <= session.num_computed_tokens
+            assert not session.mm_features and session.prompt_embeds is None
+            discarded = session.num_computed_tokens - retained
+            del session.prompt_token_ids[:discarded]
+            del session._all_token_ids[:discarded]
+            session.num_prompt_tokens -= discarded
+            session.num_computed_tokens = retained
         if self._streaming_update_overflows(session, update):
             return
         session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
@@ -1350,12 +1365,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # speculative decoding). __new__-built test schedulers carry no
         # num_sampled_tokens_per_step.
         sample_room = max(1, int(getattr(self, "num_sampled_tokens_per_step", 1) or 1))
-        if projected + sample_room <= int(max_model_len):
+        # Models that address their own cache also bound the
+        # positions a single update may consume.
+        position_budget = getattr(session, "streaming_position_budget", None)
+        if position_budget is not None and new_tokens > position_budget:
+            reason = (
+                f"{self.STREAMING_CONTEXT_OVERFLOW_STOP_REASON}: streaming update of {new_tokens} tokens "
+                f"exceeds the model's remaining position budget {position_budget}"
+            )
+        elif projected + sample_room <= int(max_model_len):
             return False
-        reason = (
-            f"{self.STREAMING_CONTEXT_OVERFLOW_STOP_REASON}: streaming session prompt would grow to "
-            f"{projected} tokens, leaving no room to sample within max_model_len {int(max_model_len)}"
-        )
+        else:
+            reason = (
+                f"{self.STREAMING_CONTEXT_OVERFLOW_STOP_REASON}: streaming session prompt would grow to "
+                f"{projected} tokens, leaving no room to sample within max_model_len {int(max_model_len)}"
+            )
         logger.error(
             "[Omni] %s: %s; finishing the request instead of extending it",
             session.request_id,

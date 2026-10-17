@@ -101,7 +101,7 @@ def _event_driven_orch_enabled(*, default: bool = False) -> bool:
 
 def _event_driven_orch_default_for_pipeline(pipeline_model_type: str | None) -> bool:
     """Return whether a pipeline has a validated event-driven default."""
-    return pipeline_model_type == "qwen3_tts"
+    return pipeline_model_type in ("qwen3_tts", "duplexio")
 
 
 def _build_terminal_empty_output(
@@ -191,7 +191,7 @@ def build_engine_core_request_from_tokens(
         prompt_embeds=prompt_embeds,
         resumable=resumable,
         additional_information=additional_info_payload,
-        model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
+        model_intermediate_buffer=serialize_additional_information(model_intermediate_buffer),
     )
 
 

@@ -1,0 +1,33 @@
+# Two-stream DuplexIO deployment.
+#
+# A local development profile for two sessions on one replica, running the
+# batched attention/GDN path without graph replay so a step is easy to inspect.
+pipeline: duplexio
+async_chunk: false
+session_mode: duplex
+active_stream_window: 2
+dtype: bfloat16
+enable_prefix_caching: false
+enable_chunked_prefill: true
+
+duplex_session:
+  max_sessions: 2
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 2
+    # Reserve one bounded compact cache layout per admitted session.
+    max_model_len: 24576
+    max_num_batched_tokens: 6144
+    # Without this the hybrid cache would derive 528 tokens per page from the
+    # mamba state size. 1024 spans the same slots in fewer, larger pages.
+    block_size: 1024
+    gpu_memory_utilization: 0.7
+    enforce_eager: false
+    async_scheduling: false
+    compilation_config:
+      # A fullgraph dynamo trace rejects the model's torch.compiler.disable()d
+      # quack GEMMs, so compilation stops at graph capture (here: none).
+      mode: 0
+      cudagraph_mode: NONE

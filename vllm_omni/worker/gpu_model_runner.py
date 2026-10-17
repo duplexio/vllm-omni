@@ -151,6 +151,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         model = getattr(self, "model", None)
+        # Frame models append several cells per decode, not one text token.
+        self.uniform_decode_query_len = getattr(model, "decode_query_len", self.uniform_decode_query_len)
+        self.cudagraph_dispatcher.uniform_decode_query_len = self.uniform_decode_query_len
         override_fn = None
         if bool(getattr(model, "supports_sampled_token_ids_cpu_override", False)):
             candidate = getattr(model, "consume_sampled_token_ids_cpu_override", None)
@@ -973,6 +976,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             return torch.tensor([]), torch.tensor([])
 
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.is_valid_runtime_mode()
+        # Frame models schedule whole frames of decode_query_len cells, so a
+        # request-count warmup (the sampler's) runs one frame per request.
+        unit = getattr(self.get_model(), "decode_query_len", 1)
+        num_tokens = cdiv(num_tokens, unit) * unit
 
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.separate_routine(). This means that we are using
@@ -1013,10 +1020,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             if num_tokens % max_query_len != 0:
                 num_scheduled_tokens_list[-1] = num_tokens % max_query_len
         else:
-            num_reqs = min(num_tokens, max_num_reqs)
-            min_tokens_per_req = num_tokens // num_reqs
+            num_reqs = min(num_tokens // unit, max_num_reqs)
+            min_tokens_per_req = num_tokens // unit // num_reqs * unit
             num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
-            num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+            num_scheduled_tokens_list[-1] += num_tokens - min_tokens_per_req * num_reqs
 
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs
@@ -1128,7 +1135,6 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     pad_attn=True,
                     for_cudagraph_capture=is_graph_capturing,
                 )
-
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
             num_scheduled_tokens,
@@ -1591,7 +1597,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
         return req_infos
 
-    def _maybe_run_batch_preprocess(self, req_ids: list[str], device: torch.device) -> None:
+    def _maybe_run_batch_preprocess(self, req_ids: list[str], device: torch.device) -> dict:
         """Run an optional model-specific batch preprocess hook.
 
         The generic runner only supplies current request ids and the runner-owned
@@ -1600,12 +1606,13 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         """
         preprocess_batch = getattr(self.model, "preprocess_batch", None)
         if not callable(preprocess_batch):
-            return
-        preprocess_batch(
+            return {}
+        prepared = preprocess_batch(
             req_ids=req_ids,
             model_intermediate_buffer=self.model_intermediate_buffer,
             device=device,
         )
+        return prepared or {}
 
     def _embed_multimodal_input_ids(self, num_scheduled_tokens, mm_embeds, is_mm_embed):
         embedding_kwargs = {}
@@ -1762,7 +1769,13 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             # need the scheduled token ids to build or replace those embeddings.
             preprocess_input_ids = input_ids if input_ids is not None else self.input_ids.gpu[:num_input_tokens]
             preprocess_device = preprocess_input_ids.device
-            self._maybe_run_batch_preprocess(self.input_batch.req_ids, preprocess_device)
+            for req_index, req_id in enumerate(self.input_batch.req_ids):
+                req_infos = self.model_intermediate_buffer.setdefault(req_id, {})
+                req_state = self.requests.get(req_id)
+                req_infos["duplex_token_offset"] = int(self.input_batch.num_computed_tokens_cpu[req_index])
+                req_infos["duplex_prompt_len"] = len(req_state.prompt_token_ids) if req_state is not None else None
+                req_infos["_omni_num_scheduled_tokens"] = int(num_scheduled_tokens_np[req_index])
+            prepared_requests = self._maybe_run_batch_preprocess(self.input_batch.req_ids, preprocess_device)
 
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
@@ -1854,6 +1867,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 decode_batch_items.clear()
 
             preprocess_input_ids = input_ids if input_ids is not None else self.input_ids.gpu[:num_input_tokens]
+            # Per-request writes land on disjoint rows and are only read after the
+            # loop. Models whose preprocess outputs stay valid for the whole step
+            # can have them go out as one multi-tensor copy instead of one per request.
+            defer_copies = getattr(self.model, "preprocess_outputs_stable_within_step", False)
+            copy_targets: list[torch.Tensor] = []
+            copy_sources: list[torch.Tensor] = []
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
@@ -1868,8 +1887,6 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
                 # call the custom process function
                 req_infos["request_id"] = req_id
-                req_infos["duplex_token_offset"] = int(self.input_batch.num_computed_tokens_cpu[req_index])
-                req_infos["duplex_prompt_len"] = len(req_state.prompt_token_ids) if req_state is not None else None
                 prompt_token_ids = getattr(req_state, "prompt_token_ids", ()) if req_state is not None else ()
                 prompt_len = len(prompt_token_ids or ())
                 num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
@@ -1898,6 +1915,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     input_ids=preprocess_input_ids[s:e],
                     input_embeds=embed_slice,
                     **req_infos,
+                    **prepared_requests.get(req_id, {}),
                 )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
@@ -1922,9 +1940,25 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
                 # update the inputs_embeds and input_ids
                 seg_len = min(span_len, req_embeds.shape[0])
-                inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
-                if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
-                    preprocess_input_ids[s : s + seg_len] = req_input_ids
+                target_ids = preprocess_input_ids[s : s + seg_len]
+                # Models that pass their input id slice through need no copy.
+                copy_ids = (
+                    isinstance(req_input_ids, torch.Tensor)
+                    and req_input_ids.numel() == seg_len
+                    and req_input_ids.data_ptr() != target_ids.data_ptr()
+                )
+                if defer_copies:
+                    copy_targets.append(inputs_embeds[s : s + seg_len])
+                    copy_sources.append(req_embeds[:seg_len])
+                    if copy_ids:
+                        copy_targets.append(target_ids)
+                        copy_sources.append(req_input_ids.reshape(target_ids.shape).to(target_ids.dtype))
+                else:
+                    inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
+                    if copy_ids:
+                        target_ids[:] = req_input_ids
+            if copy_targets:
+                torch._foreach_copy_(copy_targets, copy_sources)
             if input_ids is None:
                 input_ids = preprocess_input_ids
 

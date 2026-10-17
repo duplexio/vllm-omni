@@ -859,6 +859,17 @@ class ModelChannel:
                 }
             )
             return close_reason, True
+        input_text_delta = model_result.get("input_text_delta")
+        if isinstance(input_text_delta, str) and input_text_delta:
+            self._out.emit(
+                {
+                    "type": "input.transcript.delta",
+                    "session_id": session.session_id,
+                    "item_id": f"item_input_{session.session_id}",
+                    "epoch": session.epoch,
+                    "delta": input_text_delta,
+                }
+            )
         if model_result.get("requires_stage_handoff") is True or model_result.get("requires_tts_stage") is True:
             # Reserve the protocol response only when Stage1 emits text/audio.
             return close_reason, False

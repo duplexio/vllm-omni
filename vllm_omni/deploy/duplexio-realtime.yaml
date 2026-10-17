@@ -1,0 +1,31 @@
+# Live DuplexIO demo on one GPU: two sessions, decode frames replayed as CUDA graphs.
+#
+# The realtime profile used by examples/online_serving/duplexio/launch_realtime.sh.
+# Fits a 32 GB RTX 5090; duplexio-multistream.yaml is the same deployment without
+# graph replay, for inspecting a step.
+pipeline: duplexio
+async_chunk: false
+session_mode: duplex
+active_stream_window: 2
+dtype: bfloat16
+enable_prefix_caching: false
+enable_chunked_prefill: true
+
+duplex_session:
+  max_sessions: 2
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 2
+    max_model_len: 24576
+    max_num_batched_tokens: 6144
+    block_size: 1024
+    gpu_memory_utilization: 0.7
+    enforce_eager: false
+    async_scheduling: false
+    compilation_config:
+      mode: 0
+      cudagraph_mode: FULL_DECODE_ONLY
+      cudagraph_capture_sizes: [6, 12]
+      cudagraph_copy_inputs: true

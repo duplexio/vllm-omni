@@ -39,6 +39,7 @@ from vllm_omni.protocol.duplex.events import (
     InputCleared,
     InputCommitted,
     InputTranscriptionCompleted,
+    InputTranscriptionDelta,
     ItemAdded,
     ItemCreated,
     ItemDeleted,
@@ -87,6 +88,7 @@ DOMAIN_TERMINAL_EVENTS = frozenset(
 
 MODEL_OUTPUT_EVENTS = frozenset(
     {
+        "input.transcript.delta",
         "response.created",
         "response.listen",
         "response.speak",
@@ -120,6 +122,7 @@ __all__ = [
     "InputCleared",
     "InputCommitted",
     "InputTranscriptionCompleted",
+    "InputTranscriptionDelta",
     "ItemAdded",
     "ItemCreated",
     "ItemDeleted",

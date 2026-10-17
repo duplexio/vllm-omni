@@ -112,8 +112,12 @@ def build_omni_mm_payload(
     sparse_mm_index: dict[str, int],
     hidden_seq_len: int,
     scheduled_seq_len: int,
+    clone: bool = True,
 ) -> dict[str, object]:
-    """Build one request's multimodal payload for the step."""
+    """Build one request's multimodal payload for the step.
+
+    ``clone=False`` hands over per-request slices of fresh host tensors as-is.
+    """
     if combined_multimodal_outputs:
         # Sparse-audio producers emit per-request lists aligned to the
         # sparse request order (`meta.req_id`), not the batch order; under
@@ -158,5 +162,6 @@ def build_omni_mm_payload(
             pass_lists_through=False,
             seq_len=hidden_seq_len,
             scheduled_seq_len=scheduled_seq_len,
+            clone=clone,
         )
     return mm_payload

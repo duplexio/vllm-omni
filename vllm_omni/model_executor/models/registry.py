@@ -489,6 +489,11 @@ _OMNI_MODELS = {
         "yue2",
         "Yue2ForCausalLM",
     ),
+    "DuplexIOForConditionalGeneration": (
+        "duplexio",
+        "modeling_duplexio",
+        "DuplexIOForConditionalGeneration",
+    ),
 }
 
 

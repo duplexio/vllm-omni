@@ -1,0 +1,436 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Batch every stream's draws and read tool starts once, after all sampling is queued."""
+
+from concurrent.futures import Future
+from dataclasses import replace
+from functools import partial
+from types import SimpleNamespace
+
+import pytest
+import torch
+import xgrammar as xgr
+from torch.utils._python_dispatch import TorchDispatchMode
+
+from tests.model_executor.models.duplexio.reference_sampling import (
+    ReferenceSampling,
+    content_distribution,
+    sample_emit,
+    sample_factorized_text_ids,
+    sample_text_batch,
+    sample_tool_token,
+)
+from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
+    DuplexIOForConditionalGeneration,
+    FrameInputGraph,
+)
+from vllm_omni.model_executor.models.duplexio.tool_calling import (
+    ToolCallConstraintCompiler,
+    ToolCallConstraintState,
+    tool_call_grammar,
+)
+
+AGENT_EMIT_TEMPERATURE = 0.7
+USER_EMIT_TEMPERATURE = 0.6
+
+
+def session_sampling(model, row: int, temperature: float):
+    content = {
+        "temperature": temperature,
+        "top_k": model.text_config.vocab_size,
+        "top_p": 0.9 if row % 3 == 2 else None,
+    }
+    return model.resolve_sampling(
+        {
+            "agent": {"emission": {"temperature": AGENT_EMIT_TEMPERATURE}, "content": content},
+            "user": {"emission": {"temperature": USER_EMIT_TEMPERATURE}, "content": content},
+        }
+    )
+
+
+def reference(options, suppressed_token_ids):
+    return ReferenceSampling(options.temperature, options.top_k, options.top_p, suppressed_token_ids)
+
+
+def sampling_model(vocab_size: int, device: str):
+    """Only what text sampling reads; every stream suppresses silence (id 0)."""
+    model = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.silence_token_id = 0
+    model.agent_suppressed_token_ids = torch.tensor([0], device=device)
+    model.user_suppressed_token_ids = model.agent_suppressed_token_ids
+    model.tool_suppressed_token_ids = model.agent_suppressed_token_ids
+    model.text_config = SimpleNamespace(vocab_size=vocab_size)
+    model.config = SimpleNamespace(flowmap_config={"sampling_temperature": 1.0})
+    model.init_text_sampling(vocab_size, 8)
+    model.tool_call_compiler = object.__new__(ToolCallConstraintCompiler)
+    return model
+
+
+def fixture(device: str, *, mixed: bool):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "ping",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    vocab = ["<silence>", *sorted(set("<function=ping>\n</function>"))]
+    tokenizer = xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=len(vocab))
+    grammar = xgr.GrammarCompiler(tokenizer).compile_grammar(tool_call_grammar(tools, {"mode": "auto"}))
+    model = sampling_model(len(vocab), device)
+    infos = []
+    for index in range(8):
+        constraint = ToolCallConstraintState(
+            compiled_grammar=grammar,
+            decoded_vocab=tuple(token.encode() for token in vocab),
+            tools=tuple(tools),
+        )
+        if mixed:
+            if index == 0:
+                constraint = None
+            elif index == 1:
+                constraint = ToolCallConstraintState(compiled_grammar=None)
+            elif index == 2:
+                constraint.begin()
+            elif index == 3:
+                constraint.force_next_call = True
+        infos.append(
+            {
+                "duplexio_working_state": SimpleNamespace(
+                    tool_call_constraint=constraint,
+                    sampling=session_sampling(model, index, 0.8 if mixed and index % 3 else 0.0),
+                )
+            }
+        )
+    return model, infos, len(vocab)
+
+
+def serial_sample(model, logits, emissions, info):
+    """Per-request reference, including the synchronous tool read."""
+    state = info["duplexio_working_state"]
+    agent = sample_factorized_text_ids(
+        logits[:1],
+        emissions[:1],
+        silence_token_id=0,
+        sampling=reference(state.sampling.agent, model.agent_suppressed_token_ids),
+        emit_temperature=AGENT_EMIT_TEMPERATURE,
+    )
+    constraint = state.tool_call_constraint
+    emit = False
+    if constraint is not None and constraint.enabled and not constraint.active:
+        emit = constraint.force_next_call or bool(sample_emit(emissions[1:2], AGENT_EMIT_TEMPERATURE).item())
+    tool_sample = sample_tool_token(
+        logits[1:2],
+        constraint=constraint,
+        emit=emit,
+        sampling=reference(state.sampling.agent, model.tool_suppressed_token_ids),
+    )
+    call = None
+    if tool_sample is None:
+        tool = logits.new_full((1,), 0, dtype=torch.long)
+    else:
+        tool = tool_sample.token_id
+        if constraint.accept(tool.item()):
+            call = model.tool_call_compiler.take_completed_call(constraint)
+    user = sample_factorized_text_ids(
+        logits[2:3],
+        emissions[2:3],
+        silence_token_id=0,
+        sampling=reference(state.sampling.user, model.user_suppressed_token_ids),
+        emit_temperature=USER_EMIT_TEMPERATURE,
+    )
+    return torch.cat((user, agent, tool)), call
+
+
+def decided_inputs(rows, vocab, device, generator):
+    """Logits whose every draw is certain: saturated emits and one-hot content.
+
+    Sampling then no longer depends on the random stream, so a batch must match
+    the per-request reference exactly, including grammar-constrained tool calls.
+    """
+    logits = torch.randn(rows, 3, vocab, device=device, generator=generator) * 1e4
+    signs = torch.randint(0, 2, (rows, 3), device=device, generator=generator) * 2 - 1
+    return logits, signs * 100.0
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("graph", [False, True])
+def test_batched_tool_sampling_matches_per_request_tokens_and_calls(device, graph):
+    if graph and device == "cpu":
+        pytest.skip("serving captures the draws on CUDA")
+    model, infos, vocab = fixture(device, mixed=True)
+    if graph:
+        # As served: the draws replay from one graph per top-k and support width.
+        eager, graphs = model.sample_text, {}
+
+        def graphed(*tensors, top_k, support_width):
+            key = (top_k, support_width)
+            if key not in graphs:
+                graphs[key] = FrameInputGraph(partial(eager, top_k=top_k, support_width=support_width), tensors)
+            return graphs[key](tensors)
+
+        model.sample_text = graphed
+    reference, original, _ = fixture(device, mixed=True)
+    inputs = torch.Generator(device=device).manual_seed(53)
+    calls = 0
+    for _ in range(60):
+        logits, emissions = decided_inputs(8, vocab, device, inputs)
+        expected = [serial_sample(reference, logits[row], emissions[row], info) for row, info in enumerate(original)]
+        sampled = sample_text_batch(model, logits, emissions, infos)
+        for row in range(8):
+            torch.testing.assert_close(sampled.text_ids[row], expected[row][0], rtol=0, atol=0)
+            assert sampled.tool_calls[row] == expected[row][1]
+            calls += expected[row][1] is not None
+    assert calls, "fixture completed no tool call to compare"
+
+
+class ScalarReads(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.count = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func == torch.ops.aten._local_scalar_dense.default and args[0].is_cuda:
+            self.count += 1
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
+def test_mixed_policies_return_rows_in_request_order(device):
+    model, infos, vocab = fixture(device, mixed=True)
+    inputs = torch.Generator(device=device).manual_seed(11)
+    for order in ([7, 0, 4, 2, 6, 1, 5, 3], [3, 1, 7], [7, 3]):
+        logits, emissions = decided_inputs(8, vocab, device, inputs)
+
+        def sample(rows):
+            sampling = model.sampling_inputs([infos[index] for index in rows], logits.device)
+            return model.sample_text(
+                logits[rows],
+                emissions[rows],
+                sampling.parameters,
+                sampling.tool_bitmask,
+                top_k=sampling.top_k,
+                support_width=sampling.support_width,
+            )
+
+        actual = sample(order)
+        for row, index in enumerate(order):
+            for values, target in zip(actual, sample([index]), strict=True):
+                if values.dim() == 3:
+                    # Supports pad to the batch's widest top-k; a lone row may be narrower.
+                    width = target.shape[-1]
+                    assert (values[row, :, width:] == -1).all()
+                    values = values[..., :width]
+                torch.testing.assert_close(values[row], target[0])
+
+
+@pytest.mark.parametrize("start_tool", [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="checks GPU scalar readback")
+def test_tools_do_not_read_gpu_scalars_per_request(start_tool):
+    model, infos, vocab = fixture("cuda", mixed=False)
+    logits = torch.zeros(8, 3, vocab, device="cuda")
+    emissions = torch.full((8, 3), 100.0 if start_tool else -100.0, device="cuda")
+    with ScalarReads() as serial:
+        for row, info in enumerate(infos):
+            serial_sample(model, logits[row], emissions[row], info)
+    model, infos, _ = fixture("cuda", mixed=False)
+    with ScalarReads() as batched:
+        sample_text_batch(model, logits, emissions, infos)
+    assert serial.count == (16 if start_tool else 8)
+    assert batched.count == 0
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
+def test_agent_logprobs_match_the_distributions_actually_sampled(device):
+    """Behaviour log-probs must equal the distributions the draws came from.
+
+    Verified without replaying the generators: the truncated content distribution
+    is deterministic given the logits, the emit outcome is recoverable from
+    whether the returned id is silence, and a thresholded (greedy) decision has
+    probability one. An importance ratio divides by these numbers, so a wrong
+    value here silently corrupts learning instead of crashing.
+    """
+    model, infos, vocab = fixture(device, mixed=True)
+    inputs = torch.Generator(device=device).manual_seed(97)
+    logits = torch.randn(8, 3, vocab, device=device, generator=inputs)
+    emissions = torch.randn(8, 3, device=device, generator=inputs)
+    checked_emitted = 0
+    # Draws come from the global generator; draw a few frames so some rows emit.
+    torch.manual_seed(0)
+    for _ in range(4):
+        sampled = sample_text_batch(model, logits, emissions, infos)
+        ids, emit_logprobs, token_logprobs = sampled.text_ids[:, 1], *sampled.frame_logprobs[:, :2].unbind(1)
+        for row, info in enumerate(infos):
+            sampling = reference(info["duplexio_working_state"].sampling.agent, model.agent_suppressed_token_ids)
+            emit_logprob, token_logprob = emit_logprobs[row], token_logprobs[row]
+            assert emit_logprob.shape == token_logprob.shape == ()
+            assert emit_logprob.dtype == token_logprob.dtype == torch.float32
+
+            emitted = int(ids[row]) != model.silence_token_id
+            scaled = emissions[row, 0].float() / AGENT_EMIT_TEMPERATURE
+            torch.testing.assert_close(
+                emit_logprob.reshape(()),
+                torch.nn.functional.logsigmoid(scaled if emitted else -scaled),
+                atol=1e-5,
+                rtol=1e-4,
+            )
+            assert float(emit_logprob) < 0.0
+
+            support = sampled.support_ids[row, 0]
+            support = support[support >= 0]
+            if sampling.temperature == 0:
+                mode = content_distribution(logits[row : row + 1, 0], replace(sampling, temperature=1.0))[0][0, 0]
+                assert support.tolist() == [int(mode)]
+            else:
+                # The recorded support is exactly the truncated distribution's.
+                indices, probabilities = content_distribution(logits[row : row + 1, 0], sampling)
+                assert support.tolist() == indices[0, probabilities[0] > 0].tolist()
+            if not emitted or sampling.temperature == 0:
+                # A content draw discarded by a silent row took no action.
+                assert float(token_logprob) == 0.0
+                continue
+            # Renormalizing the logits over the support recovers the behavior log-prob.
+            renormalized = torch.log_softmax(logits[row, 0, support].float() / sampling.temperature, dim=-1)
+            torch.testing.assert_close(
+                token_logprob.reshape(()),
+                renormalized[support == int(ids[row])].reshape(()),
+                atol=1e-5,
+                rtol=1e-4,
+            )
+            position = (indices[0] == int(ids[row])).nonzero().flatten()
+            assert position.numel() == 1, "sampled id must lie in the truncated support"
+            torch.testing.assert_close(
+                token_logprob.reshape(()),
+                probabilities[0, int(position)].float().log(),
+                atol=1e-5,
+                rtol=1e-4,
+            )
+            checked_emitted += 1
+
+    assert checked_emitted, "fixture produced no emitted agent row to verify"
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("mode", ["argmax", "top_k", "top_p"])
+def test_tool_emit_logprobs_score_all_decisions_including_forced_emit_and_wait(device, mode):
+    model, infos, vocab = fixture(device, mixed=True)
+    for row, info in enumerate(infos):
+        info["duplexio_working_state"].sampling = session_sampling(model, row, 0.0 if mode == "argmax" else 0.8)
+    logits = torch.zeros(8, 3, vocab, device=device)
+    emissions = torch.zeros(8, 3, device=device)
+    emissions[:, 1] = torch.tensor([0, 0, -100, -100, -100, 100, -0.4, 0.4], device=device)
+    sampled = sample_text_batch(model, logits, emissions, infos)
+    for row in range(8):
+        emitted = sampled.text_ids[row][2].item() != model.silence_token_id
+        # Score raw logits, independent of sampling temperature or forced actions.
+        signed_logit = emissions[row, 1] if emitted else -emissions[row, 1]
+        expected = -torch.logaddexp(torch.zeros_like(signed_logit), -signed_logit)
+        torch.testing.assert_close(sampled.frame_logprobs[row, 2], expected)
+        if not emitted or mode == "argmax":
+            assert sampled.frame_logprobs[row, 3].item() == 0
+        # Only idle rows draw their tool emit; the rest are forced and flagged so.
+        assert (row in sampled.pending_tool_starts) == (row >= 4)
+        if row < 2:
+            assert not emitted
+        elif row < 4:
+            assert emitted  # active continuation / forced start ignores the negative emit logit
+            assert sampled.frame_logprobs[row, 2].item() == -100
+
+
+def test_session_waits_to_start_a_call_until_its_grammar_compiles():
+    model, infos, vocab = fixture("cpu", mixed=False)
+    compiled = infos[0]["duplexio_working_state"].tool_call_constraint.compiled_grammar
+    compiling = Future()
+    for info in infos:
+        info["duplexio_working_state"].tool_call_constraint.compiled_grammar = compiling
+    logits = torch.zeros(8, 3, vocab)
+    emissions = torch.full((8, 3), 100.0)
+
+    sampled = sample_text_batch(model, logits, emissions, infos)
+    assert not sampled.tool_starts.any()
+    assert (sampled.text_ids[:, 2] == model.silence_token_id).all()
+    torch.testing.assert_close(sampled.frame_logprobs[:, 2], torch.full((8,), -100.0))
+
+    compiling.set_result(compiled)
+    sampled = sample_text_batch(model, logits, emissions, infos)
+    assert sampled.tool_starts.all()
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("mode", ["argmax", "top_k", "top_p"])
+def test_forced_continuation_records_actual_constrained_token_probability(device, mode):
+    vocab = ["<silence>", "a", "b", "c", "d"]
+    tokenizer = xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=len(vocab))
+    constraint = ToolCallConstraintState(
+        compiled_grammar=xgr.GrammarCompiler(tokenizer).compile_grammar('root ::= ("a" | "b" | "c") "d"'),
+        decoded_vocab=tuple(token.encode() for token in vocab),
+    )
+    constraint.begin()
+    model = sampling_model(len(vocab), device)
+    content = {"temperature": 0.0 if mode == "argmax" else 0.7, "top_k": 2, "top_p": 0.8 if mode == "top_p" else None}
+    sampling = model.resolve_sampling({"agent": {"content": content}})
+    infos = [{"duplexio_working_state": SimpleNamespace(tool_call_constraint=constraint, sampling=sampling)}]
+    logits = torch.zeros(1, 3, len(vocab), device=device)
+    logits[0, 1] = torch.tensor([100.0, 0.2, 0.6, 0.9, 90.0])
+    torch.manual_seed(42)
+    sampled = sample_text_batch(model, logits, torch.full((1, 3), -100.0, device=device), infos)
+    token, logprob = sampled.text_ids[0, 2].item(), sampled.frame_logprobs[0, 3]
+    assert token in (2, 3)  # the grammar excludes the two highest raw logits; top-k excludes a
+    if mode == "argmax":
+        assert token == 3
+        assert logprob.item() == 0
+    else:
+        # Independent reference: grammar leaves a/b/c, then top-k retains c/b.
+        probabilities = (torch.tensor([0.9, 0.6], device=device) / 0.7).softmax(-1)
+        if mode == "top_p" and probabilities[0] > 0.8:
+            probabilities = torch.tensor([1.0, 0.0], device=device)
+        torch.testing.assert_close(logprob, probabilities[0 if token == 3 else 1].log())
+        assert logprob.item() < 0  # forcing emit does not force the content token

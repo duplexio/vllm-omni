@@ -51,6 +51,7 @@ from vllm_omni.engine.duplex.events import (
     InputCleared,
     InputCommitted,
     InputTranscriptionCompleted,
+    InputTranscriptionDelta,
     ItemAdded,
     ItemCreated,
     ItemDeleted,
@@ -899,6 +900,10 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
                 state, event, response_id, status=status, status_details=status_details
             ),
         ]
+    if event_type == "input.transcript.delta":
+        # A model-native transcript streamed as the model hears the user; it
+        # belongs to no committed item.
+        return [InputTranscriptionDelta(item_id=_str_or_none(event.get("item_id")), delta=str(event["delta"]))]
     if event_type == "input.transcribed":
         transcript = event.get("transcript")
         if not isinstance(transcript, str) or not transcript.strip():

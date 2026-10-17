@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Single-stage DuplexIO pipeline topology."""
+
+from vllm_omni.config.stage_config import (
+    PipelineConfig,
+    StageExecutionType,
+    StagePipelineConfig,
+)
+
+DUPLEXIO_PIPELINE = PipelineConfig(
+    model_type="duplexio",
+    model_arch="DuplexIOForConditionalGeneration",
+    hf_architectures=("DuplexIOForConditionalGeneration",),
+    default_deploy_config_name="duplexio.yaml",
+    duplex_plugin="vllm_omni.model_executor.models.duplexio.duplex.plugin.DuplexIODuplexPlugin",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="duplexio",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=True,
+            final_output_type="audio",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            engine_output_type="audio",
+            retains_state_across_chunks=True,
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)

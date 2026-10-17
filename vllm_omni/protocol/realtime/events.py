@@ -386,6 +386,19 @@ class InputTranscriptionCompleted(RealtimeEvent):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class InputTranscriptionDelta(RealtimeEvent):
+    wire_type = "conversation.item.input_audio_transcription.delta"
+
+    item_id: str | None = None  # type: ignore[assignment]
+    content_index: int = 0
+    delta: str = ""
+
+    @property
+    def text(self) -> str | None:
+        return self.delta
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class OutputAudioCleared(RealtimeEvent):
     wire_type = "output_audio_buffer.cleared"
 
@@ -440,6 +453,7 @@ __all__ = [
     "InputCleared",
     "InputCommitted",
     "InputTranscriptionCompleted",
+    "InputTranscriptionDelta",
     "ItemAdded",
     "ItemCreated",
     "ItemDeleted",

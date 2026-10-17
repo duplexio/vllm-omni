@@ -561,11 +561,15 @@ def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch):
         ec_connector_output=None,
         cudagraph_stats=None,
         kv_extracted_req_ids=["r2"],
+        streaming_retained_tokens=[6, 18],
+        streaming_position_budget=[600, 900],
         num_scheduled_tokens_np=torch.tensor([1, 2], dtype=torch.int32).numpy(),
         query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
     )
 
     assert output.req_ids == ["r1", "r2"]
+    assert output.streaming_retained_tokens == {"r1": 6, "r2": 18}
+    assert output.streaming_position_budget == {"r1": 600, "r2": 900}
     assert output.inter_stage_outputs is not None
     assert torch.equal(output.inter_stage_outputs[0]["hidden"], torch.tensor([[1.0]]))
     assert torch.equal(output.inter_stage_outputs[1]["hidden"], torch.tensor([[2.0], [3.0]]))
@@ -687,6 +691,38 @@ def test_async_omni_output_guard_requires_safe_conditions():
 
     runner.model.eager_omni_postprocess_before_async_output = True
     assert GPUARModelRunner._should_use_async_omni_output(runner)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("build_in_background", [False, True])
+def test_omni_async_output_builds_on_caller_thread_when_background_disabled(build_in_background):
+    import threading
+
+    threads = []
+
+    def builder():
+        threads.append(threading.current_thread())
+        return OmniModelRunnerOutput(req_ids=["r1"], req_id_to_index={"r1": 0})
+
+    async_output = OmniAsyncGPUModelRunnerOutput(
+        model_runner_output_builder=builder,
+        cuda_device=torch.device("cuda", torch.accelerator.current_device_index()),
+        build_in_background=build_in_background,
+        sampled_token_ids=torch.tensor([[7]], device="cuda"),
+        logprobs_tensors=None,
+        invalid_req_indices=[],
+        async_output_copy_stream=torch.cuda.Stream(),
+        vocab_size=10,
+    )
+    if not build_in_background:
+        assert async_output._background_thread is None
+        assert threads == []
+
+    output = async_output.get_output()
+
+    assert output.sampled_token_ids == [[7]]
+    assert len(threads) == 1
+    assert (threads[0] is threading.current_thread()) is not build_in_background
 
 
 def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):

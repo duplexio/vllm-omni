@@ -149,6 +149,7 @@ def _run_resumable_segment_stop(
     handle_stopped=None,
     chunk_transfer_adapter=None,
     inter_stage_output=None,
+    retained_tokens: int | None = None,
 ):
     sched = MagicMock()
     sched.requests = {session.request_id: session}
@@ -196,6 +197,9 @@ def _run_resumable_segment_stop(
     model_runner_output.req_id_to_index = {session.request_id: 0}
     model_runner_output.routed_experts = None
     model_runner_output.inter_stage_outputs = [inter_stage_output] if inter_stage_output is not None else None
+    model_runner_output.streaming_retained_tokens = (
+        {} if retained_tokens is None else {session.request_id: retained_tokens}
+    )
 
     return OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
 
@@ -1587,3 +1591,66 @@ def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, nati
 
     assert observed_limits == [7 if native else 8]
     assert sched.max_num_active_reqs == 8
+
+
+def test_streaming_retention_compacts_history_without_resetting_cached_state() -> None:
+    sched = _make_scheduler()
+    sched.max_model_len = 24
+    session = _make_request()
+    session.resumable = True
+    session.prompt_token_ids = [0] * 18
+    session._all_token_ids[:] = session.prompt_token_ids
+    session.num_prompt_tokens = 18
+    session.num_computed_tokens = 18
+    session.streaming_retained_tokens = 6
+    for _ in range(100):
+        session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+        sched._update_request_as_session(session, _make_update([0] * 6))
+        assert session.num_computed_tokens == 6
+        assert len(session.prompt_token_ids) == 12
+        assert len(session._all_token_ids) == 12
+        session.num_computed_tokens = 12
+    session.streaming_retained_tokens = 12
+    sched._update_request_as_session(session, _make_update([0] * 6))
+    assert session.num_computed_tokens == 12
+    assert len(session.prompt_token_ids) == 18
+
+
+def test_retained_context_limit_rejects_append_before_worker_execution() -> None:
+    sched = _make_scheduler()
+    sched.max_model_len = 24
+    sched.finish_requests = MagicMock()
+    session = _make_request()
+    session.resumable = True
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.prompt_token_ids = [0] * 18
+    session._all_token_ids[:] = session.prompt_token_ids
+    session.num_prompt_tokens = 18
+    session.num_computed_tokens = 18
+    session.streaming_retained_tokens = 18
+    sched._update_request_as_session(session, _make_update([0] * 6))
+    sched.finish_requests.assert_called_once_with((session.request_id,), RequestStatus.FINISHED_ERROR)
+    client, reason = sched._streaming_context_overflow[session.request_id]
+    assert client == session.client_index
+    assert reason.startswith("context_length_exceeded: ")
+    assert session.prompt_token_ids == [0] * 18
+
+
+def test_model_retention_reaches_streaming_session() -> None:
+    session = _make_request()
+    _run_resumable_segment_stop(session, retained_tokens=6)
+    assert session.streaming_retained_tokens == 6
+
+
+def test_rotary_position_limit_rejects_append_with_spare_text_capacity() -> None:
+    sched = _make_scheduler()
+    sched.max_model_len = 120
+    sched.finish_requests = MagicMock()
+    session = _make_request()
+    session.resumable = True
+    session.num_computed_tokens = 3
+    session.streaming_retained_tokens = 3
+    session.streaming_position_budget = 0
+    sched._update_request_as_session(session, _make_update([0] * 6))
+    sched.finish_requests.assert_called_once_with((session.request_id,), RequestStatus.FINISHED_ERROR)
+    assert "position budget 0" in sched._streaming_context_overflow[session.request_id][1]
