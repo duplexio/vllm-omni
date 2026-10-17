@@ -86,6 +86,7 @@ def model_config(monkeypatch, byte_tokenizer):
     )
     monkeypatch.setattr(f"{PLUGIN_MODULE}.cached_tokenizer_from_config", lambda config: tokenizer)
     return SimpleNamespace(
+        max_model_len=6 * 4096,
         hf_config=SimpleNamespace(
             voice_prompt_max_frames=125,
             default_system_prompt="system",

@@ -25,6 +25,7 @@ from vllm_omni.model_executor.models.duplexio.duplex.plugin import (
     stage_sampling_params,
     tool_result_token_ids,
 )
+from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
 from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
 
 if TYPE_CHECKING:
@@ -34,10 +35,12 @@ if TYPE_CHECKING:
 class DuplexIOStream:
     """Append frames in order and collect each append's outputs.
 
-    An append is ``[voice prompt, system tokens]`` (the first one only), one
-    live frame, then any tool-result tokens, as realtime serving plans it. The
-    scheduler may split an append into chunks: each chunk yields one output with
-    its rows, and the append's last chunk is the one that predicts.
+    Clients pass raw inputs only: the session's prompt, tools and start role,
+    PCM, and tool results as text. The stream renders them as realtime serving
+    does. An append is the prefix (the first one only), one live frame, then
+    any tool-result rows. The scheduler may split an append into chunks: each
+    chunk yields one output with its rows, and the append's last chunk is the
+    one that predicts.
     """
 
     def __init__(
@@ -47,6 +50,8 @@ class DuplexIOStream:
         self.request_id = request_id
         self.timeout = timeout
         self.tokenizer = cached_tokenizer_from_config(engine.model_config)
+        # Rows one request can hold: prefix, live frames and tool results.
+        self.max_rows = engine.model_config.max_model_len // NUM_CELLS
         self.inputs: asyncio.Queue[StreamingInput] = asyncio.Queue()
         self.appends = 0
         self.tool_generation = 0
@@ -79,32 +84,39 @@ class DuplexIOStream:
         while True:
             yield await self.inputs.get()
 
-    def tool_result_token_ids(self, output: str) -> list[int]:
-        """The rows a tool result is fed as, exactly as realtime serving feeds it."""
-        return tool_result_token_ids(self.tokenizer, output)
+    @property
+    def prefix_rows(self) -> int:
+        """Rows the first append adds before its live frame: the voice prompt and rendered system prompt."""
+        runtime = self.runtime_config
+        return runtime["duplexio_voice_prompt_frames"] + len(runtime["duplexio_system_token_ids"])
+
+    def tool_result_rows(self, output: str) -> int:
+        """Rows a tool result occupies once rendered."""
+        return len(tool_result_token_ids(self.tokenizer, output))
 
     def append(
         self,
         pcm: bytes,
         *,
-        tool_token_ids: Sequence[int] = (),
+        tool_results: Sequence[str] = (),
         final: bool = False,
         decode_audio: bool = False,
         given: GivenFrame | None = None,
     ) -> None:
         """Queue one live frame of float32 user audio, after the prefix if it is the first.
 
-        ``tool_token_ids`` (from ``tool_result_token_ids``) follow the live frame.
+        ``tool_results`` are tool outputs as text; they follow the live frame.
         A ``given`` frame replays history: the model hears its tokens and agent
         audio instead of its own last prediction. Given frames lead the stream.
         """
+        tool_token_ids = [token for output in tool_results for token in tool_result_token_ids(self.tokenizer, output)]
         if tool_token_ids:
             self.tool_generation += 1
         prompt_token_ids, fields = append_fields(
             self.runtime_config,
             pcm,
             prefix=self.appends == 0,
-            tool_token_ids=list(tool_token_ids),
+            tool_token_ids=tool_token_ids,
             tool_generation=self.tool_generation if tool_token_ids else 0,
             decode_audio=decode_audio,
             given_frame=given,

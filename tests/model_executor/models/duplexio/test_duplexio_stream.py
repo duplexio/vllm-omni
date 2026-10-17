@@ -67,13 +67,15 @@ async def test_appends_follow_the_realtime_layout_and_collect_through_the_predic
     engine = EchoEngine(stream_tokenizer)
     stream = DuplexIOStream.open(engine, "offline", session_config())
     prefix_frames = REFERENCE_FRAMES + len(stream.runtime_config["duplexio_system_token_ids"])
+    assert stream.prefix_rows == prefix_frames and stream.max_rows == 4096
 
     stream.append(pcm(1))
     assert [frame_fields(output)["predicted"] for output in await stream.collect()] == [False, True]
-    tool = stream.tool_result_token_ids("sunny")
-    assert tool == [20, 21, 22]
-    stream.append(pcm(1), tool_token_ids=tool, final=True)
+    # Tool results arrive as text and are rendered as realtime serving renders them.
+    assert stream.tool_result_rows("sunny") == 3
+    stream.append(pcm(1), tool_results=["sunny"], final=True)
     await stream.collect()
+    tool = [20, 21, 22]
 
     first, second = (append["model_intermediate_buffer"]["duplex"] for append in engine.appends)
     assert first["duplexio_prefix"] and first["frame_count"] == prefix_frames + 1
