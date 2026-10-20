@@ -69,9 +69,10 @@ def test_model_preprocess_batches_audio_without_persisting_prepared_results(enco
         state = request_state(model)
         state.voice_prompt = torch.randn_like(state.voice_prompt) * 0.1
         info = append_info(state, prefix=True, pcm=(torch.randn(1920) * 0.1).numpy().tobytes())
-        info["_omni_num_scheduled_tokens"] = 36
+        tokens = info["duplex_prompt_len"]
+        info["_omni_num_scheduled_tokens"] = tokens
         infos[str(index)] = info
-        expected[str(index)] = model.preprocess(torch.zeros(36, dtype=torch.long), None, **info)
+        expected[str(index)] = model.preprocess(torch.zeros(tokens, dtype=torch.long), None, **info)
     batch_sizes = []
     hook = encoder.encoder.register_forward_hook(
         lambda module, args, result: batch_sizes.append(result.last_hidden_state.shape[0]),
@@ -82,10 +83,10 @@ def test_model_preprocess_batches_audio_without_persisting_prepared_results(enco
     for request_id, info in infos.items():
         assert "prepared_audio" not in info
         _, embeddings, updates = model.preprocess(
-            torch.zeros(36, dtype=torch.long), None, **info, **prepared[request_id]
+            torch.zeros(info["duplex_prompt_len"], dtype=torch.long), None, **info, **prepared[request_id]
         )
         torch.testing.assert_close(embeddings, expected[request_id][1], atol=2e-5, rtol=2e-4)
-        assert updates["duplexio_working_state"].frames_seen == 6
+        assert updates["duplexio_working_state"].frames_seen == 3
         assert info["duplexio_model_state"].frames_seen == 0
 
 

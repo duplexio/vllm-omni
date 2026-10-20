@@ -9,6 +9,7 @@ import torch
 from vllm_omni.model_executor.models.duplexio.fastconformer import (
     FastConformerAudioStreamState,
 )
+from vllm_omni.model_executor.models.duplexio.flat_plan import Cursor
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
     DuplexIORequestState,
@@ -48,15 +49,18 @@ def test_request_state_fork_shares_immutable_prefix_and_codec_state() -> None:
         system_token_ids=(1, 2, 3),
         sampling=sampling,
         frames_seen=100_000,
-        audio_position=99_000,
-        persistent_keys=250_000,
+        cursor=Cursor(row=101_000, live_rows=99_000, bos_clocks=[1, 50], persistent_keys=250_000),
     )
 
     fork = state.fork()
     fork.frames_seen += 1
+    fork.cursor.live_rows += 1
+    fork.cursor.bos_clocks.append(99_001)
 
     assert state.frames_seen == 100_000
-    assert (fork.audio_position, fork.persistent_keys, fork.text_input_ids) == (99_000, 250_000, (0, 0, 0, 0))
+    # The cursor is the request's addressing: a failed step must not advance it.
+    assert (state.cursor.live_rows, state.cursor.bos_clocks) == (99_000, [1, 50])
+    assert (fork.cursor.persistent_keys, fork.text_input_ids) == (250_000, (0, 0, 0, 0))
     # The pinned prompt is immutable for the session, so a fork shares it.
     assert fork.voice_prompt is state.voice_prompt
     assert fork.output_mimi is codec_state

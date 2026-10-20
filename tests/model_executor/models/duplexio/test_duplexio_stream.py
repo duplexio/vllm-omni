@@ -17,6 +17,7 @@ from tests.model_executor.models.duplexio.test_duplexio_plugin import (  # noqa:
     session_config,
 )
 from vllm_omni.model_executor.models.duplexio.duplex import DuplexIOStream
+from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_POSITIONS
 from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -67,7 +68,7 @@ async def test_appends_follow_the_realtime_layout_and_collect_through_the_predic
     engine = EchoEngine(stream_tokenizer)
     stream = DuplexIOStream.open(engine, "offline", session_config())
     prefix_frames = REFERENCE_FRAMES + len(stream.runtime_config["duplexio_system_token_ids"])
-    assert stream.prefix_rows == prefix_frames and stream.max_rows == 4096
+    assert stream.prefix_rows == prefix_frames and stream.max_rows == 6 * 4096 // FRAME_POSITIONS
 
     stream.append(pcm(1))
     assert [frame_fields(output)["predicted"] for output in await stream.collect()] == [False, True]
@@ -78,9 +79,11 @@ async def test_appends_follow_the_realtime_layout_and_collect_through_the_predic
     tool = [20, 21, 22]
 
     first, second = (append["model_intermediate_buffer"]["duplex"] for append in engine.appends)
-    assert first["duplexio_prefix"] and first["frame_count"] == prefix_frames + 1
-    assert len(engine.appends[0]["prompt_token_ids"]) == (prefix_frames + 1) * 6
-    assert not second["duplexio_prefix"] and second["frame_count"] == 1 + len(tool)
+    frames = -(-prefix_frames // FRAME_POSITIONS) + 2
+    assert first["duplexio_prefix"] and first["frame_count"] == frames
+    assert len(engine.appends[0]["prompt_token_ids"]) == frames * FRAME_POSITIONS
+    # The live frame, the tool result's text frame, then a BOS frame.
+    assert not second["duplexio_prefix"] and second["frame_count"] == 3
     assert (second["duplexio_tool_token_ids"], second["duplexio_tool_generation"], second["final"]) == (tool, 1, True)
     assert first["runtime_config"]["duplexio_record_inputs"] is False
     await stream.close()

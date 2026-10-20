@@ -19,6 +19,7 @@ from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_reque
 from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext, DuplexRuntimeConfigError
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.model_executor.models.duplexio.duplex import DuplexIODuplexPlugin
+from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_POSITIONS
 from vllm_omni.model_executor.models.duplexio.frame_output import FRAME_FIELDS, frame_fields
 from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
 
@@ -246,14 +247,15 @@ async def test_first_append_carries_the_prefix_before_its_live_frame(model_confi
     plugin, runtime = await open_session(model_config)
     first = plan(plugin, runtime, seq=1)
     duplex = first["model_intermediate_buffer"]["duplex"]
-    prefix_frames = REFERENCE_FRAMES + 4
-    assert first["prompt_token_ids"] == [11] * ((prefix_frames + 1) * 6)
-    assert duplex["frame_count"] == prefix_frames + 1
+    # Prompt and system rows fill text frames, then come the BOS and the live frame.
+    frames = -(-(REFERENCE_FRAMES + 4) // FRAME_POSITIONS) + 2
+    assert first["prompt_token_ids"] == [11] * (frames * FRAME_POSITIONS)
+    assert duplex["frame_count"] == frames
     assert duplex["duplexio_prefix"]
     assert duplex["pcm"] == pcm(1, 0.5)
     assert "audio" not in duplex["payload"]
     later = plan(plugin, runtime, seq=2)
-    assert later["prompt_token_ids"] == [11] * 6
+    assert later["prompt_token_ids"] == [11] * FRAME_POSITIONS
     assert not later["model_intermediate_buffer"]["duplex"]["duplexio_prefix"]
 
 

@@ -224,7 +224,7 @@ def test_mixed_policies_return_rows_in_request_order(device):
         logits, emissions = decided_inputs(8, vocab, device, inputs)
 
         def sample(rows):
-            sampling = model.sampling_inputs([infos[index] for index in rows], logits.device)
+            sampling = model.sampling_inputs([infos[index]["duplexio_working_state"] for index in rows], logits.device)
             return model.sample_text(
                 logits[rows],
                 emissions[rows],
