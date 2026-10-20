@@ -28,10 +28,10 @@ class SamplingPolicy(BaseModel):
 
 
 class AudioPolicy(BaseModel):
-    """Temperature of the agent-audio head; absent, the checkpoint's."""
+    """Temperature of the agent-audio head; absent, the checkpoint's; zero, the flow map's noise-free frame."""
 
     model_config = ConfigDict(extra="forbid")
-    temperature: float | None = Field(default=None, gt=0)
+    temperature: float | None = Field(default=None, ge=0)
 
 
 class SamplingConfig(BaseModel):
