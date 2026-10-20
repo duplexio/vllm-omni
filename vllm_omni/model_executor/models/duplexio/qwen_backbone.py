@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Qwen3.5 backbone layers over DuplexIO's six-cell frames."""
+"""Qwen3.5 backbone layers over DuplexIO's flat sequence."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass, replace
-from itertools import accumulate
-from typing import Any, cast
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import Tensor, nn
 from vllm._custom_ops import reshape_and_cache_flash
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -34,9 +32,6 @@ from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     extract_layer_index,
 )
-from vllm.model_executor.utils import set_weight_attrs
-from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -44,129 +39,103 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend, FlashAttentionImpl
-from vllm.v1.attention.backends.gdn_attn import (
-    GDNAttentionBackend,
-    GDNAttentionMetadata,
-    GDNAttentionMetadataBuilder,
-)
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheSpec
-from vllm.vllm_flash_attn import flash_attn_varlen_func
 
-from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
+from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_POSITIONS
 from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
-    DuplexIOFrameMetadata,
     DuplexIOKVCacheSpec,
     DuplexIOKVLayout,
     make_duplexio_kv_cache_spec,
 )
-from vllm_omni.model_executor.models.duplexio.stream_attention import merge_row_attention
-from vllm_omni.model_executor.models.duplexio.stream_conv import expand_stream_conv_weight, stream_causal_conv
+from vllm_omni.model_executor.models.duplexio.stream_attention import (
+    ATTENTION_COLUMNS,
+    REQUEST,
+    SELF_KEY,
+    flat_paged_attention,
+)
 from vllm_omni.model_executor.models.duplexio.stream_gdn import (
-    append_gdn,
+    GDN_COLUMNS,
+    GDN_REQUEST_COLUMNS,
+    flat_gdn,
     gdn_cache_dtypes,
     gdn_cache_shapes,
-    prepare_gdn_inputs,
+    gdn_gates,
 )
 
+# Columns of a pass's packed per-position addressing: the RoPE row, the KV
+# write (a slot within a region, -1 for none, and the region:
+# ``flat_plan.Region``), then attention and GDN metadata.
+ROPE, WRITE, WRITE_REGION = 0, 1, 2
+ATTENTION = slice(3, 3 + ATTENTION_COLUMNS)
+GDN = slice(3 + ATTENTION_COLUMNS, 3 + ATTENTION_COLUMNS + GDN_COLUMNS)
+STEP_COLUMNS = 3 + ATTENTION_COLUMNS + GDN_COLUMNS
 
-class DuplexIORowReads:
-    """Per-row FlashAttention tables for one step, at stable device addresses.
 
-    Each row is one FlashAttention sequence of a single query position whose
-    heads are the row's six cells times the grouped query heads, so a KV page is
-    loaded once for all of them. A row reads two ranges (see
-    ``DuplexIOFrameMetadata.row_reads``): its audio window, as a table of ring
-    pages rotated to start at the window's first page, and the persistent
-    region. The audio window has a fixed width, so a frozen row's one extra
-    frame is read by slot and merged with the row's own cell.
+class FlatStep:
+    """One backbone pass's flat addressing, at stable device addresses.
+
+    The model installs a pass's positions before running it; every layer
+    reads them. A request's positions in a pass are contiguous and whole
+    frames. Uninstalled, the step is inert, for vLLM's warm-up and capture
+    runs: no position writes a key or commits a GDN step, and each frame is its
+    own request.
     """
 
-    def __init__(self, layout: DuplexIOKVLayout, max_tokens: int, device: torch.device) -> None:
-        self.layout = layout
-        rows = cdiv(max_tokens, NUM_CELLS)
-        self.window_keys = layout.audio_window_frames * layout.num_audio_cells
-        self.audio_pages = cdiv(self.window_keys + layout.block_size - 1, layout.block_size)
-        # Every step rewrites what it reads, so these buffers hold nothing across
-        # steps: like the rest of the KV cache, sleep may discard them.
-        self.cu_seqlens = torch.arange(rows + 1, dtype=torch.int32, device=device)
-        self.tables = torch.zeros(rows, layout.max_blocks, dtype=torch.int32, device=device)
-        self.audio_table = torch.zeros(rows, self.audio_pages, dtype=torch.int32, device=device)
-        self.audio_seqused = torch.zeros(rows, dtype=torch.int32, device=device)
-        self.persistent_seqused = torch.zeros(rows, dtype=torch.int32, device=device)
-        # Per row, whether its audio and its persistent read are empty. An
-        # empty read still hands FlashAttention one key, whose partial the
-        # merge then drops: FA2's grouped decode path writes an empty
-        # sequence's normalizer over other rows' normalizers.
-        self.empty = torch.ones(rows * 2, dtype=torch.bool, device=device)
-        self.extra_slots = torch.full((rows * layout.num_audio_cells,), -1, dtype=torch.long, device=device)
-        self.write_slots = torch.full((rows * NUM_CELLS,), -1, dtype=torch.long, device=device)
+    def __init__(self, max_tokens: int, device: torch.device) -> None:
+        self.positions = torch.zeros(max_tokens, STEP_COLUMNS, dtype=torch.int32, device=device)
+        self.rope = torch.zeros(max_tokens, dtype=torch.long, device=device)
+        self.requests = torch.zeros(
+            max_tokens // FRAME_POSITIONS + 1, GDN_REQUEST_COLUMNS, dtype=torch.int32, device=device
+        )
+        self.num_requests: int | None = None
+        self.reset()
 
-    def physical(self, tables: Tensor, logical: Tensor) -> Tensor:
-        """Resolve per-row logical slots through the rows' page tables, -1 where none."""
-        page_size = self.layout.block_size
-        valid = logical >= 0
-        logical = logical.clamp_min(0)
-        pages = tables.gather(1, torch.div(logical, page_size, rounding_mode="floor").long())
-        return (pages.long() * page_size + logical % page_size).masked_fill(~valid, -1)
+    def install(self, positions: Tensor, requests: Tensor) -> None:
+        """``positions`` ``(tokens, STEP_COLUMNS)`` and ``requests`` ``(requests, GDN_REQUEST_COLUMNS)`` int32."""
+        tokens = positions.shape[0]
+        self.positions[:tokens].copy_(positions)
+        self.rope[:tokens].copy_(positions[:, ROPE])
+        self.requests[: requests.shape[0]].copy_(requests)
+        self.num_requests = requests.shape[0]
 
-    def plan(
-        self,
-        frame: DuplexIOFrameMetadata,
-        query_start_loc: Tensor,
-        block_table: Tensor,
-        tokens: int,
-    ) -> None:
-        layout = self.layout
-        rows = tokens // NUM_CELLS
-        device = block_table.device
-        torch.arange(rows + 1, dtype=torch.int32, device=device, out=self.cu_seqlens[: rows + 1])
-        row_starts = self.cu_seqlens[:rows] * NUM_CELLS
-        request = torch.searchsorted(query_start_loc, row_starts, right=True, out_int32=True) - 1
-        tables = self.tables[:rows]
-        torch.index_select(block_table, 0, request.clamp_(0, block_table.shape[0] - 1), out=tables)
-        start, end, persistent = frame.row_reads(tokens)
-        # The window covers the last `window_keys` keys; whatever of the range
-        # precedes it is at most one frame.
-        windowed = torch.maximum(end - self.window_keys, start)
-        first_page = torch.div(windowed, layout.block_size, rounding_mode="floor")
-        audio = torch.where(windowed < end, end - first_page * layout.block_size, 0)
-        torch.eq(torch.stack((audio, persistent), 1), 0, out=self.empty[: rows * 2].view(rows, 2))
-        self.audio_seqused[:rows].copy_(audio.clamp_min(1))
-        pages = torch.remainder(
-            first_page[:, None] + torch.arange(self.audio_pages, device=device), layout.audio_ring_pages
+    def reset(self) -> None:
+        """Make every position inert: a no-op of its own frame's request."""
+        tokens = self.positions.shape[0]
+        self.positions.zero_()
+        self.positions[:, WRITE] = -1
+        self.positions[:, ATTENTION.start + SELF_KEY] = 1  # Each sees only its own key.
+        self.rope.zero_()
+        frames = torch.arange(self.requests.shape[0], device=self.requests.device, dtype=torch.int32)
+        self.positions[:, ATTENTION.start + REQUEST] = torch.arange(
+            tokens, device=frames.device, dtype=torch.int32
+        ).div(FRAME_POSITIONS, rounding_mode="floor")
+        self.requests.copy_(
+            torch.stack(
+                (
+                    frames * FRAME_POSITIONS,
+                    frames * FRAME_POSITIONS + FRAME_POSITIONS,
+                    frames,
+                    torch.zeros_like(frames),
+                ),
+                dim=1,
+            )
         )
-        torch.gather(tables, 1, pages, out=self.audio_table[:rows])
-        self.persistent_seqused[:rows].copy_(persistent.clamp_min(1))
-        extra = start[:, None] + torch.arange(layout.num_audio_cells, dtype=torch.int32, device=device)
-        self.extra_slots[: rows * layout.num_audio_cells].copy_(
-            self.physical(tables, torch.remainder(extra, layout.persistent_base))
-            .masked_fill(extra >= windowed[:, None], -1)
-            .flatten()
-        )
-        self.write_slots[:tokens].copy_(
-            self.physical(tables, frame.write_slots(tokens, layout).view(rows, NUM_CELLS)).flatten()
-        )
+        self.num_requests = None
+
+    def request_count(self, tokens: int) -> int:
+        return tokens // FRAME_POSITIONS if self.num_requests is None else self.num_requests
 
 
 @dataclass
 class DuplexIOAttentionMetadata:
-    """The step's request layout; row tables are planned by the first layer."""
-
-    num_actual_tokens: int
-    query_start_loc: Tensor
     block_table: Tensor
-    reads: DuplexIORowReads
-    reads_planned: bool = False
+    layout: DuplexIOKVLayout
 
 
 class DuplexIOFlashAttentionMetadataBuilder(AttentionMetadataBuilder[DuplexIOAttentionMetadata]):
-    """Hand the step's request layout to the impl.
-
-    Row tables need the step's frame, which the runner installs after metadata
-    is built, so they are planned at forward time, inside the CUDA graph when
-    one is captured.
-    """
+    """Hand the step's block table to the impl; the model's ``FlatStep`` holds all addressing."""
 
     _cudagraph_support = AttentionCGSupport.ALWAYS
 
@@ -182,11 +151,7 @@ class DuplexIOFlashAttentionMetadataBuilder(AttentionMetadataBuilder[DuplexIOAtt
             raise ValueError("DuplexIO applies its own audio window, not a sliding window")
         # vLLM settles a hybrid model's block size only after building it, so
         # the cache spec, not the model, owns the layout.
-        self.reads = DuplexIORowReads(
-            kv_cache_spec.layout,
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            device,
-        )
+        self.layout = kv_cache_spec.layout
 
     def build(
         self,
@@ -196,20 +161,14 @@ class DuplexIOFlashAttentionMetadataBuilder(AttentionMetadataBuilder[DuplexIOAtt
     ) -> DuplexIOAttentionMetadata:
         if common_prefix_len:
             raise NotImplementedError("DuplexIO attention does not support cascade prefixes")
-        common = common_attn_metadata
-        return DuplexIOAttentionMetadata(
-            num_actual_tokens=common.num_actual_tokens,
-            query_start_loc=common.query_start_loc,
-            block_table=common.block_table_tensor,
-            reads=self.reads,
-        )
+        return DuplexIOAttentionMetadata(common_attn_metadata.block_table_tensor, self.layout)
 
     def build_for_cudagraph_capture(self, common_attn_metadata: CommonAttentionMetadata) -> DuplexIOAttentionMetadata:
         return self.build(0, common_attn_metadata)
 
 
 class DuplexIOFlashAttentionImpl(FlashAttentionImpl):
-    """Paged FlashAttention over role-addressed slots, plus the query diagonal."""
+    """Paged attention of flat positions over their request's cache layout."""
 
     def forward(
         self,
@@ -227,90 +186,45 @@ class DuplexIOFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError("DuplexIO attention does not support output quantization")
         if attn_metadata is None:
             return output.fill_(0)
-        tokens = attn_metadata.num_actual_tokens
-        rows = tokens // NUM_CELLS
-        query, key, value = query[:tokens], key[:tokens], value[:tokens]
-        reads = attn_metadata.reads
-        layout = reads.layout
-        # Every layer shares the step's metadata, so the first to run plans
-        # the rows for all of them.
-        if not attn_metadata.reads_planned:
-            reads.plan(layer.frame, attn_metadata.query_start_loc, attn_metadata.block_table, tokens)
-            attn_metadata.reads_planned = True
+        tokens = query.shape[0]
+        layout = attn_metadata.layout
+        step = layer.step.positions[:tokens]
+        tables = attn_metadata.block_table
         keys, values = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        reshape_and_cache_flash(
+        key = key.view(tokens, self.num_kv_heads, self.head_size)
+        value = value.view(tokens, self.num_kv_heads, self.head_size)
+        # Region bases: the audio ring, the BOS ring, the persistent keys.
+        logical = step[:, WRITE] + torch.where(
+            step[:, WRITE_REGION] == 0,
+            0,
+            torch.where(step[:, WRITE_REGION] == 1, layout.bos_base, layout.persistent_base),
+        )
+        written = step[:, WRITE] >= 0
+        logical = logical.masked_fill(~written, 0)
+        request = step[:, ATTENTION.start + REQUEST].clamp(0, tables.shape[0] - 1)
+        pages = tables[request.long(), torch.div(logical, layout.block_size, rounding_mode="floor").long()]
+        slots = (pages.long() * layout.block_size + logical % layout.block_size).masked_fill(~written, -1)
+        reshape_and_cache_flash(key, value, keys, values, slots, self.kv_cache_dtype, layer._k_scale, layer._v_scale)
+        attended = flat_paged_attention(
+            query.view(tokens, self.num_heads, self.head_size),
             key,
             value,
             keys,
             values,
-            reads.write_slots[:tokens],
-            self.kv_cache_dtype,
-            layer._k_scale,
-            layer._v_scale,
+            tables,
+            step[:, ATTENTION],
+            scale=self.scale,
+            ring_slots=layout.ring_slots,
+            bos_base=layout.bos_base,
+            persistent_base=layout.persistent_base,
+            block_size=layout.block_size,
         )
-        # (tokens, heads) -> (rows, kv_heads * cells * groups): a KV head's
-        # grouped query heads of all six cells are consecutive.
-        packed = (
-            query.view(rows, NUM_CELLS, self.num_kv_heads, -1, self.head_size)
-            .transpose(1, 2)
-            .reshape(rows, -1, self.head_size)
-        )
-
-        def attend(
-            seqused: Tensor,
-            block_table: Tensor,
-            max_keys: int,
-            window: list[int] | None,
-        ) -> tuple[Tensor, Tensor]:
-            return flash_attn_varlen_func(
-                q=packed,
-                k=keys,
-                v=values,
-                max_seqlen_q=1,
-                cu_seqlens_q=reads.cu_seqlens[: rows + 1],
-                max_seqlen_k=max_keys,
-                seqused_k=seqused,
-                softmax_scale=self.scale,
-                causal=True,
-                window_size=window,
-                block_table=block_table,
-                return_softmax_lse=True,
-                fa_version=self.vllm_flash_attn_version,
-            )
-
-        audio, audio_lse = attend(
-            reads.audio_seqused[:rows],
-            reads.audio_table[:rows],
-            reads.audio_pages * layout.block_size,
-            [reads.window_keys - 1, 0],
-        )
-        persistent, persistent_lse = attend(
-            reads.persistent_seqused[:rows],
-            reads.tables[:rows, layout.audio_ring_pages :],
-            layout.max_persistent_keys,
-            None,
-        )
-        output[:tokens].copy_(
-            merge_row_attention(
-                query,
-                key,
-                value,
-                keys.flatten(0, 1),
-                values.flatten(0, 1),
-                reads.extra_slots[: rows * layout.num_audio_cells],
-                audio,
-                audio_lse,
-                persistent,
-                persistent_lse,
-                reads.empty[: rows * 2],
-                self.scale,
-            )
-        )
+        output[:tokens].copy_(attended.reshape(output[:tokens].shape))
         return output
 
 
 class DuplexIOFlashAttentionBackend(FlashAttentionBackend):
-    """Model-selected FlashAttention backend for DuplexIO full-attention layers."""
+    """Model-selected backend for DuplexIO full-attention layers; it writes its own keys."""
 
     forward_includes_kv_cache_update = True
 
@@ -323,8 +237,13 @@ class DuplexIOFlashAttentionBackend(FlashAttentionBackend):
         return DuplexIOFlashAttentionMetadataBuilder
 
 
-class DuplexIOGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
-    """Retain graph input buffers independently for each six-cell batch size."""
+@dataclass
+class DuplexIOGDNMetadata:
+    state_indices: Tensor  # The step's GDN cache slot per request, in batch order.
+
+
+class DuplexIOGDNAttentionMetadataBuilder(AttentionMetadataBuilder[DuplexIOGDNMetadata]):
+    """Each request's GDN cache slot, at a stable address; the model's ``FlatStep`` holds the rest."""
 
     def __init__(
         self,
@@ -334,118 +253,41 @@ class DuplexIOGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self.full_graph_metadata: dict[int, GDNAttentionMetadata] = {}
+        self.state_indices = torch.full(
+            (vllm_config.scheduler_config.max_num_seqs,), -1, dtype=torch.int32, device=device
+        )
 
     @classmethod
-    def get_cudagraph_support(
-        cls,
-        vllm_config: VllmConfig,
-        kv_cache_spec: AttentionSpec,
-    ) -> AttentionCGSupport:
+    def get_cudagraph_support(cls, vllm_config: VllmConfig, kv_cache_spec: AttentionSpec) -> AttentionCGSupport:
+        # A graph runs one program per request and stream, so it replays only
+        # batches split into requests as at capture: one frame each.
         if vllm_config.scheduler_config.max_num_seqs == 1:
             return AttentionCGSupport.ALWAYS
         return AttentionCGSupport.UNIFORM_BATCH
-
-    def is_full_graph_frame(
-        self,
-        metadata: CommonAttentionMetadata,
-    ) -> bool:
-        return metadata.max_query_len == NUM_CELLS and metadata.num_actual_tokens == NUM_CELLS * metadata.num_reqs
-
-    def refresh_full_graph_metadata(
-        self,
-        common: CommonAttentionMetadata,
-    ) -> GDNAttentionMetadata:
-        metadata = self.full_graph_metadata[common.num_reqs]
-        state_indices = mamba_get_block_table_tensor(
-            common.block_table_tensor,
-            common.seq_lens,
-            self.kv_cache_spec,
-            self.vllm_config.cache_config.mamba_cache_mode,
-        )[:, 0]
-        assert metadata.non_spec_state_indices_tensor is not None
-        metadata.non_spec_state_indices_tensor.copy_(state_indices)
-        assert metadata.has_initial_state is not None
-        has_initial_state = common.compute_num_computed_tokens() > 0
-        metadata.has_initial_state.copy_(has_initial_state)
-        assert metadata.prefill_state_indices is not None
-        metadata.prefill_state_indices.copy_(state_indices)
-        assert metadata.prefill_has_initial_state is not None
-        metadata.prefill_has_initial_state.copy_(has_initial_state)
-        return metadata
-
-    def retain_full_graph_metadata(
-        self,
-        metadata: GDNAttentionMetadata,
-    ) -> GDNAttentionMetadata:
-        assert metadata.non_spec_query_start_loc is not None
-        assert metadata.non_spec_state_indices_tensor is not None
-        assert metadata.has_initial_state is not None
-        assert metadata.chunk_indices is not None
-        assert metadata.chunk_offsets is not None
-        query_start_loc = metadata.non_spec_query_start_loc.clone()
-        state_indices = metadata.non_spec_state_indices_tensor.clone()
-        has_initial_state = metadata.has_initial_state.clone()
-        retained = replace(
-            metadata,
-            has_initial_state=has_initial_state,
-            chunk_indices=metadata.chunk_indices.clone(),
-            chunk_offsets=metadata.chunk_offsets.clone(),
-            prefill_query_start_loc=query_start_loc,
-            prefill_state_indices=state_indices,
-            prefill_has_initial_state=has_initial_state,
-            non_spec_query_start_loc=query_start_loc,
-            non_spec_state_indices_tensor=state_indices,
-        )
-        self.full_graph_metadata[state_indices.shape[0]] = retained
-        return retained
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
-        num_accepted_tokens: Tensor | None = None,
-        num_decode_draft_tokens_cpu: Tensor | None = None,
         fast_build: bool = False,
-    ) -> GDNAttentionMetadata:
-        if common_attn_metadata.num_reqs in self.full_graph_metadata and self.is_full_graph_frame(common_attn_metadata):
-            return self.refresh_full_graph_metadata(common_attn_metadata)
-        metadata = super().build(
-            common_prefix_len,
-            common_attn_metadata,
-            num_accepted_tokens,
-            num_decode_draft_tokens_cpu,
-            fast_build,
-        )
-        token_boundaries = common_attn_metadata.query_start_loc_cpu.tolist()
-        chunk_counts = [
-            ((end - start) // NUM_CELLS + 63) // 64 for start, end in zip(token_boundaries, token_boundaries[1:])
-        ]
-        chunks = [(request, chunk) for request, count in enumerate(chunk_counts) for chunk in range(count)]
-        metadata.chunk_indices = torch.tensor(
-            chunks,
-            dtype=torch.int32,
-            device=common_attn_metadata.query_start_loc.device,
-        )
-        metadata.chunk_offsets = torch.tensor(
-            list(accumulate(chunk_counts, initial=0)),
-            dtype=torch.int32,
-            device=common_attn_metadata.query_start_loc.device,
-        )
-        if self.is_full_graph_frame(common_attn_metadata):
-            return self.retain_full_graph_metadata(metadata)
-        return metadata
+    ) -> DuplexIOGDNMetadata:
+        common = common_attn_metadata
+        indices = mamba_get_block_table_tensor(
+            common.block_table_tensor,
+            common.seq_lens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )[:, 0]
+        self.state_indices[: indices.shape[0]].copy_(indices)
+        self.state_indices[indices.shape[0] :].fill_(-1)
+        return DuplexIOGDNMetadata(self.state_indices)
 
-    def build_for_cudagraph_capture(
-        self,
-        common_attn_metadata: CommonAttentionMetadata,
-    ) -> GDNAttentionMetadata:
-        assert self.is_full_graph_frame(common_attn_metadata)
+    def build_for_cudagraph_capture(self, common_attn_metadata: CommonAttentionMetadata) -> DuplexIOGDNMetadata:
         return self.build(0, common_attn_metadata)
 
 
 class DuplexIOGDNAttentionBackend(GDNAttentionBackend):
-    """GDN metadata backend for complete six-cell appends."""
+    """GDN cache slots for DuplexIO's per-stream recurrence."""
 
     @staticmethod
     def get_name() -> str:
@@ -457,11 +299,11 @@ class DuplexIOGDNAttentionBackend(GDNAttentionBackend):
 
 
 class DuplexIOPagedAttention(Attention):
-    """Attention layer that declares DuplexIO's cache layout; its impl addresses slots from ``frame``."""
+    """Attention layer that declares DuplexIO's cache layout; its impl addresses slots from ``step``."""
 
-    def __init__(self, *args: Any, frame: DuplexIOFrameMetadata, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, step: FlatStep, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.frame = frame
+        self.step = step
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         base = super().get_kv_cache_spec(vllm_config)
@@ -482,7 +324,7 @@ class DuplexIOQwenAttention(nn.Module):
         config: Any,
         *,
         vllm_config: VllmConfig,
-        frame: DuplexIOFrameMetadata,
+        step: FlatStep,
         prefix: str,
     ) -> None:
         super().__init__()
@@ -529,7 +371,7 @@ class DuplexIOQwenAttention(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.attn",
             attn_backend=DuplexIOFlashAttentionBackend,
-            frame=frame,
+            step=step,
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -554,19 +396,14 @@ class DuplexIOQwenAttention(nn.Module):
         return output
 
 
-@eager_break_during_capture
-def gdn_attention_core(mixed_qkv: Tensor, b: Tensor, a: Tensor, output: Tensor, layer_name: str) -> None:
-    """Variable-length GDN appends run eagerly between piecewise graph segments."""
-    torch.ops.vllm.qwen_gdn_attention_core(mixed_qkv, b, a, output, layer_name=layer_name)
-
-
 class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
-    """Qwen GDN with six independent causal-convolution histories."""
+    """Qwen GDN whose positions each step their own stream (``stream_gdn.flat_gdn``)."""
 
     def __init__(
         self,
         config: Any,
         vllm_config: VllmConfig,
+        step: FlatStep,
         prefix: str,
     ) -> None:
         super().__init__(
@@ -576,20 +413,9 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             gqa_interleaved_layout=False,
         )
         assert self.activation == "silu"
-        original_weight = cast(Tensor, self.conv1d.weight)
-        original_loader = cast(
-            Callable[[Tensor, Tensor], None],
-            cast(Any, original_weight).weight_loader,
-        )
-        expanded_weight = nn.Parameter(expand_stream_conv_weight(original_weight.detach()))
-
-        def weight_loader(param: Tensor, loaded_weight: Tensor) -> None:
-            original = param.new_empty((*param.shape[:-1], self.conv_kernel_size))
-            original_loader(original, loaded_weight)
-            param.data.copy_(expand_stream_conv_weight(original))
-
-        set_weight_attrs(expanded_weight, {"weight_loader": weight_loader})
-        self.conv1d.weight = expanded_weight
+        self.step = step
+        # The fused CUDA decode kernel knows one state per request, not per stream.
+        self.enable_fused_gdn_decode = False
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         return gdn_cache_dtypes(self.model_config.dtype)
@@ -608,28 +434,7 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        # Chunked by frames in every mode: the kernels read chunk indices against frame boundaries.
         return DuplexIOGDNAttentionBackend
-
-    def apply_stream_causal_conv(
-        self,
-        mixed_qkv: Tensor,
-        conv_state: Tensor,
-        state_indices: Tensor,
-        query_start_loc: Tensor,
-        has_initial_state: Tensor,
-        chunk_indices: Tensor,
-    ) -> Tensor:
-        return stream_causal_conv(
-            mixed_qkv,
-            self.conv1d.weight,
-            self.conv1d.bias,
-            conv_state,
-            state_indices,
-            query_start_loc,
-            has_initial_state,
-            chunk_indices,
-        )
 
     def _forward_core(
         self,
@@ -638,104 +443,45 @@ class DuplexIOQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         a: Tensor,
         core_attn_out: Tensor,
     ) -> None:
-        """Whole six-cell appends always use vLLM's prefill metadata."""
+        tokens = mixed_qkv.shape[0]
         metadata = get_forward_context().attn_metadata
         if metadata is None:
             # vLLM profiles before allocating request caches. Exercise the real
-            # append with temporary state so its workspace is included as well.
-            tokens = mixed_qkv.shape[0]
-            boundaries = torch.tensor((0, tokens), device=mixed_qkv.device, dtype=torch.int32)
-            state_indices = torch.zeros(1, device=mixed_qkv.device, dtype=torch.int32)
-            has_initial_state = torch.zeros(1, device=mixed_qkv.device, dtype=torch.bool)
-            blocks = torch.arange((tokens // NUM_CELLS + 63) // 64, device=mixed_qkv.device, dtype=torch.int32)
-            chunk_indices = torch.stack((torch.zeros_like(blocks), blocks), 1)
+            # kernels with a temporary slot so their workspace is included.
+            slots = torch.zeros(1, device=mixed_qkv.device, dtype=torch.int32)
             cache = tuple(
-                torch.empty((1, *shape), device=mixed_qkv.device, dtype=dtype)
+                torch.zeros((1, *shape), device=mixed_qkv.device, dtype=dtype)
                 for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype(), strict=True)
             )
+            requests = torch.tensor([[0, tokens, 0, 1]], device=mixed_qkv.device, dtype=torch.int32)
+            num_requests = 1
         else:
             assert isinstance(metadata, dict)
-            metadata = metadata[self.prefix]
-            assert isinstance(metadata, GDNAttentionMetadata)
-            assert metadata.spec_sequence_masks is None
-            assert metadata.num_decodes == 0
-            state_indices = metadata.prefill_state_indices
-            has_initial_state = metadata.prefill_has_initial_state
-            boundaries = metadata.prefill_query_start_loc
-            chunk_indices = metadata.chunk_indices
-            tokens = metadata.num_actual_tokens
+            gdn_metadata = metadata[self.prefix]
+            assert isinstance(gdn_metadata, DuplexIOGDNMetadata)
+            slots = gdn_metadata.state_indices
             cache = self.kv_cache
-        assert state_indices is not None and has_initial_state is not None
-        assert boundaries is not None and chunk_indices is not None
+            num_requests = self.step.request_count(tokens)
+            requests = self.step.requests[:num_requests]
         conv_state, recurrent_state = cache
         if not is_conv_state_dim_first():
             conv_state = conv_state.transpose(-1, -2)
-        mixed_qkv = self.apply_stream_causal_conv(
-            mixed_qkv[:tokens],
+        g, beta = gdn_gates(a[:tokens], b[:tokens], self.A_log, self.dt_bias)
+        core_attn_out[:tokens] = flat_gdn(
+            mixed_qkv,
+            self.conv1d.weight.squeeze(1),
+            g,
+            beta,
             conv_state,
-            state_indices,
-            boundaries,
-            has_initial_state,
-            chunk_indices,
-        )
-        q, k, v, g, beta = prepare_gdn_inputs(
-            qkv=mixed_qkv,
-            a=a[:tokens],
-            b=b[:tokens],
-            a_log=self.A_log,
-            dt_bias=self.dt_bias,
+            recurrent_state,
+            slots,
+            self.step.positions[:tokens, GDN],
+            requests,
+            num_requests,
             key_heads=self.num_k_heads // self.tp_size,
             key_dim=self.head_k_dim,
             value_dim=self.head_v_dim,
         )
-        core_attn_out[:tokens] = append_gdn(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            recurrent_state,
-            state_indices,
-            boundaries,
-            has_initial_state,
-            chunk_indices,
-        )
-
-    def forward_with_key_activity(
-        self,
-        hidden_states: Tensor,
-        key_active: Tensor,
-    ) -> Tensor:
-        num_tokens = hidden_states.shape[0]
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        projected_ba, _ = self.in_proj_ba(hidden_states)
-        beta_logits, decay_logits = self.split_ba(projected_ba)
-        beta_logits = beta_logits.contiguous()
-        decay_logits = decay_logits.contiguous()
-        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-        z_size = self.value_dim // self.tp_size
-        mixed_qkv, output_gate = mixed_qkvz.split(
-            [qkv_size, z_size],
-            dim=-1,
-        )
-        output_gate = output_gate.reshape(num_tokens, -1, self.head_v_dim)
-        # Inactive cells must not touch the recurrent state: beta = sigmoid(-inf)
-        # and the softplus-derived decay of -inf are both exactly zero.
-        inactive = ~key_active.unsqueeze(-1)
-        beta_logits = beta_logits.masked_fill(inactive, -torch.inf)
-        decay_logits = decay_logits.masked_fill(inactive, -torch.inf)
-        core_output = hidden_states.new_zeros(
-            num_tokens,
-            self.num_v_heads // self.tp_size,
-            self.head_v_dim,
-        )
-        gdn_attention_core(mixed_qkv, beta_logits, decay_logits, core_output, _encode_layer_name(self.prefix))
-        normalized = self.norm(
-            core_output.reshape(-1, self.head_v_dim),
-            output_gate.reshape(-1, self.head_v_dim),
-        ).view(num_tokens, -1)
-        output, _ = self.out_proj(normalized)
-        return output
 
 
 class DuplexIOQwenDecoderLayer(nn.Module):
@@ -745,7 +491,7 @@ class DuplexIOQwenDecoderLayer(nn.Module):
         self,
         vllm_config: VllmConfig,
         layer_type: str,
-        frame: DuplexIOFrameMetadata,
+        step: FlatStep,
         prefix: str,
     ) -> None:
         super().__init__()
@@ -756,13 +502,14 @@ class DuplexIOQwenDecoderLayer(nn.Module):
             self.linear_attn = DuplexIOQwenGatedDeltaNetAttention(
                 config,
                 vllm_config,
+                step,
                 prefix=f"{prefix}.linear_attn",
             )
         elif layer_type == "full_attention":
             self.self_attn = DuplexIOQwenAttention(
                 config,
                 vllm_config=vllm_config,
-                frame=frame,
+                step=step,
                 prefix=f"{prefix}.self_attn",
             )
         else:
@@ -782,7 +529,6 @@ class DuplexIOQwenDecoderLayer(nn.Module):
         hidden_states: Tensor,
         residual: Tensor | None,
         positions: Tensor,
-        key_active: Tensor,
     ) -> tuple[Tensor, Tensor]:
         if residual is None:
             residual = hidden_states
@@ -790,10 +536,7 @@ class DuplexIOQwenDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         if self.layer_type == "linear_attention":
-            hidden_states = self.linear_attn.forward_with_key_activity(
-                hidden_states,
-                key_active,
-            )
+            hidden_states = self.linear_attn(hidden_states)
         else:
             hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(
@@ -807,7 +550,6 @@ class DuplexIOQwenDecoderLayer(nn.Module):
 @support_torch_compile(
     dynamic_arg_dims={
         "positions": 0,
-        "key_active": 0,
         "inputs_embeds": 0,
     }
 )
@@ -825,9 +567,9 @@ class DuplexIOQwenModel(nn.Module):
             self.vocab_size,
             config.hidden_size,
         )
-        # One frame of cell addressing, shared by every full-attention layer and
-        # filled by the runner before each step.
-        self.frame = DuplexIOFrameMetadata(
+        # One pass's flat addressing, shared by every layer and installed by
+        # the model before each backbone pass.
+        self.step = FlatStep(
             vllm_config.scheduler_config.max_num_batched_tokens,
             vllm_config.device_config.device,
         )
@@ -837,7 +579,7 @@ class DuplexIOQwenModel(nn.Module):
             return DuplexIOQwenDecoderLayer(
                 vllm_config,
                 config.layer_types[layer_index],
-                self.frame,
+                self.step,
                 prefix,
             )
 
@@ -850,7 +592,6 @@ class DuplexIOQwenModel(nn.Module):
     def forward(
         self,
         positions: Tensor,
-        key_active: Tensor,
         inputs_embeds: Tensor,
     ) -> Tensor:
         hidden_states, residual = inputs_embeds, None
@@ -859,7 +600,6 @@ class DuplexIOQwenModel(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
-                key_active=key_active,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -872,6 +612,7 @@ class DuplexIOQwenModel(nn.Module):
 
 
 __all__ = [
+    "FlatStep",
     "DuplexIOFlashAttentionBackend",
     "DuplexIOFlashAttentionMetadataBuilder",
     "DuplexIOGDNAttentionBackend",

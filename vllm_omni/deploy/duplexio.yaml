@@ -14,13 +14,12 @@ stages:
   - stage_id: 0
     devices: "0"
     max_num_seqs: 1
-    # Retained text capacity: four text KV slots per six scheduler positions
-    # (49152 text slots). Audio and voice KV occupy separate fixed regions;
-    # elapsed audio frames do not consume this budget. Each append also
-    # needs scheduling headroom within max_model_len.
+    # Persistent KV capacity: one slot per token and voice-prompt row. Audio
+    # KV occupies fixed rings; elapsed audio frames do not consume this
+    # budget. Each append also needs scheduling headroom within max_model_len.
     max_model_len: 73728
-    # Scheduler chunks contain whole six-cell frames across all streams.
-    max_num_batched_tokens: 6144
+    # Scheduler chunks contain whole five-position frames.
+    max_num_batched_tokens: 6140
     # Without this the hybrid cache would derive 528 tokens per page from the
     # mamba state size. 1024 spans the same slots in fewer, larger pages.
     block_size: 1024
@@ -30,8 +29,8 @@ stages:
     enforce_eager: false
     async_scheduling: false
     compilation_config:
-      # With max_num_seqs=1, every live append is one uniform six-cell frame.
+      # With max_num_seqs=1, every live append is one uniform five-position frame.
       # Larger system/tool prefills run eagerly outside this graph.
       cudagraph_mode: FULL_DECODE_ONLY
-      cudagraph_capture_sizes: [6]
+      cudagraph_capture_sizes: [5]
       cudagraph_copy_inputs: true

@@ -5,7 +5,7 @@
 Every append is one 80 ms client (or silence) frame. The first append of an
 epoch also carries the pinned voice prompt and system tokens before that
 frame, and a pending tool result follows it as text rows. The worker samples
-once, at the append's last row.
+once, at the append's last frame (``flat_plan.append_frames``).
 """
 
 from __future__ import annotations
@@ -33,7 +33,8 @@ from vllm_omni.engine.duplex.plugin import (
 from vllm_omni.model_executor.common.duplex.payload import decode_pcm_f32le_payload
 from vllm_omni.model_executor.common.duplex.pcm_buffer import FixedFramePcmAppendBuffer
 from vllm_omni.model_executor.models.duplexio.duplex.data_plane import DuplexIODataPlane
-from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_SIZE, NUM_CELLS, SAMPLE_RATE
+from vllm_omni.model_executor.models.duplexio.flat_plan import append_frame_count
+from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_POSITIONS, FRAME_SIZE, SAMPLE_RATE
 from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
 from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
 from vllm_omni.model_executor.models.duplexio.tool_calling import tool_call_grammar
@@ -99,17 +100,18 @@ def append_fields(
     """Scheduler slots and worker fields of one append.
 
     Rows are ``[voice prompt + system tokens if prefix] + [live frame] +
-    [tool-result tokens]``, six scheduler slots each. A ``given_frame`` replays
+    [tool-result tokens]``, laid out as whole frames of ``FRAME_POSITIONS``
+    scheduler slots (``flat_plan.append_frames``). A ``given_frame`` replays
     conversation history: the live frame hears its tokens and agent audio instead
     of the model's last prediction. Given frames must lead the conversation.
     """
-    prefix_frames = (
-        runtime_config["duplexio_voice_prompt_frames"] + len(runtime_config["duplexio_system_token_ids"])
-        if prefix
-        else 0
+    frame_count = append_frame_count(
+        runtime_config["duplexio_voice_prompt_frames"],
+        len(runtime_config["duplexio_system_token_ids"]),
+        len(tool_token_ids),
+        prefix=prefix,
     )
-    frame_count = prefix_frames + 1 + len(tool_token_ids)
-    prompt_token_ids = [runtime_config["duplexio_scheduler_token_id"]] * (frame_count * NUM_CELLS)
+    prompt_token_ids = [runtime_config["duplexio_scheduler_token_id"]] * (frame_count * FRAME_POSITIONS)
     return prompt_token_ids, {
         "pcm": pcm,
         "frame_count": frame_count,

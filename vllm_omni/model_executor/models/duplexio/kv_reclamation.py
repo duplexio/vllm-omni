@@ -8,8 +8,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
 
-import torch
-from torch import Tensor
 from typing_extensions import Self
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.utils.math_utils import cdiv
@@ -21,20 +19,29 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS, NUM_TEXT_CELLS
+from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_POSITIONS
 
 
 @dataclass(frozen=True)
 class DuplexIOKVLayout:
-    """Physical slots owned by one admitted DuplexIO request.
+    """Physical slots owned by one admitted DuplexIO request, in three regions.
 
-    The first region is a ring for active audio cells: frame ``f`` (from one)
-    puts cell ``c`` at logical slot ``2 * (f - 1) + c``, stored modulo the
-    region's size, so the window a row reads is one contiguous logical range
-    that wraps whole pages. The second holds the keys no window expires, in the
-    order they were written: the pinned voice prompt, then every emitted text
-    cell. It is never reclaimed during the request. Query-local self-attention
-    uses incoming K/V directly and needs no cache slots.
+    Each region is addressed by a logical slot that only grows; the rings
+    store it modulo their size, so what a position reads of a region is one
+    contiguous logical range.
+
+    - The audio ring holds live audio keys: live frame ``f`` (from one) puts
+      its user cell at ``2 * (f - 1)`` and its agent cell one after.
+    - The BOS ring holds BOS frames' audio keys: BOS frame ``b`` (from zero)
+      puts its cells at ``2 * b`` and ``2 * b + 1``.
+    - The persistent region holds the keys no window expires, in write order:
+      every token and the pinned voice prompt.
+
+    A key with audio clock ``k`` stays visible to a position with clock ``q``
+    while ``q - k <= audio_window_frames``. A live frame writes its own frame
+    while it reads the window before it, so each ring keeps the last
+    ``audio_window_frames + 1`` frames; BOS frames decide distinct live rows,
+    so no more of them fit a window either. Queries and no-ops write nothing.
     """
 
     block_size: int
@@ -42,136 +49,26 @@ class DuplexIOKVLayout:
     max_model_len: int
 
     @property
-    def max_frames(self) -> int:
-        return self.max_model_len // NUM_CELLS
+    def ring_slots(self) -> int:
+        return 2 * (self.audio_window_frames + 1)
 
     @property
-    def audio_ring_frames(self) -> int:
-        # A live row writes its own frame while it reads the window before it.
-        return min(self.audio_window_frames + 1, self.max_frames)
-
-    @property
-    def audio_slots(self) -> int:
-        return self.audio_ring_frames * self.num_audio_cells
-
-    @property
-    def num_audio_cells(self) -> int:
-        return NUM_CELLS - NUM_TEXT_CELLS
+    def bos_base(self) -> int:
+        return cdiv(self.ring_slots, self.block_size) * self.block_size
 
     @property
     def persistent_base(self) -> int:
-        return cdiv(self.audio_slots, self.block_size) * self.block_size
-
-    @property
-    def audio_ring_pages(self) -> int:
-        return self.persistent_base // self.block_size
+        return self.bos_base + cdiv(self.ring_slots, self.block_size) * self.block_size
 
     @property
     def max_persistent_keys(self) -> int:
-        # A row writes at most four persistent keys: its text cells, or one
-        # voice-prompt key.
-        return self.max_frames * NUM_TEXT_CELLS
-
-    @property
-    def max_compact_slots(self) -> int:
-        return self.persistent_base + self.max_persistent_keys
+        # The scheduler retains one slot per persistent key (see the model's
+        # streaming_retained_tokens), so max_model_len bounds them.
+        return self.max_model_len
 
     @property
     def max_blocks(self) -> int:
-        return cdiv(self.max_compact_slots, self.block_size)
-
-
-class DuplexIOFrameMetadata:
-    """Per-token cache addressing for one model step.
-
-    A cell's slot decides its position, so nothing has to be stored alongside
-    the key: an audio slot follows its frame, a persistent slot is dense in
-    write order. What a row reads is therefore two ranges, one per region. One
-    instance is shared by every full-attention layer, which keeps the addressing
-    of writes and reads in one place.
-
-    Buffers are sized for the largest batch and keep stable addresses for
-    CUDA-graph replay. Whatever the current batch does not cover stays inert,
-    so padded graph tokens neither write a slot nor see a key.
-    """
-
-    def __init__(self, max_tokens: int, device: torch.device) -> None:
-        self.cell = torch.arange(max_tokens, device=device) % NUM_CELLS
-        self.positions = torch.arange(max_tokens, device=device)
-        self.key_active = torch.ones(max_tokens, dtype=torch.bool, device=device)
-        self.persistent_ordinal = torch.zeros(max_tokens, dtype=torch.int32, device=device)
-        self.persistent_last = torch.zeros(max_tokens, dtype=torch.int32, device=device)
-        self.audio_first = torch.ones(max_tokens, dtype=torch.int32, device=device)
-        self.audio_last = torch.full((max_tokens,), -1, dtype=torch.int32, device=device)
-        self.filled = 0
-
-    def update(
-        self,
-        *,
-        key_active: Tensor,
-        persistent_ordinal: Tensor,
-        persistent_last: Tensor,
-        audio_first: Tensor,
-        audio_last: Tensor,
-    ) -> None:
-        """Install this step's cells, one row of each tensor per token."""
-        tokens = key_active.shape[0]
-        if tokens < self.filled:
-            self.reset(tokens, self.filled)
-        self.filled = tokens
-        self.key_active[:tokens].copy_(key_active)
-        self.persistent_ordinal[:tokens].copy_(persistent_ordinal)
-        self.persistent_last[:tokens].copy_(persistent_last)
-        self.audio_first[:tokens].copy_(audio_first)
-        self.audio_last[:tokens].copy_(audio_last)
-
-    def reset(self, start: int = 0, end: int | None = None) -> None:
-        """Make tokens inert: no slot to write, no key in the window."""
-        region = slice(start, end)
-        self.key_active[region] = True
-        self.positions[region] = 0
-        self.persistent_ordinal[region] = 0
-        self.persistent_last[region] = 0
-        self.audio_first[region] = 1
-        self.audio_last[region] = -1
-        self.filled = min(self.filled, start)
-
-    def write_slots(self, tokens: int, layout: DuplexIOKVLayout) -> Tensor:
-        """Compact slot per cell in ``layout``, -1 for cells that must not enter the cache.
-
-        Live audio cells land on their own frame, one past the last frame they
-        see. Emitted text and pinned voice-prompt cells land on their persistent
-        ordinal; any other cell has ordinal zero. An audio time below zero marks
-        an inert padded token, which is skipped.
-        """
-        cell = self.cell[:tokens]
-        audio_last = self.audio_last[:tokens]
-        ordinal = self.persistent_ordinal[:tokens]
-        persistent = ordinal > 0
-        audio = (cell >= NUM_TEXT_CELLS) & self.key_active[:tokens] & (audio_last >= 0)
-        audio_slot = torch.remainder(
-            audio_last * layout.num_audio_cells + cell - NUM_TEXT_CELLS,
-            layout.persistent_base,
-        )
-        return torch.where(persistent, layout.persistent_base + ordinal - 1, audio_slot).masked_fill(
-            ~(persistent | audio), -1
-        )
-
-    def row_reads(self, tokens: int) -> tuple[Tensor, Tensor, Tensor]:
-        """Return what each row of the step reads from the cache.
-
-        Rows are whole frames, and every cell of a row reads the same keys:
-        logical audio slots ``[start, end)`` before the ring modulus, and the
-        first ``persistent`` keys of the persistent region. Audio is frames
-        ``audio_first..audio_last``; a live row writes the frame after its last,
-        and its own cell is merged separately, so nothing a step writes is read
-        back. An inert padded row reads nothing.
-        """
-        cells = NUM_CELLS - NUM_TEXT_CELLS
-        audio_last = self.audio_last[:tokens:NUM_CELLS]
-        end = (audio_last * cells).clamp_min(0)
-        start = torch.minimum((self.audio_first[:tokens:NUM_CELLS] - 1) * cells, end)
-        return start, end, self.persistent_last[:tokens:NUM_CELLS]
+        return cdiv(self.persistent_base + self.max_persistent_keys, self.block_size)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -294,7 +191,7 @@ def make_duplexio_kv_cache_spec(
     """Convert an Attention-produced full spec to DuplexIO's compact spec."""
     if base.kv_quant_mode != KVQuantMode.NONE:
         raise ValueError("DuplexIO attention does not support quantized KV cache")
-    if max_model_len < NUM_CELLS:
+    if max_model_len < FRAME_POSITIONS:
         raise ValueError("DuplexIO max_model_len must fit at least one frame")
     if base.block_size % 16:
         raise ValueError(
@@ -318,7 +215,6 @@ def make_duplexio_kv_cache_spec(
 
 
 __all__ = [
-    "DuplexIOFrameMetadata",
     "DuplexIOKVCacheManager",
     "DuplexIOKVCacheSpec",
     "DuplexIOKVLayout",

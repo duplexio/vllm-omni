@@ -25,7 +25,7 @@ from vllm_omni.model_executor.models.duplexio.duplex.plugin import (
     stage_sampling_params,
     tool_result_token_ids,
 )
-from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
+from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_POSITIONS
 from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
 
 if TYPE_CHECKING:
@@ -50,8 +50,9 @@ class DuplexIOStream:
         self.request_id = request_id
         self.timeout = timeout
         self.tokenizer = cached_tokenizer_from_config(engine.model_config)
-        # Rows one request can hold: prefix, live frames and tool results.
-        self.max_rows = engine.model_config.max_model_len // NUM_CELLS
+        # Rows one request can surely hold: a row takes at most one frame's
+        # worth of max_model_len (its tokens' persistent KV slots).
+        self.max_rows = engine.model_config.max_model_len // FRAME_POSITIONS
         self.inputs: asyncio.Queue[StreamingInput] = asyncio.Queue()
         self.appends = 0
         self.tool_generation = 0
