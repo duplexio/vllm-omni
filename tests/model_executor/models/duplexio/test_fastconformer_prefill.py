@@ -357,26 +357,23 @@ def test_tool_burst_leaves_real_asr_continuation_unchanged(encoder: FastConforme
     from tests.model_executor.models.duplexio.test_bulk_prefill import (
         append_info,
         model_fixture,
+        preprocess,
         request_state,
     )
 
     model = model_fixture()
     model.user_asr = encoder
     model.user_audio_input_adapter = torch.nn.Linear(encoder.output_dim, 11)
-    _, _, update = model.preprocess(
-        torch.zeros(36, dtype=torch.long), None, **append_info(request_state(model), prefix=True)
-    )
+    _, update, _ = preprocess(model, append_info(request_state(model), prefix=True))
     before = update["duplexio_working_state"]
     live = (torch.randn(1920) * 0.1).numpy().tobytes()
-    _, _, update = model.preprocess(torch.zeros(6, dtype=torch.long), None, **append_info(before, pcm=live))
+    _, update, _ = preprocess(model, append_info(before, pcm=live))
     plain = update["duplexio_working_state"]
-    _, _, update = model.preprocess(
-        torch.zeros(24, dtype=torch.long), None, **append_info(before, tool=(6, 7, 8), pcm=live)
-    )
+    _, update, _ = preprocess(model, append_info(before, tool=(6, 7, 8), pcm=live))
     after_tool = update["duplexio_working_state"]
     waveform = (torch.randn(1920) * 0.1).numpy().tobytes()
     continuations = []
     for state in (plain, after_tool):
-        _, _, update = model.preprocess(torch.zeros(6, dtype=torch.long), None, **append_info(state, pcm=waveform))
-        continuations.append(update["duplexio_replay"]["user_features"])
+        _, _, replay = preprocess(model, append_info(state, pcm=waveform))
+        continuations.append(replay["user_features"])
     torch.testing.assert_close(*continuations, atol=0, rtol=0)

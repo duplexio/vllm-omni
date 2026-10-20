@@ -1094,8 +1094,13 @@ class DuplexIOForConditionalGeneration(
             "text_ids": _to_device([ids for ids, _, _, _, _ in rows], torch.long, device).view(
                 -1, len(TEXT_STREAM_NAMES)
             ),
-            "user_features": torch.stack([zero_user if value is None else value.float() for value in user]),
-            "agent_audio": torch.stack([zero_agent if value is None else value.float() for value in agent]),
+            # A slice of only a BOS frame records no row.
+            "user_features": torch.stack([zero_user if value is None else value.float() for value in user])
+            if rows
+            else zero_user.new_zeros(0, zero_user.numel()),
+            "agent_audio": torch.stack([zero_agent if value is None else value.float() for value in agent])
+            if rows
+            else zero_agent.new_zeros(0, LATENT_DIM),
             "audio_mask": _to_device([live for *_, live, _ in rows], torch.bool, device),
             "prompt_frames": _to_device([prompt for *_, prompt in rows], torch.bool, device),
         }

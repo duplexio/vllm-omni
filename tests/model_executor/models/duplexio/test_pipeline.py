@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from vllm_omni.config.stage_config import load_deploy_config
+from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_POSITIONS
 from vllm_omni.model_executor.models.duplexio.pipeline import DUPLEXIO_PIPELINE
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -19,15 +20,15 @@ def test_default_deploy_pins_the_kv_page_size() -> None:
     deploy = load_deploy_config(DEPLOY_DIR / "duplexio.yaml")
     stage = deploy.stages[0]
 
-    # 12288 frames of six cells: a 16-minute session, past the model's
-    # 4096-frame audio window so the audio ring actually recycles slots.
-    assert stage.max_model_len == 12288 * 6
-    assert stage.max_num_batched_tokens == 1024 * 6
+    # Persistent KV for 73728 tokens and voice-prompt rows; audio lives in fixed rings.
+    assert stage.max_model_len == 73728
+    # Budgets are whole five-position frames, so no frame is split across steps.
+    assert stage.max_num_batched_tokens == 1228 * FRAME_POSITIONS
     assert deploy.enable_chunked_prefill
     assert not stage.enforce_eager
     assert stage.compilation_config == {
         "cudagraph_mode": "FULL_DECODE_ONLY",
-        "cudagraph_capture_sizes": [6],
+        "cudagraph_capture_sizes": [FRAME_POSITIONS],
         "cudagraph_copy_inputs": True,
     }
     # The hybrid cache would otherwise derive the page from the mamba state size.
@@ -41,7 +42,7 @@ def test_multistream_deploy_batches_two_sessions() -> None:
     assert deploy.active_stream_window == 2
     assert deploy.duplex_session.max_sessions == 2
     assert stage.max_num_seqs == 2
-    assert stage.max_num_batched_tokens == 1024 * 6
+    assert stage.max_num_batched_tokens == 1228 * FRAME_POSITIONS
     assert deploy.enable_chunked_prefill
     assert not stage.enforce_eager
     assert stage.compilation_config == {"cudagraph_mode": "NONE"}

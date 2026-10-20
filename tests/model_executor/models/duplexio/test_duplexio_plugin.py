@@ -291,7 +291,8 @@ async def test_tool_results_follow_one_live_frame_once_then_retire(model_config)
     duplex = first["model_intermediate_buffer"]["duplex"]
     assert duplex["duplexio_tool_token_ids"] == [20, 21, 22, 23, 24]
     assert duplex["duplexio_tool_generation"] == 2
-    assert len(first["prompt_token_ids"]) == 6 * 6
+    # The live frame, the five result tokens as one text frame, then the BOS frame deciding the next row.
+    assert len(first["prompt_token_ids"]) == 3 * FRAME_POSITIONS
     # A pipelined append planned before the worker reports them must not feed them again.
     assert plan(plugin, runtime, seq=3)["model_intermediate_buffer"]["duplex"]["duplexio_tool_token_ids"] == []
     # Another stage request (a new epoch) has not been fed them.
