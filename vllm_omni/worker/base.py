@@ -210,7 +210,12 @@ class OmniGPUWorkerBase(GPUWorker):
         gc.collect()
 
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
-        offload_tags = ("weights",) if level == 1 else tuple()
+        # Level 1 offloads the kv_cache pool too (upstream discards it): attention
+        # metadata builders are constructed inside the pooled initialize_kv_cache,
+        # so the pool holds persistent constants baked into captured FULL
+        # cudagraphs. Discarding maps garbage into them at wake-up; graph replay
+        # then reads phantom KV blocks. Offloading restores every pool byte.
+        offload_tags = ("weights", "kv_cache") if level == 1 else tuple()
         allocator = CuMemAllocator.get_instance()
         allocator.sleep(offload_tags=offload_tags)
         # allocator.sleep already gc.collects and empty_cache()s. A second
