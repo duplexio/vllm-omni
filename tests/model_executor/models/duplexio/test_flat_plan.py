@@ -27,16 +27,18 @@ from vllm_omni.model_executor.models.duplexio.frame_layout import (
 
 
 def test_append_frames_are_whole_frames_ending_in_their_decision() -> None:
-    first = append_frames(3, (11, 12, 13), (), prefix=True)
-    assert [frame.kind for frame in first] == [FrameKind.TEXT, FrameKind.TEXT, FrameKind.BOS, FrameKind.LIVE]
-    assert first[0].entries == ((PROMPT, 0), (PROMPT, 1), (PROMPT, 2), (SYSTEM, 11), (SYSTEM, 12))
-    assert first[1].entries == ((SYSTEM, 13),)
-    tool = append_frames(0, (), tuple(range(7)), prefix=False)
+    # The opening: prompt and system rows as text frames, then the BOS frame deciding live row 0.
+    opening = append_frames(3, (11, 12, 13), (), opening=True)
+    assert [frame.kind for frame in opening] == [FrameKind.TEXT, FrameKind.TEXT, FrameKind.BOS]
+    assert opening[0].entries == ((PROMPT, 0), (PROMPT, 1), (PROMPT, 2), (SYSTEM, 11), (SYSTEM, 12))
+    assert opening[1].entries == ((SYSTEM, 13),)
+    tool = append_frames(0, (), tuple(range(7)), opening=False)
     assert [frame.kind for frame in tool] == [FrameKind.LIVE, FrameKind.TEXT, FrameKind.TEXT, FrameKind.BOS]
-    assert [frame.kind for frame in append_frames(0, (), (), prefix=False)] == [FrameKind.LIVE]
-    for prompt, system, tools, prefix in ((3, 3, 0, True), (125, 40, 0, True), (0, 0, 7, False), (0, 0, 0, False)):
-        frames = append_frames(prompt, tuple(range(system)), tuple(range(tools)), prefix=prefix)
-        assert append_frame_count(prompt, system, tools, prefix=prefix) == len(frames)
+    assert [frame.kind for frame in append_frames(0, (), (), opening=False)] == [FrameKind.LIVE]
+    assert [frame.kind for frame in append_frames(0, (), (), opening=True)] == [FrameKind.BOS]
+    for prompt, system, tools, opening in ((3, 3, 0, True), (125, 40, 7, True), (0, 0, 7, False), (0, 0, 0, False)):
+        frames = append_frames(prompt, tuple(range(system)), tuple(range(tools)), opening=opening)
+        assert append_frame_count(prompt, system, tools, opening=opening) == len(frames)
 
 
 def reference_visibility(entries, window):

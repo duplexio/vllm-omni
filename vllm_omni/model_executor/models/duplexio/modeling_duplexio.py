@@ -205,6 +205,7 @@ class PreparedAudio:
     """One scheduled slice of an append, with its audio encoded.
 
     An append's frames are ``flat_plan.append_frames``; the slice is whole frames.
+    The opening append holds no live frame.
     """
 
     state: DuplexIORequestState
@@ -238,38 +239,9 @@ class PassInputs:
     agent_sources: list[Tensor] = field(default_factory=list)
 
 
-@dataclass
-class StepPlan:
-    """A step's requests and the work its forward does beyond the installed first pass.
-
-    A request whose slice holds a BOS frame followed by a sampled live frame
-    runs the live frame in a second pass, after the BOS frame's decision is
-    drawn (``second``: request index to its slice's frame index). A slice that
-    ends with such a BOS frame draws the decision after the step (``tail``).
-    """
-
-    states: list[DuplexIORequestState]
-    audio: list[PreparedAudio]
-    spans: list[tuple[int, int]]  # Scheduled token span per request.
-    first: PassInputs
-    second: dict[int, int]
-    tail: list[int]
-    replays: list[ReplayRows | None]
-
-
 REPLAY_NAMES = ("text_ids", "user_features", "agent_audio", "audio_mask", "prompt_frames")
-
-
-class ReplayRows:
-    """The rows an append slice fed, for clients that replay trajectories: rows, not positions.
-
-    A row is ``(text ids by stream, user features or None, agent latent or None, live, prompt)``.
-    Not a dict, so the runner's request buffer holds it by reference while the
-    forward adds the rows it plans late.
-    """
-
-    def __init__(self) -> None:
-        self.rows: list[tuple[tuple[int, ...], Tensor | None, Tensor | None, bool, bool]] = []
+# A recorded input row: text ids by stream, user features or None, agent latent or None, live, prompt.
+ReplayRow = tuple[tuple[int, ...], Tensor | None, Tensor | None, bool, bool]
 
 
 class FrameInputGraph:
@@ -383,9 +355,9 @@ class DuplexIOForConditionalGeneration(
         self.channel_emb = nn.Parameter(torch.zeros(len(TEXT_STREAM_NAMES), hidden_size))
         # The learned BOS audio cells and queries, by flat slot.
         self.flat_cell_emb = nn.Parameter(torch.zeros(SLOT_COUNT, hidden_size))
-        # Every backbone pass's flat addressing, installed before it runs.
+        # The step's flat addressing, installed before the backbone runs.
         self.step = self.model.step
-        self.step_plan: StepPlan | None = None
+        self.step_inputs: PassInputs | None = None
         adapter_hidden_size = config.audio_adapter_config.get("hidden_size") or hidden_size
         self.user_asr = FastConformerEncoder.from_checkpoint(
             config.user_asr_config,
@@ -476,11 +448,11 @@ class DuplexIOForConditionalGeneration(
         self,
         request_infos: list[dict[str, Any]],
     ) -> None:
-        """Install the step's first backbone pass at stable device addresses; without requests, an inert one."""
-        if not request_infos or self.step_plan is None:
+        """Install the step's positions at stable device addresses; without requests, an inert step."""
+        if not request_infos or self.step_inputs is None:
             self.step.reset()
             return
-        self.install_pass(self.step_plan.first)
+        self.install_pass(self.step_inputs)
 
     def install_pass(self, inputs: PassInputs) -> None:
         """Upload one pass's addressing (``qwen_backbone.STEP_COLUMNS``) into the shared step."""
@@ -538,13 +510,14 @@ class DuplexIOForConditionalGeneration(
                 prompt_rows,
                 state.system_token_ids,
                 tuple(duplex["duplexio_tool_token_ids"]),
-                prefix=prefix,
+                opening=prefix,
             )
             if len(state.frames) != append_frame_count:
                 raise ValueError("DuplexIO append frames do not match its prefix, live frame and tool result")
         state.frames_seen += frame_count
-        (live,) = (index for index, frame in enumerate(state.frames) if frame.kind == FrameKind.LIVE)
-        live_frame = live - frame_start if frame_start <= live < frame_end else None
+        # The opening append decides live row 0 and holds no live frame.
+        live = next((index for index, frame in enumerate(state.frames) if frame.kind == FrameKind.LIVE), None)
+        live_frame = live - frame_start if live is not None and frame_start <= live < frame_end else None
         given = duplex["duplexio_given_frame"]
         if live_frame is not None:
             if given is None:
@@ -705,7 +678,7 @@ class DuplexIOForConditionalGeneration(
         row: int,
         item: PreparedAudio,
         frames: list[Frame],
-        replay: ReplayRows | None,
+        replay: list[ReplayRow] | None,
     ) -> None:
         """Lay one request's frames out into ``inputs``, advancing its cursor."""
         state = item.state
@@ -731,7 +704,7 @@ class DuplexIOForConditionalGeneration(
                 if feature is None:
                     feature = self.channel_emb.new_zeros(self.user_asr.output_dim)
                 if replay is not None:
-                    replay.rows.append(((silence, *tokens), feature, latent, True, False))
+                    replay.append(((silence, *tokens), feature, latent, True, False))
             else:
                 positions = planner.plan(frame)
                 feature = latent = None
@@ -754,9 +727,9 @@ class DuplexIOForConditionalGeneration(
                     if stream == PROMPT:
                         latents = item.prompt_latents
                         assert latents is not None
-                        replay.rows.append(((silence, *quiet), None, latents[value - item.prompt_start], False, True))
+                        replay.append(((silence, *quiet), None, latents[value - item.prompt_start], False, True))
                     else:
-                        replay.rows.append(((value, *quiet), None, None, False, False))
+                        replay.append(((value, *quiet), None, None, False, False))
             inputs.positions += positions
         inputs.requests.append((start, len(inputs.positions), row, cursor.gdn_fresh))
         cursor.gdn_fresh = False
@@ -784,50 +757,21 @@ class DuplexIOForConditionalGeneration(
     ) -> list[PreparedFrames]:
         """Plan the step's positions once; request boundaries own all running counters."""
         audio = self.prepare_audio_requests(requests, device)
-        first = PassInputs()
-        second: dict[int, int] = {}
-        tail: list[int] = []
+        inputs = PassInputs()
         spans: list[tuple[int, int]] = []
-        replays: list[ReplayRows | None] = []
+        replays: list[dict[str, Tensor]] = []
         offset = 0
         for index, (item, (tokens, info)) in enumerate(zip(audio, requests, strict=True)):
-            state = item.state
-            frames = state.frames[item.frame_start : item.frame_start + item.frame_count]
-            sampled_live = info["duplex"]["duplexio_given_frame"] is None
-            # A BOS frame deciding a sampled live frame must be drawn before it.
-            cut = next(
-                (
-                    position + 1
-                    for position, frame in enumerate(frames[:-1])
-                    if frame.kind == FrameKind.BOS and frames[position + 1].kind == FrameKind.LIVE and sampled_live
-                ),
-                len(frames),
-            )
-            if cut < len(frames):
-                second[index] = cut
-            end = item.frame_start + item.frame_count
-            if (
-                frames[-1].kind == FrameKind.BOS
-                and end < len(state.frames)
-                and state.frames[end].kind == FrameKind.LIVE
-                and sampled_live
-            ):
-                tail.append(index)
-            replay = ReplayRows() if info["duplex"]["runtime_config"]["duplexio_record_inputs"] else None
-            replays.append(replay)
-            self.plan_frames(first, index, item, frames[:cut], replay)
+            frames = item.state.frames[item.frame_start : item.frame_start + item.frame_count]
+            replay: list[ReplayRow] | None = [] if info["duplex"]["runtime_config"]["duplexio_record_inputs"] else None
+            self.plan_frames(inputs, index, item, frames, replay)
+            replays.append({} if replay is None else self.replay_tensors(replay))
             spans.append((offset, offset + tokens))
             offset += tokens
         # Single-frame live appends replay one captured embedding graph per batch size.
-        uniform = not second and all(
-            item.frame_count == 1 and item.live_frame is not None and item.given is None for item in audio
-        )
-        embeddings = self.embed_pass(first, uniform)
-        if second:
-            scheduled = embeddings.new_zeros(offset, embeddings.shape[-1])
-            scheduled[self.first_pass_rows(spans, second, device)] = embeddings
-            embeddings = scheduled
-        self.step_plan = StepPlan([item.state for item in audio], audio, spans, first, second, tail, replays)
+        uniform = all(item.frame_count == 1 and item.live_frame is not None and item.given is None for item in audio)
+        embeddings = self.embed_pass(inputs, uniform)
+        self.step_inputs = inputs
         return [
             PreparedFrames(
                 embeddings[start:end],
@@ -835,15 +779,6 @@ class DuplexIOForConditionalGeneration(
             )
             for item, (start, end), replay in zip(audio, spans, replays, strict=True)
         ]
-
-    @staticmethod
-    def first_pass_rows(spans: list[tuple[int, int]], second: dict[int, int], device: torch.device) -> Tensor:
-        """Scheduled rows the first pass covers: every request's, up to its second pass."""
-        rows = [
-            torch.arange(start, start + second[index] * FRAME_POSITIONS if index in second else end)
-            for index, (start, end) in enumerate(spans)
-        ]
-        return torch.cat(rows).to(device, non_blocking=True)
 
     def frame_input_graph(self, inputs: tuple[Tensor, ...]) -> FrameInputGraph:
         """The one-frame graph for this batch size, captured on first use into the shared pool."""
@@ -934,68 +869,11 @@ class DuplexIOForConditionalGeneration(
         inputs_embeds: Tensor | None = None,
         **kwargs: object,
     ) -> Tensor:
-        """Run the backbone over the embeddings ``preprocess`` built; the step holds the addressing.
-
-        A step with a second pass draws its BOS frames' decisions after the
-        first, then runs the live frames they decided.
-        """
+        """Run the backbone over the embeddings ``preprocess`` built; the step holds the addressing."""
         del input_ids, positions, intermediate_tensors, kwargs
         assert inputs_embeds is not None
-        plan = self.step_plan
-        tokens = inputs_embeds.shape[0]
         with torch.profiler.record_function("duplexio.backbone"):
-            if plan is None or not plan.second:
-                return self.model(positions=self.step.rope[:tokens], inputs_embeds=inputs_embeds)
-            device = inputs_embeds.device
-            first = self.first_pass_rows(plan.spans, plan.second, device)
-            hidden = torch.empty_like(inputs_embeds)
-            hidden[first] = self.model(positions=self.step.rope[: first.numel()], inputs_embeds=inputs_embeds[first])
-            cut = sorted(plan.second)
-            decided = torch.stack(
-                [
-                    hidden[plan.spans[index][0] + (plan.second[index] - 1) * FRAME_POSITIONS :][:FRAME_POSITIONS]
-                    for index in cut
-                ]
-            )
-            self.decide_now(decided, [plan.states[index] for index in cut])
-            inputs = PassInputs()
-            rows = []
-            for index in cut:
-                item = plan.audio[index]
-                frames = item.state.frames[item.frame_start : item.frame_start + item.frame_count]
-                self.plan_frames(inputs, index, item, frames[plan.second[index] :], plan.replays[index])
-                start, end = plan.spans[index]
-                rows.append(torch.arange(start + plan.second[index] * FRAME_POSITIONS, end))
-            self.install_pass(inputs)
-            second = torch.cat(rows).to(device)
-            embeddings = self.embed_pass(inputs, graph=False)
-            hidden[second] = self.model(positions=self.step.rope[: second.numel()], inputs_embeds=embeddings)
-            return hidden
-
-    def decide_now(self, frames: Tensor, states: list[DuplexIORequestState]) -> None:
-        """Draw decisions the step needs before its end: the live row each BOS frame of ``frames`` decides.
-
-        The draw waits for the host, as the next frame's inputs depend on it.
-        Only a session's first live row is decided so, which no client sees.
-        """
-        inputs = self.sampling_inputs(states, frames.device)
-        text_ids, tool_starts, frame_logprobs, support_ids, audio = self.sample_rows(
-            frames,
-            inputs.parameters,
-            inputs.tool_bitmask,
-            top_k=inputs.top_k,
-            support_width=inputs.support_width,
-        )
-        text = TextSamplingResult(
-            text_ids, tool_starts, frame_logprobs, support_ids, inputs.pending, inputs.calling, [None] * len(states)
-        )
-        host_ids = text_ids.tolist()
-        self.finish_text_batch(text, states, host_ids, tool_starts.tolist())
-        for row, state in enumerate(states):
-            if text.tool_calls[row] is not None:
-                raise RuntimeError("DuplexIO cannot complete a tool call on a session's first row")
-            state.text_input_ids = (self.silence_token_id, *host_ids[row])
-            state.agent_latent = audio[row]
+            return self.model(positions=self.step.rope[: inputs_embeds.shape[0]], inputs_embeds=inputs_embeds)
 
     def make_omni_output(self, model_output: Tensor, **kwargs: Any) -> OmniOutput:
         """Sample the three text streams and audio outside the model graph."""
@@ -1004,12 +882,6 @@ class DuplexIOForConditionalGeneration(
         if not infos:  # Warm-up and profiling runs carry no requests.
             self._forced_next_token_ids = None
             return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs={})
-        plan = self.step_plan
-        if plan is not None and plan.tail:
-            # Slices ending at a BOS frame whose live frame comes next step.
-            ends = [kwargs["request_token_spans"][index][1] for index in plan.tail]
-            frames = torch.stack([hidden_states[end - FRAME_POSITIONS : end] for end in ends])
-            self.decide_now(frames, [plan.states[index] for index in plan.tail])
         batch = self.sample_frames(
             hidden_states,
             kwargs["request_token_spans"],
@@ -1039,7 +911,7 @@ class DuplexIOForConditionalGeneration(
             if any(record_hiddens[index] for index in batch.indices):
                 sampled["predictor_hiddens"] = [batch.hiddens.detach()]
         empty = torch.empty(0, dtype=hidden_states.dtype)
-        replays = [self.replay_tensors(info["duplexio_replay"]) for info in infos]
+        replays = [info["duplexio_replay"] for info in infos]
         replay = {name: [value.get(name, empty) for value in replays] for name in REPLAY_NAMES}
         step = DuplexIOStepOutput(
             batch=batch,
@@ -1080,12 +952,9 @@ class DuplexIOForConditionalGeneration(
             streaming_position_budget=[self.text_config.max_position_embeddings - state.cursor.row for state in states],
         )
 
-    def replay_tensors(self, replay: ReplayRows | None) -> dict[str, Tensor]:
-        """One request's recorded rows as tensors (``REPLAY_NAMES``); none without recording."""
-        if replay is None:
-            return {}
+    def replay_tensors(self, rows: list[ReplayRow]) -> dict[str, Tensor]:
+        """One request's recorded rows as tensors (``REPLAY_NAMES``)."""
         device = self.channel_emb.device
-        rows = replay.rows
         user = [features for _, features, _, _, _ in rows]
         agent = [latent for _, _, latent, _, _ in rows]
         zero_user = self.channel_emb.new_zeros(self.user_asr.output_dim, dtype=torch.float32)

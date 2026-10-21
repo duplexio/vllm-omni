@@ -91,7 +91,7 @@ def model_fixture() -> DuplexIOForConditionalGeneration:
     model.pad_token_id = 1
     model.silence_token_id = 2
     model.full_cudagraph_enabled = False
-    model.step_plan = None
+    model.step_inputs = None
     # Audio keys see a two-frame window here, so eviction shows up in the test.
     model.config = SimpleNamespace(audio_attention_window_frames=2, flowmap_config={"sampling_temperature": 1.0})
     model.text_config = SimpleNamespace(max_position_embeddings=262144, vocab_size=32)
@@ -129,8 +129,8 @@ def append_info(
     tool: tuple[int, ...] = (),
     pcm: bytes | None = None,
 ):
-    """One whole append: the voice prompt and system tokens if prefix, the live frame, tool tokens."""
-    frames = append_frame_count(2, len(state.system_token_ids), len(tool), prefix=prefix)
+    """One whole append: the opening (voice prompt and system tokens) if prefix, else a live frame; then tools."""
+    frames = append_frame_count(2, len(state.system_token_ids), len(tool), opening=prefix)
     return {
         "duplexio_model_state": state,
         "duplex_token_offset": 0,
@@ -145,15 +145,15 @@ def append_info(
             "epoch": 0,
             "turn_id": 0,
             "final": False,
-            "pcm": torch.zeros(1920).numpy().tobytes() if pcm is None else pcm,
+            "pcm": b"" if prefix else torch.zeros(1920).numpy().tobytes() if pcm is None else pcm,
             "runtime_config": {"duplexio_record_inputs": True, "duplexio_record_hiddens": False},
         },
     }
 
 
-def given_info(state: DuplexIORequestState, agent_pcm: Tensor, *, prefix: bool = False, **frame: int):
+def given_info(state: DuplexIORequestState, agent_pcm: Tensor, *, tool: tuple[int, ...] = (), **frame: int):
     """An append whose live frame replays history: ``frame`` names its given token ids."""
-    info = append_info(state, prefix=prefix)
+    info = append_info(state, tool=tool)
     info["duplex"]["duplexio_given_frame"] = {
         "user_token_id": 2,
         "agent_token_id": 2,
@@ -167,27 +167,30 @@ def given_info(state: DuplexIORequestState, agent_pcm: Tensor, *, prefix: bool =
 def preprocess(model, info, tokens: int | None = None):
     tokens = info["duplex_prompt_len"] - info["duplex_token_offset"] if tokens is None else tokens
     _, embeddings, update = model.preprocess(torch.zeros(tokens, dtype=torch.long), None, **info)
-    return embeddings, update, model.replay_tensors(update["duplexio_replay"])
+    return embeddings, update, update["duplexio_replay"]
 
 
 def first_pass(model):
     """The installed pass's positions, by request: (embed kind, value) per position."""
-    inputs = model.step_plan.first
+    inputs = model.step_inputs
     return [[(kind, value) for kind, value, *_ in inputs.embed[start:end]] for start, end, _, _ in inputs.requests]
 
 
+def opened(model) -> DuplexIORequestState:
+    """A session after its opening append."""
+    _, update, _ = preprocess(model, append_info(request_state(model), prefix=True))
+    return update["duplexio_working_state"]
+
+
 @torch.inference_mode()
-def test_prefix_lays_out_prompt_system_bos_then_runs_the_live_frame_after_its_decision() -> None:
+def test_the_opening_lays_out_prompt_and_system_rows_then_the_bos_frame_deciding_row_zero() -> None:
     model = model_fixture()
     embeddings, update, replay = preprocess(model, append_info(request_state(model), prefix=True))
-    # Rows, not positions: two prompt rows and three system rows; the live row is
-    # recorded once the second pass plans it.
+    # Rows, not positions: two prompt rows and three system rows; no live row yet.
     assert replay["text_ids"].tolist() == [[2, 2, 2, 2]] * 2 + [[3, 2, 2, 2], [4, 2, 2, 2], [5, 2, 2, 2]]
     assert replay["audio_mask"].tolist() == [False] * 5
     assert replay["prompt_frames"].tolist() == [True, True, False, False, False]
     torch.testing.assert_close(replay["agent_audio"][:2], latent(1, 2))
-    # The encoder hears silence under the voice prompt, then the live frame.
-    torch.testing.assert_close(model.step_plan.audio[0].user_feature, torch.full((8,), 3.0))
     (positions,) = first_pass(model)
     assert positions == [
         (Embed.AGENT_AUDIO, 0),
@@ -201,9 +204,8 @@ def test_prefix_lays_out_prompt_system_bos_then_runs_the_live_frame_after_its_de
         (Embed.CELL, BOS_USER_AUDIO_SLOT),
         (Embed.CELL, BOS_AGENT_AUDIO_SLOT),
     ]
-    # The sampled live frame waits for the BOS frame's decision: a second pass.
-    assert model.step_plan.second == {0: 2} and model.step_plan.tail == []
-    assert embeddings.shape[0] == 15 and not embeddings[10:].any()
+    # The append ends at the BOS frame: its last frame decides live row 0.
+    assert embeddings.shape[0] == 10
     torch.testing.assert_close(embeddings[0], model.agent_audio_input_adapter(latent(1))[0])
     torch.testing.assert_close(embeddings[2], model.model.embed_input_ids(torch.tensor([3]))[0] + model.channel_emb[0])
     torch.testing.assert_close(embeddings[6], model.flat_cell_emb[QUERY_SLOT_OFFSET + AGENT])
@@ -211,7 +213,9 @@ def test_prefix_lays_out_prompt_system_bos_then_runs_the_live_frame_after_its_de
     assert state.cursor == Cursor(
         row=5, live_rows=0, ring_keys=0, bos_clocks=[1], bos_keys=2, persistent_keys=5, gdn_fresh=False
     )
-    assert state.user_asr.next_mel_frame == 3
+    # The user encoder heard silence under the voice prompt; no user audio was consumed.
+    assert state.user_asr.next_mel_frame == 2
+    assert state.history_open
     assert state.input_mimi == 2
     torch.testing.assert_close(model.audio_codec.waveforms[0], torch.ones(2 * 1920))
 
@@ -247,7 +251,6 @@ def test_tool_rows_follow_the_live_frame_as_text_then_a_bos_frame_decides() -> N
         Embed.CELL,
         Embed.CELL,
     ]
-    assert model.step_plan.second == {} and model.step_plan.tail == []
     state = update["duplexio_working_state"]
     # The live row's user and agent tokens, then three tool tokens; a BOS frame for the next row.
     assert (state.cursor.persistent_keys, state.cursor.row, state.cursor.live_rows) == (10, 10, 2)
@@ -281,45 +284,40 @@ def test_live_frame_embeds_its_tokens_queries_and_audio() -> None:
 def test_given_frames_replay_history_through_the_voice_prompt_codec_stream() -> None:
     model = model_fixture()
     first, second = torch.randn(1920), torch.randn(1920)
-    _, update, replay = preprocess(
-        model, given_info(request_state(model), first, prefix=True, user_token_id=9, agent_token_id=12)
-    )
-    assert replay["text_ids"].tolist()[-1] == [2, 9, 12, 2]
+    _, update, replay = preprocess(model, given_info(opened(model), first, user_token_id=9, agent_token_id=12))
+    assert replay["text_ids"].tolist() == [[2, 9, 12, 2]]
     # The codec hears the voice prompt, then the given agent frame, as one stream.
-    torch.testing.assert_close(replay["agent_audio"][:2], latent(1, 2))
-    torch.testing.assert_close(replay["agent_audio"][-1], latent(3)[0])
-    torch.testing.assert_close(model.audio_codec.waveforms[0], torch.cat((torch.ones(2 * 1920), first)))
-    # Given tokens need no decision first: one pass.
-    assert model.step_plan.second == {}
+    torch.testing.assert_close(replay["agent_audio"], latent(3))
+    torch.testing.assert_close(model.audio_codec.waveforms[1], first)
     state = update["duplexio_working_state"]
     assert state.input_mimi == 3
     assert state.cursor.persistent_keys == 7  # Two prompt keys, three system tokens, the given user and agent text.
+    # A sampled prediction is waiting; the next given frame replaces it.
     state.text_input_ids = (2, 5, 6, 2)
     state.agent_latent = latent(7)[0]
     _, update, replay = preprocess(model, given_info(state, second, agent_token_id=13))
     assert replay["text_ids"].tolist() == [[2, 2, 13, 2]]
     torch.testing.assert_close(replay["agent_audio"], latent(4))
-    torch.testing.assert_close(model.audio_codec.waveforms[1], second)
+    torch.testing.assert_close(model.audio_codec.waveforms[2], second)
     assert update["duplexio_working_state"].cursor.live_rows == 2
 
 
 @torch.inference_mode()
 def test_given_frames_must_lead_and_hold_no_tool_calls() -> None:
     model = model_fixture()
-    _, update, _ = preprocess(model, append_info(request_state(model), prefix=True))
+    _, update, _ = preprocess(model, append_info(opened(model)))
     sampled = update["duplexio_working_state"]
     assert not sampled.history_open
     with pytest.raises(ValueError, match="lead the conversation"):
         preprocess(model, given_info(sampled, torch.zeros(1920)))
-    fresh = request_state(model)
     with pytest.raises(ValueError, match="tool calls"):
-        preprocess(model, given_info(fresh, torch.zeros(1920), prefix=True, tool_call_token_id=6))
+        preprocess(model, given_info(opened(model), torch.zeros(1920), tool_call_token_id=6))
     with pytest.raises(ValueError, match="one 1920-sample"):
-        preprocess(model, given_info(fresh, torch.zeros(960), prefix=True))
+        preprocess(model, given_info(opened(model), torch.zeros(960)))
 
 
 @pytest.mark.parametrize(
-    "frames,frames_seen,match", [(1, 0, "do not match"), (4, 0, "do not match"), (3, 3, "exactly once")]
+    "frames,frames_seen,match", [(1, 0, "do not match"), (3, 0, "do not match"), (2, 2, "exactly once")]
 )
 def test_prefix_must_be_complete_and_consumed_once(frames: int, frames_seen: int, match: str) -> None:
     model = model_fixture()
@@ -332,26 +330,19 @@ def test_prefix_must_be_complete_and_consumed_once(frames: int, frames_seen: int
         preprocess(model, info)
 
 
-@pytest.mark.parametrize(
-    "prefix,chunks",
-    [(True, (1, 1, 1)), (True, (2, 1)), (True, (1, 2)), (False, (1, 1, 2)), (False, (2, 2)), (False, (3, 1))],
-)
+@pytest.mark.parametrize("prefix,chunks", [(True, (1, 1)), (False, (1, 1, 2)), (False, (2, 2)), (False, (3, 1))])
 @torch.inference_mode()
 def test_scheduler_chunks_preserve_embeddings_and_replay(prefix: bool, chunks: tuple[int, ...]) -> None:
     model = model_fixture()
     initial = request_state(model)
-    tool = () if prefix else (3, 4, 5, 6, 7, 8)
-    if not prefix:
+    if prefix:
+        info = append_info(initial, prefix=True)
+    else:
         initial.cursor = Cursor(
             row=7, live_rows=1, ring_keys=2, bos_clocks=[1], bos_keys=2, persistent_keys=6, gdn_fresh=False
         )
-    # Given frames decide nothing mid-append, so a chunked append is one pass per chunk.
-    info = given_info(initial, torch.randn(1920), prefix=prefix, user_token_id=9)
-    info["duplex"]["duplexio_tool_token_ids"] = list(tool)
-    frames = append_frame_count(2, 3, len(tool), prefix=prefix)
-    assert sum(chunks) == frames
-    info["duplex"]["frame_count"] = frames
-    info["duplex_prompt_len"] = frames * FRAME_POSITIONS
+        info = given_info(initial, torch.randn(1920), tool=(3, 4, 5, 6, 7, 8), user_token_id=9)
+    assert sum(chunks) == info["duplex"]["frame_count"]
     model.audio_codec = CountingCodec()
     bulk, bulk_update, bulk_replay = preprocess(model, info)
     bulk_positions = first_pass(model)[0]
@@ -369,17 +360,9 @@ def test_scheduler_chunks_preserve_embeddings_and_replay(prefix: bool, chunks: t
         positions += first_pass(model)[0]
     torch.testing.assert_close(torch.cat(embeddings), bulk)
     assert positions == bulk_positions
+    # A chunk of only the BOS frame records no row.
     for key, expected in bulk_replay.items():
         torch.testing.assert_close(torch.cat([replay[key] for replay in replays]), expected)
     assert state.cursor == bulk_update["duplexio_working_state"].cursor
     assert state.user_asr.next_mel_frame == bulk_update["duplexio_working_state"].user_asr.next_mel_frame
     assert state.input_mimi == bulk_update["duplexio_working_state"].input_mimi
-
-
-@torch.inference_mode()
-def test_a_chunk_ending_at_the_bos_frame_decides_after_the_step() -> None:
-    model = model_fixture()
-    info = append_info(request_state(model), prefix=True)
-    # The text frame, then the BOS frame; the live frame comes in the next chunk.
-    preprocess(model, info, 2 * FRAME_POSITIONS)
-    assert model.step_plan.tail == [0] and model.step_plan.second == {}

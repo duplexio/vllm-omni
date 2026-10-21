@@ -64,26 +64,30 @@ async def test_stream_opens_the_session_realtime_serving_would(stream_tokenizer)
 
 
 @pytest.mark.asyncio
-async def test_appends_follow_the_realtime_layout_and_collect_through_the_prediction(stream_tokenizer) -> None:
+async def test_a_session_predicts_row_zero_at_open_then_one_row_per_user_frame(stream_tokenizer) -> None:
     engine = EchoEngine(stream_tokenizer)
     stream = DuplexIOStream.open(engine, "offline", session_config())
     prefix_frames = REFERENCE_FRAMES + len(stream.runtime_config["duplexio_system_token_ids"])
     assert stream.prefix_rows == prefix_frames and stream.max_rows == 6 * 4096 // FRAME_POSITIONS
 
-    stream.append(pcm(1))
+    # Prediction 0 comes from the opening, before any user audio.
     assert [frame_fields(output)["predicted"] for output in await stream.collect()] == [False, True]
-    # Tool results arrive as text and are rendered as realtime serving renders them.
-    assert stream.tool_result_rows("sunny") == 3
-    stream.append(pcm(1), tool_results=["sunny"], final=True)
-    await stream.collect()
-    tool = [20, 21, 22]
-
-    first, second = (append["model_intermediate_buffer"]["duplex"] for append in engine.appends)
-    frames = -(-prefix_frames // FRAME_POSITIONS) + 2
-    assert first["duplexio_prefix"] and first["frame_count"] == frames
+    (opening,) = (append["model_intermediate_buffer"]["duplex"] for append in engine.appends)
+    frames = -(-prefix_frames // FRAME_POSITIONS) + 1
+    assert opening["duplexio_prefix"] and opening["frame_count"] == frames and opening["pcm"] == b""
     assert len(engine.appends[0]["prompt_token_ids"]) == frames * FRAME_POSITIONS
-    # The live frame, the tool result's text frame, then a BOS frame.
-    assert not second["duplexio_prefix"] and second["frame_count"] == 3
-    assert (second["duplexio_tool_token_ids"], second["duplexio_tool_generation"], second["final"]) == (tool, 1, True)
-    assert first["runtime_config"]["duplexio_record_inputs"] is False
+
+    # T user frames, a tool result after the second, give T further predictions.
+    assert stream.tool_result_rows("sunny") == 3
+    user_frames = 3
+    for frame in range(user_frames):
+        stream.append(pcm(1), tool_results=["sunny"] if frame == 1 else (), final=frame == user_frames - 1)
+        await stream.collect()
+    predictions = 1 + user_frames
+    assert len(engine.appends) == predictions
+    live = [append["model_intermediate_buffer"]["duplex"] for append in engine.appends[1:]]
+    assert not any(append["duplexio_prefix"] for append in live)
+    assert [append["frame_count"] for append in live] == [1, 3, 1]  # The tool append: live, text and BOS frames.
+    assert (live[1]["duplexio_tool_token_ids"], live[1]["duplexio_tool_generation"]) == ([20, 21, 22], 1)
+    assert live[-1]["final"] and opening["runtime_config"]["duplexio_record_inputs"] is False
     await stream.close()

@@ -3,12 +3,15 @@
 """Host bookkeeping of DuplexIO's flat sequence: appends as frames, frames as positions.
 
 An append is a list of frames (``frame_layout.FRAME_POSITIONS`` positions
-each), so the scheduler, whose budgets are whole frames, never splits one:
+each), so the scheduler, whose budgets are whole frames, never splits one.
+Every append ends with the frame deciding the next row, and returns that
+decision:
 
-- the session's first: text frames of the voice prompt and system tokens,
-  padded with no-ops, then the BOS frame and the first live frame;
-- every other: the live frame, then, with a tool result, its text frames and
-  a BOS frame.
+- the session's opening append, before any user audio: text frames of the
+  voice prompt, the system tokens and any tool result, padded with no-ops,
+  then the BOS frame deciding live row 0;
+- each user-audio append: its live frame, then, with a tool result, the
+  result's text frames and a BOS frame.
 
 ``Cursor`` holds what a request's positions so far leave behind: its row (the
 RoPE position), the audio clock, and how much of each KV region
@@ -72,15 +75,15 @@ PROMPT = -1  # A text-frame entry that is a pinned voice-prompt row; its id is t
 
 
 def append_frames(
-    prompt_rows: int, system_token_ids: tuple[int, ...], tool_token_ids: tuple[int, ...], *, prefix: bool
+    prompt_rows: int, system_token_ids: tuple[int, ...], tool_token_ids: tuple[int, ...], *, opening: bool
 ) -> list[Frame]:
-    """The frames of one append."""
-    if prefix:
-        entries = [(PROMPT, row) for row in range(prompt_rows)] + [(SYSTEM, token) for token in system_token_ids]
-        return [*text_frames(entries), Frame(FrameKind.BOS), Frame(FrameKind.LIVE)]
-    frames = [Frame(FrameKind.LIVE)]
-    if tool_token_ids:
-        frames += [*text_frames([(SYSTEM, token) for token in tool_token_ids]), Frame(FrameKind.BOS)]
+    """The frames of one append: the session's opening one, or a user-audio one."""
+    text = [(SYSTEM, token) for token in tool_token_ids]
+    frames = [] if opening else [Frame(FrameKind.LIVE)]
+    if opening:
+        text = [(PROMPT, row) for row in range(prompt_rows)] + [(SYSTEM, token) for token in system_token_ids] + text
+    if text or opening:
+        frames += [*text_frames(text), Frame(FrameKind.BOS)]
     return frames
 
 
@@ -91,11 +94,10 @@ def text_frames(entries: list[tuple[int, int]]) -> list[Frame]:
     ]
 
 
-def append_frame_count(prompt_rows: int, system_tokens: int, tool_tokens: int, *, prefix: bool) -> int:
+def append_frame_count(prompt_rows: int, system_tokens: int, tool_tokens: int, *, opening: bool) -> int:
     """``len(append_frames(...))`` from the counts alone, for the scheduler side."""
-    if prefix:
-        return -(-(prompt_rows + system_tokens) // FRAME_POSITIONS) + 2
-    return 1 + (-(-tool_tokens // FRAME_POSITIONS) + 1 if tool_tokens else 0)
+    text = tool_tokens + (prompt_rows + system_tokens if opening else 0)
+    return (0 if opening else 1) + (-(-text // FRAME_POSITIONS) + 1 if text or opening else 0)
 
 
 @dataclass

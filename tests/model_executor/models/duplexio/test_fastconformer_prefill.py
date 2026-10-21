@@ -86,7 +86,7 @@ def test_model_preprocess_batches_audio_without_persisting_prepared_results(enco
             torch.zeros(info["duplex_prompt_len"], dtype=torch.long), None, **info, **prepared[request_id]
         )
         torch.testing.assert_close(embeddings, expected[request_id][1], atol=2e-5, rtol=2e-4)
-        assert updates["duplexio_working_state"].frames_seen == 3
+        assert updates["duplexio_working_state"].frames_seen == 2
         assert info["duplexio_model_state"].frames_seen == 0
 
 

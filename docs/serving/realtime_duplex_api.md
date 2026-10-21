@@ -443,6 +443,28 @@ without `extra_body.auto_response`, and `response.cancel` /
 `output_audio_buffer.clear` restart its conversation context (a new Stage 0
 request replays the voice/persona prefill).
 
+#### Models that speak first: one output frame before any input
+
+Some models decide their first output frame before they hear anything
+(`DuplexModelPlugin.session_open_payload`). DuplexIO is one: frame *k* of its
+audio plays while the user's frame *k* is recorded. For such a model:
+
+- **Opening the session** prefills its context (voice prompt, rendered system
+  prompt, any pending tool result) in an append of the server's own, and
+  returns **prediction 0** at once: agent audio frame 0, its text token if
+  any, the user word if any, and emit probabilities and log probabilities as
+  for any other frame. Clients receive it after `session.updated`, before
+  sending audio.
+- **Each `input_audio_buffer.append` of one 80 ms frame** (frame *k* = 0 …
+  *T*−1) is answered by **prediction *k*+1**. *T* user frames therefore give
+  *T*+1 output frames; output frame *k* belongs to playback slot *k*, so it
+  plays without an extra frame of delay.
+- **Tool results** (`function_call_output`) are fed after the next user frame
+  and still return that append's single prediction.
+- A cancel that starts a new epoch (`response.cancel`,
+  `output_audio_buffer.clear`, `input_audio_buffer.clear`) opens the new
+  epoch's model request the same way, with its own prediction 0.
+
 ### Compatibility with the OpenAI Realtime protocol
 
 The Realtime dialect is, by design, an OpenAI-Realtime-compatible surface:

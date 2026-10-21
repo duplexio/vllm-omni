@@ -30,6 +30,7 @@ from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.commands import DuplexCommand
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
 from vllm_omni.engine.duplex.contracts import (
+    DuplexAppendPlan,
     DuplexOutputContext,
     DuplexRequestIdentity,
     DuplexStagePort,
@@ -223,8 +224,9 @@ async def open_harness(
     stage_count: int = 2,
     clock: Any = None,
     log_stats: bool = False,
+    plugin: Any = None,
 ) -> Harness:
-    plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
+    plugin = plugin or MiniCPMO45DuplexPlugin(_fake_encode_audio)
     port = RecordingStagePort(stage_count=stage_count)
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
@@ -490,6 +492,53 @@ async def test_append_plans_and_submits_one_model_unit_in_wire_order() -> None:
         assert second.already_submitted is True
         assert second.prompt["model_intermediate_buffer"]["duplex"]["seq"] == 2
         assert h.session.input_seq == 2
+    finally:
+        await close_harness(h)
+
+
+class OpeningPlugin(MiniCPMO45DuplexPlugin):
+    """A plugin that decides before any input: each stage request opens with an append of its own."""
+
+    OPEN = {"type": "test.open"}
+
+    def session_open_payload(self, runtime_config):
+        del runtime_config
+        return dict(self.OPEN)
+
+    def plan_append(self, **kwargs):
+        if kwargs["payload"] == self.OPEN:
+            duplex = {"seq": kwargs["seq"], "epoch": kwargs["fence"].epoch, "payload": dict(self.OPEN)}
+            return DuplexAppendPlan(prompt={"prompt_token_ids": [1], "model_intermediate_buffer": {"duplex": duplex}})
+        return super().plan_append(**kwargs)
+
+
+def submitted_payload_types(h: Harness) -> list[tuple[int, str | None]]:
+    return [
+        (
+            submission.context.fence.epoch,
+            submission.prompt["model_intermediate_buffer"]["duplex"]["payload"].get("type"),
+        )
+        for submission in h.port.submissions
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_plugin_opening_runs_before_any_input_and_once_per_epoch() -> None:
+    h = await open_harness(plugin=OpeningPlugin(_fake_encode_audio))
+    try:
+        # The opening is the session's first append, before any client command.
+        assert submitted_payload_types(h) == [(0, "test.open")]
+        assert h.port.submissions[0].prompt["model_intermediate_buffer"]["duplex"]["seq"] == 1
+        await h.run(append_audio())
+        await h.run(append_audio())
+        assert [epoch for epoch, _ in submitted_payload_types(h)] == [0, 0, 0]
+        assert h.port.submissions[1].prompt["model_intermediate_buffer"]["duplex"]["seq"] == 2
+        # A barge-in starts a new epoch, whose stage request opens before its first audio.
+        await h.run(commands.BargeIn())
+        await h.run(append_audio())
+        assert submitted_payload_types(h)[3] == (1, "test.open")
+        assert submitted_payload_types(h)[4][0] == 1
+        assert len(h.port.submissions) == 5
     finally:
         await close_harness(h)
 

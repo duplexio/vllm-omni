@@ -17,7 +17,7 @@ from typing import Any
 FRAME_FIELDS = (
     "duplex_epoch",
     "duplex_turn_id",
-    "prefix",  # The append carried the voice prompt and system tokens.
+    "prefix",  # The session's opening append (voice prompt, system tokens): it predicts live row 0.
     "tool_result",  # The append carried tool-result rows after its live frame,
     "tool_generation",  # the newest of which had this generation.
     "given",  # The live frame heard given history instead of the last prediction.
