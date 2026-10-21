@@ -19,6 +19,7 @@ from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_reque
 from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext, DuplexRuntimeConfigError
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.model_executor.models.duplexio.duplex import DuplexIODuplexPlugin
+from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_POSITIONS
 from vllm_omni.model_executor.models.duplexio.frame_output import FRAME_FIELDS, frame_fields
 from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
 
@@ -106,6 +107,8 @@ async def open_session(model_config, **extra_body: object) -> tuple[DuplexIODupl
 
 
 def plan(plugin: DuplexIODuplexPlugin, runtime: dict[str, object], seq: int, request_id: str = REQUEST_ID) -> dict:
+    """Plan append ``seq``: the opening (seq 1, ``session_open_payload``), or a user-audio frame."""
+    payload = plugin.session_open_payload(runtime) if seq <= 1 else frame_payload()
     return plugin.plan_append(
         request_id=request_id,
         fence=DuplexFence("session", epoch=0, turn_id=0),
@@ -113,7 +116,7 @@ def plan(plugin: DuplexIODuplexPlugin, runtime: dict[str, object], seq: int, req
         runtime_config=runtime,
         seq=seq,
         turn_seq=seq,
-        payload=frame_payload(),
+        payload=payload,
         final=False,
         sampling_params=None,
     ).prompt
@@ -242,18 +245,33 @@ def test_capabilities_use_the_scheduler_data_plane() -> None:
 
 
 @pytest.mark.asyncio
-async def test_first_append_carries_the_prefix_before_its_live_frame(model_config) -> None:
+async def test_sessions_open_with_the_prefix_before_any_user_audio(model_config) -> None:
     plugin, runtime = await open_session(model_config)
     first = plan(plugin, runtime, seq=1)
     duplex = first["model_intermediate_buffer"]["duplex"]
-    prefix_frames = REFERENCE_FRAMES + 4
-    assert first["prompt_token_ids"] == [11] * ((prefix_frames + 1) * 6)
-    assert duplex["frame_count"] == prefix_frames + 1
+    # Prompt and system rows fill text frames, then the BOS frame deciding live row 0.
+    frames = -(-(REFERENCE_FRAMES + 4) // FRAME_POSITIONS) + 1
+    assert first["prompt_token_ids"] == [11] * (frames * FRAME_POSITIONS)
+    assert duplex["frame_count"] == frames
     assert duplex["duplexio_prefix"]
-    assert duplex["pcm"] == pcm(1, 0.5)
-    assert "audio" not in duplex["payload"]
+    assert duplex["pcm"] == b""
+    # Every user frame follows the opening: audio never opens a stage request.
+    with pytest.raises(ValueError, match="opening append"):
+        plugin.plan_append(
+            request_id=REQUEST_ID,
+            fence=DuplexFence("session", epoch=0, turn_id=0),
+            session_config={},
+            runtime_config=runtime,
+            seq=1,
+            turn_seq=1,
+            payload=frame_payload(),
+            final=False,
+            sampling_params=None,
+        )
     later = plan(plugin, runtime, seq=2)
-    assert later["prompt_token_ids"] == [11] * 6
+    assert later["model_intermediate_buffer"]["duplex"]["pcm"] == pcm(1, 0.5)
+    assert "audio" not in later["model_intermediate_buffer"]["duplex"]["payload"]
+    assert later["prompt_token_ids"] == [11] * FRAME_POSITIONS
     assert not later["model_intermediate_buffer"]["duplex"]["duplexio_prefix"]
 
 
@@ -289,7 +307,8 @@ async def test_tool_results_follow_one_live_frame_once_then_retire(model_config)
     duplex = first["model_intermediate_buffer"]["duplex"]
     assert duplex["duplexio_tool_token_ids"] == [20, 21, 22, 23, 24]
     assert duplex["duplexio_tool_generation"] == 2
-    assert len(first["prompt_token_ids"]) == 6 * 6
+    # The live frame, the five result tokens as one text frame, then the BOS frame deciding the next row.
+    assert len(first["prompt_token_ids"]) == 3 * FRAME_POSITIONS
     # A pipelined append planned before the worker reports them must not feed them again.
     assert plan(plugin, runtime, seq=3)["model_intermediate_buffer"]["duplex"]["duplexio_tool_token_ids"] == []
     # Another stage request (a new epoch) has not been fed them.

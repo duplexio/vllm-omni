@@ -25,7 +25,7 @@ from vllm_omni.model_executor.models.duplexio.duplex.plugin import (
     stage_sampling_params,
     tool_result_token_ids,
 )
-from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
+from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_POSITIONS
 from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
 
 if TYPE_CHECKING:
@@ -37,26 +37,41 @@ class DuplexIOStream:
 
     Clients pass raw inputs only: the session's prompt, tools and start role,
     PCM, and tool results as text. The stream renders them as realtime serving
-    does. An append is the prefix (the first one only), one live frame, then
-    any tool-result rows. The scheduler may split an append into chunks: each
-    chunk yields one output with its rows, and the append's last chunk is the
-    one that predicts.
+    does. Opening the stream queues the session's opening append (the voice
+    prompt and system prefix), whose prediction is live row 0; each ``append``
+    is then one live frame and any tool-result rows, and predicts the next row.
+    So the first ``collect`` returns prediction 0, and T appends give T + 1
+    predictions. The scheduler may split an append into chunks: each chunk
+    yields one output with its rows, and the append's last chunk is the one
+    that predicts.
     """
 
     def __init__(
-        self, engine: AsyncOmni, request_id: str, runtime_config: dict[str, Any], *, timeout: float = 120.0
+        self,
+        engine: AsyncOmni,
+        request_id: str,
+        runtime_config: dict[str, Any],
+        *,
+        timeout: float = 120.0,
+        decode_audio: bool = False,
     ) -> None:
         self.runtime_config = runtime_config
         self.request_id = request_id
         self.timeout = timeout
         self.tokenizer = cached_tokenizer_from_config(engine.model_config)
-        # Rows one request can hold: prefix, live frames and tool results.
-        self.max_rows = engine.model_config.max_model_len // NUM_CELLS
+        # Rows one request can surely hold: a row takes at most one frame's
+        # worth of max_model_len (its tokens' persistent KV slots).
+        self.max_rows = engine.model_config.max_model_len // FRAME_POSITIONS
         self.inputs: asyncio.Queue[StreamingInput] = asyncio.Queue()
-        self.appends = 0
         self.tool_generation = 0
         params = stage_sampling_params(tuple(engine.default_sampling_params_list))
         self.outputs = engine.generate(self.stream(), sampling_params_list=list(params), request_id=request_id)
+        self.put(
+            *append_fields(
+                runtime_config, b"", prefix=True, tool_token_ids=[], tool_generation=0, decode_audio=decode_audio
+            ),
+            final=False,
+        )
 
     @classmethod
     def open(
@@ -68,17 +83,18 @@ class DuplexIOStream:
         record_inputs: bool = False,
         record_hiddens: bool = False,
         timeout: float = 120.0,
+        decode_audio: bool = False,
     ) -> DuplexIOStream:
-        """Open a session from the same configuration a realtime client sends.
+        """Open a session from the same configuration a realtime client sends, and queue its opening.
 
         ``record_inputs`` returns each frame's model inputs with its outputs, so
         a trajectory can be replayed; ``record_hiddens`` also returns the
-        predictor's hidden states.
+        predictor's hidden states. ``decode_audio`` decodes prediction 0's agent audio.
         """
         runtime_config = session_runtime_config(session, engine.model_config)
         runtime_config["duplexio_record_inputs"] = record_inputs
         runtime_config["duplexio_record_hiddens"] = record_hiddens
-        return cls(engine, request_id, runtime_config, timeout=timeout)
+        return cls(engine, request_id, runtime_config, timeout=timeout, decode_audio=decode_audio)
 
     async def stream(self) -> AsyncGenerator[StreamingInput, None]:
         while True:
@@ -86,7 +102,7 @@ class DuplexIOStream:
 
     @property
     def prefix_rows(self) -> int:
-        """Rows the first append adds before its live frame: the voice prompt and rendered system prompt."""
+        """Rows the opening append adds: the voice prompt and rendered system prompt."""
         runtime = self.runtime_config
         return runtime["duplexio_voice_prompt_frames"] + len(runtime["duplexio_system_token_ids"])
 
@@ -103,7 +119,7 @@ class DuplexIOStream:
         decode_audio: bool = False,
         given: GivenFrame | None = None,
     ) -> None:
-        """Queue one live frame of float32 user audio, after the prefix if it is the first.
+        """Queue one live frame of float32 user audio; its prediction decides the next row.
 
         ``tool_results`` are tool outputs as text; they follow the live frame.
         A ``given`` frame replays history: the model hears its tokens and agent
@@ -115,13 +131,15 @@ class DuplexIOStream:
         prompt_token_ids, fields = append_fields(
             self.runtime_config,
             pcm,
-            prefix=self.appends == 0,
+            prefix=False,
             tool_token_ids=tool_token_ids,
             tool_generation=self.tool_generation if tool_token_ids else 0,
             decode_audio=decode_audio,
             given_frame=given,
         )
-        self.appends += 1
+        self.put(prompt_token_ids, fields, final=final)
+
+    def put(self, prompt_token_ids: list[int], fields: dict[str, object], *, final: bool) -> None:
         duplex = {**fields, "runtime_config": self.runtime_config, "epoch": 0, "turn_id": 0, "final": final}
         self.inputs.put_nowait(
             StreamingInput(

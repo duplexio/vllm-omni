@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """DuplexIO full-duplex model plugin: engine policy and session policy in one class.
 
-Every append is one 80 ms client (or silence) frame. The first append of an
-epoch also carries the pinned voice prompt and system tokens before that
-frame, and a pending tool result follows it as text rows. The worker samples
-once, at the append's last row.
+A session opens with an append of its own, before any user audio: the pinned
+voice prompt and system tokens (and any pending tool result), closed by the
+frame that decides live row 0. Every later append is one 80 ms client (or
+silence) frame, with a pending tool result after it as text rows. Each append
+returns one prediction, the decision at its last frame
+(``flat_plan.append_frames``), so T user frames give T + 1 predictions and
+prediction k is live row k.
 """
 
 from __future__ import annotations
@@ -33,7 +36,8 @@ from vllm_omni.engine.duplex.plugin import (
 from vllm_omni.model_executor.common.duplex.payload import decode_pcm_f32le_payload
 from vllm_omni.model_executor.common.duplex.pcm_buffer import FixedFramePcmAppendBuffer
 from vllm_omni.model_executor.models.duplexio.duplex.data_plane import DuplexIODataPlane
-from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_SIZE, NUM_CELLS, SAMPLE_RATE
+from vllm_omni.model_executor.models.duplexio.flat_plan import append_frame_count
+from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_POSITIONS, FRAME_SIZE, SAMPLE_RATE
 from vllm_omni.model_executor.models.duplexio.frame_output import frame_fields
 from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
 from vllm_omni.model_executor.models.duplexio.tool_calling import tool_call_grammar
@@ -86,6 +90,10 @@ class GivenFrame(TypedDict):
     agent_pcm: bytes  # One frame of float32 agent audio at the model's sample rate.
 
 
+#: The payload of a session's opening append (``DuplexModelPlugin.session_open_payload``).
+OPEN_PAYLOAD = {"type": "duplexio.open"}
+
+
 def append_fields(
     runtime_config: Mapping[str, Any],
     pcm: bytes,
@@ -98,18 +106,20 @@ def append_fields(
 ) -> tuple[list[int], dict[str, object]]:
     """Scheduler slots and worker fields of one append.
 
-    Rows are ``[voice prompt + system tokens if prefix] + [live frame] +
-    [tool-result tokens]``, six scheduler slots each. A ``given_frame`` replays
-    conversation history: the live frame hears its tokens and agent audio instead
-    of the model's last prediction. Given frames must lead the conversation.
+    The opening append (``prefix``, without PCM) is the voice prompt and system
+    tokens; any other is a live frame of ``pcm``. Tool-result tokens follow
+    either. Rows are laid out as whole frames of ``FRAME_POSITIONS`` scheduler
+    slots (``flat_plan.append_frames``). A ``given_frame`` replays conversation
+    history: the live frame hears its tokens and agent audio instead of the
+    model's last prediction. Given frames must lead the conversation.
     """
-    prefix_frames = (
-        runtime_config["duplexio_voice_prompt_frames"] + len(runtime_config["duplexio_system_token_ids"])
-        if prefix
-        else 0
+    frame_count = append_frame_count(
+        runtime_config["duplexio_voice_prompt_frames"],
+        len(runtime_config["duplexio_system_token_ids"]),
+        len(tool_token_ids),
+        opening=prefix,
     )
-    frame_count = prefix_frames + 1 + len(tool_token_ids)
-    prompt_token_ids = [runtime_config["duplexio_scheduler_token_id"]] * (frame_count * NUM_CELLS)
+    prompt_token_ids = [runtime_config["duplexio_scheduler_token_id"]] * (frame_count * FRAME_POSITIONS)
     return prompt_token_ids, {
         "pcm": pcm,
         "frame_count": frame_count,
@@ -161,13 +171,22 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
         sampling_params: object,
     ) -> DuplexAppendPlan:
         del sampling_params
-        pcm = decode_pcm_f32le_payload(payload, sample_rate_hz=SAMPLE_RATE, exact_samples=FRAME_SIZE, model="DuplexIO")
         assert isinstance(payload, Mapping)
+        opening = payload.get("type") == OPEN_PAYLOAD["type"]
+        if opening != (seq <= 1):
+            raise ValueError("A DuplexIO stage request opens with exactly one opening append, before any audio")
+        pcm = (
+            b""
+            if opening
+            else decode_pcm_f32le_payload(
+                payload, sample_rate_hz=SAMPLE_RATE, exact_samples=FRAME_SIZE, model="DuplexIO"
+            )
+        )
         results = self.data_plane.take_tool_results(request_id, runtime_config["duplexio_tool_results"])
         prompt_token_ids, fields = append_fields(
             runtime_config,
             pcm,
-            prefix=seq <= 1,
+            prefix=opening,
             tool_token_ids=[token for result in results for token in result["token_ids"]],
             tool_generation=results[-1]["generation"] if results else 0,
             decode_audio=True,
@@ -200,6 +219,11 @@ class DuplexIODuplexPlugin(DuplexModelPlugin):
         # Single stage: every segment already reaches the data plane as the raw stage output.
         del stage_id, final_stage_id, segment_finished, segment_token_ids, segment_output_metadata, output
         return None
+
+    def session_open_payload(self, runtime_config: Mapping[str, object]) -> dict[str, object] | None:
+        """Every session opens with its prefix, which decides live row 0 before the user's first frame."""
+        del runtime_config
+        return dict(OPEN_PAYLOAD)
 
     # ---- session policy ----
 
@@ -520,4 +544,4 @@ def student_prompt_token_ids(
     return tokenizer.encode(rendered, add_special_tokens=False)
 
 
-__all__ = ["DuplexIODuplexPlugin", "GivenFrame", "append_fields", "stage_sampling_params"]
+__all__ = ["OPEN_PAYLOAD", "DuplexIODuplexPlugin", "GivenFrame", "append_fields", "stage_sampling_params"]

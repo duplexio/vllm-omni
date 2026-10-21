@@ -185,6 +185,8 @@ class DuplexSessionRunner:
         self._worker_stopped = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
+        #: The epoch whose stage request got the plugin's opening append.
+        self._opened_epoch: int | None = None
         #: Flags more than one component reads and writes (see session_context).
         self.run = DuplexRunState()
         self.ctx = DuplexSessionContext(
@@ -233,6 +235,9 @@ class DuplexSessionRunner:
         self.control.init_turn_detection()
         self._worker = self._loop.create_task(self._run(), name=f"duplex-session-{session.session_id}")
         self.emit({"type": "session.created", "session": session.as_public_dict()})
+        # Queued first, so the opening runs ahead of every client command.
+        if self.plugin.session_open_payload(session.runtime_config) is not None:
+            self._mailbox.put_nowait(_Internal("open_append"))
 
     def submit(self, command: DuplexCommand) -> None:
         self._mailbox.put_nowait(command)
@@ -526,6 +531,10 @@ class DuplexSessionRunner:
                 operation_id=self.model_state.committed_audio_operation_id,
                 retained_committed_payload=(payload if self.model_state.committed_audio_payload is payload else None),
             )
+            return
+        if item.kind == "open_append":
+            if not self.run.closing and self.session.state == DuplexSessionState.OPEN:
+                await self._open_epoch()
             return
         if item.kind == "commit":
             await self._on_commit(dict(item.payload))
@@ -1055,6 +1064,15 @@ class DuplexSessionRunner:
         self._clear_completed_pending_silence()
         return self.model_state.audio_buffer.has_pending() or self.model_state.audio_buffer.has_reserved()
 
+    async def _open_epoch(self) -> None:
+        """Give the current epoch's stage request the plugin's opening append, once."""
+        session = self.session
+        payload = self.plugin.session_open_payload(session.runtime_config)
+        if payload is None or self._opened_epoch == session.epoch:
+            return
+        self._opened_epoch = session.epoch
+        await self._start_append(payload, final=False, opening=True)
+
     async def _start_append(
         self,
         payload: dict[str, object],
@@ -1067,9 +1085,13 @@ class DuplexSessionRunner:
         silence_continuation: bool = False,
         on_append_accepted: Callable[[float], None] | None = None,
         before_append: Callable[[], bool] | None = None,
+        opening: bool = False,
     ) -> asyncio.Task[bool]:
         session = self.session
         model_state = self.model_state
+        if not opening:
+            # A cancel starts a new epoch, and with it a new stage request, which opens first.
+            await self._open_epoch()
         if not silence_continuation:
             self._mark_pending_silence_superseded()
             if on_append_accepted is None:

@@ -132,7 +132,8 @@ def sample_text_batch(
     infos: list[dict[str, Any]],
 ) -> TextSamplingResult:
     """Run the model's batched text sampling outside a frame step, then apply the host's tool decisions."""
-    inputs = model.sampling_inputs(infos, logits.device)
+    states = [info["duplexio_working_state"] for info in infos]
+    inputs = model.sampling_inputs(states, logits.device)
     text_ids, tool_starts, frame_logprobs, support_ids = model.sample_text(
         logits,
         emit_logits,
@@ -150,5 +151,5 @@ def sample_text_batch(
         inputs.calling,
         [None] * len(infos),
     )
-    model.finish_text_batch(text, infos, text_ids.tolist(), tool_starts.tolist())
+    model.finish_text_batch(text, states, text_ids.tolist(), tool_starts.tolist())
     return text

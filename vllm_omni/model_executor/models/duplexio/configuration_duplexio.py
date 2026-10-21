@@ -28,6 +28,7 @@ class DuplexIOConfig(PretrainedConfig):
         voice_prompt_max_frames: int = 125,
         default_system_prompt: str = "",
         head_dtype: str = "float32",
+        sequence_layout: str = "grid",
         **kwargs: Any,
     ) -> None:
         self.text_config = _text_config(text_config)
@@ -39,6 +40,7 @@ class DuplexIOConfig(PretrainedConfig):
         self.voice_prompt_max_frames = voice_prompt_max_frames
         self.silence_token_id = silence_token_id
         self.default_system_prompt = default_system_prompt
+        self.sequence_layout = sequence_layout
         self.validate()
 
     def get_text_config(self, decoder: bool | None = None, encoder: bool | None = None) -> PretrainedConfig:
@@ -46,6 +48,11 @@ class DuplexIOConfig(PretrainedConfig):
         return self.text_config
 
     def validate(self) -> None:
+        if self.sequence_layout != "flat":
+            raise ValueError(
+                "DuplexIO serves flat-sequence checkpoints (sequence_layout: flat); re-export this one with "
+                "duplexio's export-vllm from a flat model"
+            )
         if self.pad_token_id is None:
             raise ValueError("DuplexIO requires a pad_token_id")
         if self.user_asr_config.get("model_type") != "nemotron_asr_streaming":

@@ -1,21 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # ruff: noqa: N803  (Triton constexpr arguments keep their kernel names)
-"""Packed GDN prefill and recurrent six-cell decode.
+"""Per-stream GatedDeltaNet over flat positions, reading and writing each request's cache slot.
 
-The recurrent kernel adapts flash-linear-attention's fused recurrent gated delta
-rule (MIT; see GDN_LICENSE).
+A request's slot holds, for each of its six streams, the last three pre-conv
+inputs (``(kernel - 1) * streams`` conv columns, stream-major) and the FP32
+recurrent state (``streams * value_heads`` heads). Each position steps its own
+stream from that stream's state: a real position commits the step, a query or
+no-op computes it and keeps nothing. The conv and recurrence follow
+``duplexio.decode.gdn_decode``: FP32 conv with SiLU rounded to the activation
+dtype, then flash-linear-attention's fused recurrent rule with in-kernel Q/K L2
+normalization (MIT; see GDN_LICENSE).
 """
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
-from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
 from torch import Tensor
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+from vllm.triton_utils import tl, triton
 
-from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_CELLS
+from vllm_omni.model_executor.models.duplexio.frame_layout import NUM_GDN_STREAMS
+
+# Columns of the per-position GDN metadata.
+STREAM, REAL = 0, 1
+GDN_COLUMNS = 2
+# Columns of the per-request GDN metadata: its positions [start, end) in the
+# pass, its row in the step's state indices, and whether its slot is unowned.
+REQUEST_START, REQUEST_END, REQUEST_ROW, REQUEST_FRESH = range(4)
+GDN_REQUEST_COLUMNS = 4
 
 
 def gdn_cache_dtypes(dtype: torch.dtype) -> tuple[torch.dtype, ...]:
@@ -31,222 +43,256 @@ def gdn_cache_shapes(
     value_dim: int,
     conv_kernel_size: int,
 ) -> tuple[tuple[int, ...], ...]:
-    """Keep convolution history and six independent recurrent head groups."""
+    """Every stream's convolution history and recurrent heads, in one slot."""
     conv_shape, recurrent_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
         tp_size,
         key_heads,
         value_heads,
         key_dim,
         value_dim,
-        (conv_kernel_size - 1) * NUM_CELLS + 1,
+        (conv_kernel_size - 1) * NUM_GDN_STREAMS + 1,
         0,
     )
-    return conv_shape, (recurrent_shape[0] * NUM_CELLS, *recurrent_shape[1:])
+    return conv_shape, (recurrent_shape[0] * NUM_GDN_STREAMS, *recurrent_shape[1:])
 
 
-@torch.compile(dynamic=True, fullgraph=True)
-def prepare_gdn_inputs(
-    qkv: Tensor,
-    a: Tensor,
-    b: Tensor,
-    a_log: Tensor,
-    dt_bias: Tensor,
-    key_heads: int,
-    key_dim: int,
-    value_dim: int,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """L2-normalize Q and K in FP32, rounded back to their dtype; the decay gate stays FP32."""
-    key_width = key_heads * key_dim
-    q, k, v = qkv.split((key_width, key_width, qkv.shape[1] - key_width * 2), -1)
-    # FLA's l2norm: x * rsqrt(sum(x^2) + eps).
-    q, k = (x.view(qkv.shape[0], key_heads, key_dim) for x in (q, k))
-    q, k = ((x.float() * torch.rsqrt(x.float().square().sum(-1, keepdim=True) + 1e-6)).to(x.dtype) for x in (q, k))
-    beta = b.sigmoid()
-    g = -a_log.float().exp() * F.softplus(a.float() + dt_bias)
-    return q, k, v.view(qkv.shape[0], -1, value_dim), g, beta
-
-
-def initial_gdn_state(cache: Tensor, slots: Tensor, has_state: Tensor) -> Tensor:
-    """Ignore unowned cache bytes when a request starts or reuses a slot.
-
-    Eager: its row count is the step's request count, which a compiled
-    version would specialize on (one prefilling request is common).
-    """
-    return torch.where(has_state[:, None, None, None], cache[slots], 0)
+def gdn_gates(a: Tensor, b: Tensor, a_log: Tensor, dt_bias: Tensor) -> tuple[Tensor, Tensor]:
+    """FP32 decay ``g`` and the write strength ``beta`` in the activation dtype, as Qwen computes them."""
+    return -a_log.float().exp() * F.softplus(a.float() + dt_bias), b.sigmoid()
 
 
 @triton.jit
-def slot_recurrent_gdn_kernel(
-    q,
-    k,
-    v,
+def flat_gdn_kernel(
+    x,
+    weight,
     g,
     beta,
-    o,
-    state,
+    output,
+    conv_state,
+    recurrent_state,
     slots,
-    has_state,
-    cu_seqlens,
+    positions,
+    requests,
     scale,
-    stride_q,
-    stride_k,
-    stride_v,
-    stride_slot,
+    stride_x,
+    stride_weight,
+    stride_conv_slot,
+    stride_conv_channel,
+    stride_conv_time,
+    stride_state_slot,
+    stride_positions,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    BK: tl.constexpr,
     BV: tl.constexpr,
-    SINGLE_FRAME: tl.constexpr = False,
+    STREAMS: tl.constexpr,
 ):
-    """fla's fused recurrent gated delta rule, reading and writing each request's cache slot in place.
-
-    Keep FP32 key-major state, with value tiles accessing contiguous columns.
-    """
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
-    i_n, i_hv = i_nh // HV, i_nh % HV
+    """One (request, stream, value head, value tile): step the stream's positions in order."""
+    i_v, i_segment = tl.program_id(0), tl.program_id(1)
+    segment, i_hv = i_segment // HV, i_segment % HV
+    request, stream = segment // STREAMS, segment % STREAMS
     i_h = i_hv // (HV // H)
-    if SINGLE_FRAME:
-        bos, eos = i_n, i_n + 1
-    else:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-    o_k = tl.arange(0, BK)
+    start = tl.load(requests + request * 4)
+    end = tl.load(requests + request * 4 + 1)
+    slot = tl.load(slots + tl.load(requests + request * 4 + 2)).to(tl.int64)
+    # A padded request has no slot: it reads zeros and writes nothing.
+    owned = slot >= 0
+    fresh = (tl.load(requests + request * 4 + 3) != 0) | ~owned
+    slot = tl.maximum(slot, 0)
+
+    o_k = tl.arange(0, K)
     o_v = i_v * BV + tl.arange(0, BV)
-    p_q = q + bos * stride_q + i_h * K + o_k
-    p_k = k + bos * stride_k + i_h * K + o_k
-    p_v = v + bos * stride_v + i_hv * V + o_v
-    p_g = g + bos * HV + i_hv
-    p_beta = beta + bos * HV + i_hv
-    p_o = o + (bos * HV + i_hv) * V + o_v
-    mask_k = o_k < K
-    mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
-    p_h = state + tl.load(slots + i_n).to(tl.int64) * stride_slot + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
-    b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    valid_state = tl.load(has_state + i_n) != 0
-    b_h += tl.load(p_h, mask=mask_h & valid_state, other=0).to(tl.float32)
-    state_changed = ~valid_state
-    for _ in tl.range(0, eos - bos):
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_q = b_q * scale
-        b_beta = tl.load(p_beta).to(tl.float32)
-        b_g = tl.load(p_g).to(tl.float32)
-        if (b_beta != 0) | (b_g != 0):
-            b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-            b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-            b_h *= tl.exp(b_g)
-            b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
-            b_h += b_k[:, None] * b_v
-            state_changed = True
-        b_o = tl.sum(b_h * b_q[:, None], 0)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
-        p_q += stride_q
-        p_k += stride_k
-        p_v += stride_v
-        p_g += HV
-        p_beta += HV
-        p_o += HV * V
-    # Inactive streams still read/query memory, but need not rewrite it.
-    tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h & state_changed)
+    q_channel = i_h * K + o_k
+    k_channel = H * K + i_h * K + o_k
+    v_channel = 2 * H * K + i_hv * V + o_v
+
+    history = conv_state + slot * stride_conv_slot + stream * 3 * stride_conv_time
+    keep = ~fresh
+    q0 = tl.load(history + q_channel * stride_conv_channel, mask=keep, other=0).to(tl.float32)
+    q1 = tl.load(history + q_channel * stride_conv_channel + stride_conv_time, mask=keep, other=0).to(tl.float32)
+    q2 = tl.load(history + q_channel * stride_conv_channel + 2 * stride_conv_time, mask=keep, other=0).to(tl.float32)
+    k0 = tl.load(history + k_channel * stride_conv_channel, mask=keep, other=0).to(tl.float32)
+    k1 = tl.load(history + k_channel * stride_conv_channel + stride_conv_time, mask=keep, other=0).to(tl.float32)
+    k2 = tl.load(history + k_channel * stride_conv_channel + 2 * stride_conv_time, mask=keep, other=0).to(tl.float32)
+    v0 = tl.load(history + v_channel * stride_conv_channel, mask=keep, other=0).to(tl.float32)
+    v1 = tl.load(history + v_channel * stride_conv_channel + stride_conv_time, mask=keep, other=0).to(tl.float32)
+    v2 = tl.load(history + v_channel * stride_conv_channel + 2 * stride_conv_time, mask=keep, other=0).to(tl.float32)
+    # Taps oldest first: output = w0 * x[t-3] + w1 * x[t-2] + w2 * x[t-1] + w3 * x[t].
+    wq = weight + q_channel * stride_weight
+    wk = weight + k_channel * stride_weight
+    wv = weight + v_channel * stride_weight
+    wq0 = tl.load(wq).to(tl.float32)
+    wq1 = tl.load(wq + 1).to(tl.float32)
+    wq2 = tl.load(wq + 2).to(tl.float32)
+    wq3 = tl.load(wq + 3).to(tl.float32)
+    wk0 = tl.load(wk).to(tl.float32)
+    wk1 = tl.load(wk + 1).to(tl.float32)
+    wk2 = tl.load(wk + 2).to(tl.float32)
+    wk3 = tl.load(wk + 3).to(tl.float32)
+    wv0 = tl.load(wv).to(tl.float32)
+    wv1 = tl.load(wv + 1).to(tl.float32)
+    wv2 = tl.load(wv + 2).to(tl.float32)
+    wv3 = tl.load(wv + 3).to(tl.float32)
+
+    p_h = recurrent_state + slot * stride_state_slot + ((stream * HV + i_hv) * K + o_k[:, None]) * V + o_v[None, :]
+    b_h = tl.load(p_h, mask=keep, other=0).to(tl.float32)
+    # A fresh slot writes every stream, so streams it does not step start from zero later.
+    committed = fresh.to(tl.int32)
+    for p in tl.range(start, end):
+        meta = positions + p * stride_positions
+        if tl.load(meta) == stream:
+            row = x + p * stride_x
+            xq = tl.load(row + q_channel).to(tl.float32)
+            xk = tl.load(row + k_channel).to(tl.float32)
+            xv = tl.load(row + v_channel).to(tl.float32)
+            b_q = wq0 * q0 + wq1 * q1 + wq2 * q2 + wq3 * xq
+            b_k = wk0 * k0 + wk1 * k1 + wk2 * k2 + wk3 * xk
+            b_v = wv0 * v0 + wv1 * v1 + wv2 * v2 + wv3 * xv
+            # SiLU, rounded to the activation dtype as the conv output is.
+            b_q = (b_q * tl.sigmoid(b_q)).to(output.dtype.element_ty).to(tl.float32)
+            b_k = (b_k * tl.sigmoid(b_k)).to(output.dtype.element_ty).to(tl.float32)
+            b_v = (b_v * tl.sigmoid(b_v)).to(output.dtype.element_ty).to(tl.float32)
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6) * scale
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+            b_g = tl.load(g + p * HV + i_hv).to(tl.float32)
+            b_beta = tl.load(beta + p * HV + i_hv).to(tl.float32)
+            stepped = b_h * tl.exp(b_g)
+            b_v = b_beta * (b_v - tl.sum(stepped * b_k[:, None], 0))
+            stepped += b_k[:, None] * b_v[None, :]
+            b_o = tl.sum(stepped * b_q[:, None], 0)
+            tl.store(output + (p * HV + i_hv) * V + o_v, b_o.to(output.dtype.element_ty))
+            if tl.load(meta + 1) != 0:
+                b_h = stepped
+                q0, q1, q2 = q1, q2, xq
+                k0, k1, k2 = k1, k2, xk
+                v0, v1, v2 = v1, v2, xv
+                committed = committed | 1
+    tl.store(p_h, b_h, mask=owned & (committed != 0))
 
 
-def slot_recurrent_gdn(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
+@triton.jit
+def flat_conv_history_kernel(
+    x,
+    conv_state,
+    slots,
+    positions,
+    requests,
+    channels,
+    stride_x,
+    stride_conv_slot,
+    stride_conv_channel,
+    stride_conv_time,
+    stride_positions,
+    STREAMS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Shift each stream's last three committed inputs into its history, after every read of it."""
+    segment, block = tl.program_id(0), tl.program_id(1)
+    request, stream = segment // STREAMS, segment % STREAMS
+    start = tl.load(requests + request * 4)
+    end = tl.load(requests + request * 4 + 1)
+    slot = tl.load(slots + tl.load(requests + request * 4 + 2)).to(tl.int64)
+    owned = slot >= 0
+    fresh = (tl.load(requests + request * 4 + 3) != 0) | ~owned
+    slot = tl.maximum(slot, 0)
+    channel = block * BLOCK + tl.arange(0, BLOCK)
+    inside = channel < channels
+    history = conv_state + slot * stride_conv_slot + channel * stride_conv_channel + stream * 3 * stride_conv_time
+    keep = inside & ~fresh
+    h0 = tl.load(history, mask=keep, other=0)
+    h1 = tl.load(history + stride_conv_time, mask=keep, other=0)
+    h2 = tl.load(history + 2 * stride_conv_time, mask=keep, other=0)
+    changed = fresh.to(tl.int32)
+    for p in tl.range(start, end):
+        meta = positions + p * stride_positions
+        if (tl.load(meta) == stream) & (tl.load(meta + 1) != 0):
+            h0, h1 = h1, h2
+            h2 = tl.load(x + p * stride_x + channel, mask=inside, other=0)
+            changed = changed | 1
+    store = inside & owned & (changed != 0)
+    tl.store(history, h0, mask=store)
+    tl.store(history + stride_conv_time, h1, mask=store)
+    tl.store(history + 2 * stride_conv_time, h2, mask=store)
+
+
+def flat_gdn(
+    mixed_qkv: Tensor,
+    weight: Tensor,
     g: Tensor,
     beta: Tensor,
-    cache: Tensor,
+    conv_state: Tensor,
+    recurrent_state: Tensor,
     slots: Tensor,
-    boundaries: Tensor,
-    has_state: Tensor,
+    positions: Tensor,
+    requests: Tensor,
+    num_requests: int,
+    *,
+    key_heads: int,
+    key_dim: int,
+    value_dim: int,
 ) -> Tensor:
-    """Advance each request's recurrent state in its cache slot; return the outputs."""
-    tokens, heads, key_dim = k.shape
-    value_heads, value_dim = v.shape[1:]
-    assert q.stride()[1:] == k.stride()[1:] == (key_dim, 1) and v.stride()[1:] == (value_dim, 1)
-    assert g.is_contiguous() and beta.is_contiguous() and g.shape == beta.shape == (tokens, value_heads)
-    assert cache.shape[1:] == (value_heads, key_dim, value_dim) and cache.stride()[1:] == (
-        key_dim * value_dim,
-        value_dim,
-        1,
-    )
-    output = torch.empty((tokens, value_heads, value_dim), dtype=v.dtype, device=v.device)
-    single_frame = tokens == slots.shape[0]
-    block_v = min(32 if single_frame else 8, triton.next_power_of_2(value_dim))
-    grid = (triton.cdiv(value_dim, block_v), slots.shape[0] * value_heads)
-    slot_recurrent_gdn_kernel[grid](
-        q,
-        k,
-        v,
+    """Run each position of ``mixed_qkv`` ``(tokens, conv_dim)`` on its stream; returns its core outputs.
+
+    The outputs are ``(tokens, value_heads, value_dim)``.
+
+    ``weight`` is the ``(conv_dim, 4)`` causal kernel, ``conv_state`` a
+    ``(slots, conv_dim, 3 * streams)`` view and ``recurrent_state``
+    ``(slots, streams * value_heads, key_dim, value_dim)``; ``slots`` holds the
+    step's state index per request, ``positions`` ``(tokens, GDN_COLUMNS)`` rows (any row stride) and
+    ``requests`` ``(num_requests, GDN_REQUEST_COLUMNS)`` int32.
+    """
+    tokens, channels = mixed_qkv.shape
+    value_heads = g.shape[1]
+    assert weight.shape == (channels, 4) and weight.stride(1) == 1
+    assert mixed_qkv.stride(1) == 1 and g.is_contiguous() and beta.is_contiguous()
+    assert recurrent_state.shape[1:] == (NUM_GDN_STREAMS * value_heads, key_dim, value_dim)
+    assert recurrent_state.stride()[1:] == (key_dim * value_dim, value_dim, 1)
+    output = torch.zeros((tokens, value_heads, value_dim), dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+    segments = num_requests * NUM_GDN_STREAMS
+    block_v = min(32, triton.next_power_of_2(value_dim))
+    flat_gdn_kernel[(triton.cdiv(value_dim, block_v), segments * value_heads)](
+        mixed_qkv,
+        weight,
         g,
         beta,
         output,
-        cache,
+        conv_state,
+        recurrent_state,
         slots,
-        has_state,
-        boundaries,
+        positions,
+        requests,
         key_dim**-0.5,
-        q.stride(0),
-        k.stride(0),
-        v.stride(0),
-        cache.stride(0),
-        H=heads,
+        mixed_qkv.stride(0),
+        weight.stride(0),
+        *conv_state.stride(),
+        recurrent_state.stride(0),
+        positions.stride(0),
+        H=key_heads,
         HV=value_heads,
         K=key_dim,
         V=value_dim,
-        BK=triton.next_power_of_2(key_dim),
         BV=block_v,
-        SINGLE_FRAME=single_frame,
-        num_warps=2 if single_frame else 1,
-        num_stages=3,
+        STREAMS=NUM_GDN_STREAMS,
+        num_warps=2,
+        num_stages=1,
+    )
+    block = 256
+    flat_conv_history_kernel[(segments, triton.cdiv(channels, block))](
+        mixed_qkv,
+        conv_state,
+        slots,
+        positions,
+        requests,
+        channels,
+        mixed_qkv.stride(0),
+        *conv_state.stride(),
+        positions.stride(0),
+        STREAMS=NUM_GDN_STREAMS,
+        BLOCK=block,
+        num_warps=4,
     )
     return output
 
 
-def append_gdn(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    g: Tensor,
-    beta: Tensor,
-    cache: Tensor,
-    slots: Tensor,
-    boundaries: Tensor,
-    has_state: Tensor,
-    chunks: Tensor,
-) -> Tensor:
-    """Append packed whole-frame requests, resetting newly allocated slots.
-
-    Each request contains at least six cells. Six cells per request therefore
-    identifies a decode-only batch without reading sequence lengths on the CPU.
-    Q/K are normalized at preparation; cached recurrence always remains FP32.
-    """
-    tokens = q.shape[0]
-    frames = tokens // NUM_CELLS
-    q, k, v = (x.reshape(frames, -1, x.shape[2]) for x in (q, k, v))
-    g, beta = (x.reshape(frames, -1) for x in (g, beta))
-    boundaries = boundaries // NUM_CELLS
-    if q.shape[0] == slots.shape[0]:
-        output = slot_recurrent_gdn(q, k, v, g, beta, cache, slots, boundaries, has_state)
-        return output.reshape(tokens, -1, v.shape[-1])
-    initial = initial_gdn_state(cache, slots, has_state)
-    # The autograd wrapper ignores precomputed chunks and rebuilds them with a host sync.
-    # Its forward assumes the contiguous layout the wrapper enforces; V is a strided split of QKV.
-    q, k, v, g, beta = (tensor.unsqueeze(0).contiguous() for tensor in (q, k, v, g, beta))
-    _, output, _, final, _, _ = chunk_gated_delta_rule_fwd(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        k.shape[-1] ** -0.5,
-        initial,
-        True,
-        cu_seqlens=boundaries,
-        chunk_indices=chunks,
-    )
-    # Cache views alias vLLM's mixed-dtype allocation; mutate outside compilation.
-    cache[slots] = final
-    return output[0].reshape(tokens, -1, v.shape[-1])
+__all__ = ["GDN_COLUMNS", "GDN_REQUEST_COLUMNS", "flat_gdn", "gdn_cache_dtypes", "gdn_cache_shapes", "gdn_gates"]

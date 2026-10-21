@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Project DuplexIO frame outputs into duplex events."""
+"""Project DuplexIO frame outputs into duplex events.
+
+Every prediction is one frame of agent audio and text, the first coming from the
+session's opening append before any user audio: frame k plays during the user's frame k.
+"""
 
 from __future__ import annotations
 

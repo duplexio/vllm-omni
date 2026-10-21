@@ -317,6 +317,16 @@ class DuplexModelPlugin(ABC):
             "sample_rate_hz": int(self.silence_continuation_sample_rate_hz),
         }
 
+    def session_open_payload(self, runtime_config: Mapping[str, object]) -> dict[str, object] | None:
+        """An append to run as soon as a session opens, before any client input; None for none.
+
+        A model that decides before it hears anything (its first output frame
+        plays while the user's first frame is recorded) prefills its context
+        here and returns that decision as the session's first output.
+        """
+        del runtime_config
+        return None
+
     # ---- engine policy (was DuplexRuntimeExtension) ----
 
     @abstractmethod

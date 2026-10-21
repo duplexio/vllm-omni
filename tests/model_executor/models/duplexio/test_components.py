@@ -8,7 +8,6 @@ import torch
 from torch import nn
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from vllm_omni.model_executor.models.duplexio.audio_adapters import (
     AudioInputAdapter,
@@ -16,21 +15,23 @@ from vllm_omni.model_executor.models.duplexio.audio_adapters import (
 from vllm_omni.model_executor.models.duplexio.configuration_duplexio import (
     DuplexIOConfig,
 )
-from vllm_omni.model_executor.models.duplexio.kv_reclamation import (
-    DuplexIOFrameMetadata,
-    DuplexIOKVLayout,
-)
+from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_POSITIONS, SLOT_COUNT
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
     text_suppression_ids,
 )
 from vllm_omni.model_executor.models.duplexio.pipeline import DUPLEXIO_PIPELINE
 from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
+    ATTENTION,
+    GDN,
+    STEP_COLUMNS,
+    WRITE,
     DuplexIOFlashAttentionMetadataBuilder,
     DuplexIOGDNAttentionBackend,
     DuplexIOGDNAttentionMetadataBuilder,
     DuplexIOQwenGatedDeltaNetAttention,
     DuplexIOQwenModel,
+    FlatStep,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -54,6 +55,7 @@ def _config() -> DuplexIOConfig:
         audio_adapter_config={"hidden_size": 16},
         pad_token_id=1,
         silence_token_id=2,
+        sequence_layout="flat",
     )
 
 
@@ -86,49 +88,32 @@ def test_duplexio_text_config_uses_one_dimensional_rope() -> None:
     assert rope_parameters["partial_rotary_factor"] == 0.25
 
 
-def test_duplexio_installs_cell_addressing_at_stable_buffers() -> None:
-    model = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
-    nn.Module.__init__(model)
-    layout = DuplexIOKVLayout(
-        block_size=16,
-        audio_window_frames=2,
-        max_model_len=120,
-    )
-    model.frame = DuplexIOFrameMetadata(12, torch.device("cpu"))
-    frame = model.frame
-    buffers = (
-        frame.key_active,
-        frame.persistent_ordinal,
-        frame.persistent_last,
-        frame.audio_first,
-        frame.audio_last,
-        frame.positions,
-    )
-    pointers = tuple(buffer.data_ptr() for buffer in buffers)
-    info = {
-        "duplexio": {
-            "key_active": torch.tensor([True, False, False, False, True, True]),
-            "persistent_ordinal": torch.tensor([7, 0, 0, 0, 0, 0], dtype=torch.int32),
-            "persistent_last": torch.full((6,), 6, dtype=torch.int32),
-            "audio_first": torch.full((6,), 1, dtype=torch.int32),
-            "audio_last": torch.full((6,), 4, dtype=torch.int32),
-            "positions": torch.arange(30, 36),
-        }
-    }
+def test_flat_step_installs_passes_at_stable_buffers_and_resets_inert() -> None:
+    step = FlatStep(4 * FRAME_POSITIONS, torch.device("cpu"))
+    pointers = (step.positions.data_ptr(), step.rope.data_ptr(), step.requests.data_ptr())
+    positions = torch.arange(2 * FRAME_POSITIONS * STEP_COLUMNS, dtype=torch.int32).view(-1, STEP_COLUMNS)
+    requests = torch.tensor([[0, 5, 1, 1], [5, 10, 0, 0]], dtype=torch.int32)
 
-    model.update_graph_inputs([info, info])
+    step.install(positions, requests)
 
-    for name, buffer in zip(info["duplexio"], buffers, strict=True):
-        expected = info["duplexio"][name]
-        torch.testing.assert_close(buffer[:12], torch.cat((expected, expected)))
+    torch.testing.assert_close(step.positions[: 2 * FRAME_POSITIONS], positions)
+    torch.testing.assert_close(step.rope[: 2 * FRAME_POSITIONS], positions[:, 0].long())
+    assert step.request_count(2 * FRAME_POSITIONS) == 2
+    # An empty step leaves nothing addressable: every position is a no-op of its own frame.
+    step.reset()
+    assert torch.equal(step.positions[:, WRITE], torch.full((4 * FRAME_POSITIONS,), -1, dtype=torch.int32))
+    attention = step.positions[:, ATTENTION]
+    assert not (attention[:, 1:7] != 0).any() and bool((attention[:, 7] == 1).all())
+    assert not step.positions[:, GDN][:, 1].any()
+    assert step.request_count(3 * FRAME_POSITIONS) == 3
+    assert pointers == (step.positions.data_ptr(), step.rope.data_ptr(), step.requests.data_ptr())
 
-    # An empty step must leave nothing addressable behind.
-    model.update_graph_inputs([])
 
-    assert torch.equal(frame.write_slots(12, layout), torch.full((12,), -1))
-    start, end, persistent = frame.row_reads(12)
-    assert torch.equal(start, end) and not persistent.any()
-    assert pointers == tuple(buffer.data_ptr() for buffer in buffers)
+def test_duplexio_config_requires_the_flat_layout() -> None:
+    config = _config().to_dict()
+    config["sequence_layout"] = "grid"
+    with pytest.raises(ValueError, match="flat"):
+        DuplexIOConfig.from_dict(config)
 
 
 def test_duplexio_config_requires_hybrid_qwen_backbone() -> None:
@@ -152,7 +137,7 @@ def test_duplexio_qwen_backbone_uses_vllm_compile_boundary() -> None:
     assert TorchCompileWithNoGuardsWrapper in DuplexIOQwenModel.__bases__
 
 
-def test_duplexio_cudagraph_supports_uniform_six_cell_batches() -> None:
+def test_duplexio_cudagraph_supports_uniform_frame_batches() -> None:
     single = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=1))
     multiple = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=2))
 
@@ -180,84 +165,12 @@ def test_duplexio_gdn_cache_allocation_preserves_fp32_recurrence() -> None:
     )
 
 
-def test_duplexio_gdn_chunks_by_frames_without_full_graphs_too() -> None:
-    """vLLM's stock GDN backend chunks by tokens, which the frame-strided kernels would misread."""
+def test_duplexio_gdn_uses_its_own_backend() -> None:
+    """vLLM's stock GDN metadata plans chunks by tokens; flat positions step their own streams."""
     attention = DuplexIOQwenGatedDeltaNetAttention.__new__(DuplexIOQwenGatedDeltaNetAttention)
     nn.Module.__init__(attention)
 
     assert attention.get_attn_backend() is DuplexIOGDNAttentionBackend
-
-
-def test_duplexio_gdn_graph_refreshes_every_recurrent_state_input(
-    monkeypatch,
-) -> None:
-    builder = DuplexIOGDNAttentionMetadataBuilder.__new__(DuplexIOGDNAttentionMetadataBuilder)
-    builder.kv_cache_spec = object()
-    builder.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(mamba_cache_mode="align"))
-    metadata = SimpleNamespace(
-        non_spec_state_indices_tensor=torch.zeros(1, dtype=torch.long),
-        has_initial_state=torch.zeros(1, dtype=torch.bool),
-        prefill_state_indices=torch.zeros(1, dtype=torch.long),
-        prefill_has_initial_state=torch.zeros(1, dtype=torch.bool),
-    )
-    builder.full_graph_metadata = {1: metadata}
-    common = SimpleNamespace(
-        num_reqs=1,
-        block_table_tensor=torch.zeros((1, 1), dtype=torch.int32),
-        seq_lens=torch.tensor([12], dtype=torch.int32),
-        compute_num_computed_tokens=lambda: torch.tensor([6]),
-    )
-    monkeypatch.setattr(
-        "vllm_omni.model_executor.models.duplexio.qwen_backbone.mamba_get_block_table_tensor",
-        lambda *args: torch.tensor([[7]], dtype=torch.long),
-    )
-
-    refreshed = builder.refresh_full_graph_metadata(common)
-
-    assert refreshed is metadata
-    torch.testing.assert_close(
-        metadata.non_spec_state_indices_tensor,
-        torch.tensor([7]),
-    )
-    torch.testing.assert_close(
-        metadata.prefill_state_indices,
-        torch.tensor([7]),
-    )
-    torch.testing.assert_close(
-        metadata.has_initial_state,
-        torch.tensor([True]),
-    )
-    torch.testing.assert_close(
-        metadata.prefill_has_initial_state,
-        torch.tensor([True]),
-    )
-
-
-def test_gdn_graph_buffers_are_independent_per_batch_size() -> None:
-    builder = DuplexIOGDNAttentionMetadataBuilder.__new__(DuplexIOGDNAttentionMetadataBuilder)
-    builder.full_graph_metadata = {}
-    for requests in (1, 3, 8):
-        boundaries = torch.arange(requests + 1, dtype=torch.int32) * 6
-        metadata = GDNAttentionMetadata(
-            num_prefills=requests,
-            num_prefill_tokens=requests * 6,
-            num_decodes=0,
-            num_decode_tokens=0,
-            num_spec_decodes=0,
-            num_spec_decode_tokens=0,
-            num_actual_tokens=requests * 6,
-            non_spec_query_start_loc=boundaries,
-            non_spec_state_indices_tensor=torch.arange(requests, dtype=torch.int32),
-            has_initial_state=torch.ones(requests, dtype=torch.bool),
-            chunk_indices=torch.stack((torch.arange(requests), torch.zeros(requests, dtype=torch.long)), 1),
-            chunk_offsets=torch.arange(requests + 1),
-        )
-        retained = builder.retain_full_graph_metadata(metadata)
-        boundaries.fill_(-1)
-        torch.testing.assert_close(retained.prefill_query_start_loc, torch.arange(requests + 1, dtype=torch.int32) * 6)
-    for requests, metadata in builder.full_graph_metadata.items():
-        assert metadata.num_actual_tokens == requests * 6
-        torch.testing.assert_close(metadata.prefill_query_start_loc, torch.arange(requests + 1, dtype=torch.int32) * 6)
 
 
 def test_mlp_adapters_return_backbone_inputs_without_a_skip() -> None:
@@ -279,8 +192,8 @@ def test_unfinished_tool_context_does_not_run_prediction_heads() -> None:
     model = DuplexIOForConditionalGeneration.__new__(DuplexIOForConditionalGeneration)
 
     predictions = model.sample_frames(
-        torch.zeros(6, 4),
-        [(0, 6)],
+        torch.zeros(FRAME_POSITIONS, 4),
+        [(0, FRAME_POSITIONS)],
         [{"duplex": {}}],
         [False],
     )
@@ -293,7 +206,8 @@ def test_checkpoint_names_map_onto_the_flat_heads() -> None:
     nn.Module.__init__(model)
     model.lm_head = nn.Linear(4, 8, bias=False)
     model.channel_emb = nn.Parameter(torch.zeros(4, 4))
-    model.user_emit_head = nn.Linear(24, 1)
+    model.flat_cell_emb = nn.Parameter(torch.zeros(SLOT_COUNT, 4))
+    model.user_emit_head = nn.Linear(4, 1)
     weights = {name: torch.randn_like(value) for name, value in model.state_dict().items()}
     checkpoint = {
         (

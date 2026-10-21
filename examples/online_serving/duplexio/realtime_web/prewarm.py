@@ -90,7 +90,8 @@ async def prewarm(
                     )
                     await asyncio.sleep(SEND_INTERVAL_SECONDS)
 
-            # The model answers every user frame with one audio frame.
+            # The model answers the session's opening, then every user frame, with
+            # one frame; waiting for as many audio frames as user frames covers the stream.
             sender = asyncio.create_task(send_frames())
             for _ in frames:
                 await wait_for_event(websocket, {"response.output_audio.delta"})

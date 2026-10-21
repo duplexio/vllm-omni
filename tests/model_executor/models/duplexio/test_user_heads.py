@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""User policy heads read the full frame and load in place."""
+"""User policy heads read the user audio cell and load in place."""
 
 from types import SimpleNamespace
 
@@ -11,6 +11,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
 
 from tests.model_executor.models.duplexio.reference_sampling import sample_text_batch
+from vllm_omni.model_executor.models.duplexio.frame_layout import FRAME_POSITIONS
 from vllm_omni.model_executor.models.duplexio.modeling_duplexio import (
     DuplexIOForConditionalGeneration,
 )
@@ -33,10 +34,10 @@ def head_model(device="cpu"):
     model.silence_token_id = 0
     model.lm_head = nn.Linear(32, 64, bias=False)
     model.lm_head.quant_method = UnquantizedEmbeddingMethod()
-    model.user_token_projection = nn.Linear(6 * 32, 32)
-    model.user_emit_head = nn.Linear(6 * 32, 1)
-    model.agent_emit_head = nn.Linear(6 * 32, 1)
-    model.tool_call_emit_head = nn.Linear(6 * 32, 1)
+    model.user_token_projection = nn.Linear(32, 32)
+    model.user_emit_head = nn.Linear(32, 1)
+    model.agent_emit_head = nn.Linear(32, 1)
+    model.tool_call_emit_head = nn.Linear(32, 1)
     model.logits_processor = LocalVocabulary()
     model.text_config = SimpleNamespace(vocab_size=64)
     model.config = SimpleNamespace(flowmap_config={"sampling_temperature": 1.0})
@@ -149,7 +150,7 @@ def test_checkpoint_loader_loads_both_user_heads_in_place():
 @torch.inference_mode()
 def test_loaded_user_heads_update_the_captured_graph_and_publish_version():
     model = head_model("cuda")
-    rows = torch.randn(3, 6, 32, device="cuda")
+    rows = torch.randn(3, FRAME_POSITIONS, 32, device="cuda")
     pointers = {name: p.data_ptr() for name, p in model.named_parameters()}
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
