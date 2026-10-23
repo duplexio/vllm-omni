@@ -1416,6 +1416,9 @@ class DuplexIOForConditionalGeneration(
             "llm.": "",
             "user_asr.model.encoder.": "user_asr.encoder.",
             "user_asr.model.": None,
+            # Exported for runtimes without the processor; the encoder derives its own.
+            "user_asr.mel_filters": None,
+            "user_asr.stft_window": None,
             "audio_sampler.flow.": "audio_sampler.",
         }
     )

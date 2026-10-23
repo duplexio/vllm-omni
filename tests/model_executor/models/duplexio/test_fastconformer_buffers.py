@@ -40,3 +40,13 @@ def test_frontend_buffers_live_on_the_device_the_model_is_built_on() -> None:
     with torch.device("meta"):
         encoder = FastConformerEncoder(*encoder_parts())
     assert encoder.mel_filters.device.type == encoder.stft_window.device.type == "meta"
+
+
+def test_exported_frontend_constants_are_not_loaded_as_weights() -> None:
+    # DuplexIO exports ship them for the Apple runtime, which has no processor.
+    from vllm_omni.model_executor.models.duplexio.modeling_duplexio import DuplexIOForConditionalGeneration
+
+    weights = [(name, torch.zeros(1)) for name in ("user_asr.mel_filters", "user_asr.stft_window",
+                                                   "user_asr.model.encoder.layers.0.weight")]
+    mapped = [name for name, _ in DuplexIOForConditionalGeneration.hf_to_vllm_mapper.apply(weights)]
+    assert mapped == ["user_asr.encoder.layers.0.weight"]
