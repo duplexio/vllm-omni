@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
@@ -119,6 +120,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # [Omni] A parked duplex session holds its KV until its next append, so
+        # preempted sessions can wait forever behind parked ones: every session
+        # must fit at max_model_len.
+        sessions = self.vllm_config.model_config.duplex_max_sessions
+        capacity = get_max_concurrency_for_kv_cache_config(self.vllm_config, self.kv_cache_config)
+        if sessions > capacity:
+            raise ValueError(
+                f"The KV cache holds {capacity:.2f} requests at max_model_len="
+                f"{self.vllm_config.model_config.max_model_len}, fewer than duplex_session.max_sessions={sessions}; "
+                "lower max_model_len or the session count, or raise gpu_memory_utilization"
+            )
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
