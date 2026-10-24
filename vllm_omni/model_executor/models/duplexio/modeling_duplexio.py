@@ -797,7 +797,8 @@ class DuplexIOForConditionalGeneration(
         default dtype that serving runs with (weight loading changes it, which
         compiled code guards on). Sampling graphs also key on the batch's top-k,
         which only requests know; they are captured here for the default
-        sampling policy, which unconfigured sessions use.
+        sampling policy, which unconfigured sessions use, and for the policies
+        the deployment declares. An undeclared policy captures on its first batch.
         """
         if not self.full_cudagraph_enabled or self.frame_input_graphs:
             return
@@ -826,18 +827,39 @@ class DuplexIOForConditionalGeneration(
             user_sources = torch.zeros(size + 1, self.user_asr.output_dim, device=device)
             agent_sources = torch.zeros(size + 1, LATENT_DIM, device=device)
             self.frame_input_graph((packed, user_sources, agent_sources))
-        sampling = self.resolve_sampling(SamplingConfig().model_dump())
-        top_k = sampled_top_k((sampling.agent, sampling.user), self.text_config.vocab_size)
-        width = support_width([sampling.agent], top_k)
-        parameters = torch.tensor(
-            [(*sampling.parameters, sampling.flow_temperature, 0)] * max_rows,
-            dtype=torch.float32,
-            device=device,
-        )
+        # The default policy, and every policy the deployment declares it will serve
+        # (``additional_config.duplexio_sampling_policies``, SamplingConfig dumps).
+        declared = self.vllm_config.additional_config.get("duplexio_sampling_policies", [])
+        for policy in (SamplingConfig().model_dump(), *declared):
+            sampling = self.resolve_sampling(policy)
+            top_k = sampled_top_k((sampling.agent, sampling.user), self.text_config.vocab_size)
+            width = support_width([sampling.agent], top_k)
+            parameters = torch.tensor(
+                [(*sampling.parameters, sampling.flow_temperature, 0)],
+                dtype=torch.float32,
+                device=device,
+            )
+            self.capture_sampling_graphs(parameters, top_k, width)
+
+    def capture_sampling_graphs(self, parameters: Tensor, top_k: int | None, width: int) -> None:
+        """Capture the sampling graphs of one policy (top-k and support width) for every batch size.
+
+        ``parameters`` is one row of the policy's sampling parameters. A batch that
+        later shrinks, e.g. while clients drain their sessions, then never stalls
+        the remaining streams on a compile and capture of its new size.
+        """
+        max_rows = self.vllm_config.scheduler_config.max_num_seqs
         rows = self.channel_emb.new_zeros(max_rows, FRAME_POSITIONS, self.text_config.hidden_size)
+        parameters = parameters[:1].expand(max_rows, -1).contiguous()
         for size in range(1, max_rows + 1):
+            key = (size, top_k, width)
+            if key in self.sampling_graphs:
+                continue
             tensors = (rows[:size], parameters[:size], self.allow_all_bitmask[:size])
-            self.sampling_graph(tensors, top_k, width)
+            pool = next(iter(self.sampling_graphs.values())).graph.pool() if self.sampling_graphs else None
+            self.sampling_graphs[key] = FrameInputGraph(
+                partial(self.sample_rows, top_k=top_k, support_width=width), tensors, pool,
+            )
 
     def project_positions(self, packed: Tensor, user_sources: Tensor, agent_sources: Tensor) -> tuple[Tensor]:
         """Tensor-only input embeddings of flat positions, shared by all requests.
@@ -1130,12 +1152,10 @@ class DuplexIOForConditionalGeneration(
         return FrameBatch(indices=indices, text=text, audio=audio, hiddens=rows)
 
     def sampling_graph(self, tensors: tuple[Tensor, ...], top_k: int | None, width: int) -> FrameInputGraph:
-        """The sampling graph for this batch size and top-k, captured on first use into the shared pool."""
+        """The sampling graph for this batch size and policy; a policy's first batch captures all sizes."""
         key = (tensors[0].shape[0], top_k, width)
         if key not in self.sampling_graphs:
-            pool = next(iter(self.sampling_graphs.values())).graph.pool() if self.sampling_graphs else None
-            sample = partial(self.sample_rows, top_k=top_k, support_width=width)
-            self.sampling_graphs[key] = FrameInputGraph(sample, tensors, pool)
+            self.capture_sampling_graphs(tensors[1], top_k, width)
         return self.sampling_graphs[key]
 
     def autocast(self, value: Tensor) -> torch.autocast:
