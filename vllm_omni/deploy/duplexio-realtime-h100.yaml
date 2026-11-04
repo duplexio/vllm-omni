@@ -16,5 +16,6 @@ stages:
     compilation_config:
       mode: 0
       cudagraph_mode: FULL_DECODE_ONLY
-      cudagraph_capture_sizes: [6, 12, 18, 24, 30, 36, 42, 48]
+      # One per live session count: FRAME_POSITIONS (5) x sessions.
+      cudagraph_capture_sizes: [5, 10, 15, 20, 25, 30, 35, 40]
       cudagraph_copy_inputs: true
