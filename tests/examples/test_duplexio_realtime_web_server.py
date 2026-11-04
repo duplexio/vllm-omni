@@ -152,9 +152,16 @@ def test_sampling_defaults_are_the_engine_defaults_and_the_checkpoint_audio_temp
         encoding="utf-8",
     )
 
+    unpenalized = {"repetition_penalty": 1.0, "repetition_window": 64}
     assert server.load_sampling_defaults(config_path) == {
-        "agent": {"emission": {"temperature": 1.0}, "content": {"temperature": 0.6, "top_k": 20, "top_p": 0.95}},
-        "user": {"emission": {"temperature": 0.0}, "content": {"temperature": 0.0, "top_k": None, "top_p": None}},
+        "agent": {
+            "emission": {"temperature": 1.0},
+            "content": {"temperature": 0.6, "top_k": 20, "top_p": 0.95, **unpenalized},
+        },
+        "user": {
+            "emission": {"temperature": 0.0},
+            "content": {"temperature": 0.0, "top_k": None, "top_p": None, **unpenalized},
+        },
         "audio": {"temperature": 0.3},
     }
 

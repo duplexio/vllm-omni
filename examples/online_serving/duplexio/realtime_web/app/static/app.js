@@ -31,6 +31,8 @@
   const textTemperature = document.getElementById('text-temperature');
   const textTopK = document.getElementById('text-top-k');
   const textTopP = document.getElementById('text-top-p');
+  const textRepetitionPenalty = document.getElementById('text-repetition-penalty');
+  const textRepetitionWindow = document.getElementById('text-repetition-window');
   const audioTemperature = document.getElementById('audio-temperature');
   const agentEmitTemperature = document.getElementById('agent-emit-temperature');
   const toolPicker = document.getElementById('tool-picker');
@@ -254,6 +256,8 @@
     textTemperature.value = floatValue(text.temperature);
     textTopK.value = text.top_k ?? '';
     textTopP.value = floatValue(text.top_p);
+    textRepetitionPenalty.value = floatValue(text.repetition_penalty);
+    textRepetitionWindow.value = text.repetition_window ?? '';
     audioTemperature.value = floatValue(audio.temperature);
     agentEmitTemperature.value = floatValue(emit.temperature);
   }
@@ -269,14 +273,17 @@
   function samplingOptions() {
     const text = {};
     const audio = {};
+    // An empty top K or top P is unrestricted; any other empty field keeps the server's default.
     const textValues = [
-      ['temperature', textTemperature],
-      ['top_k', textTopK],
-      ['top_p', textTopP],
+      ['temperature', textTemperature, false],
+      ['top_k', textTopK, true],
+      ['top_p', textTopP, true],
+      ['repetition_penalty', textRepetitionPenalty, false],
+      ['repetition_window', textRepetitionWindow, false],
     ];
-    for (const [name, input] of textValues) {
+    for (const [name, input, emptyIsUnrestricted] of textValues) {
       const value = samplingNumber(input);
-      if (name !== 'temperature' || value !== null) text[name] = value;
+      if (emptyIsUnrestricted || value !== null) text[name] = value;
     }
     const audioTemperatureValue = samplingNumber(audioTemperature);
     if (audioTemperatureValue !== null) audio.temperature = audioTemperatureValue;

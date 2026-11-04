@@ -172,6 +172,10 @@ def test_frontend_sends_sampling_parameters_before_session_start() -> None:
     assert "const sessionSampling = samplingOptions();" in app
     assert "duplexio_sampling: sessionSampling" in app
     assert "agentEmitTemperature.value = floatValue(emit.temperature)" in app
+    assert 'id="text-repetition-penalty"' in index
+    assert 'id="text-repetition-window"' in index
+    assert "['repetition_penalty', textRepetitionPenalty, false]" in app
+    assert "['repetition_window', textRepetitionWindow, false]" in app
     assert "samplingPicker.disabled = true" in app
     assert "samplingPicker.disabled = false" in app
 
