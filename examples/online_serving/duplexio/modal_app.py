@@ -68,7 +68,8 @@ repo_root = Path(__file__).resolve().parents[3] if modal.is_local() else APP_ROO
 REQUIREMENTS = repo_root / "examples" / "online_serving" / "duplexio" / "modal_requirements.txt"
 model_image = (
     modal.Image.from_registry("nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.13")
-    .apt_install("git", "ninja-build")
+    # libGL and GLib: OpenCV (opencv-python in the freeze) loads them at import.
+    .apt_install("git", "ninja-build", "libgl1", "libglib2.0-0")
     .add_local_file(REQUIREMENTS, "/tmp/modal_requirements.txt", copy=True)
     .run_commands(
         "pip install --no-cache-dir uv",
