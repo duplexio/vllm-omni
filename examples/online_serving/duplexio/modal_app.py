@@ -29,7 +29,7 @@ SUFFIX = f"-{VARIANT}" if VARIANT else ""
 VARIANT_ENV = {"DUPLEXIO_MODAL_VARIANT": VARIANT} if VARIANT else {}
 APP_NAME = f"duplexio-vllm-omni{SUFFIX}"
 MODEL_VOLUME_NAME = "duplexio-vllm-models"
-MODEL_NAME = "run514428_step5000_v7_steps8"
+MODEL_NAME = "ftudrop_535994_step10000"
 MODEL_PATH = Path("/models") / MODEL_NAME
 # Upload a mono 24 kHz clip alongside the model for startup warmup.
 # Browser sessions send their own uploaded reference audio.
@@ -61,19 +61,20 @@ BACKEND_WEBSOCKET_URL = f"wss://{BACKEND_HOST}"
 repo_root = Path(__file__).resolve().parents[3] if modal.is_local() else APP_ROOT
 
 
-# Serving runs the stack the cluster and the RTX 5090 demo serve on: torch
-# 2.11+cu130, the PyPI vLLM 0.26.0 wheel (a CUDA 13 build pinned to that torch),
-# and the quack/FLA kernels the model calls directly.
+# Serving runs the exact package set the RTX 5090 demo serves on
+# (modal_requirements.txt, a freeze of that venv: vLLM 0.31.0, torch 2.13+cu130,
+# the pinned transformers commit and the FLA/quack kernels), installed without
+# dependency resolution so nothing can move a pin.
+REQUIREMENTS = repo_root / "examples" / "online_serving" / "duplexio" / "modal_requirements.txt"
 model_image = (
     modal.Image.from_registry("nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.13")
     .apt_install("git", "ninja-build")
-    .uv_pip_install(
-        "torch==2.11.0",
-        "torchvision==0.26.0",
-        "torchaudio==2.11.0",
-        extra_index_url="https://download.pytorch.org/whl/cu130",
+    .add_local_file(REQUIREMENTS, "/tmp/modal_requirements.txt", copy=True)
+    .run_commands(
+        "pip install --no-cache-dir uv",
+        "uv pip install --system --no-deps --index-strategy unsafe-best-match "
+        "--extra-index-url https://download.pytorch.org/whl/cu130 -r /tmp/modal_requirements.txt",
     )
-    .uv_pip_install("vllm==0.26.0")
     .add_local_dir(
         repo_root,
         str(APP_ROOT),
@@ -102,21 +103,6 @@ model_image = (
             "examples/online_serving/duplexio/realtime_web/app",
             "examples/online_serving/duplexio/realtime_web/server.py",
         ],
-    )
-    # Installed from inside the image so the requirements file resolves relative
-    # to itself, and so vllm-omni's own pins cannot move torch. common.txt, not
-    # cuda.txt: the cuda extras (fa3-fwd, onnxruntime) serve the diffusion and
-    # other-model paths, and are absent from the validated training venv.
-    .run_commands(
-        f"python -m pip install --no-cache-dir -r {APP_ROOT}/requirements/common.txt",
-    )
-    # Last, so the kernel and transformers pins win over any resolution above.
-    .uv_pip_install(
-        "nvidia-cutlass-dsl==4.6.0",
-        "quack-kernels==0.6.3",
-        "flash-linear-attention==0.5.1",
-        "fla-core==0.5.1",
-        "transformers==5.14.1",
     )
     .env(
         {
