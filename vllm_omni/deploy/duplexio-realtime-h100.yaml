@@ -10,8 +10,9 @@ stages:
   - stage_id: 0
     max_num_seqs: 8
     max_model_len: 73728
-    # Eight full-length sessions (8 x 73728 tokens) with a little headroom.
-    kv_cache_memory_bytes: 15300000000
+    # Eight full-length sessions (8 x 73728 tokens) with a little headroom: 15.3 GB
+    # held 4.52 of them for the per-stream GDN flat layout (startup check, 2026-11-04).
+    kv_cache_memory_bytes: 28000000000
     # Replaces the base block whole: one decode graph per live session count.
     compilation_config:
       mode: 0
