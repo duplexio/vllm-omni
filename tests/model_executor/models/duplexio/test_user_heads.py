@@ -75,7 +75,11 @@ def sampling_info(model, device="cpu", mode="top_k", emit_temperature=0.7):
             },
         }
     )
-    return {"duplexio_working_state": SimpleNamespace(tool_call_constraint=None, sampling=sampling)}
+    return {
+        "duplexio_working_state": SimpleNamespace(
+            tool_call_constraint=None, sampling=sampling, recent_text_ids=((), ())
+        )
+    }
 
 
 @pytest.mark.parametrize(

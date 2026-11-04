@@ -4,6 +4,10 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# The longest repetition window a policy may ask for; the sampling graphs take
+# every row's recent tokens padded to it, so all policies share one shape.
+MAX_REPETITION_WINDOW = 256
+
 
 class EmissionPolicy(BaseModel):
     """Temperature of a stream's speak-versus-silence decision; zero is greedy."""
@@ -13,12 +17,20 @@ class EmissionPolicy(BaseModel):
 
 
 class ContentPolicy(BaseModel):
-    """How a stream draws a token once it speaks; zero temperature is greedy."""
+    """How a stream draws a token once it speaks; zero temperature is greedy.
+
+    ``repetition_penalty`` scales, as in vLLM, the logits of the tokens among the
+    stream's last ``repetition_window`` words (given or sampled): positive logits
+    are divided by it, negative ones multiplied. One is no penalty. The tool-call
+    stream is never penalized; its grammar repeats structural tokens by design.
+    """
 
     model_config = ConfigDict(extra="forbid")
     temperature: float = Field(default=0.0, ge=0)
     top_k: int | None = Field(default=None, ge=1)
     top_p: float | None = Field(default=None, gt=0, le=1)
+    repetition_penalty: float = Field(default=1.0, gt=0)
+    repetition_window: int = Field(default=64, ge=1, le=MAX_REPETITION_WINDOW)
 
 
 class SamplingPolicy(BaseModel):

@@ -14,15 +14,18 @@ class TokenSamplingOptions:
     temperature: float
     top_k: int | None
     top_p: float | None
+    repetition_penalty: float = 1.0
+    repetition_window: int = 0  # How many of the stream's recent words the penalty reads.
 
 
 # Columns of the per-row parameters that ``sample_streams`` reads; each setting
 # holds one value per stream, in logits order (agent, tool, user).
 TEMPERATURE, TOP_K, TOP_P, EMIT_TEMPERATURE = slice(0, 3), slice(3, 6), slice(6, 9), slice(9, 12)
+REPETITION_PENALTY = slice(12, 15)
 # The flow-map audio head's temperature, read after text sampling.
-FLOW_TEMPERATURE = 12
+FLOW_TEMPERATURE = 15
 # 0: no tool grammar, 1: inside or forced into a call, 2: idle and free to start one.
-TOOL_STATE = 13
+TOOL_STATE = 16
 NO_TOP_P = 2.0  # A cumulative probability never exceeds it.
 
 
@@ -36,7 +39,26 @@ def sampling_parameters(
         *(float(options.top_k or vocab_size) for options in streams),
         *(NO_TOP_P if options.top_p is None else options.top_p for options in streams),
         *emit,
+        # The tool stream's grammar repeats structural tokens; it is never penalized.
+        agent.repetition_penalty,
+        1.0,
+        user.repetition_penalty,
     )
+
+
+def penalize_repetitions(logits: Tensor, recent_ids: Tensor, penalty: Tensor) -> Tensor:
+    """Apply each stream's repetition penalty to the tokens it said recently.
+
+    ``recent_ids`` is ``[rows, 3, window]`` in logits order, padded with -1, and
+    ``penalty`` ``[rows, 3]``; a penalty of one leaves its stream unchanged.
+    """
+    vocab_size = logits.shape[-1]
+    # Padding lands in an extra column, so it never clears a real token's mark.
+    seen = torch.zeros(*logits.shape[:-1], vocab_size + 1, dtype=torch.bool, device=logits.device)
+    seen.scatter_(-1, recent_ids.masked_fill(recent_ids < 0, vocab_size), True)
+    penalty = penalty.unsqueeze(-1)
+    penalized = torch.where(logits > 0, logits / penalty, logits * penalty)
+    return torch.where(seen[..., :vocab_size], penalized, logits)
 
 
 def sampled_top_k(streams: list[TokenSamplingOptions], vocab_size: int) -> int | None:
@@ -69,6 +91,7 @@ def sample_streams(
     emit_logits: Tensor,
     parameters: Tensor,
     blocked: Tensor,
+    recent_ids: Tensor,
     *,
     top_k: int | None,
     support_width: int,
@@ -77,7 +100,8 @@ def sample_streams(
     """Draw every row's three emit decisions and content tokens in one pass.
 
     ``logits`` is ``[rows, 3, vocab]`` and ``emit_logits`` ``[rows, 3]``, in stream order
-    (agent, tool, user); ``blocked`` marks suppressed and grammar-forbidden ids. Each row
+    (agent, tool, user); ``blocked`` marks suppressed and grammar-forbidden ids, and
+    ``recent_ids`` each stream's recent words (see ``penalize_repetitions``). Each row
     brings its own settings in ``parameters``; only the widest ``top_k`` is shared.
 
     Returns the ``[rows, 3]`` ids in text-input order (user, agent, tool), the idle rows
@@ -85,11 +109,13 @@ def sample_streams(
     ``[rows, 2, support_width]`` agent and tool content supports: the ids the draw
     could pick, best first and padded with -1. A consumer that renormalizes over a
     recorded support scores exactly the distribution sampled, even where its own
-    logits would move a top-p or top-k boundary.
+    logits would move a top-p or top-k boundary; under a repetition penalty, only once
+    it penalizes its logits the same way.
     """
     temperature, emit_temperature = parameters[:, TEMPERATURE], parameters[:, EMIT_TEMPERATURE]
     greedy = temperature == 0
-    scaled = (logits.float() / temperature.masked_fill(greedy, 1).unsqueeze(-1)).masked_fill(
+    logits = penalize_repetitions(logits.float(), recent_ids, parameters[:, REPETITION_PENALTY])
+    scaled = (logits / temperature.masked_fill(greedy, 1).unsqueeze(-1)).masked_fill(
         blocked,
         torch.finfo(torch.float32).min,
     )

@@ -102,6 +102,7 @@ def fixture(device: str, *, mixed: bool):
                 "duplexio_working_state": SimpleNamespace(
                     tool_call_constraint=constraint,
                     sampling=session_sampling(model, index, 0.8 if mixed and index % 3 else 0.0),
+                    recent_text_ids=((), ()),
                 )
             }
         )
@@ -230,6 +231,7 @@ def test_mixed_policies_return_rows_in_request_order(device):
                 emissions[rows],
                 sampling.parameters,
                 sampling.tool_bitmask,
+                sampling.recent_ids,
                 top_k=sampling.top_k,
                 support_width=sampling.support_width,
             )
@@ -417,7 +419,13 @@ def test_forced_continuation_records_actual_constrained_token_probability(device
     model = sampling_model(len(vocab), device)
     content = {"temperature": 0.0 if mode == "argmax" else 0.7, "top_k": 2, "top_p": 0.8 if mode == "top_p" else None}
     sampling = model.resolve_sampling({"agent": {"content": content}})
-    infos = [{"duplexio_working_state": SimpleNamespace(tool_call_constraint=constraint, sampling=sampling)}]
+    infos = [
+        {
+            "duplexio_working_state": SimpleNamespace(
+                tool_call_constraint=constraint, sampling=sampling, recent_text_ids=((), ())
+            )
+        }
+    ]
     logits = torch.zeros(1, 3, len(vocab), device=device)
     logits[0, 1] = torch.tensor([100.0, 0.2, 0.6, 0.9, 90.0])
     torch.manual_seed(42)

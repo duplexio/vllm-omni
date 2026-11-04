@@ -16,13 +16,25 @@ def test_user_sampling_is_independent_of_the_agent_default() -> None:
         }
     )
     assert exploring.agent == serving.agent
-    assert serving.agent.content.model_dump() == {"temperature": 0.6, "top_k": 20, "top_p": 0.95}
-    assert exploring.user.content.model_dump() == {"temperature": 1.0, "top_k": None, "top_p": None}
+    unpenalized = {"repetition_penalty": 1.0, "repetition_window": 64}
+    assert serving.agent.content.model_dump() == {"temperature": 0.6, "top_k": 20, "top_p": 0.95, **unpenalized}
+    assert exploring.user.content.model_dump() == {"temperature": 1.0, "top_k": None, "top_p": None, **unpenalized}
     assert serving.user.emission.temperature == serving.user.content.temperature == 0.0
     assert serving.audio.temperature is None
 
 
-@pytest.mark.parametrize("content", [{"mode": "argmax"}, {"temperature": -1}, {"top_k": 0}, {"top_p": 0}])
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"mode": "argmax"},
+        {"temperature": -1},
+        {"top_k": 0},
+        {"top_p": 0},
+        {"repetition_penalty": 0},
+        {"repetition_window": 0},
+        {"repetition_window": 257},
+    ],
+)
 def test_invalid_or_obsolete_settings_fail_at_request_boundary(content) -> None:
     with pytest.raises(ValidationError):
         SamplingConfig.model_validate({"user": {"content": content}})

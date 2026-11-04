@@ -80,7 +80,7 @@ from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
     STEP_COLUMNS,
     DuplexIOQwenModel,
 )
-from vllm_omni.model_executor.models.duplexio.sampling_config import SamplingConfig
+from vllm_omni.model_executor.models.duplexio.sampling_config import MAX_REPETITION_WINDOW, SamplingConfig
 from vllm_omni.model_executor.models.duplexio.stream_gdn import GDN_REQUEST_COLUMNS, gdn_cache_dtypes, gdn_cache_shapes
 from vllm_omni.model_executor.models.duplexio.text_sampling import (
     FLOW_TEMPERATURE,
@@ -124,6 +124,7 @@ class SamplingInputs:
 
     parameters: Tensor  # [rows, columns], with the columns text_sampling names.
     tool_bitmask: Tensor
+    recent_ids: Tensor  # [rows, 3, MAX_REPETITION_WINDOW] words the penalty reads, see penalize_repetitions.
     top_k: int | None
     support_width: int
     pending: list[int]
@@ -189,6 +190,9 @@ class DuplexIORequestState:
     history_open: bool = True
     # The step whose sampled ids this request still waits for on the host.
     pending_output: DuplexIOStepOutput | None = None
+    # The agent's and user's last words in context, oldest first, kept only while
+    # their policy penalizes repetition.
+    recent_text_ids: tuple[tuple[int, ...], tuple[int, ...]] = ((), ())
 
     def fork(self) -> DuplexIORequestState:
         """Commit an append only after its model step succeeds."""
@@ -434,6 +438,12 @@ class DuplexIOForConditionalGeneration(
             torch.arange(32, dtype=torch.int32, device=device),
             persistent=False,
         )
+        # Batches without a repetition penalty replay with no recent words.
+        self.register_buffer(
+            "no_recent_ids",
+            torch.full((max_rows, len(streams), MAX_REPETITION_WINDOW), -1, dtype=torch.long, device=device),
+            persistent=False,
+        )
         # Batches without a tool grammar replay with this mask.
         self.register_buffer(
             "allow_all_bitmask",
@@ -672,6 +682,23 @@ class DuplexIOForConditionalGeneration(
             return given["user_token_id"], given["agent_token_id"], given["tool_call_token_id"]
         return state.text_input_ids[1:]
 
+    def record_recent_words(self, state: DuplexIORequestState, tokens: tuple[int, int, int]) -> None:
+        """Keep the agent's and user's words of a live row for their repetition penalties."""
+        user_token, agent_token, _ = tokens
+        quiet = (self.silence_token_id, self.pad_token_id)
+        agent, user = (
+            (*recent, token)[-options.repetition_window :]
+            if options.repetition_penalty != 1 and token not in quiet
+            else recent
+            for recent, token, options in zip(
+                state.recent_text_ids,
+                (agent_token, user_token),
+                (state.sampling.agent, state.sampling.user),
+                strict=True,
+            )
+        )
+        state.recent_text_ids = (agent, user)
+
     def plan_frames(
         self,
         inputs: PassInputs,
@@ -693,6 +720,7 @@ class DuplexIOForConditionalGeneration(
         for frame in frames:
             if frame.kind == FrameKind.LIVE:
                 tokens = self.live_tokens(state, item.given)
+                self.record_recent_words(state, tokens)
                 live = {
                     stream: token
                     for stream, token in zip((USER, AGENT, TOOL_CALL), tokens, strict=True)
@@ -855,7 +883,7 @@ class DuplexIOForConditionalGeneration(
             key = (size, top_k, width)
             if key in self.sampling_graphs:
                 continue
-            tensors = (rows[:size], parameters[:size], self.allow_all_bitmask[:size])
+            tensors = (rows[:size], parameters[:size], self.allow_all_bitmask[:size], self.no_recent_ids[:size])
             pool = next(iter(self.sampling_graphs.values())).graph.pool() if self.sampling_graphs else None
             self.sampling_graphs[key] = FrameInputGraph(
                 partial(self.sample_rows, top_k=top_k, support_width=width), tensors, pool,
@@ -1130,7 +1158,7 @@ class DuplexIOForConditionalGeneration(
         else:
             rows = torch.stack([hidden_states[end - FRAME_POSITIONS : end] for end in ends])
         inputs = self.sampling_inputs([infos[index]["duplexio_working_state"] for index in indices], rows.device)
-        tensors = (rows, inputs.parameters, inputs.tool_bitmask)
+        tensors = (rows, inputs.parameters, inputs.tool_bitmask, inputs.recent_ids)
         if self.full_cudagraph_enabled:
             graph = self.sampling_graph(tensors, inputs.top_k, inputs.support_width)
             text_ids, tool_starts, frame_logprobs, support_ids, audio = graph(tensors)
@@ -1167,6 +1195,7 @@ class DuplexIOForConditionalGeneration(
         rows: Tensor,
         parameters: Tensor,
         tool_bitmask: Tensor,
+        recent_ids: Tensor,
         *,
         top_k: int | None,
         support_width: int = 0,
@@ -1184,6 +1213,7 @@ class DuplexIOForConditionalGeneration(
                 emit_logits,
                 parameters,
                 tool_bitmask,
+                recent_ids,
                 top_k=top_k,
                 support_width=support_width,
             )
@@ -1242,6 +1272,18 @@ class DuplexIOForConditionalGeneration(
             parameters.append((*state.sampling.parameters, state.sampling.flow_temperature, tool_state))
             streams += (state.sampling.agent, state.sampling.user)
         top_k = sampled_top_k(streams, vocab_size)
+        if any(state.recent_text_ids != ((), ()) for state in states):
+            # Logits order (agent, tool, user); the tool stream is never penalized.
+            recent_ids = _to_device(
+                [
+                    [(*ids, *(-1,) * (MAX_REPETITION_WINDOW - len(ids))) for ids in (agent, (), user)]
+                    for agent, user in (state.recent_text_ids for state in states)
+                ],
+                torch.long,
+                device,
+            )
+        else:
+            recent_ids = self.no_recent_ids[: len(states)]
         return SamplingInputs(
             parameters=_to_device(parameters, torch.float32, device),
             tool_bitmask=(
@@ -1249,6 +1291,7 @@ class DuplexIOForConditionalGeneration(
                 if pending or calling
                 else self.allow_all_bitmask[: len(states)]
             ),
+            recent_ids=recent_ids,
             top_k=top_k,
             support_width=support_width(streams[0::2], top_k),
             pending=pending,
@@ -1261,6 +1304,7 @@ class DuplexIOForConditionalGeneration(
         emit_logits: Tensor,
         parameters: Tensor,
         tool_bitmask: Tensor,
+        recent_ids: Tensor,
         *,
         top_k: int | None,
         support_width: int = 0,
@@ -1275,6 +1319,7 @@ class DuplexIOForConditionalGeneration(
             emit_logits,
             parameters,
             blocked,
+            recent_ids,
             top_k=top_k,
             support_width=support_width,
             silence_token_id=self.silence_token_id,
@@ -1304,7 +1349,13 @@ class DuplexIOForConditionalGeneration(
         """Validate a session's sampling once; agent text and tool calls share the agent policy."""
         config = SamplingConfig.model_validate(sampling)
         agent, user = (
-            TokenSamplingOptions(policy.content.temperature, policy.content.top_k, policy.content.top_p)
+            TokenSamplingOptions(
+                policy.content.temperature,
+                policy.content.top_k,
+                policy.content.top_p,
+                policy.content.repetition_penalty,
+                policy.content.repetition_window,
+            )
             for policy in (config.agent, config.user)
         )
         emit = (config.agent.emission.temperature, config.agent.emission.temperature, config.user.emission.temperature)

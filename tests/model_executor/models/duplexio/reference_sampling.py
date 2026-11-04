@@ -139,6 +139,7 @@ def sample_text_batch(
         emit_logits,
         inputs.parameters,
         inputs.tool_bitmask,
+        inputs.recent_ids,
         top_k=inputs.top_k,
         support_width=inputs.support_width,
     )
