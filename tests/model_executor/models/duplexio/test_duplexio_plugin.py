@@ -411,3 +411,18 @@ async def test_data_plane_forwards_completed_tool_calls(model_config) -> None:
 def test_frame_fields_round_trip_the_append_kind() -> None:
     fields = frame_fields({"frame": pack_frame(prefix=True, tool_result=True, tool_generation=4)})
     assert fields["prefix"] is True and fields["tool_result"] is True and fields["tool_generation"] == 4
+
+
+@pytest.mark.parametrize("amplitude", [0.003, 0.3])
+async def test_reference_audio_is_brought_to_the_training_loudness(model_config, amplitude) -> None:
+    import numpy as np
+    import pyloudnorm
+
+    t = np.arange(2 * 24_000) / 24_000
+    audio = (amplitude * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    _, runtime = await open_session(model_config, ref_audio_data=base64.b64encode(audio.tobytes()).decode())
+    pinned = np.frombuffer(runtime["duplexio_voice_prompt_pcm"], dtype=np.float32)
+    assert pinned.shape == (25 * 1920,)
+    assert pyloudnorm.Meter(24_000).integrated_loudness(pinned.astype(np.float64)) == pytest.approx(-23.0, abs=0.1)
+    _, again = await open_session(model_config, ref_audio_data=base64.b64encode(pinned.tobytes()).decode())
+    np.testing.assert_allclose(np.frombuffer(again["duplexio_voice_prompt_pcm"], dtype=np.float32), pinned, atol=1e-4)

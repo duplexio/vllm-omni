@@ -18,6 +18,8 @@ import binascii
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypedDict
 
+import numpy as np
+import pyloudnorm
 from pydantic import ValidationError
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionToolsParam
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -475,7 +477,32 @@ def voice_prompt_from_session(config: DuplexSessionConfig, max_frames: int) -> t
         raise DuplexRuntimeConfigError(
             "DuplexIO reference audio is shorter than one 80 ms frame", code="ref_audio_too_short"
         )
-    return raw[: frames * 4 * FRAME_SIZE], frames
+    return normalized_voice_prompt(raw[: frames * 4 * FRAME_SIZE]), frames
+
+
+# DuplexIO's voice-prompt level (duplexio.voice_prompt.load_voice_clip): the recordings' -23 LUFS.
+VOICE_PROMPT_LUFS = -23.0
+VOICE_PROMPT_CEILING = 10 ** (-1.0 / 20)  # -1 dBFS
+
+
+def normalized_voice_prompt(pcm: bytes) -> bytes:
+    """The reference brought to the level training pins it at, whatever the client's mic gain.
+
+    BS.1770 integrated loudness, one gain to -23 LUFS, and samples the gain pushes past -1 dBFS
+    bent smoothly toward full scale. A reference too short to measure (under 0.5 s) or silent
+    keeps its level. Already-normalized audio passes through unchanged.
+    """
+    audio = np.frombuffer(pcm, dtype=np.float32).astype(np.float64)
+    if audio.shape[0] < SAMPLE_RATE // 2:
+        return pcm
+    level = pyloudnorm.Meter(SAMPLE_RATE).integrated_loudness(audio)
+    if not np.isfinite(level):
+        return pcm
+    audio = audio * 10 ** ((VOICE_PROMPT_LUFS - level) / 20)
+    over = np.abs(audio) > VOICE_PROMPT_CEILING
+    excess = (np.abs(audio[over]) - VOICE_PROMPT_CEILING) / (1.0 - VOICE_PROMPT_CEILING)
+    audio[over] = np.sign(audio[over]) * (VOICE_PROMPT_CEILING + (1.0 - VOICE_PROMPT_CEILING) * np.tanh(excess))
+    return audio.astype(np.float32).tobytes()
 
 
 def normalize_tools(value: object) -> list[dict[str, Any]]:

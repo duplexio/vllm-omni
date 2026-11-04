@@ -131,6 +131,8 @@ vsa = [
 duplexio = [
     # DuplexIO's per-stream gated delta rule runs flash-linear-attention's kernels.
     "flash-linear-attention==0.5.2",
+    # The voice prompt is loudness-normalized to the training level.
+    "pyloudnorm>=0.1.1",
 ]
 
 docs = [
