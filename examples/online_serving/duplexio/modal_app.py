@@ -29,7 +29,7 @@ SUFFIX = f"-{VARIANT}" if VARIANT else ""
 VARIANT_ENV = {"DUPLEXIO_MODAL_VARIANT": VARIANT} if VARIANT else {}
 APP_NAME = f"duplexio-vllm-omni{SUFFIX}"
 MODEL_VOLUME_NAME = "duplexio-vllm-models"
-MODEL_NAME = "ftudrop_535994_step10000"
+MODEL_NAME = "distill1k_536193_step1000"
 MODEL_PATH = Path("/models") / MODEL_NAME
 # Upload a mono 24 kHz clip alongside the model for startup warmup.
 # Browser sessions send their own uploaded reference audio.
