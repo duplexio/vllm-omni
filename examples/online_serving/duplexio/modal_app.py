@@ -121,22 +121,19 @@ model_image = (
         }
     )
 )
+# The page imports the serving package's sampling schema (realtime_web/server.py), and
+# vllm_omni's package imports pull in vLLM itself, so the page runs on the model
+# image with the page files as a final layer: page changes rebuild only that layer,
+# never the GPU image or its snapshot.
 frontend_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install(
-        "av==17.0.1",
-        "bcrypt==4.3.0",
-        "fastapi==0.136.3",
-        "numpy==2.2.6",
-        "uvicorn==0.52.1",
-        "websockets==17.0.1",
-    )
+    model_image
+    .uv_pip_install("bcrypt==4.3.0")
     .add_local_dir(
         repo_root / "examples" / "online_serving" / "duplexio" / "realtime_web",
         remote_path=str(FRONTEND_ROOT),
         copy=True,
     )
-    .env({"PYTHONPATH": f"/app:{FRONTEND_ROOT}", **VARIANT_ENV})
+    .env({"PYTHONPATH": f"/app:{FRONTEND_ROOT}:{APP_ROOT}", **VARIANT_ENV})
 )
 model_volume = modal.Volume.from_name(MODEL_VOLUME_NAME, create_if_missing=True)
 app = modal.App(APP_NAME)
