@@ -105,6 +105,13 @@ model_image = (
             "examples/online_serving/duplexio/realtime_web/server.py",
         ],
     )
+    # Installed (editable, no dependency resolution) for its entry points: vLLM's
+    # spawned engine cores import only vllm, which registers DuplexIO through
+    # vllm-omni's `vllm.general_plugins` entry point. Off PYTHONPATH alone, the
+    # engine core intermittently rejects DuplexIOForConditionalGeneration.
+    .run_commands(
+        f"SETUPTOOLS_SCM_PRETEND_VERSION=0.1.dev0 uv pip install --system --no-deps -e {APP_ROOT}",
+    )
     .env(
         {
             "PYTHONPATH": f"{APP_ROOT}:{RELAY_DIR}",
