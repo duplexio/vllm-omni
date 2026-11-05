@@ -412,10 +412,11 @@ class DuplexIOForConditionalGeneration(
             torch.tensor(tool_suppressed, dtype=torch.long, device=self.channel_emb.device),
             persistent=False,
         )
-        # The user stream suppresses only the silence token.
+        # The user stream suppresses the silence and pad tokens: the training layout
+        # carries neither as a token, so a sampled pad would be fed back as none.
         self.register_buffer(
             "user_suppressed_token_ids",
-            torch.tensor([self.silence_token_id], dtype=torch.long, device=self.channel_emb.device),
+            torch.tensor([self.silence_token_id, self.pad_token_id], dtype=torch.long, device=self.channel_emb.device),
             persistent=False,
         )
         vocab_size = self.text_config.vocab_size
