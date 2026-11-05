@@ -77,7 +77,7 @@ def fixture(device: str, *, mixed: bool):
             },
         }
     ]
-    vocab = ["<silence>", *sorted(set("<function=ping>\n</function>"))]
+    vocab = ["<silence>", "<tool_call>", *sorted(set("<function=ping>\n</function>"))]
     tokenizer = xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=len(vocab))
     grammar = xgr.GrammarCompiler(tokenizer).compile_grammar(tool_call_grammar(tools, {"mode": "auto"}))
     model = sampling_model(len(vocab), device)
@@ -87,6 +87,7 @@ def fixture(device: str, *, mixed: bool):
             compiled_grammar=grammar,
             decoded_vocab=tuple(token.encode() for token in vocab),
             tools=tuple(tools),
+            opening_token_id=1,
         )
         if mixed:
             if index == 0:
@@ -416,6 +417,7 @@ def test_forced_continuation_records_actual_constrained_token_probability(device
         decoded_vocab=tuple(token.encode() for token in vocab),
     )
     constraint.begin()
+    constraint.opened = True  # a call already past its <tool_call>
     model = sampling_model(len(vocab), device)
     content = {"temperature": 0.0 if mode == "argmax" else 0.7, "top_k": 2, "top_p": 0.8 if mode == "top_p" else None}
     sampling = model.resolve_sampling({"agent": {"content": content}})

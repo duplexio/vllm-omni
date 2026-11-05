@@ -30,7 +30,7 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream() -> None
         }
     ]
     body = "<function=ping>\n</function>"
-    vocab = ["<silence>", *sorted(set(body))]
+    vocab = ["<silence>", "<tool_call>", *sorted(set(body))]
     grammar = tool_call_grammar(tools, {"mode": "auto"})
     assert grammar is not None
     tokenizer_info = xgr.TokenizerInfo(
@@ -43,6 +43,7 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream() -> None
         compiled_grammar=compiled,
         decoded_vocab=tuple(value.encode() for value in vocab),
         tools=tuple(tools),
+        opening_token_id=1,
     )
     sampling = ReferenceSampling(
         temperature=0.0,
@@ -72,7 +73,8 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream() -> None
         if complete:
             break
 
-    assert generated == body
+    # The call opens with <tool_call> as in training, then follows its grammar.
+    assert generated == "<tool_call>" + body
     assert complete
     assert not state.active
 
@@ -87,9 +89,10 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream() -> None
 
 def test_session_grammar_compiles_without_blocking_its_request() -> None:
     tools = [{"type": "function", "function": {"name": "ping", "parameters": {"type": "object", "properties": {}}}}]
-    vocab = ["<silence>", *sorted(set("<function=ping>\n</function>"))]
+    vocab = ["<silence>", "<tool_call>", *sorted(set("<function=ping>\n</function>"))]
     compiler = object.__new__(ToolCallConstraintCompiler)
     compiler.decoded_vocab = tuple(value.encode() for value in vocab)
+    compiler.opening_token_id = 1
     compiler.compiler = xgr.GrammarCompiler(
         xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=len(vocab))
     )

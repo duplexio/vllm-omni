@@ -108,7 +108,7 @@ def sample_tool_token(
         constraint.begin()
     constrained_logits = logits.clone()
     bitmask = xgr.allocate_token_bitmask(1, constrained_logits.shape[-1])
-    constraint.matcher.fill_next_token_bitmask(bitmask)
+    constraint.fill_next_token_bitmask(bitmask)
     xgr.apply_token_bitmask_inplace(
         constrained_logits,
         bitmask.to(constrained_logits.device),
