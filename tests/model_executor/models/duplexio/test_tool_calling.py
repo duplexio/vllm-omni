@@ -19,7 +19,8 @@ from vllm_omni.model_executor.models.duplexio.tool_calling import (
 )
 
 
-def test_tool_call_latches_grammar_until_complete_then_releases_stream() -> None:
+@pytest.mark.parametrize("opening_token_id", [1, -1])
+def test_tool_call_latches_grammar_until_complete_then_releases_stream(opening_token_id: int) -> None:
     tools = [
         {
             "type": "function",
@@ -43,7 +44,7 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream() -> None
         compiled_grammar=compiled,
         decoded_vocab=tuple(value.encode() for value in vocab),
         tools=tuple(tools),
-        opening_token_id=1,
+        opening_token_id=opening_token_id,
     )
     sampling = ReferenceSampling(
         temperature=0.0,
@@ -73,8 +74,9 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream() -> None
         if complete:
             break
 
-    # The call opens with <tool_call> as in training, then follows its grammar.
-    assert generated == "<tool_call>" + body
+    # A v10+ export's call opens with <tool_call> as in training, then follows its
+    # grammar; an older export's starts with the grammar.
+    assert generated == ("<tool_call>" if opening_token_id >= 0 else "") + body
     assert complete
     assert not state.active
 

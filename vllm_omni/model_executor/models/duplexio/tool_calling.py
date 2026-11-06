@@ -299,7 +299,8 @@ class ToolCallConstraintState:
     capture: ToolCallCapture | None = None
     completed_call: dict[str, Any] | None = None
     # Every call opens with this token, as in training (and the teacher's chat),
-    # before its grammar: the token carries the decision to call.
+    # before its grammar: the token carries the decision to call. -1: no opening
+    # (exports before v10), the grammar's first token starts the call.
     opening_token_id: int = -1
     opened: bool = False
     # The opening's mask on the host, shared by every fork.
@@ -349,12 +350,16 @@ class ToolCallConstraintState:
         )
         self.capture = ToolCallCapture(self.tools)
         self.completed_call = None
-        self.opened = False
+        self.opened = self.opening_token_id < 0
 
     def first_token_bitmask(self, vocab_size: int) -> torch.Tensor:
-        """The host mask a call starts with: its opening token alone."""
-        assert self.opening_token_id >= 0, "DuplexIO tool calls need their opening token"
-        if self.start_bitmask is None:
+        """The host mask a call starts with: its opening token alone, else its grammar's first token."""
+        if self.start_bitmask is None and self.opening_token_id < 0:
+            self.start_bitmask = xgr.allocate_token_bitmask(1, vocab_size)
+            xgr.GrammarMatcher(self.grammar, terminate_without_stop_token=True).fill_next_token_bitmask(
+                self.start_bitmask,
+            )
+        elif self.start_bitmask is None:
             self.start_bitmask = torch.zeros(xgr.get_bitmask_shape(1, vocab_size), dtype=torch.int32)
             # Bit i of word i // 32 allows token i (int32 two's complement for bit 31).
             word, bit = divmod(self.opening_token_id, 32)
@@ -419,13 +424,14 @@ def token_bitmasks(
 
 
 class ToolCallConstraintCompiler:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase, vocab_size: int) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, vocab_size: int, *, opening: bool) -> None:
+        """``opening``: calls open with ``<tool_call>`` (``DuplexIOConfig.tool_calls_open``)."""
         tokenizer_info = xgr.TokenizerInfo.from_huggingface(
             tokenizer,
             vocab_size=vocab_size,
         )
         self.decoded_vocab = tuple(tokenizer_info.decoded_vocab)
-        self.opening_token_id = tokenizer.convert_tokens_to_ids("<tool_call>")
+        self.opening_token_id = tokenizer.convert_tokens_to_ids("<tool_call>") if opening else -1
         self.compiler = xgr.GrammarCompiler(
             tokenizer_info,
             cache_limit_bytes=64 * 1024 * 1024,

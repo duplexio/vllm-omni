@@ -421,7 +421,7 @@ class DuplexIOForConditionalGeneration(
         )
         vocab_size = self.text_config.vocab_size
         self.init_text_sampling(vocab_size, vllm_config.scheduler_config.max_num_seqs)
-        self.tool_call_compiler = ToolCallConstraintCompiler(self.tokenizer, vocab_size)
+        self.tool_call_compiler = ToolCallConstraintCompiler(self.tokenizer, vocab_size, opening=config.tool_calls_open)
         self.set_custom_preprocess(self.preprocess)
         self.set_custom_postprocess(self.postprocess)
 

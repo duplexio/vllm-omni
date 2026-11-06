@@ -37,7 +37,7 @@ from vllm_omni.model_executor.models.duplexio.qwen_backbone import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _config() -> DuplexIOConfig:
+def _config(**kwargs) -> DuplexIOConfig:
     return DuplexIOConfig(
         user_asr_config={"model_type": "nemotron_asr_streaming"},
         text_config={
@@ -56,7 +56,14 @@ def _config() -> DuplexIOConfig:
         pad_token_id=1,
         silence_token_id=2,
         sequence_layout="flat",
+        **kwargs,
     )
+
+
+def test_tool_calls_open_from_export_version_10() -> None:
+    assert not _config(duplexio_export_version=9).tool_calls_open
+    assert _config(duplexio_export_version=10).tool_calls_open
+    assert DuplexIOConfig.from_dict(_config(duplexio_export_version=10).to_dict()).tool_calls_open
 
 
 def test_duplexio_config_round_trips_nested_text_config() -> None:

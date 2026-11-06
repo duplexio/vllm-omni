@@ -29,6 +29,7 @@ class DuplexIOConfig(PretrainedConfig):
         default_system_prompt: str = "",
         head_dtype: str = "float32",
         sequence_layout: str = "grid",
+        duplexio_export_version: int = 0,
         **kwargs: Any,
     ) -> None:
         self.text_config = _text_config(text_config)
@@ -41,7 +42,13 @@ class DuplexIOConfig(PretrainedConfig):
         self.silence_token_id = silence_token_id
         self.default_system_prompt = default_system_prompt
         self.sequence_layout = sequence_layout
+        self.duplexio_export_version = duplexio_export_version
         self.validate()
+
+    @property
+    def tool_calls_open(self) -> bool:
+        """Whether the tool stream opens each call with ``<tool_call>`` (exports from v10)."""
+        return self.duplexio_export_version >= 10
 
     def get_text_config(self, decoder: bool | None = None, encoder: bool | None = None) -> PretrainedConfig:
         """Return Qwen's config for vLLM cache and parallelism planning."""
