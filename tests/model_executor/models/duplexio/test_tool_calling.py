@@ -30,8 +30,8 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream(opening_t
             },
         }
     ]
-    body = "\n<function=ping>\n</function>\n</tool_call>" if closed else "<function=ping>\n</function>"
-    vocab = ["<silence>", "<tool_call>", "</tool_call>", *sorted(set(body))]
+    body = "\n<function=ping>\n</function>\n" if closed else "<function=ping>\n</function>"
+    vocab = ["<silence>", "<tool_call>", "</tool_call>", *sorted(set(body + "</tool_call>"))]
     grammar = tool_call_grammar(tools, {"mode": "auto"}, closed=closed)
     assert grammar is not None
     tokenizer_info = xgr.TokenizerInfo(
@@ -45,7 +45,7 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream(opening_t
         decoded_vocab=tuple(value.encode() for value in vocab),
         tools=tuple(tools),
         opening_token_id=opening_token_id,
-        closed=closed,
+        closing_token_id=2 if closed else -1,
     )
     sampling = ReferenceSampling(
         temperature=0.0,
@@ -54,7 +54,7 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream(opening_t
         suppressed_token_ids=torch.tensor([0], dtype=torch.long),
     )
     generator = torch.Generator().manual_seed(0)
-    generated = ""
+    generated = []
 
     for frame in range(100):
         logits = torch.zeros(1, len(vocab))
@@ -71,14 +71,16 @@ def test_tool_call_latches_grammar_until_complete_then_releases_stream(opening_t
         sampled_id = sampled.token_id.item()
         complete = state.accept(sampled_id)
         assert sampled_id != 0
-        generated += vocab[sampled_id]
+        generated.append(vocab[sampled_id])
         if complete:
             break
 
     # A v10+ export's call opens with <tool_call> as in training, then follows its
     # grammar; an older export's starts with the grammar. A v11 export's call is the
-    # teacher chat's whole block and completes only at </tool_call>.
-    assert generated == ("<tool_call>" if opening_token_id >= 0 else "") + body
+    # teacher chat's whole block and completes only at its </tool_call> token.
+    opening = ["<tool_call>"] if opening_token_id >= 0 else []
+    closing = ["</tool_call>"] if closed else []
+    assert generated == [*opening, *body, *closing]
     assert complete
     assert not state.active
 
@@ -97,7 +99,7 @@ def test_session_grammar_compiles_without_blocking_its_request() -> None:
     compiler = object.__new__(ToolCallConstraintCompiler)
     compiler.decoded_vocab = tuple(value.encode() for value in vocab)
     compiler.opening_token_id = 1
-    compiler.closed = True
+    compiler.closing_token_id = 2
     compiler.compiler = xgr.GrammarCompiler(
         xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=len(vocab))
     )
@@ -176,7 +178,7 @@ def test_tool_grammar_rejects_schema_constraints_it_cannot_enforce() -> None:
         tool_call_grammar(tools, {"mode": "auto"})
 
 
-def test_a_closed_call_completes_at_its_closing_tag() -> None:
+def test_a_closed_call_is_captured_before_its_closing_token() -> None:
     tools = (
         {
             "type": "function",
@@ -187,7 +189,7 @@ def test_a_closed_call_completes_at_its_closing_tag() -> None:
         },
     )
     capture = ToolCallCapture(tools, closed=True)
-    capture.accept_text("\n<function=ping>\n<parameter=level>\n3\n</parameter>\n</function>\n")
-    assert capture.stage == "parameter"  # still waiting for </tool_call>
-    capture.accept_text("</tool_call>")
+    capture.accept_text("\n<function=ping>\n<parameter=level>\n3\n</parameter>\n</function>")
+    assert capture.stage == "parameter"  # still waiting for the "\n" before </tool_call>
+    capture.accept_text("\n")
     assert capture.complete() == {"name": "ping", "arguments": {"level": 3}}

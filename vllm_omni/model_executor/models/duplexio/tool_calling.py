@@ -18,9 +18,9 @@ from jsonschema.validators import validator_for
 from transformers import PreTrainedTokenizerBase
 
 TOOL_CALL_STRING_LIMIT = 512
-# Around a closed call's function, after its <tool_call> opening.
+# Around a closed call's function: after its <tool_call> opening, before its </tool_call> closing.
 CALL_HEAD = "\n"
-CALL_TAIL = "\n</tool_call>"
+CALL_TAIL = "\n"
 SCHEMA_ANNOTATION_KEYS = {
     "$comment",
     "$id",
@@ -189,8 +189,8 @@ def tool_call_grammar(
     *,
     closed: bool = False,
 ) -> xgr.Grammar | None:
-    r"""A call after its opening; ``closed`` (exports from v11) wraps it as the
-    teacher's chat does, ``\n<function=...>...</function>\n</tool_call>``."""
+    r"""A call between its opening and closing tokens; ``closed`` (exports from v11)
+    wraps it as the teacher's chat does, ``\n<function=...>...</function>\n``."""
     available = selected_tools(tools, tool_choice)
     if not available:
         return None
@@ -315,10 +315,13 @@ class ToolCallConstraintState:
     # (exports before v10), the grammar's first token starts the call.
     opening_token_id: int = -1
     opened: bool = False
-    # The call ends at </tool_call> rather than </function> (exports from v11).
-    closed: bool = False
-    # The opening's mask on the host, shared by every fork.
+    # Once its grammar is done, a call ends with this token, as in training: -1:
+    # no closing (exports before v11), the grammar's last token ends the call.
+    closing_token_id: int = -1
+    closing: bool = False
+    # The opening's and closing's masks on the host, shared by every fork.
     start_bitmask: torch.Tensor | None = None
+    end_bitmask: torch.Tensor | None = None
 
     def fork(self) -> ToolCallConstraintState:
         return ToolCallConstraintState(
@@ -331,8 +334,10 @@ class ToolCallConstraintState:
             completed_call=(dict(self.completed_call) if self.completed_call is not None else None),
             opening_token_id=self.opening_token_id,
             opened=self.opened,
-            closed=self.closed,
+            closing_token_id=self.closing_token_id,
+            closing=self.closing,
             start_bitmask=self.start_bitmask,
+            end_bitmask=self.end_bitmask,
         )
 
     @property
@@ -356,6 +361,11 @@ class ToolCallConstraintState:
     def active(self) -> bool:
         return self.matcher is not None
 
+    @property
+    def matching(self) -> bool:
+        """Whether the grammar decides the next token: a call past its opening, before its closing."""
+        return self.matcher is not None and self.opened and not self.closing
+
     def begin(self) -> None:
         if self.matcher is not None:
             raise RuntimeError("DuplexIO tool call state is already active")
@@ -363,30 +373,34 @@ class ToolCallConstraintState:
             self.grammar,
             terminate_without_stop_token=True,
         )
-        self.capture = ToolCallCapture(self.tools, closed=self.closed)
+        self.capture = ToolCallCapture(self.tools, closed=self.closing_token_id >= 0)
         self.completed_call = None
         self.opened = self.opening_token_id < 0
+        self.closing = False
 
-    def first_token_bitmask(self, vocab_size: int) -> torch.Tensor:
-        """The host mask a call starts with: its opening token alone, else its grammar's first token."""
+    def edge_bitmask(self, vocab_size: int) -> torch.Tensor:
+        """The host mask at a call's edges: its closing token alone once its grammar is done,
+        else the start's: its opening token alone, else its grammar's first token."""
+        if self.closing:
+            if self.end_bitmask is None:
+                self.end_bitmask = single_token_bitmask(self.closing_token_id, vocab_size)
+            return self.end_bitmask
         if self.start_bitmask is None and self.opening_token_id < 0:
             self.start_bitmask = xgr.allocate_token_bitmask(1, vocab_size)
             xgr.GrammarMatcher(self.grammar, terminate_without_stop_token=True).fill_next_token_bitmask(
                 self.start_bitmask,
             )
         elif self.start_bitmask is None:
-            self.start_bitmask = torch.zeros(xgr.get_bitmask_shape(1, vocab_size), dtype=torch.int32)
-            # Bit i of word i // 32 allows token i (int32 two's complement for bit 31).
-            word, bit = divmod(self.opening_token_id, 32)
-            self.start_bitmask[0, word] = (1 << bit) - (1 << 32 if bit == 31 else 0)
+            self.start_bitmask = single_token_bitmask(self.opening_token_id, vocab_size)
         return self.start_bitmask
 
     def fill_next_token_bitmask(self, bitmask: torch.Tensor, row: int = 0) -> None:
         """Row ``row`` of ``bitmask``: the next token a started or idle call allows."""
-        if self.matcher is not None and self.opened:
+        if self.matching:
+            assert self.matcher is not None
             self.matcher.fill_next_token_bitmask(bitmask, row)
         else:
-            bitmask[row] = self.first_token_bitmask(bitmask.shape[-1] * 32)[0]
+            bitmask[row] = self.edge_bitmask(bitmask.shape[-1] * 32)[0]
 
     def accept(self, token_id: int) -> bool:
         if self.matcher is not None and not self.opened:
@@ -394,17 +408,35 @@ class ToolCallConstraintState:
                 raise RuntimeError(f"DuplexIO tool call opened with token {token_id}, not {self.opening_token_id}")
             self.opened = True
             return False
-        if self.matcher is None or not self.matcher.accept_token(token_id):
-            raise RuntimeError(f"DuplexIO tool grammar rejected sampled token {token_id}")
+        if self.closing:
+            if token_id != self.closing_token_id:
+                raise RuntimeError(f"DuplexIO tool call closed with token {token_id}, not {self.closing_token_id}")
+        else:
+            if self.matcher is None or not self.matcher.accept_token(token_id):
+                raise RuntimeError(f"DuplexIO tool grammar rejected sampled token {token_id}")
+            assert self.capture is not None
+            self.capture.accept_bytes(self.decoded_vocab[token_id])
+            if not self.matcher.is_completed():
+                return False
+            if self.closing_token_id >= 0:
+                self.closing = True
+                return False
         assert self.capture is not None
-        self.capture.accept_bytes(self.decoded_vocab[token_id])
-        completed = self.matcher.is_completed()
-        if completed:
-            self.completed_call = self.capture.complete()
-            self.matcher = None
-            self.capture = None
-            self.force_next_call = False
-        return completed
+        self.completed_call = self.capture.complete()
+        self.matcher = None
+        self.capture = None
+        self.closing = False
+        self.force_next_call = False
+        return True
+
+
+def single_token_bitmask(token_id: int, vocab_size: int) -> torch.Tensor:
+    """A host mask allowing ``token_id`` alone."""
+    bitmask = torch.zeros(xgr.get_bitmask_shape(1, vocab_size), dtype=torch.int32)
+    # Bit i of word i // 32 allows token i (int32 two's complement for bit 31).
+    word, bit = divmod(token_id, 32)
+    bitmask[0, word] = (1 << bit) - (1 << 32 if bit == 31 else 0)
+    return bitmask
 
 
 def token_bitmasks(
@@ -423,9 +455,7 @@ def token_bitmasks(
     )
     torch.cat(
         [
-            allow_all
-            if constraint is None or (constraint.active and constraint.opened)
-            else constraint.first_token_bitmask(vocab_size)
+            allow_all if constraint is None or constraint.matching else constraint.edge_bitmask(vocab_size)
             for constraint in constraints
         ],
         out=bitmask,
@@ -433,7 +463,8 @@ def token_bitmasks(
     # One fill per row: a fill takes microseconds, while BatchGrammarMatcher's
     # thread handoff costs about a millisecond even at 32 rows.
     for row, constraint in enumerate(constraints):
-        if constraint is not None and constraint.matcher is not None and constraint.opened:
+        if constraint is not None and constraint.matching:
+            assert constraint.matcher is not None
             constraint.matcher.fill_next_token_bitmask(bitmask, row)
     return bitmask.to(device, non_blocking=True)
 
@@ -443,7 +474,7 @@ class ToolCallConstraintCompiler:
         """``opening``: calls open with ``<tool_call>`` (``DuplexIOConfig.tool_calls_open``); ``closed``:
         they end at ``</tool_call>`` (``DuplexIOConfig.tool_calls_close``)."""
         assert opening or not closed, "a closed call also opens with <tool_call>"
-        self.closed = closed
+        self.closing_token_id = tokenizer.convert_tokens_to_ids("</tool_call>") if closed else -1
         tokenizer_info = xgr.TokenizerInfo.from_huggingface(
             tokenizer,
             vocab_size=vocab_size,
@@ -477,7 +508,7 @@ class ToolCallConstraintCompiler:
         tools: Sequence[Mapping[str, Any]],
         tool_choice: Mapping[str, Any],
     ) -> ToolCallConstraintState:
-        grammar = tool_call_grammar(tools, tool_choice, closed=self.closed)
+        grammar = tool_call_grammar(tools, tool_choice, closed=self.closing_token_id >= 0)
         if grammar is None:
             return ToolCallConstraintState(compiled_grammar=None)
         return ToolCallConstraintState(
@@ -486,7 +517,7 @@ class ToolCallConstraintCompiler:
             tools=tuple(tools),
             force_next_call=tool_choice.get("mode") in {"required", "named"},
             opening_token_id=self.opening_token_id,
-            closed=self.closed,
+            closing_token_id=self.closing_token_id,
         )
 
     def take_completed_call(
