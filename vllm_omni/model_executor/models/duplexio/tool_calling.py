@@ -18,6 +18,9 @@ from jsonschema.validators import validator_for
 from transformers import PreTrainedTokenizerBase
 
 TOOL_CALL_STRING_LIMIT = 512
+# Around a closed call's function, after its <tool_call> opening.
+CALL_HEAD = "\n"
+CALL_TAIL = "\n</tool_call>"
 SCHEMA_ANNOTATION_KEYS = {
     "$comment",
     "$id",
@@ -183,11 +186,18 @@ def selected_tools(
 def tool_call_grammar(
     tools: Sequence[Mapping[str, Any]],
     tool_choice: Mapping[str, Any],
+    *,
+    closed: bool = False,
 ) -> xgr.Grammar | None:
+    r"""A call after its opening; ``closed`` (exports from v11) wraps it as the
+    teacher's chat does, ``\n<function=...>...</function>\n</tool_call>``."""
     available = selected_tools(tools, tool_choice)
     if not available:
         return None
-    return xgr.Grammar.union(*(tool_function_grammar(tool) for tool in available))
+    functions = xgr.Grammar.union(*(tool_function_grammar(tool) for tool in available))
+    if not closed:
+        return functions
+    return xgr.Grammar.concat(literal_grammar(CALL_HEAD), functions, literal_grammar(CALL_TAIL))
 
 
 @dataclass
@@ -195,6 +205,7 @@ class ToolCallCapture:
     """Capture tool-call fields as grammar-constrained bytes are accepted."""
 
     tools: tuple[Mapping[str, Any], ...]
+    closed: bool = False  # the call is wrapped in CALL_HEAD and CALL_TAIL
     decoder: Any = field(default_factory=lambda: codecs.getincrementaldecoder("utf-8")())
     buffer: str = ""
     stage: str = "function"
@@ -208,6 +219,7 @@ class ToolCallCapture:
         decoder.setstate(self.decoder.getstate())
         return ToolCallCapture(
             tools=self.tools,
+            closed=self.closed,
             decoder=decoder,
             buffer=self.buffer,
             stage=self.stage,
@@ -227,7 +239,7 @@ class ToolCallCapture:
                 header_end = self.buffer.find(">\n")
                 if header_end < 0:
                     return
-                prefix = "<function="
+                prefix = (CALL_HEAD if self.closed else "") + "<function="
                 assert self.buffer.startswith(prefix)
                 self.function_name = self.buffer[len(prefix) : header_end]
                 tool = next(tool for tool in self.tools if tool["function"]["name"] == self.function_name)
@@ -237,7 +249,7 @@ class ToolCallCapture:
                 continue
 
             if self.stage == "parameter":
-                closing_tag = "</function>"
+                closing_tag = "</function>" + (CALL_TAIL if self.closed else "")
                 if closing_tag.startswith(self.buffer):
                     if len(self.buffer) < len(closing_tag):
                         return
@@ -303,6 +315,8 @@ class ToolCallConstraintState:
     # (exports before v10), the grammar's first token starts the call.
     opening_token_id: int = -1
     opened: bool = False
+    # The call ends at </tool_call> rather than </function> (exports from v11).
+    closed: bool = False
     # The opening's mask on the host, shared by every fork.
     start_bitmask: torch.Tensor | None = None
 
@@ -317,6 +331,7 @@ class ToolCallConstraintState:
             completed_call=(dict(self.completed_call) if self.completed_call is not None else None),
             opening_token_id=self.opening_token_id,
             opened=self.opened,
+            closed=self.closed,
             start_bitmask=self.start_bitmask,
         )
 
@@ -348,7 +363,7 @@ class ToolCallConstraintState:
             self.grammar,
             terminate_without_stop_token=True,
         )
-        self.capture = ToolCallCapture(self.tools)
+        self.capture = ToolCallCapture(self.tools, closed=self.closed)
         self.completed_call = None
         self.opened = self.opening_token_id < 0
 
@@ -424,8 +439,11 @@ def token_bitmasks(
 
 
 class ToolCallConstraintCompiler:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase, vocab_size: int, *, opening: bool) -> None:
-        """``opening``: calls open with ``<tool_call>`` (``DuplexIOConfig.tool_calls_open``)."""
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, vocab_size: int, *, opening: bool, closed: bool) -> None:
+        """``opening``: calls open with ``<tool_call>`` (``DuplexIOConfig.tool_calls_open``); ``closed``:
+        they end at ``</tool_call>`` (``DuplexIOConfig.tool_calls_close``)."""
+        assert opening or not closed, "a closed call also opens with <tool_call>"
+        self.closed = closed
         tokenizer_info = xgr.TokenizerInfo.from_huggingface(
             tokenizer,
             vocab_size=vocab_size,
@@ -459,7 +477,7 @@ class ToolCallConstraintCompiler:
         tools: Sequence[Mapping[str, Any]],
         tool_choice: Mapping[str, Any],
     ) -> ToolCallConstraintState:
-        grammar = tool_call_grammar(tools, tool_choice)
+        grammar = tool_call_grammar(tools, tool_choice, closed=self.closed)
         if grammar is None:
             return ToolCallConstraintState(compiled_grammar=None)
         return ToolCallConstraintState(
@@ -468,6 +486,7 @@ class ToolCallConstraintCompiler:
             tools=tuple(tools),
             force_next_call=tool_choice.get("mode") in {"required", "named"},
             opening_token_id=self.opening_token_id,
+            closed=self.closed,
         )
 
     def take_completed_call(

@@ -66,6 +66,12 @@ def test_tool_calls_open_from_export_version_10() -> None:
     assert DuplexIOConfig.from_dict(_config(duplexio_export_version=10).to_dict()).tool_calls_open
 
 
+def test_tool_calls_close_from_export_version_11() -> None:
+    assert not _config(duplexio_export_version=10).tool_calls_close
+    assert _config(duplexio_export_version=11).tool_calls_close
+    assert _config(duplexio_export_version=11).tool_calls_open
+
+
 def test_duplexio_config_round_trips_nested_text_config() -> None:
     config = _config()
     restored = DuplexIOConfig.from_dict(config.to_dict())

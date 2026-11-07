@@ -50,6 +50,11 @@ class DuplexIOConfig(PretrainedConfig):
         """Whether the tool stream opens each call with ``<tool_call>`` (exports from v10)."""
         return self.duplexio_export_version >= 10
 
+    @property
+    def tool_calls_close(self) -> bool:
+        """Whether each call is the teacher chat's whole block, ending at ``</tool_call>`` (exports from v11)."""
+        return self.duplexio_export_version >= 11
+
     def get_text_config(self, decoder: bool | None = None, encoder: bool | None = None) -> PretrainedConfig:
         """Return Qwen's config for vLLM cache and parallelism planning."""
         return self.text_config
